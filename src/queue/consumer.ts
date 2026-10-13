@@ -204,8 +204,11 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
   let stopped: Promise<StopResult> | undefined
 
   /** Gives one store call `storeTimeoutMs`; a call that takes longer fails instead of wedging a slot. */
-  async function bounded<T>(call: Promise<T>, what: string): Promise<T> {
+  async function bounded<T>(call: Promise<T>, what: string, cancel?: AbortSignal): Promise<T> {
     const stop = new AbortController()
+    // Cancelling ends the wait's timer (so it cannot hold the process open); the call is then no
+    // longer timed, and its answer is the caller's to ignore.
+    cancel?.addEventListener('abort', () => stop.abort(), { once: true })
     const timer = new Promise<never>((_, reject) => {
       void sleep(storeTimeoutMs, stop.signal).then(() => {
         if (!stop.signal.aborted) {
@@ -364,12 +367,20 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         renewalPending = true
         void (async () => {
           try {
-            if (!(await bounded(store.renew(key, token, leaseSeconds), 'renew'))) {
+            const kept = await bounded(
+              store.renew(key, token, leaseSeconds),
+              'renew',
+              stopKeepAlive.signal
+            )
+            // Once the handler has ended, an answer is history: do not blame or abort it.
+            if (!kept && !stopKeepAlive.signal.aborted) {
               log.warn('lost the claim while its handler was running', fields)
               flight.control.abort()
             }
           } catch (error) {
-            log.warn('could not renew the claim', { ...fields, errorName: nameOf(error) })
+            if (!stopKeepAlive.signal.aborted) {
+              log.warn('could not renew the claim', { ...fields, errorName: nameOf(error) })
+            }
           } finally {
             renewalPending = false
           }

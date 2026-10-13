@@ -1004,3 +1004,53 @@ describe('the lease covers a slow store', () => {
     expect(leases).toEqual([60])
   })
 })
+
+describe('a renewal still in flight when the handler ends', () => {
+  test('answering false afterwards neither logs a lost claim nor aborts the finished handler', async () => {
+    let answer!: (value: boolean) => void
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        renew: () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve
+          }),
+      }),
+    })
+    const hold = gate()
+    let signal: AbortSignal | undefined
+    const consumer = t.make({
+      'test.ping': async (_m, ctx) => {
+        signal = ctx.signal
+        await hold.opened
+      },
+    })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(10_000)
+    hold.open()
+    await running
+    answer(false)
+    await t.time.settle()
+    expect(signal?.aborted).toBe(false)
+    expect(t.logger.entries.some((e) => e.message.includes('lost the claim'))).toBe(false)
+  })
+
+  test('a renewal that never answers leaves no timer behind once the flight is done', async () => {
+    const t = setup({
+      store: (inner) => ({ ...inner, renew: () => new Promise<boolean>(() => undefined) }),
+    })
+    const hold = gate()
+    const consumer = t.make({ 'test.ping': async () => hold.opened })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(10_000)
+    expect(t.time.pending()).toBeGreaterThan(0)
+    hold.open()
+    await running
+    await t.time.settle()
+    expect(t.time.pending()).toBe(0)
+  })
+})

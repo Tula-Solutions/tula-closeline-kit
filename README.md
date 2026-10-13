@@ -400,7 +400,7 @@ UUID unless you pass one: when you retry a publish, pass the same envelope, so t
 recognise the copy. `encode` and `decode` validate with Zod on the way in and out. A body that is
 not JSON, has an unknown type or another version, lacks (or wrongly has) an Organization id, or
 fails its payload schema is never dropped and never throws in the consumer: `receive` returns it as
-`{ kind: 'invalid', reason, issues }` (field names the schema declares and codes, never values; a record key or any path under a union is shown as `*`), the consumer logs and
+`{ kind: 'invalid', reason, issues }` (field names the schema declares and codes, never values; a record key or any path under a union is shown as `*`). Paths under a union or intersection are masked entirely, so a payload shaped as a discriminated union reports no field names; prefer an object with optional fields where diagnostics matter, the consumer logs and
 reports it and hides it for `invalidDelaySeconds`, and the queue's redrive policy sends it to the
 dead-letter queue after `maxReceiveCount` deliveries.
 

@@ -248,8 +248,9 @@ function createConsumer(options) {
   let abandonedCount = 0;
   let finishedCount = 0;
   let stopped;
-  async function bounded(call, what) {
+  async function bounded(call, what, cancel) {
     const stop = new AbortController;
+    cancel?.addEventListener("abort", () => stop.abort(), { once: true });
     const timer = new Promise((_, reject) => {
       sleep(storeTimeoutMs, stop.signal).then(() => {
         if (!stop.signal.aborted) {
@@ -387,12 +388,15 @@ function createConsumer(options) {
         renewalPending = true;
         (async () => {
           try {
-            if (!await bounded(store.renew(key, token, leaseSeconds), "renew")) {
+            const kept = await bounded(store.renew(key, token, leaseSeconds), "renew", stopKeepAlive.signal);
+            if (!kept && !stopKeepAlive.signal.aborted) {
               log.warn("lost the claim while its handler was running", fields);
               flight.control.abort();
             }
           } catch (error) {
-            log.warn("could not renew the claim", { ...fields, errorName: nameOf(error) });
+            if (!stopKeepAlive.signal.aborted) {
+              log.warn("could not renew the claim", { ...fields, errorName: nameOf(error) });
+            }
           } finally {
             renewalPending = false;
           }
