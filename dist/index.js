@@ -10,7 +10,7 @@ import {
   redactFields,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-f8qftbbb.js";
+} from "./shared/chunk-7vbr3qrx.js";
 
 // src/auth/claims.ts
 import {
@@ -512,7 +512,10 @@ function isSentryDsn(value, environment) {
   const match = hasDsnShape(value);
   return match !== null && (match[1] === "https" || environment === "local");
 }
-var sentryDsnSchema = z3.preprocess((value) => typeof value === "string" && value.trim() === "" ? undefined : value, z3.string().refine((value) => hasDsnShape(value) !== null, {
+var sentryDsnSchema = z3.preprocess((value) => {
+  const trimmed = typeof value === "string" ? value.trim() : value;
+  return trimmed === "" ? undefined : trimmed;
+}, z3.string().refine((value) => hasDsnShape(value) !== null, {
   message: "SENTRY_DSN must look like https://<key>@<host>/<project id>"
 }).optional());
 function requireSentryDsn(env, ctx) {
@@ -639,25 +642,32 @@ var DATA_COLLECTION_OFF = {
   frameContextLines: 0
 };
 var TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/;
+var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/;
+var INVALID_IDENTIFIER = "[invalid]";
+var MASK = "[redacted]";
 var MAX_MESSAGE = 8192;
 var MAX_NAME = 200;
 var MAX_LINKED_ERRORS = 6;
 var MAX_GROUP_CHILDREN = 5;
 var MAX_STACK_SOURCE_MESSAGE = 1048576;
 var MAX_STACK_TAIL = 16384;
+var MAX_STACK_HEADER = 1024;
+var MAX_EXCEPTIONS = 12;
+var MAX_FRAMES = 200;
 var MAX_STRING_VALUE = 512;
 var KEPT_EVENT_KEYS = new Set([
   "event_id",
   "timestamp",
   "platform",
-  "exception",
   "release",
   "environment",
-  "sdk",
-  "debug_meta"
+  "sdk"
 ]);
 function text(value, max) {
   return scrubText2(String(value)).slice(0, max);
+}
+function identifier(value) {
+  return typeof value === "string" && IDENTIFIER.test(value) ? value : INVALID_IDENTIFIER;
 }
 function pathWithoutQuery(path) {
   const end = path.search(/[?#]/);
@@ -668,16 +678,16 @@ function buildTags(base, context, error) {
   if (context.tags !== undefined) {
     for (const [key, value] of Object.entries(context.tags).slice(0, MAX_TAGS)) {
       if (TAG_KEY.test(key)) {
-        tags[key] = text(value, MAX_TAG_VALUE);
+        tags[key] = isSensitiveKey(key) ? MASK : text(value, MAX_TAG_VALUE);
       }
     }
   }
   Object.assign(tags, base);
   if (context.organizationId !== undefined) {
-    tags.organization_id = text(context.organizationId, MAX_TAG_VALUE);
+    tags.organization_id = identifier(context.organizationId);
   }
   if (context.requestId !== undefined) {
-    tags.request_id = text(context.requestId, MAX_TAG_VALUE);
+    tags.request_id = identifier(context.requestId);
   }
   if (context.method !== undefined) {
     tags.http_method = text(context.method, 16);
@@ -686,7 +696,7 @@ function buildTags(base, context, error) {
     tags.http_status = String(Math.trunc(context.status));
   }
   if (isAppError2(error)) {
-    tags.error_code = error.code;
+    tags.error_code = text(error.code, MAX_TAG_VALUE);
   }
   return tags;
 }
@@ -713,15 +723,41 @@ function read(get) {
 function isErrorLike(value) {
   return value instanceof Error || typeof value === "object" && value !== null && Object.prototype.toString.call(value) === "[object Error]";
 }
-function framesOf(stack) {
+function messageEnd(stack, message) {
+  if (message === "") {
+    const newline = stack.indexOf(`
+`);
+    return newline === -1 ? stack.length : newline;
+  }
+  let from = 0;
+  for (let attempt = 0;attempt < 3; attempt++) {
+    const at = stack.indexOf(message, from);
+    if (at === -1 || at > MAX_STACK_HEADER) {
+      return -1;
+    }
+    const end = at + message.length;
+    if (end === stack.length || stack[end] === `
+`) {
+      return end;
+    }
+    from = at + 1;
+  }
+  return -1;
+}
+function framesOf(stack, message) {
   if (typeof stack !== "string") {
     return "";
   }
-  const tail = stack.length > MAX_STACK_TAIL ? stack.slice(-MAX_STACK_TAIL) : stack;
-  const lines = tail.split(`
+  const limit = message.length + MAX_STACK_HEADER + MAX_STACK_TAIL;
+  const head = stack.length > limit ? stack.slice(0, limit) : stack;
+  const end = messageEnd(head, message);
+  if (end === -1) {
+    return "";
+  }
+  const lines = head.slice(end).split(`
 `);
-  if (tail !== stack) {
-    lines.shift();
+  if (head !== stack) {
+    lines.pop();
   }
   return lines.filter((line) => /^\s+at /.test(line)).join(`
 `);
@@ -739,7 +775,7 @@ function boundedCopy(source, budget) {
   define(copy, "name", name);
   const header = `${name}: ${message.split(`
 `, 1)[0]}`;
-  const frames = typeof rawMessage === "string" && rawMessage.length > MAX_STACK_SOURCE_MESSAGE ? "" : framesOf(read(() => source.stack));
+  const frames = typeof rawMessage === "string" && rawMessage.length <= MAX_STACK_SOURCE_MESSAGE ? framesOf(read(() => source.stack), rawMessage) : "";
   define(copy, "stack", frames === "" ? header : `${header}
 ${frames}`);
   if (budget.left > 0) {
@@ -778,6 +814,74 @@ function toReportable(value) {
     return new Error("an error that could not be read was thrown");
   }
 }
+function isPlain2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function ownFrame(frame) {
+  const out = {};
+  if (typeof frame.filename === "string") {
+    out.filename = frame.filename;
+  }
+  if (typeof frame.function === "string") {
+    out.function = frame.function;
+  }
+  if (typeof frame.lineno === "number" && Number.isFinite(frame.lineno)) {
+    out.lineno = frame.lineno;
+  }
+  if (typeof frame.colno === "number" && Number.isFinite(frame.colno)) {
+    out.colno = frame.colno;
+  }
+  return out;
+}
+function ownMechanism(mechanism) {
+  const out = {};
+  if (typeof mechanism.type === "string") {
+    out.type = mechanism.type.slice(0, 64);
+  }
+  if (typeof mechanism.handled === "boolean") {
+    out.handled = mechanism.handled;
+  }
+  for (const key of ["exception_id", "parent_id"]) {
+    const value = mechanism[key];
+    if (typeof value === "number" && Number.isSafeInteger(value)) {
+      out[key] = value;
+    }
+  }
+  if (typeof mechanism.source === "string" && /^[a-z_]{1,32}$/.test(mechanism.source)) {
+    out.source = mechanism.source;
+  }
+  if (typeof mechanism.is_exception_group === "boolean") {
+    out.is_exception_group = mechanism.is_exception_group;
+  }
+  return out;
+}
+function ownException(exception) {
+  if (!isPlain2(exception) || !Array.isArray(exception.values)) {
+    return;
+  }
+  const values = [];
+  for (const entry of exception.values.slice(0, MAX_EXCEPTIONS)) {
+    if (!isPlain2(entry)) {
+      continue;
+    }
+    const out = {};
+    if (typeof entry.type === "string") {
+      out.type = entry.type;
+    }
+    if (typeof entry.value === "string") {
+      out.value = entry.value;
+    }
+    const frames = isPlain2(entry.stacktrace) ? entry.stacktrace.frames : undefined;
+    if (Array.isArray(frames)) {
+      out.stacktrace = { frames: frames.slice(-MAX_FRAMES).filter(isPlain2).map(ownFrame) };
+    }
+    if (isPlain2(entry.mechanism)) {
+      out.mechanism = ownMechanism(entry.mechanism);
+    }
+    values.push(out);
+  }
+  return { values };
+}
 function confine(event, hint) {
   const own = hint.data;
   const kept = {};
@@ -788,6 +892,10 @@ function confine(event, hint) {
   }
   kept.level = "error";
   kept.tags = own?.tags ?? {};
+  const exception = ownException(event.exception);
+  if (exception !== undefined) {
+    kept.exception = exception;
+  }
   const runtime = event.contexts?.runtime;
   kept.contexts = {
     ...runtime === undefined ? {} : { runtime },
@@ -828,7 +936,9 @@ function createSentryReporter(options) {
     enableRuntimeChannelInjection: false,
     beforeSend: (event, hint) => {
       try {
-        return scrubEvent(confine(event, hint));
+        const { tags, ...rest } = confine(event, hint);
+        const clean = scrubEvent(rest);
+        return clean === null ? null : { ...clean, tags };
       } catch {
         return null;
       }

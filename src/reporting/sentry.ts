@@ -10,6 +10,7 @@ import {
 } from '@sentry/bun'
 import { isAppError } from '../errors'
 import { cutText, scrubText } from '../scrub'
+import { isSensitiveKey } from '../sensitive'
 import { isSentryDsn } from './env'
 import {
   type ErrorContext,
@@ -36,6 +37,12 @@ const DATA_COLLECTION_OFF: NonNullable<BunOptions['dataCollection']> = {
   frameContextLines: 0,
 }
 const TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/
+// The ids the adapter sets from typed context are sent as they are, never through `scrubText`: an
+// operator filters on them, so a pattern that guesses wrong must not be able to change one. A value
+// outside this charset and length is not an id and is replaced by a fixed marker.
+const IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/
+const INVALID_IDENTIFIER = '[invalid]'
+const MASK = '[redacted]'
 
 // What `capture` hands the SDK is bounded, so the work it does before returning is too, whatever it
 // is given. The SDK follows at most six errors (the one captured and five linked), so building
@@ -47,20 +54,23 @@ const MAX_GROUP_CHILDREN = 5
 // An error whose message is longer than this is not read back through `error.stack`, which repeats
 // the message: building that string takes time in proportion to it. It is sent without frames.
 const MAX_STACK_SOURCE_MESSAGE = 1_048_576
+// The most a stack may hold besides its message: the frames that are read, and a name in front.
 const MAX_STACK_TAIL = 16_384
+const MAX_STACK_HEADER = 1_024
+const MAX_EXCEPTIONS = 12
+const MAX_FRAMES = 200
 const MAX_STRING_VALUE = 512
 
-// The event fields the adapter lets through; anything else on an event came from a scope that
-// belongs to someone else (see `confine`).
+// The event fields the adapter lets through as they are; anything else on an event came from a scope
+// that belongs to someone else (see `confine`). `exception` is not here: it is rebuilt field by
+// field (`ownException`). `debug_meta` is not, because the adapter sets none.
 const KEPT_EVENT_KEYS: ReadonlySet<string> = new Set([
   'event_id',
   'timestamp',
   'platform',
-  'exception',
   'release',
   'environment',
   'sdk',
-  'debug_meta',
 ])
 
 /** Options for createSentryReporter: the common ones plus the DSN, which is required. */
@@ -84,6 +94,11 @@ function text(value: unknown, max: number): string {
   return scrubText(String(value)).slice(0, max)
 }
 
+/** An id as it was given when it has the shape of one, otherwise a fixed marker. */
+function identifier(value: unknown): string {
+  return typeof value === 'string' && IDENTIFIER.test(value) ? value : INVALID_IDENTIFIER
+}
+
 function pathWithoutQuery(path: string): string {
   const end = path.search(/[?#]/)
   return end === -1 ? path : path.slice(0, end)
@@ -99,16 +114,17 @@ function buildTags(
   if (context.tags !== undefined) {
     for (const [key, value] of Object.entries(context.tags).slice(0, MAX_TAGS)) {
       if (TAG_KEY.test(key)) {
-        tags[key] = text(value, MAX_TAG_VALUE)
+        // The tags skip `scrubEvent` (see `beforeSend`), so a sensitive key is dealt with here.
+        tags[key] = isSensitiveKey(key) ? MASK : text(value, MAX_TAG_VALUE)
       }
     }
   }
   Object.assign(tags, base)
   if (context.organizationId !== undefined) {
-    tags.organization_id = text(context.organizationId, MAX_TAG_VALUE)
+    tags.organization_id = identifier(context.organizationId)
   }
   if (context.requestId !== undefined) {
-    tags.request_id = text(context.requestId, MAX_TAG_VALUE)
+    tags.request_id = identifier(context.requestId)
   }
   if (context.method !== undefined) {
     tags.http_method = text(context.method, 16)
@@ -117,7 +133,7 @@ function buildTags(
     tags.http_status = String(Math.trunc(context.status))
   }
   if (isAppError(error)) {
-    tags.error_code = error.code
+    tags.error_code = text(error.code, MAX_TAG_VALUE)
   }
   return tags
 }
@@ -159,15 +175,48 @@ function isErrorLike(value: unknown): value is Error {
   )
 }
 
-/** The frames of a stack: its `at` lines, taken from the end so a long message in front costs nothing. */
-function framesOf(stack: unknown): string {
+/**
+ * Where the message ends inside a stack, which starts with the error's name and its message; -1 when
+ * the stack does not hold the message there (the message was changed after the error was made).
+ */
+function messageEnd(stack: string, message: string): number {
+  if (message === '') {
+    const newline = stack.indexOf('\n')
+    return newline === -1 ? stack.length : newline
+  }
+  let from = 0
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const at = stack.indexOf(message, from)
+    if (at === -1 || at > MAX_STACK_HEADER) {
+      return -1
+    }
+    const end = at + message.length
+    if (end === stack.length || stack[end] === '\n') {
+      return end
+    }
+    from = at + 1
+  }
+  return -1
+}
+
+/**
+ * The frames of a stack: its `at` lines that come after the message's own lines, so a line of the
+ * message that imitates a frame is never one. Only the first 16 KiB after the message is read, and a
+ * stack that does not hold the message where it should is sent without frames.
+ */
+function framesOf(stack: unknown, message: string): string {
   if (typeof stack !== 'string') {
     return ''
   }
-  const tail = stack.length > MAX_STACK_TAIL ? stack.slice(-MAX_STACK_TAIL) : stack
-  const lines = tail.split('\n')
-  if (tail !== stack) {
-    lines.shift()
+  const limit = message.length + MAX_STACK_HEADER + MAX_STACK_TAIL
+  const head = stack.length > limit ? stack.slice(0, limit) : stack
+  const end = messageEnd(head, message)
+  if (end === -1) {
+    return ''
+  }
+  const lines = head.slice(end).split('\n')
+  if (head !== stack) {
+    lines.pop()
   }
   return lines.filter((line) => /^\s+at /.test(line)).join('\n')
 }
@@ -198,9 +247,12 @@ function boundedCopy(source: Error, budget: { left: number }): Error {
   // The SDK skips the first line of a stack, so the header must be exactly one line.
   const header = `${name}: ${message.split('\n', 1)[0]}`
   const frames =
-    typeof rawMessage === 'string' && rawMessage.length > MAX_STACK_SOURCE_MESSAGE
-      ? ''
-      : framesOf(read(() => source.stack))
+    typeof rawMessage === 'string' && rawMessage.length <= MAX_STACK_SOURCE_MESSAGE
+      ? framesOf(
+          read(() => source.stack),
+          rawMessage
+        )
+      : ''
   define(copy, 'stack', frames === '' ? header : `${header}\n${frames}`)
   if (budget.left > 0) {
     const cause = read(() => (source as { cause?: unknown }).cause)
@@ -247,6 +299,86 @@ function toReportable(value: unknown): Error {
   }
 }
 
+type Plain = Record<string, unknown>
+
+function isPlain(value: unknown): value is Plain {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function ownFrame(frame: Plain): Plain {
+  const out: Plain = {}
+  if (typeof frame.filename === 'string') {
+    out.filename = frame.filename
+  }
+  if (typeof frame.function === 'string') {
+    out.function = frame.function
+  }
+  if (typeof frame.lineno === 'number' && Number.isFinite(frame.lineno)) {
+    out.lineno = frame.lineno
+  }
+  if (typeof frame.colno === 'number' && Number.isFinite(frame.colno)) {
+    out.colno = frame.colno
+  }
+  return out
+}
+
+function ownMechanism(mechanism: Plain): Plain {
+  const out: Plain = {}
+  if (typeof mechanism.type === 'string') {
+    out.type = mechanism.type.slice(0, 64)
+  }
+  if (typeof mechanism.handled === 'boolean') {
+    out.handled = mechanism.handled
+  }
+  // How a cause chain is linked, so the tracker can show it as one.
+  for (const key of ['exception_id', 'parent_id']) {
+    const value = mechanism[key]
+    if (typeof value === 'number' && Number.isSafeInteger(value)) {
+      out[key] = value
+    }
+  }
+  if (typeof mechanism.source === 'string' && /^[a-z_]{1,32}$/.test(mechanism.source)) {
+    out.source = mechanism.source
+  }
+  if (typeof mechanism.is_exception_group === 'boolean') {
+    out.is_exception_group = mechanism.is_exception_group
+  }
+  return out
+}
+
+/**
+ * The exception entries of an event, rebuilt from known fields only: type, value, the frames (file,
+ * function, line, column) and the mechanism (type, handled, and the links between a cause chain's
+ * entries). Whatever else the SDK or an event processor put in the subtree is not carried over.
+ */
+function ownException(exception: unknown): { values: Plain[] } | undefined {
+  if (!isPlain(exception) || !Array.isArray(exception.values)) {
+    return undefined
+  }
+  const values: Plain[] = []
+  for (const entry of exception.values.slice(0, MAX_EXCEPTIONS)) {
+    if (!isPlain(entry)) {
+      continue
+    }
+    const out: Plain = {}
+    if (typeof entry.type === 'string') {
+      out.type = entry.type
+    }
+    if (typeof entry.value === 'string') {
+      out.value = entry.value
+    }
+    const frames = isPlain(entry.stacktrace) ? entry.stacktrace.frames : undefined
+    if (Array.isArray(frames)) {
+      out.stacktrace = { frames: frames.slice(-MAX_FRAMES).filter(isPlain).map(ownFrame) }
+    }
+    if (isPlain(entry.mechanism)) {
+      out.mechanism = ownMechanism(entry.mechanism)
+    }
+    values.push(out)
+  }
+  return { values }
+}
+
 /**
  * Keeps only what this adapter put on the event. The SDK merges the process-wide global and
  * isolation scopes into every event, and an application or another library can set tags, extra
@@ -262,6 +394,10 @@ function confine(event: Event, hint: EventHint): Event {
   }
   kept.level = 'error'
   kept.tags = own?.tags ?? {}
+  const exception = ownException(event.exception)
+  if (exception !== undefined) {
+    kept.exception = exception
+  }
   const runtime = (event.contexts as Record<string, unknown> | undefined)?.runtime
   kept.contexts = {
     ...(runtime === undefined ? {} : { runtime }),
@@ -325,7 +461,11 @@ export function createSentryReporter(options: SentryReporterOptions): SentryRepo
     enableRuntimeChannelInjection: false,
     beforeSend: (event, hint) => {
       try {
-        return scrubEvent(confine(event, hint)) as typeof event | null
+        // The tags are the adapter's own and were checked or scrubbed one by one when they were
+        // built; they skip `scrubEvent`, which would run its patterns over an id again.
+        const { tags, ...rest } = confine(event, hint)
+        const clean = scrubEvent(rest)
+        return clean === null ? null : ({ ...clean, tags } as typeof event)
       } catch {
         return null
       }

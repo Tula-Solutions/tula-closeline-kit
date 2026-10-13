@@ -7,7 +7,7 @@ import { scrubText } from '../src/scrub'
 
 /**
  * Benchmark: reporting an error with no DSN configured, reporting one through the Sentry adapter,
- * and scrubbing free text, in five legs.
+ * and scrubbing free text, in six legs.
  *
  * Input: 2,000 distinct inputs per leg (300 for the 32 KiB leg), built from a fixed sequence (no
  * randomness), run one after another, each timed on its own.
@@ -29,6 +29,9 @@ import { scrubText } from '../src/scrub'
  *   mixed prose with secrets, email addresses, telephone numbers and card numbers in it. Expected
  *   complexity O(input length): about 0.6 ms measured, so it bounds what one log line or one
  *   error message can cost.
+ * - `scrubText, 32 KiB of @` is an input made only of `@`, the shape that made email masking
+ *   quadratic (a backward search from each `@` over the whole text). Expected complexity
+ *   O(input length). The mixed-prose leg above cannot catch that, so this one has its own budget.
  *
  * Budgets, per call, and why each number (measured over many runs on one developer machine):
  * - mean: the regression gate across all 2,000 calls. Measured 0.0001 ms for the no-op capture,
@@ -41,7 +44,8 @@ import { scrubText } from '../src/scrub'
  *   to measure, fails every batch. About 10x the measured 0.0001 ms, 8x 0.002 ms and 8x 0.004 ms.
  * - The Sentry leg measured 0.08 ms for the mean, median and p95; the budgets are 5x, 4x and 7x.
  *   The 32 KiB leg measured 0.6 ms; the budgets are 5x, 4x and 6x. Both are wide on purpose: they
- *   catch an accidental quadratic or an uncapped input, not a few percent.
+ *   catch an accidental quadratic or an uncapped input, not a few percent. The 32 KiB of `@` leg
+ *   measured 0.65 ms; the budgets are the same as the other 32 KiB leg.
  * The no-op budgets sit near the timer's resolution on purpose: a timer read costs about as much
  * as the call, so what the leg proves is that capture stays in the sub-microsecond range, which
  * is "nothing measurable" next to any request.
@@ -62,6 +66,7 @@ const SCRUB_PLAIN_BUDGET: Budget = { meanMs: 0.008, medianMs: 0.006, tailMs: 0.0
 const SCRUB_SECRETS_BUDGET: Budget = { meanMs: 0.015, medianMs: 0.012, tailMs: 0.03 }
 const SENTRY_CAPTURE_BUDGET: Budget = { meanMs: 0.4, medianMs: 0.35, tailMs: 0.6 }
 const SCRUB_32K_BUDGET: Budget = { meanMs: 3, medianMs: 2.5, tailMs: 4 }
+const SCRUB_AT_BUDGET: Budget = { meanMs: 3, medianMs: 2.5, tailMs: 4 }
 
 const reporter = createErrorReporter({
   service: 'bench',
@@ -156,6 +161,14 @@ if (scrubText(bigMessages[0] as string).includes('hunter2')) {
   process.exit(1)
 }
 
+// Only `@`, with a counter in front so the inputs differ: linear email masking is a few hundred
+// microseconds on it; the quadratic search it replaced took 16 to 23 ms.
+const atMessages: string[] = []
+for (let i = 0; i < CALLS_32K + WARMUP_32K; i++) {
+  const prefix = `run ${i}: `
+  atMessages.push(prefix + '@'.repeat(32_768 - prefix.length))
+}
+
 interface Leg<T> {
   name: string
   budget: Budget
@@ -202,6 +215,15 @@ const legs: Array<Leg<CaptureInput> | Leg<string>> = [
     name: 'scrubText, 32 KiB input',
     budget: SCRUB_32K_BUDGET,
     inputs: bigMessages,
+    warmup: WARMUP_32K,
+    run: (message: string) => {
+      scrubText(message)
+    },
+  } satisfies Leg<string>,
+  {
+    name: 'scrubText, 32 KiB of @',
+    budget: SCRUB_AT_BUDGET,
+    inputs: atMessages,
     warmup: WARMUP_32K,
     run: (message: string) => {
       scrubText(message)

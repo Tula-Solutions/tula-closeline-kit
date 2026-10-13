@@ -83,6 +83,16 @@ printed to the console. An `http:` DSN is accepted only when `ENVIRONMENT` is `l
 - A thrown value that is not an `Error` (an object, a number, `null`) is replaced by an `Error`
   that names only its type, `non-Error value thrown (object)`, and for a string also the string
   after `scrubText`, cut to 512 characters. None of the object's fields is sent.
+- Frames are read only from the lines of the stack after the message's own lines, so a message line
+  that imitates `    at fn (file:1:2)` is never a frame. A stack that does not hold the message
+  where it should (the message was changed after the error was made) is sent without frames.
+
+The event's `exception` entries are rebuilt by the adapter from known fields (type, value, frames
+with file, function, line and column, and the mechanism's type, handled flag and cause links), not
+kept from the SDK, so nothing another event processor adds to them is sent; there is no
+`debug_meta`. The `organization_id` and `request_id` tags are checked against `[A-Za-z0-9_.:-]` and
+64 characters and sent as they are, not through `scrubText`; a value that fails is sent as
+`[invalid]`.
 
 Every event then passes the kit's key-based redaction and `scrubText` on every string, in
 `beforeSend`. Only the fields this adapter set are kept: the SDK merges its process-wide global
@@ -108,28 +118,73 @@ It masks:
   `token`, `secret`, `apiKey`, `authorization`, `cookie`, `body`, `transcript`, `recording`, `pass`,
   `pwd`, `passwd`, `auth`, `signature`, `sig`, `sid`, `session`, `session_id`,
   `AWS_SECRET_ACCESS_KEY`, ...). A quoted value is masked up to its closing quote (a doubled quote
-  is part of it); an unquoted value is masked to the end of the line; a value in a URL query string
-  (after `?` or `&`) to the next `&`, `#`, space, comma or semicolon;
+  is part of it); an unquoted value is masked to the end of the line, except after a quoted key
+  (JSON, `{"sid":42,"id":"x"}`), where it ends at the next `,`, `}`, `]` or space and an object or
+  array value ends where it closes; a value in a URL query string (after `?` or `&`) ends at the
+  next `&`, `#`, space, comma or semicolon;
 - URL credentials, and database and broker URLs whole (`postgres://`, `redis://`, ... including a
   password with a space or a newline);
 - the value in a Postgres constraint detail, `Key (email)=([redacted]) already exists.`;
-- email addresses;
-- telephone numbers: `+` and 8 to 15 digits, or 9 to 15 digits with spaces, dashes, dots or
-  parentheses (`(415) 555-0199`, `415.555.0199`, `020 7946 0958`);
-- payment card numbers: 13 to 19 digits, with or without spaces or dashes, that pass the Luhn check
-  and do not start with 1 (epoch timestamps in milliseconds, microseconds and nanoseconds do, and
-  must stay readable; UATP airline cards, the only cards that start with 1, are not recognised).
+- email addresses, including letters beyond ASCII (`jörg.müller@acme.de`, `田中@example.jp`);
+- telephone numbers written with a `+` (8 to 15 digits), with a parenthesised area code
+  (`(415) 555-0199`, `+1 (415) 555-0199`) or in the national trunk form, a first group that starts
+  with `0` and has 2 to 5 digits (`020 7946 0958`, `06 12 34 56 78`, `0171-123-4567`);
+- payment card numbers: 13 to 19 digits, bare or written in the usual groups (4-4-4-4, 4-6-5), in a
+  card issuer's range (3x, 4, 5, 6, 2221 to 2720) that pass the Luhn check. A run that starts with
+  `1` (epoch timestamps in milliseconds, microseconds and nanoseconds do, and must stay readable) is
+  a card only when it is written in four groups of four.
 
-It leaves alone: bare digit runs that are not a card number (ids, counters, timestamps, ports),
-digits inside a longer word (`req_4111…`, hex ids), ISO dates (`2024-05-12 10:30`), IPv4 addresses,
-version numbers, `@scope/package` names, and file positions in stack frames
-(`at verify (/app/src/auth/token:12:3)` is not read as the key `token`).
+**An identifier is never altered.** When a pattern cannot tell a telephone number or a card from an
+id, it leaves the text alone. So these stay readable: UUIDs (including any made of digits only),
+`org_`, `usr_`, `req_` and `evt_` ids, ULIDs, hashes, epoch and compact timestamps, ISO dates and
+times with offsets, version numbers and CalVer, byte counts and money amounts with separators,
+ranges (`984757-662552`), lists of numeric ids, IPv4 and IPv6 addresses, any digits attached to a
+letter, `_`, or a `-` or `.` that follows one, ports, `@scope/package` names, and file positions in
+stack frames (`at verify (/app/src/auth/token:12:3)` is not read as the key `token`). A property
+test holds this to 20,000 UUIDs and thousands of ids of every other kind from a fixed seed.
+
+**Not covered, on purpose.** Free-text scrubbing is a second line of defence that favours keeping
+identifiers intact; the main protection is key-based redaction of structured fields, so put personal
+data in fields, not in messages. These are not masked in free text:
+- telephone numbers written as bare digits, or with separators but without a `+`, a parenthesised
+  area code or a trunk zero (`4155550199`, `415-555-0199`, `1-800-555-0199`, French dotted
+  `01.23.45.67.89`, which reads as an IPv4 address);
+- IBANs and other bank account identifiers, and national ids;
+- postal addresses and names.
+
+The one place an id can still be altered: a bare run of 13 to 19 digits that starts in a card
+issuer's range and passes the Luhn check by chance (about one in ten such runs), and four numeric
+ids of four digits written one after the other like a card.
 
 **It over-masks on purpose.** Prose after a sensitive key goes with the value, because a free-text
 value cannot be told from a secret: `Invalid token: expired` becomes `Invalid token: [redacted]`,
 `Request body: invalid JSON` loses its last words, and `login failed password=x for ann` ends at
-`password=[redacted]`. A ten-digit list written with spaces can read as a telephone number. Put
-the facts that must survive in structured log fields, not after a sensitive word in a message.
+`password=[redacted]`. Put the facts that must survive in structured log fields, not after a
+sensitive word in a message.
+
+### Behaviour changes in 0.4.0
+
+For callers of the logger and `scrubText` before this version:
+- **More log field names are redacted.** Before: `password`, `token`, `secret`, `apiKey`,
+  `authorization`, `cookie`, `body`, `transcript`, `recording` and their suffix forms. Now also
+  `pass`, `pwd`, `passwd`, `passphrase`, `auth`, `sig`, `sid`, `session`, `sessionId`, `sessid`,
+  `signature` and `AWS_SECRET_ACCESS_KEY`, and `pass`, `sig`, `sid` and `auth` as a whole word of a
+  longer key (`db_pass`, `x-auth`, `userSid`, `X-Amz-Sig`) and `session` as its last word
+  (`userSession`). A field named `auth: { mode }`, `pass: true` or `session: { ... }` is now
+  `[redacted]`. A word inside another word is not touched: `bypass`, `compass`, `inside`, `design`,
+  `possession` and `sessionCount` stay readable.
+- **Log messages and error messages are scrubbed.** `msg`, and the `message` and `stack` of a logged
+  `Error`, go through `scrubText`. An unquoted value after a sensitive key is masked to the end of
+  the line (`login failed password=x for ann` becomes `login failed password=[redacted]`), except
+  after a quoted JSON key.
+- **Messages are cut at 32 KiB** (a trailing partial word is dropped and `[truncated]` added).
+- **Email addresses, telephone numbers and card numbers are masked in messages**, within the limits
+  above.
+- **`sentryDsnSchema` trims** surrounding whitespace, as `createErrorReporter` does; a DSN with a
+  trailing newline now boots.
+- **The memory reporter** drops captures, and its `flush` resolves `false`, after `close`.
+- **Tags set from typed context** (`organization_id`, `request_id`) are sent as they are when they
+  match `[A-Za-z0-9_.:-]{1,64}`, and as `[invalid]` otherwise.
 
 ### Wiring it into a service
 

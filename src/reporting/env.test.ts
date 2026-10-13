@@ -68,9 +68,7 @@ describe('SENTRY_DSN must be one the Sentry SDK accepts (review F2)', () => {
   test.each([
     ['a trailing slash', 'https://abc123@o1.ingest.sentry.io/42/'],
     ['a dash in the key', 'https://ab-cd@o1.ingest.sentry.io/42'],
-    ['a leading space', ' https://abc123@o1.ingest.sentry.io/42'],
-    ['a trailing space', 'https://abc123@o1.ingest.sentry.io/42 '],
-    ['a trailing newline', 'https://abc123@o1.ingest.sentry.io/42\n'],
+    ['a space inside', 'https://abc123@o1.ingest.sentry.io/4 2'],
     ['no project id', 'https://abc123@o1.ingest.sentry.io/'],
     ['a project id that is not a number', 'https://abc123@o1.ingest.sentry.io/abc'],
     ['a project id with a suffix', 'https://abc123@o1.ingest.sentry.io/42abc'],
@@ -103,6 +101,25 @@ describe('SENTRY_DSN must be one the Sentry SDK accepts (review F2)', () => {
     expect(serviceEnv.safeParse({ ENVIRONMENT: 'prod', SENTRY_DSN: dsn, PORT: '1' }).success).toBe(
       true
     )
+  })
+})
+
+describe('the env schema trims the DSN as createErrorReporter does (N-trim)', () => {
+  test.each([
+    ['a leading space', ' https://abc123@o1.ingest.sentry.io/42'],
+    ['a trailing space', 'https://abc123@o1.ingest.sentry.io/42 '],
+    ['a trailing newline', 'https://abc123@o1.ingest.sentry.io/42\n'],
+    ['a carriage return and newline', 'https://abc123@o1.ingest.sentry.io/42\r\n'],
+  ])('%s is trimmed and the trimmed DSN is the value', (_name, dsn) => {
+    const result = serviceEnv.safeParse({ ENVIRONMENT: 'prod', SENTRY_DSN: dsn, PORT: '1' })
+    expect(result.success).toBe(true)
+    expect(result.data?.SENTRY_DSN).toBe('https://abc123@o1.ingest.sentry.io/42')
+  })
+
+  test('a DSN of only whitespace is not set', () => {
+    expect(
+      serviceEnv.safeParse({ ENVIRONMENT: 'local', SENTRY_DSN: ' \n ', PORT: '1' }).data?.SENTRY_DSN
+    ).toBeUndefined()
   })
 })
 

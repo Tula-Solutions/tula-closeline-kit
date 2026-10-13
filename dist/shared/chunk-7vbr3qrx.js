@@ -64,17 +64,22 @@ function toErrorBody2(error) {
 var MAX_LOCAL_PART = 64;
 var MAX_DOMAIN = 255;
 var MAX_RUN_DIGITS = 64;
+var MAX_CARD_DIGITS = 19;
 function isDigit(code) {
   return code >= 48 && code <= 57;
 }
 function isLetter(code) {
   return code >= 65 && code <= 90 || code >= 97 && code <= 122;
 }
-function isLocalPartCode(code) {
-  return isDigit(code) || isLetter(code) || code === 46 || code === 95 || code === 37 || code === 43 || code === 45;
+var UNICODE_WORD = /[\p{L}\p{M}\p{N}]/u;
+function isWideWordCode(code, char) {
+  return code > 127 && (code >= 55296 && code <= 57343 || UNICODE_WORD.test(char));
 }
-function isDomainCode(code) {
-  return isDigit(code) || isLetter(code) || code === 46 || code === 45;
+function isLocalPartCode(code, char) {
+  return isDigit(code) || isLetter(code) || isWideWordCode(code, char) || code === 46 || code === 95 || code === 37 || code === 43 || code === 45;
+}
+function isDomainCode(code, char) {
+  return isDigit(code) || isLetter(code) || isWideWordCode(code, char) || code === 46 || code === 45;
 }
 function isWordLetter(code) {
   return isLetter(code) || code === 95;
@@ -89,20 +94,20 @@ function maskEmails(text, mask) {
   while (at !== -1) {
     let start = at;
     const floor = Math.max(copied, at - MAX_LOCAL_PART);
-    while (start > floor && isLocalPartCode(text.charCodeAt(start - 1))) {
+    while (start > floor && isLocalPartCode(text.charCodeAt(start - 1), text[start - 1])) {
       start--;
     }
     let end = at + 1;
     const ceiling = Math.min(text.length, at + 1 + MAX_DOMAIN);
-    while (end < ceiling && isDomainCode(text.charCodeAt(end))) {
+    while (end < ceiling && isDomainCode(text.charCodeAt(end), text[end])) {
       end++;
     }
     while (end > at + 1 && (text[end - 1] === "." || text[end - 1] === "-")) {
       end--;
     }
-    const dot = text.lastIndexOf(".", end - 1);
-    const tld = dot > at + 1 ? text.slice(dot + 1, end) : "";
-    if (start < at && tld.length >= 2 && tld.length <= 24 && /^[A-Za-z]+$/.test(tld)) {
+    const dot = text.slice(at + 1, end).lastIndexOf(".");
+    const tld = dot > 0 ? text.slice(at + 2 + dot, end) : "";
+    if (start < at && tld.length >= 2 && tld.length <= 24 && /^\p{L}+$/u.test(tld)) {
       out += text.slice(copied, start) + mask;
       copied = end;
       at = text.indexOf("@", end);
@@ -112,7 +117,7 @@ function maskEmails(text, mask) {
   }
   return copied === 0 ? text : out + text.slice(copied);
 }
-function readRun(text, from) {
+function readRun(text, from, maxDigits) {
   let p = from;
   let plus = false;
   let paren = false;
@@ -146,7 +151,7 @@ function readRun(text, from) {
     run.groupEnds.push(q);
     run.digits += q - p;
     run.end = q;
-    if (run.digits >= MAX_RUN_DIGITS) {
+    if (run.digits >= maxDigits) {
       break;
     }
     let k = q;
@@ -206,17 +211,87 @@ function leadingNonPhoneGroups(run) {
   }
   return 0;
 }
+function isAlnum(code) {
+  return isDigit(code) || isLetter(code);
+}
+function attachedBefore(text, index) {
+  if (index === 0) {
+    return false;
+  }
+  const code = text.charCodeAt(index - 1);
+  if (isWordLetter(code) || isDigit(code)) {
+    return true;
+  }
+  if (code === 45 || code === 46) {
+    return index >= 2 && isAlnum(text.charCodeAt(index - 2));
+  }
+  return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2));
+}
+function attachedAfter(text, index) {
+  if (index >= text.length) {
+    return false;
+  }
+  const code = text.charCodeAt(index);
+  if (isWordLetter(code)) {
+    return true;
+  }
+  return (code === 45 || code === 46) && isAlnum(text.charCodeAt(index + 1));
+}
+function isUuidLayout(run) {
+  const { groups, seps } = run;
+  return groups.length === 5 && groups[0] === 8 && groups[1] === 4 && groups[2] === 4 && groups[3] === 4 && groups[4] === 12 && seps.every((sep) => sep === "-");
+}
+function hasIssuerPrefix(digits) {
+  const first = digits[0];
+  if (first === "4" || first === "5" || first === "6") {
+    return true;
+  }
+  if (first === "3") {
+    return digits[1] !== "1" && digits[1] !== "2" && digits[1] !== "3";
+  }
+  if (first === "2") {
+    const prefix = Number(digits.slice(0, 4));
+    return prefix >= 2221 && prefix <= 2720;
+  }
+  return digits.startsWith("81") || digits.startsWith("86");
+}
+function isCardLayout(groups) {
+  const last = groups.length - 1;
+  if (groups.length === 1) {
+    return true;
+  }
+  if (groups.slice(0, last).every((length) => length === 4)) {
+    return groups[last] <= 4;
+  }
+  return groups.length === 3 && groups[0] === 4 && groups[1] === 6 && (groups[2] === 5 || groups[2] === 4);
+}
 function isCard(text, run) {
   if (run.digits < 13 || run.digits > 19 || run.paren || run.plus) {
     return false;
   }
-  if (!run.seps.every((sep) => sep === " " || sep === "-")) {
+  if (!run.seps.every((sep) => sep === " " || sep === "-") || !isCardLayout(run.groups)) {
     return false;
   }
   const digits = digitsOf(text, run);
-  return digits[0] !== "1" && passesLuhn(digits);
+  if (digits[0] === "1") {
+    return run.groups.length === 4 && run.groups.every((length) => length === 4) && passesLuhn(digits);
+  }
+  return hasIssuerPrefix(digits) && passesLuhn(digits);
 }
-function isPhone(run) {
+function hasPhoneLead(text, run) {
+  if (run.plus) {
+    return true;
+  }
+  if (run.paren) {
+    return run.seps[0]?.startsWith(")") === true;
+  }
+  const first = run.groups[0];
+  return text.charCodeAt(run.start) === 48 && first >= 2 && first <= 5 && run.seps.every((sep) => sep === run.seps[0]);
+}
+function isPhone(text, run) {
+  if (!hasPhoneLead(text, run)) {
+    return false;
+  }
   if (run.plus) {
     return run.digits >= 8 && run.digits <= 15;
   }
@@ -231,26 +306,41 @@ function isPhone(run) {
   }
   return groups.every((length, i) => length <= limit && (i === 0 || length >= 2));
 }
-function isSeveralNumbers(run) {
-  return run.digits >= 20 && run.groups.every((length, i) => i === 0 || length >= 2);
+function isSeveralNumbers(text, run) {
+  if (run.digits < 16 || !run.groups.every((length, i) => i === 0 || length >= 2)) {
+    return false;
+  }
+  if (hasPhoneLead(text, run)) {
+    return true;
+  }
+  if (run.digits < 20 || run.groups.length < 5 || !run.groups.slice(0, 4).every((length) => length === 4) || !run.seps.slice(0, 3).every((sep) => sep === " " || sep === "-")) {
+    return false;
+  }
+  const card = digitsOf(text, run).slice(0, 16);
+  return card[0] !== "1" && hasIssuerPrefix(card) && passesLuhn(card);
 }
 function maskNumbers(text, mask) {
   let out = "";
   let copied = 0;
   let i = 0;
+  let sequenceEnd = 0;
   while (i < text.length) {
     const code = text.charCodeAt(i);
     if (!(isDigit(code) || code === 43 || code === 40)) {
       i++;
       continue;
     }
-    const run = readRun(text, i);
+    const inside = isDigit(code) && i < sequenceEnd;
+    const run = readRun(text, i, inside ? MAX_CARD_DIGITS + 1 : MAX_RUN_DIGITS);
     if (run === null) {
       i++;
       continue;
     }
     const before = i === 0 ? 0 : text.charCodeAt(i - 1);
-    const after = run.end < text.length ? text.charCodeAt(run.end) : 0;
+    if (isUuidLayout(run)) {
+      i = run.end;
+      continue;
+    }
     const skip = leadingNonPhoneGroups(run);
     if (skip > 0) {
       i = run.groupEnds[skip - 1];
@@ -258,9 +348,9 @@ function maskNumbers(text, mask) {
     }
     let masked = false;
     if (run.groups.length === 1 && !run.plus) {
-      masked = !isWordLetter(before) && !isDigit(before) && before !== 46 && !isWordLetter(after) && isCard(text, run);
-    } else if (!(isWordLetter(before) || isDigit(before))) {
-      masked = isCard(text, run) || isPhone(run) || isSeveralNumbers(run);
+      masked = before !== 46 && !attachedBefore(text, i) && !attachedAfter(text, run.end) && isCard(text, run);
+    } else if (!attachedBefore(text, i) && !attachedAfter(text, run.end)) {
+      masked = isCard(text, run) || !inside && (isPhone(text, run) || isSeveralNumbers(text, run));
     }
     if (masked) {
       const end = run.paren && text[run.end] === ")" ? run.end + 1 : run.end;
@@ -268,6 +358,9 @@ function maskNumbers(text, mask) {
       copied = end;
       i = end;
     } else {
+      if (run.groups.length > 1) {
+        sequenceEnd = Math.max(sequenceEnd, run.end);
+      }
       i = run.groups.length > 1 ? run.groupEnds[0] : run.end;
     }
   }
@@ -317,13 +410,31 @@ var SENSITIVE_SUFFIXES = [
   "body",
   "bodies"
 ];
+var SENSITIVE_WORD_SEGMENTS = new Set(["pass", "sig", "sid", "auth"]);
+var SENSITIVE_LAST_SEGMENTS = new Set(["session"]);
+function wordsOf(key) {
+  const words = [];
+  for (const part of key.split(/[_.-]+/)) {
+    const pieces = part.match(/[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+/g);
+    if (pieces !== null) {
+      for (const piece of pieces) {
+        words.push(piece.toLowerCase());
+      }
+    }
+  }
+  return words;
+}
 function normalizeKey(key) {
   return key.toLowerCase().replace(/[_-]/g, "");
 }
 function isSensitiveKey(key) {
   const normalized = normalizeKey(key);
   const singular = normalized.endsWith("s") ? normalized.slice(0, -1) : normalized;
-  return [normalized, singular].some((name) => SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix)));
+  if ([normalized, singular].some((name) => SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix)))) {
+    return true;
+  }
+  const words = wordsOf(key);
+  return words.some((word) => SENSITIVE_WORD_SEGMENTS.has(word)) || SENSITIVE_LAST_SEGMENTS.has(words.at(-1) ?? "");
 }
 function mayBeTokenCount(key) {
   return normalizeKey(key).endsWith("tokens");
@@ -368,24 +479,54 @@ function cutText2(text, max) {
 function maskSecretWords(text) {
   return text.replace(TOKEN_WORD, (word) => SECRET_WORDS.some((pattern) => pattern.test(word)) ? MASK : word);
 }
-function valueEnd(text, start, inQuery) {
-  const first = text[start];
-  if (first === '"' || first === "'") {
-    for (let i = start + 1;i < text.length; i++) {
-      if (text[i] === "\\") {
-        i++;
-      } else if (text[i] === first) {
-        if (text[i + 1] !== first) {
-          return i + 1;
-        }
-        i++;
+function bracketEnd(text, start) {
+  let depth = 0;
+  for (let i = start;i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      i = quotedEnd(text, i) - 1;
+    } else if (c === "{" || c === "[") {
+      depth++;
+    } else if (c === "}" || c === "]") {
+      depth--;
+      if (depth === 0) {
+        return i + 1;
       }
     }
-    return text.length;
+  }
+  return text.length;
+}
+function quotedEnd(text, start) {
+  const first = text[start];
+  for (let i = start + 1;i < text.length; i++) {
+    if (text[i] === "\\") {
+      i++;
+    } else if (text[i] === first) {
+      if (text[i + 1] !== first) {
+        return i + 1;
+      }
+      i++;
+    }
+  }
+  return text.length;
+}
+function valueEnd(text, start, inQuery, jsonKey) {
+  const first = text[start];
+  if (first === '"' || first === "'") {
+    return quotedEnd(text, start);
+  }
+  if (jsonKey && (first === "{" || first === "[")) {
+    return bracketEnd(text, start);
   }
   let end = start;
   if (inQuery) {
     while (end < text.length && !/[\s,;&#"']/.test(text[end])) {
+      end++;
+    }
+    return end;
+  }
+  if (jsonKey) {
+    while (end < text.length && !/[\s,}\]]/.test(text[end])) {
       end++;
     }
     return end;
@@ -489,7 +630,8 @@ function maskPairs(text) {
         continue;
       }
       const before = text[match.index - 1];
-      const end = valueEnd(text, start, before === "?" || before === "&");
+      const jsonKey = match[0].charAt(key.length) === '"' || match[0].charAt(key.length) === "'";
+      const end = valueEnd(text, start, before === "?" || before === "&", jsonKey);
       if (end === start) {
         continue;
       }

@@ -34,9 +34,16 @@ export function isSentryDsn(value: string, environment: Environment): boolean {
   return match !== null && (match[1] === 'https' || environment === 'local')
 }
 
-/** Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". */
+/**
+ * Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". Surrounding
+ * whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
+ * the value a service boots with is the one the reporter uses.
+ */
 export const sentryDsnSchema = z.preprocess(
-  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  (value) => {
+    const trimmed = typeof value === 'string' ? value.trim() : value
+    return trimmed === '' ? undefined : trimmed
+  },
   z
     .string()
     // The scheme is checked by `requireSentryDsn`, which knows the environment.

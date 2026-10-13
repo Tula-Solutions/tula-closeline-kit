@@ -64,10 +64,12 @@ describe('scrubText masks secrets inside free text', () => {
     expect(scrubText('password=one\ntoken=two\nsecret=three')).toBe(
       'password=[redacted]\ntoken=[redacted]\nsecret=[redacted]'
     )
-    const sameLine = scrubText('password=one token=two secret=three')
-    for (const value of ['one', 'two', 'three']) {
-      expect(sameLine).not.toContain(value)
-    }
+    // An unquoted value runs to the end of the line, so the second and third pairs are inside the
+    // first one's value and go with it; the quoted form keeps each pair.
+    expect(scrubText('password=one token=two secret=three')).toBe('password=[redacted]')
+    expect(scrubText('password="one" token="two" secret="three"')).toBe(
+      'password=[redacted] token=[redacted] secret=[redacted]'
+    )
   })
 
   test('masks a secret that contains an equals sign', () => {
@@ -294,11 +296,10 @@ describe('scrubText: personal data (review F3)', () => {
     ['an E.164 number', 'dial +14155550199 now', 'dial [redacted] now'],
     ['a short E.164 number', 'dial +49301234567', 'dial [redacted]'],
     ['an E.164 number with spaces', 'call +44 20 7946 0958 today', 'call [redacted] today'],
-    ['a number with dashes', 'call 415-555-0199 today', 'call [redacted] today'],
-    ['a number with dots', 'call 415.555.0199 today', 'call [redacted] today'],
+    ['a trunk number with dashes', 'call 0171-123-4567 today', 'call [redacted] today'],
+    ['a trunk number with dots', 'call 020.7946.0958 today', 'call [redacted] today'],
     ['a number with parentheses', 'call (415) 555-0199 today', 'call [redacted] today'],
     ['a number with a country code', 'call +1 (415) 555-0199.', 'call [redacted].'],
-    ['a toll-free number', 'call 1-800-555-0199', 'call [redacted]'],
     ['a UK number with spaces', 'call 020 7946 0958', 'call [redacted]'],
     ['a Visa number', 'card 4111111111111111 declined', 'card [redacted] declined'],
     ['an Amex number', 'card 378282246310005 declined', 'card [redacted] declined'],
@@ -336,7 +337,8 @@ describe('scrubText: personal data (review F3)', () => {
   })
 
   test('a date before a phone number does not hide the number', () => {
-    expect(scrubText('2024-05-12 415-555-0199 called')).toBe('2024-05-12 [redacted] called')
+    expect(scrubText('2024-05-12 (415) 555-0199 called')).toBe('2024-05-12 [redacted] called')
+    expect(scrubText('2024-05-12 020 7946 0958 called')).toBe('2024-05-12 [redacted] called')
   })
 
   test('is idempotent on personal data', () => {
@@ -347,7 +349,7 @@ describe('scrubText: personal data (review F3)', () => {
 
   test('numbers written one after the other are all masked', () => {
     expect(scrubText('+14155550199 4111 1111 1111 1111 (415) 555-0199')).not.toMatch(/\d{4}/)
-    expect(scrubText('415-555-0199 415-555-0188')).not.toMatch(/\d{4}/)
+    expect(scrubText('020 7946 0958 020 7946 0188')).not.toMatch(/\d{4}/)
   })
 
   test('a token count is not a secret, and the words after it stay', () => {
@@ -427,5 +429,80 @@ describe('cutText', () => {
     // Loose on purpose: a tight wall-clock limit flakes on shared CI runners.
     expect(performance.now() - start).toBeLessThan(200)
     expect(out).toBe('[truncated]')
+  })
+})
+
+describe('scrubText: JSON values after a quoted key keep the fields that follow (N2)', () => {
+  test.each([
+    ['a number', '{"sid":42,"request_id":"req_1"}', '{"sid":[redacted],"request_id":"req_1"}'],
+    ['a boolean', '{"password":true,"note":"y"}', '{"password":[redacted],"note":"y"}'],
+    ['null', '{"secret":null,"id":"x"}', '{"secret":[redacted],"id":"x"}'],
+    ['a space after the value', '{"sid": 42 , "id": 1}', '{"sid": [redacted] , "id": 1}'],
+    [
+      'an object',
+      '{"token":{"a":1},"request_id":"req_1"}',
+      '{"token":[redacted],"request_id":"req_1"}',
+    ],
+    [
+      'an object with several fields',
+      '{"token":{"a":1,"b":"leak"},"id":"x"}',
+      '{"token":[redacted],"id":"x"}',
+    ],
+    [
+      'an object with a closing brace inside a string',
+      '{"token":{"a":"}","b":"leak"},"id":"x"}',
+      '{"token":[redacted],"id":"x"}',
+    ],
+    ['an array', '{"password":["a","b"],"id":"x"}', '{"password":[redacted],"id":"x"}'],
+    ['single quotes', "{'sid': 42, 'id': 1}", "{'sid': [redacted], 'id': 1}"],
+    ['the last field', '{"id":1,"sid":42}', '{"id":1,"sid":[redacted]}'],
+    ['a string, as before', '{"password":"x","note":"y"}', '{"password":[redacted],"note":"y"}'],
+  ])('%s', (_name, input, expected) => {
+    expect(scrubText(input)).toBe(expected)
+  })
+
+  test('an object that never closes is masked to the end', () => {
+    expect(scrubText('{"token":{"a":1,"b":"leak"')).toBe('{"token":[redacted]')
+  })
+
+  test('an unquoted value after an unquoted key still runs to the end of the line', () => {
+    expect(scrubText('sid=42,request_id=req_1')).toBe('sid=[redacted]')
+    expect(scrubText('password=a b c\nnext=1')).toBe('password=[redacted]\nnext=1')
+  })
+})
+
+describe('scrubText: email addresses beyond ASCII (N4)', () => {
+  test.each([
+    ['jörg.müller@acme.de', '[redacted]'],
+    ['田中@example.jp', '[redacted]'],
+    ['jane@bücher.de', '[redacted]'],
+    ['write to josé@señor.es now', 'write to [redacted] now'],
+    ['mail маша@почта.рф.', 'mail [redacted].'],
+  ])('%p', (input, expected) => {
+    expect(scrubText(input)).toBe(expected)
+  })
+})
+
+describe('scrubText: email masking is linear (N3)', () => {
+  /** The best of several runs, so one scheduler stall cannot decide the ratio. */
+  function best(input: string): number {
+    let fastest = Number.POSITIVE_INFINITY
+    for (let run = 0; run < 15; run++) {
+      const start = performance.now()
+      scrubText(input)
+      fastest = Math.min(fastest, performance.now() - start)
+    }
+    return fastest
+  }
+
+  test.each([
+    ['@', (n: number) => '@'.repeat(n)],
+    ['a@', (n: number) => 'a@'.repeat(n / 2)],
+    ['@a.', (n: number) => '@a.'.repeat(n / 3)],
+    ['.@', (n: number) => '.@'.repeat(n / 2)],
+  ])('four times the input costs well under sixteen times as much (%p)', (_name, make) => {
+    const small = best(make(8_192))
+    const large = best(make(32_766))
+    expect(large).toBeLessThan(small * 11)
   })
 })

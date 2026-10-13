@@ -82,29 +82,65 @@ function maskSecretWords(text: string): string {
   )
 }
 
-/**
- * Where a value that starts at `start` ends: a closing quote (a doubled quote inside is part of the
- * value), or, unquoted, the end of the line. A value in a URL query string ends at the next `&`,
- * `#`, quote, comma, semicolon or space instead.
- */
-function valueEnd(text: string, start: number, inQuery: boolean): number {
-  const first = text[start]
-  if (first === '"' || first === "'") {
-    for (let i = start + 1; i < text.length; i++) {
-      if (text[i] === '\\') {
-        i++
-      } else if (text[i] === first) {
-        if (text[i + 1] !== first) {
-          return i + 1
-        }
-        i++
+/** Where the JSON object or array that opens at `start` closes; the end of the text when it never does. */
+function bracketEnd(text: string, start: number): number {
+  let depth = 0
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]
+    if (c === '"' || c === "'") {
+      i = quotedEnd(text, i) - 1
+    } else if (c === '{' || c === '[') {
+      depth++
+    } else if (c === '}' || c === ']') {
+      depth--
+      if (depth === 0) {
+        return i + 1
       }
     }
-    return text.length
+  }
+  return text.length
+}
+
+/** Where the quoted string that opens at `start` ends (after its closing quote; the text's end if none). */
+function quotedEnd(text: string, start: number): number {
+  const first = text[start]
+  for (let i = start + 1; i < text.length; i++) {
+    if (text[i] === '\\') {
+      i++
+    } else if (text[i] === first) {
+      if (text[i + 1] !== first) {
+        return i + 1
+      }
+      i++
+    }
+  }
+  return text.length
+}
+
+/**
+ * Where a value that starts at `start` ends: a closing quote (a doubled quote inside is part of the
+ * value), or, unquoted, the end of the line. After a quoted key (`"sid":42`) an unquoted value is
+ * JSON: an object or array ends where it closes and anything else at the next `,`, `}`, `]` or
+ * space, so the fields that follow stay readable. A value in a URL query string ends at the next
+ * `&`, `#`, quote, comma, semicolon or space instead.
+ */
+function valueEnd(text: string, start: number, inQuery: boolean, jsonKey: boolean): number {
+  const first = text[start]
+  if (first === '"' || first === "'") {
+    return quotedEnd(text, start)
+  }
+  if (jsonKey && (first === '{' || first === '[')) {
+    return bracketEnd(text, start)
   }
   let end = start
   if (inQuery) {
     while (end < text.length && !/[\s,;&#"']/.test(text[end] as string)) {
+      end++
+    }
+    return end
+  }
+  if (jsonKey) {
+    while (end < text.length && !/[\s,}\]]/.test(text[end] as string)) {
       end++
     }
     return end
@@ -215,7 +251,8 @@ function maskPairs(text: string): string {
         continue
       }
       const before = text[match.index - 1]
-      const end = valueEnd(text, start, before === '?' || before === '&')
+      const jsonKey = match[0].charAt(key.length) === '"' || match[0].charAt(key.length) === "'"
+      const end = valueEnd(text, start, before === '?' || before === '&', jsonKey)
       if (end === start) {
         continue
       }
@@ -237,9 +274,12 @@ function maskPairs(text: string): string {
  * Masks secrets and personal data inside free text (an error message, a log message): bearer
  * tokens, JWTs and common API-key shapes, URL credentials, connection strings, the value in a
  * Postgres `Key (column)=(value)` detail, the value of any `key=value` or `key: value` pair whose
- * key the kit treats as sensitive (to the end of the line when unquoted), email addresses,
- * telephone numbers and payment card numbers. Input over 32 KiB is cut. Runs in time linear in the
- * input and never throws; if it somehow fails it returns a fixed placeholder.
+ * key the kit treats as sensitive (to the end of the line when unquoted, to the end of the JSON
+ * value after a quoted key), email addresses, telephone numbers written with a `+`, `(area code)` or
+ * trunk zero, and payment card numbers. An identifier (a UUID, a prefixed id, a timestamp, a
+ * version, a count) is never altered: where a pattern cannot tell, the text is left alone. Input
+ * over 32 KiB is cut. Runs in time linear in the input and never throws; if it somehow fails it
+ * returns a fixed placeholder.
  */
 export function scrubText(text: string): string {
   try {

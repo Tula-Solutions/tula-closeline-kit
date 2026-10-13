@@ -273,7 +273,11 @@ declare const environmentSchema: z2.ZodEnum<{
 * data region, is Sentry's.
 */
 declare function isSentryDsn(value: string, environment: Environment): boolean;
-/** Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". */
+/**
+* Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". Surrounding
+* whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
+* the value a service boots with is the one the reporter uses.
+*/
 declare const sentryDsnSchema: z2.ZodPreprocess<z2.ZodOptional<z2.ZodString>, unknown>;
 /**
 * Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
@@ -352,9 +356,12 @@ declare function cutText(text: string, max: number): string;
 * Masks secrets and personal data inside free text (an error message, a log message): bearer
 * tokens, JWTs and common API-key shapes, URL credentials, connection strings, the value in a
 * Postgres `Key (column)=(value)` detail, the value of any `key=value` or `key: value` pair whose
-* key the kit treats as sensitive (to the end of the line when unquoted), email addresses,
-* telephone numbers and payment card numbers. Input over 32 KiB is cut. Runs in time linear in the
-* input and never throws; if it somehow fails it returns a fixed placeholder.
+* key the kit treats as sensitive (to the end of the line when unquoted, to the end of the JSON
+* value after a quoted key), email addresses, telephone numbers written with a `+`, `(area code)` or
+* trunk zero, and payment card numbers. An identifier (a UUID, a prefixed id, a timestamp, a
+* version, a count) is never altered: where a pattern cannot tell, the text is left alone. Input
+* over 32 KiB is cut. Runs in time linear in the input and never throws; if it somehow fails it
+* returns a fixed placeholder.
 */
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */

@@ -6,6 +6,7 @@ const MAX_LOCAL_PART = 64
 const MAX_DOMAIN = 255
 // A run is read at most this far; several numbers written together can have more.
 const MAX_RUN_DIGITS = 64
+const MAX_CARD_DIGITS = 19
 
 function isDigit(code: number): boolean {
   return code >= 48 && code <= 57
@@ -15,10 +16,19 @@ function isLetter(code: number): boolean {
   return (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
 }
 
-function isLocalPartCode(code: number): boolean {
+// A letter, mark or number above U+007F (`jörg`, `田中`, `bücher`) belongs to an address too. The
+// test runs only on such characters, and a surrogate half is taken as part of one.
+const UNICODE_WORD = /[\p{L}\p{M}\p{N}]/u
+
+function isWideWordCode(code: number, char: string): boolean {
+  return code > 127 && ((code >= 0xd800 && code <= 0xdfff) || UNICODE_WORD.test(char))
+}
+
+function isLocalPartCode(code: number, char: string): boolean {
   return (
     isDigit(code) ||
     isLetter(code) ||
+    isWideWordCode(code, char) ||
     code === 46 || // .
     code === 95 || // _
     code === 37 || // %
@@ -27,8 +37,8 @@ function isLocalPartCode(code: number): boolean {
   )
 }
 
-function isDomainCode(code: number): boolean {
-  return isDigit(code) || isLetter(code) || code === 46 || code === 45
+function isDomainCode(code: number, char: string): boolean {
+  return isDigit(code) || isLetter(code) || isWideWordCode(code, char) || code === 46 || code === 45
 }
 
 /** True for a character that makes a digit run part of a longer word (`usr_4111…`, `ab4111…`). */
@@ -47,21 +57,26 @@ export function maskEmails(text: string, mask: string): string {
   while (at !== -1) {
     let start = at
     const floor = Math.max(copied, at - MAX_LOCAL_PART)
-    while (start > floor && isLocalPartCode(text.charCodeAt(start - 1))) {
+    while (
+      start > floor &&
+      isLocalPartCode(text.charCodeAt(start - 1), text[start - 1] as string)
+    ) {
       start--
     }
     let end = at + 1
     const ceiling = Math.min(text.length, at + 1 + MAX_DOMAIN)
-    while (end < ceiling && isDomainCode(text.charCodeAt(end))) {
+    while (end < ceiling && isDomainCode(text.charCodeAt(end), text[end] as string)) {
       end++
     }
     // A full stop or dash right after the address belongs to the sentence.
     while (end > at + 1 && (text[end - 1] === '.' || text[end - 1] === '-')) {
       end--
     }
-    const dot = text.lastIndexOf('.', end - 1)
-    const tld = dot > at + 1 ? text.slice(dot + 1, end) : ''
-    if (start < at && tld.length >= 2 && tld.length <= 24 && /^[A-Za-z]+$/.test(tld)) {
+    // Searched inside the domain only: a search over the whole text from here back would rescan the
+    // same stretch at every `@` of a long run of them.
+    const dot = text.slice(at + 1, end).lastIndexOf('.')
+    const tld = dot > 0 ? text.slice(at + 2 + dot, end) : ''
+    if (start < at && tld.length >= 2 && tld.length <= 24 && /^\p{L}+$/u.test(tld)) {
       out += text.slice(copied, start) + mask
       copied = end
       at = text.indexOf('@', end)
@@ -89,7 +104,7 @@ interface Run {
   digits: number
 }
 
-function readRun(text: string, from: number): Run | null {
+function readRun(text: string, from: number, maxDigits: number): Run | null {
   let p = from
   let plus = false
   let paren = false
@@ -123,7 +138,7 @@ function readRun(text: string, from: number): Run | null {
     run.groupEnds.push(q)
     run.digits += q - p
     run.end = q
-    if (run.digits >= MAX_RUN_DIGITS) {
+    if (run.digits >= maxDigits) {
       break
     }
     let k = q
@@ -194,20 +209,136 @@ function leadingNonPhoneGroups(run: Run): number {
   return 0
 }
 
+/** True for a letter or digit. */
+function isAlnum(code: number): boolean {
+  return isDigit(code) || isLetter(code)
+}
+
+/**
+ * True when the character before `index` ties the run to a longer token: a letter or `_`, a digit,
+ * or a `-` or `.` that follows a letter or digit (`req-415-…`, `4815-9301-…` inside a UUID,
+ * `2026.10.25.564`), or a `:` that follows a digit (`10:30:05.109`). Such a run is part of an identifier, not a number on its own.
+ */
+function attachedBefore(text: string, index: number): boolean {
+  if (index === 0) {
+    return false
+  }
+  const code = text.charCodeAt(index - 1)
+  if (isWordLetter(code) || isDigit(code)) {
+    return true
+  }
+  if (code === 45 || code === 46) {
+    return index >= 2 && isAlnum(text.charCodeAt(index - 2))
+  }
+  // `10:30:05.109-0800`: the seconds of a time are not a telephone number.
+  return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2))
+}
+
+/** True when the character after the run ties it to a longer token; see `attachedBefore`. */
+function attachedAfter(text: string, index: number): boolean {
+  if (index >= text.length) {
+    return false
+  }
+  const code = text.charCodeAt(index)
+  if (isWordLetter(code)) {
+    return true
+  }
+  return (code === 45 || code === 46) && isAlnum(text.charCodeAt(index + 1))
+}
+
+/** True for the layout of a UUID, 8-4-4-4-12 joined by dashes, which no number is written in. */
+function isUuidLayout(run: Run): boolean {
+  const { groups, seps } = run
+  return (
+    groups.length === 5 &&
+    groups[0] === 8 &&
+    groups[1] === 4 &&
+    groups[2] === 4 &&
+    groups[3] === 4 &&
+    groups[4] === 12 &&
+    seps.every((sep) => sep === '-')
+  )
+}
+
+/** True when the first four digits fall in a range a card issuer uses. */
+function hasIssuerPrefix(digits: string): boolean {
+  const first = digits[0]
+  if (first === '4' || first === '5' || first === '6') {
+    return true
+  }
+  if (first === '3') {
+    return digits[1] !== '1' && digits[1] !== '2' && digits[1] !== '3'
+  }
+  if (first === '2') {
+    const prefix = Number(digits.slice(0, 4))
+    return prefix >= 2221 && prefix <= 2720
+  }
+  return digits.startsWith('81') || digits.startsWith('86')
+}
+
+/** True when the groups are laid out as a card is: 4-4-4-4 (and the shorter or longer variants), 4-6-5. */
+function isCardLayout(groups: number[]): boolean {
+  const last = groups.length - 1
+  if (groups.length === 1) {
+    return true
+  }
+  if (groups.slice(0, last).every((length) => length === 4)) {
+    return (groups[last] as number) <= 4
+  }
+  return (
+    groups.length === 3 &&
+    groups[0] === 4 &&
+    groups[1] === 6 &&
+    (groups[2] === 5 || groups[2] === 4)
+  )
+}
+
 function isCard(text: string, run: Run): boolean {
   if (run.digits < 13 || run.digits > 19 || run.paren || run.plus) {
     return false
   }
-  if (!run.seps.every((sep) => sep === ' ' || sep === '-')) {
+  if (!run.seps.every((sep) => sep === ' ' || sep === '-') || !isCardLayout(run.groups)) {
     return false
   }
   const digits = digitsOf(text, run)
   // Epoch timestamps in milliseconds, microseconds and nanoseconds (2001 to 2033) start with 1 and
-  // are as long as a card number; card issuers' ranges start with 2 to 9.
-  return digits[0] !== '1' && passesLuhn(digits)
+  // are as long as a card number, so a run starting with 1 is a card only when it is written in
+  // four groups of four. Compact timestamps (`20260623025718`) and most other ids start in no
+  // issuer's range either.
+  if (digits[0] === '1') {
+    return (
+      run.groups.length === 4 && run.groups.every((length) => length === 4) && passesLuhn(digits)
+    )
+  }
+  return hasIssuerPrefix(digits) && passesLuhn(digits)
 }
 
-function isPhone(run: Run): boolean {
+/**
+ * True when a number written with separators opens the way telephone numbers do: a `+`, a
+ * parenthesised area code `(415)`, or the national trunk zero (`020 7946 0958`, `06 12 34 56 78`).
+ * Without one of those it cannot be told from an id, a range or a count, and is left alone.
+ */
+function hasPhoneLead(text: string, run: Run): boolean {
+  if (run.plus) {
+    return true
+  }
+  if (run.paren) {
+    return run.seps[0]?.startsWith(')') === true
+  }
+  const first = run.groups[0] as number
+  // Written with one kind of separator throughout, so `05.109-0800` (seconds, then an offset) is not one.
+  return (
+    text.charCodeAt(run.start) === 48 &&
+    first >= 2 &&
+    first <= 5 &&
+    run.seps.every((sep) => sep === run.seps[0])
+  )
+}
+
+function isPhone(text: string, run: Run): boolean {
+  if (!hasPhoneLead(text, run)) {
+    return false
+  }
   if (run.plus) {
     return run.digits >= 8 && run.digits <= 15
   }
@@ -226,34 +357,60 @@ function isPhone(run: Run): boolean {
 }
 
 // Two or more numbers written one after the other (`+14155550199 4111 1111 1111 1111`) read as one
-// run too long for either; a run this long is more than one number, so all of it goes.
-function isSeveralNumbers(run: Run): boolean {
-  return run.digits >= 20 && run.groups.every((length, i) => i === 0 || length >= 2)
+// run too long for either. A run that is too long for a telephone number and opens as one, or opens
+// as a card followed by more digits, is more than one number, so all of it goes.
+function isSeveralNumbers(text: string, run: Run): boolean {
+  if (run.digits < 16 || !run.groups.every((length, i) => i === 0 || length >= 2)) {
+    return false
+  }
+  if (hasPhoneLead(text, run)) {
+    return true
+  }
+  if (
+    run.digits < 20 ||
+    run.groups.length < 5 ||
+    !run.groups.slice(0, 4).every((length) => length === 4) ||
+    !run.seps.slice(0, 3).every((sep) => sep === ' ' || sep === '-')
+  ) {
+    return false
+  }
+  const card = digitsOf(text, run).slice(0, 16)
+  return card[0] !== '1' && hasIssuerPrefix(card) && passesLuhn(card)
 }
 
 /**
  * Masks telephone numbers (`+` and 8 to 15 digits, or 9 to 15 digits with spaces, dashes, dots or
- * parentheses) and payment card numbers (13 to 19 digits that pass the Luhn check). A bare run of
- * digits is never a telephone number, and is a card only when it is not part of a longer word, so
- * ids, counters and timestamps stay readable.
+ * parentheses that open with a `+`, a `(area code)` or a trunk zero) and payment card numbers (13 to
+ * 19 digits in a card issuer's range that pass the Luhn check). A bare run of digits is never a
+ * telephone number, and a run that is part of a longer token (a UUID, a CalVer, `req-…`) is never
+ * touched, so ids, counters and timestamps stay readable.
  */
 export function maskNumbers(text: string, mask: string): string {
   let out = ''
   let copied = 0
   let i = 0
+  // End of the longest run of digit groups already rejected as a whole. A group inside it is not the
+  // start of a telephone number (`649 005 068 150` holds `005 068 150`), but a card can still start there.
+  let sequenceEnd = 0
   while (i < text.length) {
     const code = text.charCodeAt(i)
     if (!(isDigit(code) || code === 43 || code === 40)) {
       i++
       continue
     }
-    const run = readRun(text, i)
+    // Inside a run already rejected only a card can start (at most 19 digits), so read no further.
+    const inside = isDigit(code) && i < sequenceEnd
+    const run = readRun(text, i, inside ? MAX_CARD_DIGITS + 1 : MAX_RUN_DIGITS)
     if (run === null) {
       i++
       continue
     }
     const before = i === 0 ? 0 : text.charCodeAt(i - 1)
-    const after = run.end < text.length ? text.charCodeAt(run.end) : 0
+    if (isUuidLayout(run)) {
+      // A UUID made of digits only is an id; it is never read as numbers.
+      i = run.end
+      continue
+    }
     const skip = leadingNonPhoneGroups(run)
     if (skip > 0) {
       // The date or address is left as it is; what follows it is looked at on its own.
@@ -262,15 +419,14 @@ export function maskNumbers(text: string, mask: string): string {
     }
     let masked = false
     if (run.groups.length === 1 && !run.plus) {
-      // Bare digits: only a card number, and not inside a word or after a decimal point.
+      // Bare digits: only a card number, and not inside a longer token or after a decimal point.
       masked =
-        !isWordLetter(before) &&
-        !isDigit(before) &&
         before !== 46 &&
-        !isWordLetter(after) &&
+        !attachedBefore(text, i) &&
+        !attachedAfter(text, run.end) &&
         isCard(text, run)
-    } else if (!(isWordLetter(before) || isDigit(before))) {
-      masked = isCard(text, run) || isPhone(run) || isSeveralNumbers(run)
+    } else if (!attachedBefore(text, i) && !attachedAfter(text, run.end)) {
+      masked = isCard(text, run) || (!inside && (isPhone(text, run) || isSeveralNumbers(text, run)))
     }
     if (masked) {
       const end = run.paren && text[run.end] === ')' ? run.end + 1 : run.end
@@ -279,6 +435,9 @@ export function maskNumbers(text: string, mask: string): string {
       i = end
     } else {
       // Not a number; try again from the next group, which can start one.
+      if (run.groups.length > 1) {
+        sequenceEnd = Math.max(sequenceEnd, run.end)
+      }
       i = run.groups.length > 1 ? (run.groupEnds[0] as number) : run.end
     }
   }

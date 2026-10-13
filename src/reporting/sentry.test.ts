@@ -825,3 +825,181 @@ describe('close (review F5)', () => {
     expect(performance.now() - start).toBeLessThan(400)
   })
 })
+
+describe('ids in tags are sent as they are (N1)', () => {
+  /** A seeded generator, so the ids are the same on every run. */
+  function seeded(seed: number): () => number {
+    let state = seed >>> 0
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0
+      let t = state
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+  }
+  const random = seeded(24)
+  const hex = (length: number): string =>
+    Array.from({ length }, () => '0123456789abcdef'[Math.floor(random() * 16)]).join('')
+  const uuid = (): string =>
+    `${hex(8)}-${hex(4)}-4${hex(3)}-${'89ab'[Math.floor(random() * 4)]}${hex(3)}-${hex(12)}`
+
+  test('10,000 random UUIDs used as organization and request ids reach the wire unchanged', async () => {
+    const h = harness()
+    const pairs: Array<[string, string]> = []
+    for (let i = 0; i < 10_000; i++) {
+      pairs.push([uuid(), uuid()])
+    }
+    for (const [organizationId, requestId] of pairs) {
+      h.reporter.capture(new Error('boom'), { organizationId, requestId })
+    }
+    const events = await h.events()
+    expect(events).toHaveLength(pairs.length)
+    const altered = events.filter((event) => {
+      const pair = pairs.find(([organizationId]) => organizationId === event.tags.organization_id)
+      return pair === undefined || pair[1] !== event.tags.request_id
+    })
+    expect(altered).toHaveLength(0)
+  })
+
+  test.each([
+    ['a UUID', 'ae506499-d871-4815-9301-322b14037713'],
+    ['a prefixed ULID', 'org_01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
+    ['a request id with digits', 'req_984757662552'],
+    ['a short id', 'a'],
+    ['a 64 character id', 'a'.repeat(64)],
+  ])('%s is kept', async (_name, id) => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'), { organizationId: id, requestId: id })
+    const tags = (await h.events())[0]?.tags
+    expect(tags?.organization_id).toBe(id)
+    expect(tags?.request_id).toBe(id)
+  })
+
+  test.each([
+    ['a space', 'req 1'],
+    ['a secret', 'Bearer abc123def456'],
+    ['an equals sign', 'token=abc'],
+    ['a newline', 'req_1\nreq_2'],
+    ['an email address', 'jane@acme.com'],
+    ['more than 64 characters', 'a'.repeat(65)],
+    ['nothing', ''],
+    ['a non-ASCII letter', 'org_é1'],
+  ])('a value with %s is replaced by a fixed marker', async (_name, value) => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'), { organizationId: value, requestId: value })
+    const tags = (await h.events())[0]?.tags
+    expect(tags?.organization_id).toBe('[invalid]')
+    expect(tags?.request_id).toBe('[invalid]')
+    expect(h.wire()).not.toContain('abc123def456')
+    expect(h.wire()).not.toContain('jane@acme.com')
+  })
+
+  test('a free-form tag under a sensitive key is still redacted', async () => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'), { tags: { sessionToken: 'KEYED-VALUE-1', note: 'ok' } })
+    const tags = (await h.events())[0]?.tags
+    expect(tags?.sessionToken).toBe('[redacted]')
+    expect(tags?.note).toBe('ok')
+  })
+})
+
+describe('the exception is rebuilt from known fields (N5)', () => {
+  test('fields added by another event processor do not reach the wire', async () => {
+    const h = harness()
+    h.reporter.client.addEventProcessor((event) => {
+      const value = event.exception?.values?.[0]
+      if (value !== undefined) {
+        Object.assign(value, { thread_id: 99, extra_thing: 'LEAK-EXTRA-VALUE' })
+        Object.assign(value.mechanism ?? {}, { data: { leak: 'LEAK-MECHANISM-DATA' } })
+        const frame = value.stacktrace?.frames?.[0]
+        if (frame !== undefined) {
+          Object.assign(frame, { abs_path: 'LEAK-ABS-PATH', vars: { password: 'LEAK-VARS' } })
+        }
+      }
+      Object.assign(event, { debug_meta: { images: [{ code_file: 'LEAK-IMAGE' }] } })
+      return event
+    })
+    h.reporter.capture(new Error('boom'))
+    const events = await h.events()
+    expect(h.wire()).not.toContain('LEAK')
+    const value = events[0]?.exception.values[0] as unknown as Record<string, unknown>
+    expect(
+      Object.keys(value).every((key) => ['type', 'value', 'stacktrace', 'mechanism'].includes(key))
+    ).toBe(true)
+    const frames = (value.stacktrace as { frames: Array<Record<string, unknown>> }).frames
+    expect(frames.length).toBeGreaterThan(0)
+    for (const frame of frames) {
+      expect(
+        Object.keys(frame).every((key) => ['filename', 'function', 'lineno', 'colno'].includes(key))
+      ).toBe(true)
+    }
+    expect(events[0]).not.toHaveProperty('debug_meta')
+  })
+
+  test('the type, the value, the frames and the mechanism are kept', async () => {
+    const h = harness()
+    h.reporter.capture(new TypeError('Failed to load team team_01'))
+    const value = (await h.events())[0]?.exception.values[0] as unknown as {
+      type: string
+      value: string
+      stacktrace: { frames: Array<{ filename: string; lineno: number; colno: number }> }
+      mechanism: { type: string; handled: boolean }
+    }
+    expect(value.type).toBe('TypeError')
+    expect(value.value).toBe('Failed to load team team_01')
+    expect(value.mechanism.type).toBe('generic')
+    expect(value.mechanism.handled).toBe(true)
+    const frame = value.stacktrace.frames.at(-1)
+    expect(typeof frame?.filename).toBe('string')
+    expect(typeof frame?.lineno).toBe('number')
+    expect(typeof frame?.colno).toBe('number')
+  })
+
+  test('a cause chain keeps its order and its links', async () => {
+    const h = harness()
+    h.reporter.capture(new Error('outer', { cause: new Error('inner') }))
+    const values = (await h.events())[0]?.exception.values ?? []
+    expect(values.map((value) => value.value)).toEqual(['inner', 'outer'])
+  })
+})
+
+describe('only the frames after the message are frames (N5)', () => {
+  const LEAK = 'MSGBODYLEAK Hello Jane I am sick'
+
+  /** The `function` of every frame sent for an error, as one string. */
+  async function framesSent(error: Error): Promise<string> {
+    const h = harness()
+    h.reporter.capture(error)
+    const events = await h.events()
+    const frames = events.flatMap((event) =>
+      event.exception.values.flatMap((value) => value.stacktrace.frames)
+    )
+    return JSON.stringify(frames)
+  }
+
+  test('a message line that imitates a frame, past the 8 KiB cut, is not sent', async () => {
+    const h = harness()
+    h.reporter.capture(new Error(`${'x'.repeat(9_000)}\n    at ${LEAK} (/app/a.ts:1:2)`))
+    await h.events()
+    expect(h.wire()).not.toContain('MSGBODYLEAK')
+  })
+
+  test('a message line that imitates a frame, inside the message, is not a frame', async () => {
+    const sent = await framesSent(new Error(`top\n    at ${LEAK} (/app/a.ts:1:2)\nbottom`))
+    expect(sent).not.toContain('MSGBODYLEAK')
+  })
+
+  test('the real frames of such an error are still sent', async () => {
+    const h = harness()
+    h.reporter.capture(new Error(`top\n    at ${LEAK} (/app/a.ts:1:2)\nbottom`))
+    const frames = (await h.events())[0]?.exception.values[0]?.stacktrace.frames ?? []
+    expect(frames.length).toBeGreaterThan(0)
+  })
+
+  test('an error whose message was changed after it was made is sent without frames', async () => {
+    const error = new Error('first')
+    error.message = `changed\n    at ${LEAK} (/app/a.ts:1:2)`
+    expect(await framesSent(error)).not.toContain('MSGBODYLEAK')
+  })
+})

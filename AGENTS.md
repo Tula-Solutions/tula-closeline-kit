@@ -37,7 +37,8 @@ Other scripts are in `package.json`.
   O(message length), linear with a 32 KiB cap (about 0.6 ms at the cap). Budgets in
   `bench/reporting.bench.ts`: no-op `capture` mean 0.001 ms, Sentry `capture` mean 0.4 ms, an
   ordinary message mean 0.008 ms, a message with secrets mean 0.015 ms and a 32 KiB input mean
-  3 ms, each with a median and best-batch p95 budget as above.
+  3 ms and a 32 KiB input made only of `@` (the shape that made email masking quadratic) mean 3 ms,
+  each with a median and best-batch p95 budget as above.
 
 ## Issues
 
