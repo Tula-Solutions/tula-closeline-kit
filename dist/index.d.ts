@@ -479,15 +479,6 @@ interface InternalClient {
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
-/** The Organization id format of the contract: `org_` and 32 lower-case hex digits. */
-declare const contractOrganizationIdCheck: OrganizationIdCheck;
-/**
-* Builds the one function every store uses to accept an Organization id. The id must pass the
-* hard character rule above and the `check` (the contract's format by default), so a store never
-* builds a key or a namespace from a caller's string that was not validated first. Pass a looser
-* `check` only in tests.
-*/
-declare function createOrganizationIdGuard(check?: OrganizationIdCheck): (value: unknown) => value is string;
 import { z as z3 } from "zod";
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
@@ -1035,42 +1026,6 @@ interface ObjectStore {
 	*/
 	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
 }
-/** The validated parts of a `list` call. */
-interface ListQuery {
-	prefix: string;
-	after: string | undefined;
-	limit: number;
-}
-/** The checks both adapters run before touching their store. */
-interface StorageValidator {
-	/** Throws unless `organizationId` is acceptable; returns it. */
-	organization(organizationId: unknown): string;
-	/** Throws unless `key` is a valid key; returns it. */
-	key(key: unknown): string;
-	/** Throws unless `body` is a Uint8Array within the size limit. */
-	body(body: unknown): Uint8Array;
-	/** Throws unless the content type is valid; returns it, or the default. */
-	contentType(contentType: unknown): string;
-	/** Validates and normalises the options of a list call. */
-	list(options: ListOptions | undefined): ListQuery;
-	/** The largest object accepted, in bytes. */
-	readonly maxObjectBytes: number;
-}
-/** Options of {@link createStorageValidator}. */
-interface StorageValidatorOptions {
-	/** Largest object in bytes; default 25 MiB, at most 100 MiB. */
-	maxObjectBytes?: number | undefined;
-	/** Extra Organization id rule; the contract's format by default. */
-	isOrganizationId?: OrganizationIdCheck | undefined;
-}
-/** Encodes a key as an opaque list cursor. */
-declare function encodeCursor(key: string): string;
-/**
-* Builds the validator an {@link ObjectStore} adapter uses. A cursor is the last key of the
-* previous page, so decoding one gives a key that is checked like any other and cannot point
-* outside the Organization.
-*/
-declare function createStorageValidator(options?: StorageValidatorOptions): StorageValidator;
 /** The `area.reason` codes the vector store port and adapters throw. */
 declare const VECTOR_ERROR_CODES: {
 	/** An Organization id, vector id, attribute, filter, batch or `topK` is not acceptable. */
@@ -1169,44 +1124,6 @@ interface VectorStore {
 	*/
 	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
 }
-/** A record after validation. */
-interface CheckedRecord {
-	id: string;
-	vector: Float32Array;
-	attributes: VectorAttributes;
-}
-/** A search after validation. */
-interface CheckedQuery {
-	vector: Float32Array;
-	topK: number;
-	filter: VectorAttributes;
-}
-/** The checks both adapters run before touching their store. */
-interface VectorValidator {
-	/** The dimension count of the store. */
-	readonly dimensions: number;
-	/** Throws unless `organizationId` is acceptable; returns it. */
-	organization(organizationId: unknown): string;
-	/** Validates a batch of records. */
-	records(records: unknown): CheckedRecord[];
-	/** Validates a search. */
-	query(query: unknown): CheckedQuery;
-	/** Validates a batch of ids. */
-	ids(ids: unknown): string[];
-	/** Validates a non-empty filter. */
-	nonEmptyFilter(filter: unknown): VectorAttributes;
-}
-/** Options of {@link createVectorValidator}. */
-interface VectorValidatorOptions {
-	/** The dimension count of the embedding model, 1 to 4096. */
-	dimensions: number;
-	/** Extra Organization id rule; the contract's format by default. */
-	isOrganizationId?: OrganizationIdCheck | undefined;
-}
-/** True when `a` and `b` hold the same value, for attribute matching. */
-declare function attributesMatch(attributes: VectorAttributes, filter: VectorAttributes): boolean;
-/** Builds the validator a {@link VectorStore} adapter uses. */
-declare function createVectorValidator(options: VectorValidatorOptions): VectorValidator;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, CheckedQuery, CheckedRecord, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, ListQuery, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StorageValidator, StorageValidatorOptions, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VectorValidator, VectorValidatorOptions, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, attributesMatch, contractOrganizationIdCheck, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createOrganizationIdGuard, createRemoteKeySet, createStaticKeySet, createStorageValidator, createTokenVerifier, createVectorValidator, cutText, defineMessage, encodeCursor, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };

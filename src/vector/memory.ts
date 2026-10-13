@@ -1,11 +1,6 @@
 import type { OrganizationIdCheck } from '../organization'
-import {
-  attributesMatch,
-  type CheckedRecord,
-  createVectorValidator,
-  type SearchHit,
-  type VectorStore,
-} from './port'
+import type { SearchHit, VectorStore } from './port'
+import { attributesMatch, type CheckedRecord, createVectorValidator } from './validate'
 
 /** Options for {@link createMemoryVectorStore}. */
 export interface MemoryVectorStoreOptions {

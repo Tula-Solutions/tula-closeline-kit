@@ -7,7 +7,7 @@ import type {
   PutObjectCommand,
 } from '@aws-sdk/client-s3'
 import { createS3ObjectStore, type S3Sender } from './aws'
-import { encodeCursor } from './port'
+import { encodeCursor } from './validate'
 
 type Command = Parameters<S3Sender['send']>[0]
 type Options = Parameters<S3Sender['send']>[1]

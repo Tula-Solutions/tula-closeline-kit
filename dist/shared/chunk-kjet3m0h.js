@@ -1,65 +1,37 @@
 import {
-  AppError2
-} from "./chunk-tya44yhr.js";
+  STORAGE_ERROR_CODES2,
+  StorageError2,
+  MAX_KEY_BYTES2,
+  MAX_KEY_SEGMENTS2,
+  DEFAULT_MAX_OBJECT_BYTES2,
+  MAX_OBJECT_BYTES_LIMIT2,
+  DEFAULT_LIST_LIMIT2,
+  MAX_LIST_LIMIT2,
+  DEFAULT_CONTENT_TYPE2
+} from "./chunk-r2rshw7g.js";
 
-// src/organization.ts
+// src/organization-guard.ts
 import { organizationIdSchema } from "tula-closeline-contract";
-var contractOrganizationIdCheck2 = (value) => organizationIdSchema.safeParse(value).success;
+var contractOrganizationIdCheck = (value) => organizationIdSchema.safeParse(value).success;
 var SAFE_ORGANIZATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-function createOrganizationIdGuard2(check = contractOrganizationIdCheck2) {
+function createOrganizationIdGuard(check = contractOrganizationIdCheck) {
   return (value) => typeof value === "string" && SAFE_ORGANIZATION_ID.test(value) && check(value);
 }
 
-// src/storage/errors.ts
-var STORAGE_ERROR_CODES2 = {
-  invalidRequest: "storage.invalid_request",
-  objectTooLarge: "storage.object_too_large",
-  rejected: "storage.rejected",
-  unavailable: "storage.unavailable",
-  badResponse: "storage.bad_response"
-};
-var STATUS = {
-  "storage.invalid_request": 400,
-  "storage.object_too_large": 413,
-  "storage.rejected": 500,
-  "storage.unavailable": 503,
-  "storage.bad_response": 502
-};
-
-class StorageError2 extends AppError2 {
-  constructor(code, message, options = {}) {
-    super({
-      code,
-      status: STATUS[code],
-      message,
-      ...options.cause === undefined ? {} : { cause: options.cause },
-      ...options.details === undefined ? {} : { details: options.details }
-    });
-    this.name = "StorageError";
-  }
-}
-
-// src/storage/port.ts
-var MAX_KEY_BYTES2 = 512;
-var MAX_KEY_SEGMENTS2 = 16;
-var DEFAULT_MAX_OBJECT_BYTES2 = 25 * 1024 * 1024;
-var MAX_OBJECT_BYTES_LIMIT2 = 100 * 1024 * 1024;
-var DEFAULT_LIST_LIMIT2 = 100;
-var MAX_LIST_LIMIT2 = 1000;
-var DEFAULT_CONTENT_TYPE2 = "application/octet-stream";
+// src/storage/validate.ts
 var SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 var CONTENT_TYPE = /^[A-Za-z0-9][\w!#$&^.+-]*\/[A-Za-z0-9][\w!#$&^.+-]*(?:;[ \t]*[\w.-]+=[\w.+"-]+)*$/;
 var CURSOR = /^[A-Za-z0-9_-]{1,700}$/;
 var bad = (message) => new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, message);
-function encodeCursor2(key) {
+function encodeCursor(key) {
   return Buffer.from(key, "utf8").toString("base64url");
 }
-function createStorageValidator2(options = {}) {
+function createStorageValidator(options = {}) {
   const maxObjectBytes = options.maxObjectBytes ?? DEFAULT_MAX_OBJECT_BYTES2;
   if (!Number.isInteger(maxObjectBytes) || maxObjectBytes < 1 || maxObjectBytes > MAX_OBJECT_BYTES_LIMIT2) {
     throw new TypeError("maxObjectBytes must be a whole number from 1 to 104857600");
   }
-  const isOrganization = createOrganizationIdGuard2(options.isOrganizationId);
+  const isOrganization = createOrganizationIdGuard(options.isOrganizationId);
   function key(value) {
     if (typeof value !== "string" || value === "" || value.length > MAX_KEY_BYTES2) {
       throw bad("the key must be a non-empty string of at most 512 bytes");
@@ -97,7 +69,7 @@ function createStorageValidator2(options = {}) {
     } catch {
       throw bad("the cursor is not one this store gave");
     }
-    if (encodeCursor2(decoded) !== value) {
+    if (encodeCursor(decoded) !== value) {
       throw bad("the cursor is not one this store gave");
     }
     return decoded;
@@ -145,4 +117,4 @@ function createStorageValidator2(options = {}) {
   };
 }
 
-export { contractOrganizationIdCheck2, createOrganizationIdGuard2, STORAGE_ERROR_CODES2, StorageError2, MAX_KEY_BYTES2, MAX_KEY_SEGMENTS2, DEFAULT_MAX_OBJECT_BYTES2, MAX_OBJECT_BYTES_LIMIT2, DEFAULT_LIST_LIMIT2, MAX_LIST_LIMIT2, DEFAULT_CONTENT_TYPE2, encodeCursor2, createStorageValidator2 };
+export { createOrganizationIdGuard, encodeCursor, createStorageValidator };

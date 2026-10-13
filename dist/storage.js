@@ -1,10 +1,12 @@
 import {
   STORAGE_ERROR_CODES2,
   StorageError2,
-  DEFAULT_CONTENT_TYPE2,
-  encodeCursor2,
-  createStorageValidator2
-} from "./shared/chunk-qh6vnyss.js";
+  DEFAULT_CONTENT_TYPE2
+} from "./shared/chunk-r2rshw7g.js";
+import {
+  encodeCursor,
+  createStorageValidator
+} from "./shared/chunk-kjet3m0h.js";
 
 // src/storage/aws.ts
 import {
@@ -61,7 +63,7 @@ function createS3ObjectStore(options) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new TypeError("maxAttempts must be a whole number from 1 to 10");
   }
-  const check = createStorageValidator2({
+  const check = createStorageValidator({
     maxObjectBytes: options.maxObjectBytes,
     isOrganizationId: options.isOrganizationId
   });
@@ -206,7 +208,7 @@ function createS3ObjectStore(options) {
       const result = { items };
       const last = items.at(-1);
       if (output.IsTruncated === true && last !== undefined) {
-        result.nextCursor = encodeCursor2(last.key);
+        result.nextCursor = encodeCursor(last.key);
       }
       return result;
     }

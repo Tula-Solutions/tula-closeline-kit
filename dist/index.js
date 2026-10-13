@@ -12,25 +12,8 @@ import {
   MAX_TOP_K2,
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
-  MAX_ATTRIBUTE_STRING2,
-  attributesMatch2,
-  createVectorValidator2
-} from "./shared/chunk-z6zyk10w.js";
-import {
-  contractOrganizationIdCheck2,
-  createOrganizationIdGuard2,
-  STORAGE_ERROR_CODES2,
-  StorageError2,
-  MAX_KEY_BYTES2,
-  MAX_KEY_SEGMENTS2,
-  DEFAULT_MAX_OBJECT_BYTES2,
-  MAX_OBJECT_BYTES_LIMIT2,
-  DEFAULT_LIST_LIMIT2,
-  MAX_LIST_LIMIT2,
-  DEFAULT_CONTENT_TYPE2,
-  encodeCursor2,
-  createStorageValidator2
-} from "./shared/chunk-qh6vnyss.js";
+  MAX_ATTRIBUTE_STRING2
+} from "./shared/chunk-wvahtrty.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -41,6 +24,17 @@ import {
   INVALID_REASONS2,
   createMessageRegistry2
 } from "./shared/chunk-mjkmsg3r.js";
+import {
+  STORAGE_ERROR_CODES2,
+  StorageError2,
+  MAX_KEY_BYTES2,
+  MAX_KEY_SEGMENTS2,
+  DEFAULT_MAX_OBJECT_BYTES2,
+  MAX_OBJECT_BYTES_LIMIT2,
+  DEFAULT_LIST_LIMIT2,
+  MAX_LIST_LIMIT2,
+  DEFAULT_CONTENT_TYPE2
+} from "./shared/chunk-r2rshw7g.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -1646,8 +1640,6 @@ export {
   assertBatchCount2 as assertBatchCount,
   assertReceiveOptions2 as assertReceiveOptions,
   assertVisibility2 as assertVisibility,
-  attributesMatch2 as attributesMatch,
-  contractOrganizationIdCheck2 as contractOrganizationIdCheck,
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
@@ -1656,15 +1648,11 @@ export {
   createMemoryProcessedStore,
   createMessageRegistry2 as createMessageRegistry,
   createNoopErrorReporter,
-  createOrganizationIdGuard2 as createOrganizationIdGuard,
   createRemoteKeySet,
   createStaticKeySet,
-  createStorageValidator2 as createStorageValidator,
   createTokenVerifier,
-  createVectorValidator2 as createVectorValidator,
   cutText2 as cutText,
   defineMessage2 as defineMessage,
-  encodeCursor2 as encodeCursor,
   environmentSchema,
   isAppError2 as isAppError,
   isSentryDsn,
