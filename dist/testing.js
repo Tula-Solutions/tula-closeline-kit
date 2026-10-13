@@ -2,21 +2,26 @@ import {
   scrubText2,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-x863z57h.js";
+} from "./shared/chunk-z6tfjj1b.js";
 import {
+  systemClock2,
   createFixedClock2,
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-pzmynk9n.js";
+} from "./shared/chunk-mjkmsg3r.js";
+import {
+  encodeCursor2,
+  createStorageValidator2
+} from "./shared/chunk-qh6vnyss.js";
 import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2,
   systemSleep2
-} from "./shared/chunk-pkdp60t0.js";
+} from "./shared/chunk-dpkegc79.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -339,6 +344,77 @@ function createTestRegistry(options = {}) {
     ...options
   });
 }
+// src/storage/memory.ts
+function createMemoryObjectStore(options = {}) {
+  const clock = options.clock ?? systemClock2;
+  const check = createStorageValidator2({
+    maxObjectBytes: options.maxObjectBytes,
+    isOrganizationId: options.isOrganizationId
+  });
+  const organizations = new Map;
+  const info = (key, entry) => ({
+    key,
+    size: entry.body.byteLength,
+    contentType: entry.contentType,
+    lastModified: new Date(entry.lastModified)
+  });
+  return {
+    async put(organizationId, key, body, putOptions) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const bytes = check.body(body);
+      const contentType = check.contentType(putOptions?.contentType);
+      let objects = organizations.get(org);
+      if (objects === undefined) {
+        objects = new Map;
+        organizations.set(org, objects);
+      }
+      objects.set(name, { body: bytes.slice(), contentType, lastModified: clock.now() });
+    },
+    async get(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const entry = organizations.get(org)?.get(name);
+      if (entry === undefined) {
+        return;
+      }
+      const stored = { ...info(name, entry), body: entry.body.slice() };
+      return stored;
+    },
+    async head(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const entry = organizations.get(org)?.get(name);
+      return entry === undefined ? undefined : info(name, entry);
+    },
+    async delete(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      organizations.get(org)?.delete(name);
+    },
+    async list(organizationId, listOptions) {
+      const org = check.organization(organizationId);
+      const { prefix, after, limit } = check.list(listOptions);
+      const matches = [];
+      for (const pair of organizations.get(org) ?? []) {
+        if (pair[0].startsWith(prefix) && (after === undefined || pair[0] > after)) {
+          matches.push(pair);
+        }
+      }
+      matches.sort((x, y) => x[0] < y[0] ? -1 : 1);
+      const items = matches.slice(0, limit).map(([name, entry]) => {
+        const { key, size, lastModified } = info(name, entry);
+        return { key, size, lastModified };
+      });
+      const last = items.at(-1);
+      const result = { items };
+      if (matches.length > limit && last !== undefined) {
+        result.nextCursor = encodeCursor2(last.key);
+      }
+      return result;
+    }
+  };
+}
 
 // src/testing.ts
 function build(entries, bound) {
@@ -373,6 +449,7 @@ export {
   DEFAULT_TEST_USER_ID,
   createMemoryErrorReporter,
   createMemoryLogger,
+  createMemoryObjectStore,
   createMemoryQueue,
   createTestDeps,
   createTestJwks,

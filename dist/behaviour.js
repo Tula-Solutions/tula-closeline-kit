@@ -1,6 +1,6 @@
 import {
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-pzmynk9n.js";
+} from "./shared/chunk-mjkmsg3r.js";
 
 // src/queue/behaviour.ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -360,7 +360,361 @@ function processedStoreBehaviour(name, make) {
     });
   });
 }
+// src/storage/behaviour.ts
+import { afterEach as afterEach3, describe as describe3, expect as expect3, test as test3 } from "bun:test";
+var bytes = (text) => new TextEncoder().encode(text);
+var text = (data) => new TextDecoder().decode(data);
+function objectStoreBehaviour(name, make, skip = false) {
+  const run = skip ? describe3.skip : describe3;
+  run(`ObjectStore behaviour: ${name}`, () => {
+    const open = [];
+    afterEach3(async () => {
+      await Promise.all(open.splice(0).map((subject) => subject.close()));
+    });
+    async function subject() {
+      const made = await make();
+      open.push(made);
+      return made;
+    }
+    async function keysOf(s, org, prefix) {
+      const keys = [];
+      let cursor;
+      for (let page = 0;page < 50; page++) {
+        const got = await s.store.list(org, {
+          ...prefix === undefined ? {} : { prefix },
+          ...cursor === undefined ? {} : { cursor },
+          limit: 1000
+        });
+        keys.push(...got.items.map((item) => item.key));
+        cursor = got.nextCursor;
+        if (cursor === undefined) {
+          break;
+        }
+      }
+      return keys;
+    }
+    const BAD_KEYS = [
+      "",
+      "/",
+      "/a",
+      "a/",
+      "a//b",
+      ".",
+      "..",
+      "../a",
+      "a/..",
+      "a/../b",
+      "a/./b",
+      ".hidden",
+      "a/.hidden",
+      "%2e%2e/a",
+      "a%2fb",
+      "a\\b",
+      "a b",
+      "a\x00b",
+      `a
+b`,
+      "café",
+      `${"a/".repeat(16)}a`,
+      "x".repeat(513),
+      `${"x".repeat(129)}`
+    ];
+    test3.each(BAD_KEYS.map((key) => [JSON.stringify(key.slice(0, 40)), key]))("the key %s is refused by every operation", async (_label, key) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const code = { code: "storage.invalid_request" };
+      await expect3(s.store.put(a, key, bytes("x"))).rejects.toMatchObject(code);
+      await expect3(s.store.get(a, key)).rejects.toMatchObject(code);
+      await expect3(s.store.head(a, key)).rejects.toMatchObject(code);
+      await expect3(s.store.delete(a, key)).rejects.toMatchObject(code);
+    });
+    test3.each([
+      ["empty", ""],
+      ["a path", "org/../x"],
+      ["a separator", "/x"],
+      ["an encoded separator", "x%2Fy"],
+      ["a dot segment", ".."],
+      ["a wildcard", "x*"],
+      ["spaces", "x y"],
+      ["too long", "x".repeat(65)]
+    ])("an Organization id that is %s is refused", async (_label, id) => {
+      const s = await subject();
+      const code = { code: "storage.invalid_request" };
+      await expect3(s.store.put(id, "k", bytes("x"))).rejects.toMatchObject(code);
+      await expect3(s.store.get(id, "k")).rejects.toMatchObject(code);
+      await expect3(s.store.head(id, "k")).rejects.toMatchObject(code);
+      await expect3(s.store.delete(id, "k")).rejects.toMatchObject(code);
+      await expect3(s.store.list(id)).rejects.toMatchObject(code);
+    });
+    test3("an id built from another Organization id and a path does not reach it", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await s.store.put(b, "secret.txt", bytes("b only"));
+      for (const id of [`${a}/../${b}`, `${a}/${b}`, `../${b}`, `${b}/`, `${b}/.`]) {
+        await expect3(s.store.get(id, "secret.txt")).rejects.toMatchObject({
+          code: "storage.invalid_request"
+        });
+        await expect3(s.store.list(id)).rejects.toMatchObject({ code: "storage.invalid_request" });
+      }
+    });
+    test3("an object comes back as written, with its content type as given", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.put(a, "docs/one.txt", bytes("hello"), {
+        contentType: "text/plain; charset=utf-8"
+      });
+      const got = await s.store.get(a, "docs/one.txt");
+      expect3(got?.key).toBe("docs/one.txt");
+      expect3(text(got?.body ?? new Uint8Array)).toBe("hello");
+      expect3(got?.size).toBe(5);
+      expect3(got?.contentType).toBe("text/plain; charset=utf-8");
+      expect3(got?.lastModified).toBeInstanceOf(Date);
+      expect3(Number.isNaN(got?.lastModified.getTime())).toBe(false);
+      const info = await s.store.head(a, "docs/one.txt");
+      expect3(info).toMatchObject({
+        key: "docs/one.txt",
+        size: 5,
+        contentType: "text/plain; charset=utf-8"
+      });
+    });
+    test3("without a content type the store says application/octet-stream", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.put(a, "blob", new Uint8Array([0, 255, 1, 254]));
+      const got = await s.store.get(a, "blob");
+      expect3(got?.contentType).toBe("application/octet-stream");
+      expect3([...got?.body ?? []]).toEqual([0, 255, 1, 254]);
+    });
+    test3("content is stored as bytes whatever its content type claims", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const html = bytes("<script>alert(1)</script>");
+      await s.store.put(a, "liar.png", html, { contentType: "image/png" });
+      const got = await s.store.get(a, "liar.png");
+      expect3(text(got?.body ?? new Uint8Array)).toBe("<script>alert(1)</script>");
+      expect3(got?.contentType).toBe("image/png");
+    });
+    test3("an empty object is stored", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.put(a, "empty", new Uint8Array);
+      expect3((await s.store.get(a, "empty"))?.size).toBe(0);
+    });
+    test3.each([
+      ["no slash", "text"],
+      ["a header break", `text/plain\r
+x-injected: 1`],
+      ["spaces in the type", "te xt/plain"],
+      ["a quote-less parameter name", "text/plain; =x"],
+      ["an empty string", ""],
+      ["too long", `text/${"x".repeat(260)}`]
+    ])("a content type with %s is refused and nothing is stored", async (_label, contentType) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect3(s.store.put(a, "k", bytes("x"), { contentType })).rejects.toMatchObject({
+        code: "storage.invalid_request"
+      });
+      expect3(await s.store.head(a, "k")).toBeUndefined();
+    });
+    test3("a body that is not bytes is refused", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect3(s.store.put(a, "k", "text")).rejects.toMatchObject({
+        code: "storage.invalid_request"
+      });
+    });
+    test3("an object over the size limit is refused and the limit itself is accepted", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect3(s.store.put(a, "big", new Uint8Array(s.maxObjectBytes + 1))).rejects.toMatchObject({ code: "storage.object_too_large" });
+      expect3(await s.store.head(a, "big")).toBeUndefined();
+      await s.store.put(a, "edge", new Uint8Array(s.maxObjectBytes));
+      expect3((await s.store.head(a, "edge"))?.size).toBe(s.maxObjectBytes);
+    });
+    test3("a missing object reads as undefined", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      expect3(await s.store.get(a, "nothing")).toBeUndefined();
+      expect3(await s.store.head(a, "nothing")).toBeUndefined();
+    });
+    test3("writing a key again replaces the object, and writing the same thing twice changes nothing", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.put(a, "k", bytes("one"), { contentType: "text/plain" });
+      await s.store.put(a, "k", bytes("two"), { contentType: "text/csv" });
+      await s.store.put(a, "k", bytes("two"), { contentType: "text/csv" });
+      const got = await s.store.get(a, "k");
+      expect3(text(got?.body ?? new Uint8Array)).toBe("two");
+      expect3(got?.contentType).toBe("text/csv");
+      expect3(await keysOf(s, a)).toEqual(["k"]);
+    });
+    test3("deleting removes the object, and deleting again or deleting nothing resolves", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.put(a, "k", bytes("x"));
+      await s.store.delete(a, "k");
+      expect3(await s.store.get(a, "k")).toBeUndefined();
+      await s.store.delete(a, "k");
+      await s.store.delete(a, "never-existed");
+    });
+    test3("a second Organization cannot read, head, list or delete the first one's objects", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await s.store.put(a, "docs/plan.txt", bytes("a secret"));
+      expect3(await s.store.get(b, "docs/plan.txt")).toBeUndefined();
+      expect3(await s.store.head(b, "docs/plan.txt")).toBeUndefined();
+      expect3(await keysOf(s, b)).toEqual([]);
+      expect3(await keysOf(s, b, "docs/")).toEqual([]);
+      await s.store.delete(b, "docs/plan.txt");
+      expect3(text((await s.store.get(a, "docs/plan.txt"))?.body ?? new Uint8Array)).toBe("a secret");
+    });
+    test3("the same key in two Organizations holds two objects", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await s.store.put(a, "same", bytes("from a"));
+      await s.store.put(b, "same", bytes("from b"));
+      expect3(text((await s.store.get(a, "same"))?.body ?? new Uint8Array)).toBe("from a");
+      expect3(text((await s.store.get(b, "same"))?.body ?? new Uint8Array)).toBe("from b");
+      await s.store.delete(a, "same");
+      expect3(text((await s.store.get(b, "same"))?.body ?? new Uint8Array)).toBe("from b");
+    });
+    test3("an Organization whose id starts with another id is a different Organization", async () => {
+      const s = await subject();
+      const { a, aExtended } = s.organizations;
+      await s.store.put(a, "one", bytes("a"));
+      await s.store.put(aExtended, "two", bytes("extended"));
+      expect3(await keysOf(s, a)).toEqual(["one"]);
+      expect3(await keysOf(s, aExtended)).toEqual(["two"]);
+      expect3(await s.store.get(a, "two")).toBeUndefined();
+      expect3(await s.store.get(aExtended, "one")).toBeUndefined();
+      await s.store.delete(a, "two");
+      expect3(await keysOf(s, aExtended)).toEqual(["two"]);
+    });
+    test3("a key cannot name another Organization through a path", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await s.store.put(b, "secret.txt", bytes("b only"));
+      for (const key of [
+        `../${b}/secret.txt`,
+        `/${b}/secret.txt`,
+        `${b}/../${b}/secret.txt`,
+        `..%2f${b}%2fsecret.txt`
+      ]) {
+        await expect3(s.store.get(a, key)).rejects.toMatchObject({ code: "storage.invalid_request" });
+        await expect3(s.store.delete(a, key)).rejects.toMatchObject({
+          code: "storage.invalid_request"
+        });
+      }
+      for (const prefix of ["../", `../${b}/`, "/", `${a}/../${b}/`, "%2e%2e/", "*", ".."]) {
+        await expect3(s.store.list(a, { prefix })).rejects.toMatchObject({
+          code: "storage.invalid_request"
+        });
+      }
+      expect3(text((await s.store.get(b, "secret.txt"))?.body ?? new Uint8Array)).toBe("b only");
+    });
+    test3("a list is a page, in key order, that ends with no cursor", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      for (const key of ["c", "a", "b/2", "b/1", "d"]) {
+        await s.store.put(a, key, bytes(key));
+      }
+      const seen = [];
+      let cursor;
+      let pages = 0;
+      do {
+        const page = await s.store.list(a, {
+          limit: 2,
+          ...cursor === undefined ? {} : { cursor }
+        });
+        expect3(page.items.length).toBeLessThanOrEqual(2);
+        seen.push(...page.items.map((item) => item.key));
+        for (const item of page.items) {
+          expect3(item.size).toBe(item.key.length);
+          expect3(item.lastModified).toBeInstanceOf(Date);
+        }
+        cursor = page.nextCursor;
+        pages += 1;
+      } while (cursor !== undefined && pages < 10);
+      expect3(seen).toEqual(["a", "b/1", "b/2", "c", "d"]);
+      expect3(pages).toBe(3);
+    });
+    test3("a list without a limit returns at most 100", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await Promise.all(Array.from({ length: 105 }, (_, i) => s.store.put(a, `n${String(i).padStart(3, "0")}`, bytes("x"))));
+      const page = await s.store.list(a);
+      expect3(page.items).toHaveLength(100);
+      expect3(page.nextCursor).toBeDefined();
+      const rest = await s.store.list(a, { cursor: page.nextCursor });
+      expect3(rest.items).toHaveLength(5);
+      expect3(rest.nextCursor).toBeUndefined();
+    });
+    test3("a prefix keeps only the keys that start with it", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      for (const key of ["docs/a.txt", "docs/b.txt", "docs2/c.txt", "other/d.txt", "docsx"]) {
+        await s.store.put(a, key, bytes("x"));
+      }
+      expect3(await keysOf(s, a, "docs/")).toEqual(["docs/a.txt", "docs/b.txt"]);
+      expect3(await keysOf(s, a, "docs/a")).toEqual(["docs/a.txt"]);
+      expect3(await keysOf(s, a, "docs")).toEqual([
+        "docs/a.txt",
+        "docs/b.txt",
+        "docs2/c.txt",
+        "docsx"
+      ]);
+      expect3(await keysOf(s, a, "nothing/")).toEqual([]);
+    });
+    test3.each([[0], [-1], [1001], [1.5], [Number.NaN]])("a list limit of %p is refused", async (limit) => {
+      const s = await subject();
+      await expect3(s.store.list(s.organizations.a, { limit })).rejects.toMatchObject({
+        code: "storage.invalid_request"
+      });
+    });
+    test3("a forged cursor is refused", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const forged = [
+        "not a cursor!",
+        "",
+        Buffer.from("../x").toString("base64url"),
+        Buffer.from("/x").toString("base64url"),
+        Buffer.from(`${a}/../x`).toString("base64url"),
+        `${Buffer.from("k").toString("base64url")}=`,
+        "a".repeat(701)
+      ];
+      for (const cursor of forged) {
+        await expect3(s.store.list(a, { cursor })).rejects.toMatchObject({
+          code: "storage.invalid_request"
+        });
+      }
+    });
+    test3("one Organization's cursor used by another lists only the second one's objects", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      for (const key of ["k1", "k2", "k3"]) {
+        await s.store.put(a, key, bytes("a"));
+      }
+      await s.store.put(b, "k9", bytes("b"));
+      const page = await s.store.list(a, { limit: 1 });
+      const cursor = page.nextCursor;
+      const other = await s.store.list(b, { cursor });
+      expect3(other.items.map((item) => item.key)).toEqual(["k9"]);
+    });
+    test3("the body that get returns is a copy", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const original = bytes("keep");
+      await s.store.put(a, "k", original);
+      original[0] = 0;
+      const first = await s.store.get(a, "k");
+      (first?.body)[1] = 0;
+      expect3(text((await s.store.get(a, "k"))?.body ?? new Uint8Array)).toBe("keep");
+    });
+  });
+}
 export {
+  objectStoreBehaviour,
   processedStoreBehaviour,
   queueBehaviour
 };

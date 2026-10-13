@@ -346,4 +346,95 @@ interface StoreSubject {
 * Leases are 60 seconds, so a subject that really waits should scale them or fake the database clock.
 */
 declare function processedStoreBehaviour(name: string, make: () => Promise<StoreSubject>): void;
-export { QueueSubject, StoreSubject, processedStoreBehaviour, queueBehaviour };
+/** What a listing says about one object. */
+interface ObjectEntry {
+	/** The key, relative to the Organization. */
+	key: string;
+	/** The size in bytes. */
+	size: number;
+	/** When the object was last written. */
+	lastModified: Date;
+}
+/** What {@link ObjectStore.head} says about one object. */
+interface ObjectInfo extends ObjectEntry {
+	/** The content type as the writer gave it. Informational only: nothing may branch on it. */
+	contentType: string;
+}
+/** An object with its body. */
+interface StoredObject extends ObjectInfo {
+	/** The bytes. A copy: changing it does not change the store. */
+	body: Uint8Array;
+}
+/** Options of {@link ObjectStore.put}. */
+interface PutOptions {
+	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
+	contentType?: string;
+}
+/** Options of {@link ObjectStore.list}. */
+interface ListOptions {
+	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface ListPage {
+	/** Objects in ascending key order. */
+	items: ObjectEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Object storage scoped by Organization. Every call takes the Organization id first and can reach
+* only that Organization's objects: the adapter derives the real location from the validated id,
+* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
+* id that starts with another id) can name another Organization's data. Keys are relative to the
+* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
+* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
+* keeps the content type as given and never looks at the content. Bodies are held in memory, so an
+* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
+* {@link StorageError}; only `storage.unavailable` is worth retrying.
+*/
+interface ObjectStore {
+	/**
+	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
+	* same object. O(object size).
+	*/
+	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/** Reads an object, or returns `undefined` when there is none. O(object size). */
+	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
+	/** Reads an object's metadata, or returns `undefined` when there is none. O(1). */
+	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
+	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
+	delete(organizationId: string, key: string): Promise<void>;
+	/**
+	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
+	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
+	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
+	*/
+	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface ObjectStoreSubject {
+	/** The store under test, empty for the Organizations below. */
+	store: ObjectStore;
+	/** Three Organization ids the store accepts, none empty of data: B is unrelated, and `aExtended` starts with `a`. */
+	organizations: {
+		a: string;
+		b: string;
+		aExtended: string;
+	};
+	/** The store's `maxObjectBytes`, small (a few KiB) so the suite can cross it. */
+	maxObjectBytes: number;
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link ObjectStore} must show. Run it with {@link objectStoreBehaviour}
+* against the memory adapter and against the S3 adapter on its stand-in; a change that passes for
+* one and fails for the other is a bug in one of them.
+*/
+declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
+export { ObjectStoreSubject, QueueSubject, StoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour };

@@ -477,6 +477,17 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
+/** Decides whether a string is an Organization id this deployment accepts. */
+type OrganizationIdCheck = (value: string) => boolean;
+/** The Organization id format of the contract: `org_` and 32 lower-case hex digits. */
+declare const contractOrganizationIdCheck: OrganizationIdCheck;
+/**
+* Builds the one function every store uses to accept an Organization id. The id must pass the
+* hard character rule above and the `check` (the contract's format by default), so a store never
+* builds a key or a namespace from a caller's string that was not validated first. Pass a looser
+* `check` only in tests.
+*/
+declare function createOrganizationIdGuard(check?: OrganizationIdCheck): (value: unknown) => value is string;
 import { z as z3 } from "zod";
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
@@ -912,6 +923,149 @@ declare function cutText(text: string, max: number): string;
 * returns a fixed placeholder.
 */
 declare function scrubText(text: string): string;
+/** The `area.reason` codes the object storage port and adapters throw. */
+declare const STORAGE_ERROR_CODES: {
+	/** An Organization id, key, prefix, cursor, content type, limit or body is not acceptable. */
+	readonly invalidRequest: "storage.invalid_request";
+	/** An object is over the store's size limit. */
+	readonly objectTooLarge: "storage.object_too_large";
+	/** The store refused the call for a reason a retry cannot fix (no such bucket, access denied). */
+	readonly rejected: "storage.rejected";
+	/** The store did not answer, in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "storage.unavailable";
+	/** The store answered with something this adapter cannot use. */
+	readonly badResponse: "storage.bad_response";
+};
+/** One of {@link STORAGE_ERROR_CODES}'s values. */
+type StorageErrorCode = (typeof STORAGE_ERROR_CODES)[keyof typeof STORAGE_ERROR_CODES];
+/** What an object store throws. Its message never holds an object body, a key or a URL. */
+declare class StorageError extends AppError {
+	readonly code: StorageErrorCode;
+	constructor(code: StorageErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** The longest key, in bytes. */
+declare const MAX_KEY_BYTES = 512;
+/** The most `/`-separated segments a key can have. */
+declare const MAX_KEY_SEGMENTS = 16;
+/** The default largest object, in bytes (25 MiB). */
+declare const DEFAULT_MAX_OBJECT_BYTES: number;
+/** The largest `maxObjectBytes` a store can be configured with (100 MiB): bodies are held in memory. */
+declare const MAX_OBJECT_BYTES_LIMIT: number;
+/** The default page size of {@link ObjectStore.list}. */
+declare const DEFAULT_LIST_LIMIT = 100;
+/** The largest page size of {@link ObjectStore.list}. */
+declare const MAX_LIST_LIMIT = 1e3;
+/** The content type stored when the caller gives none. */
+declare const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+/** What a listing says about one object. */
+interface ObjectEntry {
+	/** The key, relative to the Organization. */
+	key: string;
+	/** The size in bytes. */
+	size: number;
+	/** When the object was last written. */
+	lastModified: Date;
+}
+/** What {@link ObjectStore.head} says about one object. */
+interface ObjectInfo extends ObjectEntry {
+	/** The content type as the writer gave it. Informational only: nothing may branch on it. */
+	contentType: string;
+}
+/** An object with its body. */
+interface StoredObject extends ObjectInfo {
+	/** The bytes. A copy: changing it does not change the store. */
+	body: Uint8Array;
+}
+/** Options of {@link ObjectStore.put}. */
+interface PutOptions {
+	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
+	contentType?: string;
+}
+/** Options of {@link ObjectStore.list}. */
+interface ListOptions {
+	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface ListPage {
+	/** Objects in ascending key order. */
+	items: ObjectEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Object storage scoped by Organization. Every call takes the Organization id first and can reach
+* only that Organization's objects: the adapter derives the real location from the validated id,
+* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
+* id that starts with another id) can name another Organization's data. Keys are relative to the
+* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
+* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
+* keeps the content type as given and never looks at the content. Bodies are held in memory, so an
+* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
+* {@link StorageError}; only `storage.unavailable` is worth retrying.
+*/
+interface ObjectStore {
+	/**
+	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
+	* same object. O(object size).
+	*/
+	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/** Reads an object, or returns `undefined` when there is none. O(object size). */
+	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
+	/** Reads an object's metadata, or returns `undefined` when there is none. O(1). */
+	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
+	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
+	delete(organizationId: string, key: string): Promise<void>;
+	/**
+	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
+	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
+	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
+	*/
+	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
+}
+/** The validated parts of a `list` call. */
+interface ListQuery {
+	prefix: string;
+	after: string | undefined;
+	limit: number;
+}
+/** The checks both adapters run before touching their store. */
+interface StorageValidator {
+	/** Throws unless `organizationId` is acceptable; returns it. */
+	organization(organizationId: unknown): string;
+	/** Throws unless `key` is a valid key; returns it. */
+	key(key: unknown): string;
+	/** Throws unless `body` is a Uint8Array within the size limit. */
+	body(body: unknown): Uint8Array;
+	/** Throws unless the content type is valid; returns it, or the default. */
+	contentType(contentType: unknown): string;
+	/** Validates and normalises the options of a list call. */
+	list(options: ListOptions | undefined): ListQuery;
+	/** The largest object accepted, in bytes. */
+	readonly maxObjectBytes: number;
+}
+/** Options of {@link createStorageValidator}. */
+interface StorageValidatorOptions {
+	/** Largest object in bytes; default 25 MiB, at most 100 MiB. */
+	maxObjectBytes?: number | undefined;
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck | undefined;
+}
+/** Encodes a key as an opaque list cursor. */
+declare function encodeCursor(key: string): string;
+/**
+* Builds the validator an {@link ObjectStore} adapter uses. A cursor is the last key of the
+* previous page, so decoding one gives a key that is checked like any other and cannot point
+* outside the Organization.
+*/
+declare function createStorageValidator(options?: StorageValidatorOptions): StorageValidator;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, PreviousVersion, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, ListQuery, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, Sleep, StorageError, StorageErrorCode, StorageValidator, StorageValidatorOptions, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, contractOrganizationIdCheck, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createOrganizationIdGuard, createRemoteKeySet, createStaticKeySet, createStorageValidator, createTokenVerifier, cutText, defineMessage, encodeCursor, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };

@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-const ROOT = new URL('../index.ts', import.meta.url).pathname
-const QUEUE = new URL('../queue.ts', import.meta.url).pathname
-const TESTING = new URL('../testing.ts', import.meta.url).pathname
-const BEHAVIOUR = new URL('../behaviour.ts', import.meta.url).pathname
+const ROOT = new URL('./index.ts', import.meta.url).pathname
+const QUEUE = new URL('./queue.ts', import.meta.url).pathname
+const STORAGE = new URL('./storage.ts', import.meta.url).pathname
+const TESTING = new URL('./testing.ts', import.meta.url).pathname
+const BEHAVIOUR = new URL('./behaviour.ts', import.meta.url).pathname
 
 /**
  * Follows the imports of `entry` through the kit's own source and returns every package it names,
@@ -34,14 +35,23 @@ async function analyse(entry: string): Promise<{ packages: string[]; output: str
   return { packages: [...seen], output: (await result.outputs[0]?.text()) ?? '' }
 }
 
-describe('importing the kit does not load the AWS SDK unless the queue entry is asked for', () => {
+describe('importing the kit does not load an AWS SDK client unless its own entry is asked for', () => {
   test('the control: the queue entry names it', async () => {
     expect(await packagesImportedBy(QUEUE)).toContain('@aws-sdk/client-sqs')
+  })
+
+  test('the storage entry names the S3 client and not the SQS one, and the queue entry the reverse', async () => {
+    const storage = await packagesImportedBy(STORAGE)
+    expect(storage).toContain('@aws-sdk/client-s3')
+    expect(storage).not.toContain('@aws-sdk/client-sqs')
+    const queue = await packagesImportedBy(QUEUE)
+    expect(queue).not.toContain('@aws-sdk/client-s3')
   })
 
   test.each([
     ['root', ROOT],
     ['testing', TESTING],
+    ['behaviour', BEHAVIOUR],
   ])('the %s entry does not', async (_name, entry) => {
     const packages = await packagesImportedBy(entry)
     expect(packages.length).toBeGreaterThan(0)
@@ -50,7 +60,7 @@ describe('importing the kit does not load the AWS SDK unless the queue entry is 
 
   test('only the behaviour entry names bun:test', async () => {
     expect((await analyse(BEHAVIOUR)).output).toContain('bun:test')
-    for (const entry of [ROOT, TESTING, QUEUE]) {
+    for (const entry of [ROOT, TESTING, QUEUE, STORAGE]) {
       expect((await analyse(entry)).output).not.toContain('bun:test')
     }
   })
