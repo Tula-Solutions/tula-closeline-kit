@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { scrubText } from './scrub'
+import { cutText, scrubText } from './scrub'
 
 const JWT =
   'eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c3JfMSIsIm9yZyI6Im9yZ18xIn0.c2lnbmF0dXJlLWJ5dGVz'
@@ -17,6 +17,7 @@ describe('scrubText masks secrets inside free text', () => {
     ['a single-quoted pair', "client_secret = 'a b c'", 'a b c'],
     ['an escaped quote in a quoted value', String.raw`password="ab\"cd" next`, 'cd'],
     ['a query string pair', 'GET /cb?code=1&access_token=zzz999&x=2', 'zzz999'],
+    ['a pair at the end of the line', 'config token: s3cr3t-value', 's3cr3t-value'],
     ['a pair nested in another pair', 'data=password=abc999', 'abc999'],
     ['an authorization header line', 'Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpw'],
     ['a cookie header line', 'Cookie: sid=abc999; theme=dark', 'abc999'],
@@ -51,16 +52,22 @@ describe('scrubText masks secrets inside free text', () => {
   })
 
   test('keeps the surrounding words and the key name', () => {
+    // An unquoted value runs to the end of the line, so the words after it go too.
     expect(scrubText('login failed password=hunter2 for ann')).toBe(
-      'login failed password=[redacted] for ann'
+      'login failed password=[redacted]'
     )
     expect(scrubText('Authorization: Bearer abc.def.ghi')).toBe('Authorization: [redacted]')
     expect(scrubText('bad Bearer abc123 here')).toBe('bad Bearer [redacted] here')
   })
 
   test('masks every occurrence, not only the first', () => {
-    const out = scrubText('password=one token=two secret=three')
-    expect(out).toBe('password=[redacted] token=[redacted] secret=[redacted]')
+    expect(scrubText('password=one\ntoken=two\nsecret=three')).toBe(
+      'password=[redacted]\ntoken=[redacted]\nsecret=[redacted]'
+    )
+    const sameLine = scrubText('password=one token=two secret=three')
+    for (const value of ['one', 'two', 'three']) {
+      expect(sameLine).not.toContain(value)
+    }
   })
 
   test('masks a secret that contains an equals sign', () => {
@@ -189,5 +196,233 @@ describe('scrubText is bounded and never throws', () => {
       },
     }
     expect(() => scrubText(hostile as unknown as string)).not.toThrow()
+  })
+})
+
+describe('scrubText: keys beyond the listed words (review F3)', () => {
+  test.each([
+    ['AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'wJalrXUtnFEMI'],
+    ['aws_secret_access_key: wJalrXUtnFEMI/K7MDENG', 'wJalrXUtnFEMI'],
+    ['pass=hunter2x', 'hunter2x'],
+    ['pwd=hunter2x', 'hunter2x'],
+    ['passwd: hunter2x', 'hunter2x'],
+    ['auth=hunter2x', 'hunter2x'],
+    ['session_id=abc123def', 'abc123def'],
+    ['sessionId: abc123def', 'abc123def'],
+    ['PHPSESSID=abc123def', 'abc123def'],
+    ['session=abc123def', 'abc123def'],
+    ['sid=abc123def', 'abc123def'],
+    ['sig=abc123def', 'abc123def'],
+    ['X-Amz-Signature=abc123def', 'abc123def'],
+    ['signature: abc123def', 'abc123def'],
+  ])('%s', (input, secret) => {
+    const out = scrubText(input)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('[redacted]')
+  })
+
+  test('URL query parameters with sensitive names are masked and the rest of the URL kept', () => {
+    expect(scrubText('GET /f?sig=abc123def&x=1 HTTP/1.1')).toBe(
+      'GET /f?sig=[redacted]&x=1 HTTP/1.1'
+    )
+    expect(
+      scrubText(
+        'https://b.s3.amazonaws.com/o?X-Amz-Expires=60&X-Amz-Signature=abc123def&X-Amz-Date=20240101'
+      )
+    ).toBe(
+      'https://b.s3.amazonaws.com/o?X-Amz-Expires=60&X-Amz-Signature=[redacted]&X-Amz-Date=20240101'
+    )
+    expect(scrubText('https://x.test/cb?code=1&session_id=abc123def#top')).toBe(
+      'https://x.test/cb?code=1&session_id=[redacted]#top'
+    )
+  })
+
+  test('a quoted value with a doubled quote is masked whole', () => {
+    expect(scrubText("password='it''s' next")).toBe('password=[redacted] next')
+    expect(scrubText('password="say ""hi"" now" next')).toBe('password=[redacted] next')
+  })
+
+  test.each([
+    ['a newline in the password', 'connect postgres://u:pa\nss@h/db failed', ['ss@h', 'pa\n']],
+    ['a space in the password', 'connect postgres://u:pa ss@h/db failed', ['ss@h', 'word', 'pa ']],
+    ['a plain URL', 'connect postgres://u:pass@h:5432/db?sslmode=require now', ['pass', 'h:5432']],
+  ])('a connection string with %s is masked to its end', (_name, input, gone) => {
+    const out = scrubText(input)
+    for (const part of gone) {
+      expect(out).not.toContain(part)
+    }
+    expect(out.startsWith('connect postgres://[redacted]')).toBe(true)
+    expect(out.endsWith('failed') || out.endsWith('now')).toBe(true)
+  })
+
+  test('a connection string with no credentials stops at whitespace', () => {
+    expect(scrubText('redis://cache:6379 is down')).toBe('redis://[redacted] is down')
+  })
+
+  test.each([
+    [
+      'Detail: Key (email)=(jane@acme.com) already exists.',
+      'Detail: Key (email)=([redacted]) already exists.',
+    ],
+    [
+      'Key (organization_id, name)=(org_1, Acme (EU)) already exists.',
+      'Key (organization_id, name)=([redacted]) already exists.',
+    ],
+    [
+      'Key (team_id)=(team_9) is not present in table "teams".',
+      'Key (team_id)=([redacted]) is not present in table "teams".',
+    ],
+    ['Key (phone)=(+14155550199)', 'Key (phone)=([redacted])'],
+    ['Key (x)=(unterminated value and more', 'Key (x)=([redacted]'],
+  ])('a Postgres key detail is masked: %s', (input, expected) => {
+    expect(scrubText(input)).toBe(expected)
+  })
+
+  test('an unquoted value after a content key runs to the end of the line', () => {
+    expect(scrubText('transcript: hello my card is 4111 1111 1111 1111 ok\nnext line')).toBe(
+      'transcript: [redacted]\nnext line'
+    )
+    expect(scrubText('body=Hi Jane, call me\r\nnext')).toBe('body=[redacted]\r\nnext')
+  })
+})
+
+describe('scrubText: personal data (review F3)', () => {
+  test.each([
+    ['an email', 'user jane@acme.com not found', 'user [redacted] not found'],
+    ['an email with a plus tag', 'sent to jane.doe+crm@sub.acme.co.uk.', 'sent to [redacted].'],
+    ['two emails', 'a@b.io and c_d@e-f.com', '[redacted] and [redacted]'],
+    ['an E.164 number', 'dial +14155550199 now', 'dial [redacted] now'],
+    ['a short E.164 number', 'dial +49301234567', 'dial [redacted]'],
+    ['an E.164 number with spaces', 'call +44 20 7946 0958 today', 'call [redacted] today'],
+    ['a number with dashes', 'call 415-555-0199 today', 'call [redacted] today'],
+    ['a number with dots', 'call 415.555.0199 today', 'call [redacted] today'],
+    ['a number with parentheses', 'call (415) 555-0199 today', 'call [redacted] today'],
+    ['a number with a country code', 'call +1 (415) 555-0199.', 'call [redacted].'],
+    ['a toll-free number', 'call 1-800-555-0199', 'call [redacted]'],
+    ['a UK number with spaces', 'call 020 7946 0958', 'call [redacted]'],
+    ['a Visa number', 'card 4111111111111111 declined', 'card [redacted] declined'],
+    ['an Amex number', 'card 378282246310005 declined', 'card [redacted] declined'],
+    ['a card with spaces', 'card 5555 5555 5555 4444 declined', 'card [redacted] declined'],
+    ['a card with dashes', 'card 6011-1111-1111-1117 declined', 'card [redacted] declined'],
+    ['a 13 digit Visa number', 'card 4222222222222 declined', 'card [redacted] declined'],
+    ['a 19 digit number', 'card 6759649826438453003 declined', 'card [redacted] declined'],
+  ])('masks %s', (_name, input, expected) => {
+    expect(scrubText(input)).toBe(expected)
+  })
+
+  test.each([
+    'trace 4bf92f3577b34da6a3ce929d0e0e4736 span 00f067aa0ba902b7',
+    'id 550e8400-e29b-41d4-a716-446655440000',
+    'at 1700000000123 and 1700000000000000 and 1700000000000000000',
+    'created_at=1700000000999',
+    'order 4111111111111112 not a card',
+    'user_4111111111111111 stays',
+    'hex deadbeef4111111111111111 stays',
+    'order 1234567890',
+    'order 123456789012',
+    '2024-05-12 10:30:00 started',
+    '2024-05-12T10:30:00Z started',
+    'peer 192.168.100.200:5432 refused',
+    'peer 10.0.1.5 refused',
+    'bun@1.4.2 and @sentry/bun@11.6.0',
+    'pi is 3.14159265358979',
+    'took 12 ms, 5 retries, 2 of 3',
+    'GET /v1/teams/team_01 failed with 502 after 3 retries in 45 ms',
+    'ratio 0.123456789012',
+    'port 5432 pid 123456',
+    'user@host and @scope/pkg and a @ b',
+  ])('leaves %p alone', (text) => {
+    expect(scrubText(text)).toBe(text)
+  })
+
+  test('a date before a phone number does not hide the number', () => {
+    expect(scrubText('2024-05-12 415-555-0199 called')).toBe('2024-05-12 [redacted] called')
+  })
+
+  test('is idempotent on personal data', () => {
+    const once = scrubText('jane@acme.com, +14155550199; 4111 1111 1111 1111 / (415) 555-0199')
+    expect(once).toBe('[redacted], [redacted]; [redacted] / [redacted]')
+    expect(scrubText(once)).toBe(once)
+  })
+
+  test('numbers written one after the other are all masked', () => {
+    expect(scrubText('+14155550199 4111 1111 1111 1111 (415) 555-0199')).not.toMatch(/\d{4}/)
+    expect(scrubText('415-555-0199 415-555-0188')).not.toMatch(/\d{4}/)
+  })
+
+  test('a token count is not a secret, and the words after it stay', () => {
+    expect(scrubText('used tokens: 1200 of 4000')).toBe('used tokens: 1200 of 4000')
+    expect(scrubText('inputTokens=300 outputTokens=20')).toBe('inputTokens=300 outputTokens=20')
+    expect(scrubText('tokens: abc123 of 4000')).toBe('tokens: [redacted]')
+  })
+})
+
+describe('scrubText: stack-frame positions are not keys (review F8)', () => {
+  test.each([
+    'at verify (/app/src/auth/token:12:3)',
+    'at verify (/app/src/auth/token:12:3)\n    at run (/app/src/secret:40:11)',
+    'at verify (C:\\app\\password:7:1)',
+  ])('%p is unchanged', (text) => {
+    expect(scrubText(text)).toBe(text)
+  })
+
+  test('a colon pair that is not a frame position is still masked', () => {
+    expect(scrubText('password:123:456')).toBe('password:[redacted]')
+    expect(scrubText('see /v1/token:abc123')).toContain('[redacted]')
+  })
+
+  test('prose after a sensitive key is masked (documented over-masking)', () => {
+    expect(scrubText('Invalid token: expired')).toBe('Invalid token: [redacted]')
+    expect(scrubText('Request body: invalid JSON')).toBe('Request body: [redacted]')
+  })
+})
+
+describe('scrubText: the new passes stay linear', () => {
+  const LIMIT_MS = 250
+  test.each([
+    ['many at signs', '@'.repeat(100_000)],
+    ['local parts and at signs', `${'a'.repeat(63)}@`.repeat(1_600)],
+    ['long domains', `a@${'b'.repeat(250)}`.repeat(400)],
+    ['at sign chain', 'a@'.repeat(50_000)],
+    ['single digits and dashes', '1-'.repeat(50_000)],
+    ['single digits and spaces', '1 '.repeat(50_000)],
+    ['digit groups', '12 '.repeat(33_000)],
+    ['phone shapes', '(415) 555-0199 '.repeat(7_000)],
+    ['plus signs', '+1'.repeat(50_000)],
+    ['open parentheses', '(1'.repeat(50_000)],
+    ['one long digit run', '4'.repeat(100_000)],
+    ['luhn candidates', '4111111111111111 '.repeat(6_000)],
+    ['key detail prefixes', 'Key (a)=('.repeat(12_000)],
+    ['key detail with long values', `Key (a)=(${'v'.repeat(600)}`.repeat(160)],
+    ['connection prefixes with at signs', 'postgres://@ '.repeat(8_000)],
+    ['connection prefixes with spaces', 'postgres://u:p '.repeat(7_000)],
+    ['query keys', '?sig=&'.repeat(17_000)],
+    ['frame positions', '/token:1:2 '.repeat(10_000)],
+    ['dates', '2024-05-12 '.repeat(9_000)],
+    ['ipv4 chains', '10.0.0.1.'.repeat(11_000)],
+  ])('a 100 KB input of %s finishes quickly', (_name, input) => {
+    expect(input.length).toBeGreaterThanOrEqual(50_000)
+    const start = performance.now()
+    scrubText(input)
+    expect(performance.now() - start).toBeLessThan(LIMIT_MS)
+  })
+})
+
+describe('cutText', () => {
+  test('returns text that fits as it is', () => {
+    expect(cutText('short', 10)).toBe('short')
+    expect(cutText('exactly10!', 10)).toBe('exactly10!')
+  })
+
+  test('cuts at the limit, drops a trailing partial word and marks the cut', () => {
+    expect(cutText('alpha beta gamma', 12)).toBe('alpha beta [truncated]')
+    expect(cutText('alpha beta gamma', 11)).toBe('alpha beta [truncated]')
+  })
+
+  test('is bounded by the limit, not by the length of the text', () => {
+    const start = performance.now()
+    const out = cutText('a'.repeat(50_000_000), 8_192)
+    expect(performance.now() - start).toBeLessThan(20)
+    expect(out).toBe('[truncated]')
   })
 })

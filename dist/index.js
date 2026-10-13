@@ -1,12 +1,16 @@
 import {
   systemClock2,
   createFixedClock2,
+  AppError2,
+  isAppError2,
+  toErrorBody2,
   isSensitiveKey,
+  cutText2,
   scrubText2,
   redactFields,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-2mcekygv.js";
+} from "./shared/chunk-f8qftbbb.js";
 
 // src/auth/claims.ts
 import {
@@ -311,44 +315,10 @@ function createRemoteKeySet(options) {
     }
   };
 }
-// src/errors.ts
-var CODE_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
-
-class AppError extends Error {
-  code;
-  status;
-  details;
-  constructor(init) {
-    super(init.message, init.cause === undefined ? undefined : { cause: init.cause });
-    if (!CODE_PATTERN.test(init.code)) {
-      throw new TypeError(`AppError code must look like "area.reason", got ${JSON.stringify(init.code)}`);
-    }
-    if (!Number.isInteger(init.status) || init.status < 100 || init.status > 599) {
-      throw new TypeError(`AppError status must be an HTTP status, got ${init.status}`);
-    }
-    this.name = "AppError";
-    this.code = init.code;
-    this.status = init.status;
-    if (init.details !== undefined) {
-      this.details = init.details;
-    }
-  }
-}
-function isAppError(value) {
-  return value instanceof AppError;
-}
-function toErrorBody(error) {
-  const body = { error: { code: error.code, message: error.message } };
-  if (error.details !== undefined) {
-    body.error.details = error.details;
-  }
-  return body;
-}
-
 // src/auth/middleware.ts
 var BEARER = /^Bearer ([^\s]+)$/i;
 function unauthenticated() {
-  return new AppError({
+  return new AppError2({
     code: "auth.unauthenticated",
     status: 401,
     message: "Authentication is required."
@@ -358,7 +328,7 @@ function errorClass(error) {
   return error instanceof Error ? error.constructor?.name ?? "Error" : typeof error;
 }
 function unavailable() {
-  return new AppError({
+  return new AppError2({
     code: "auth.unavailable",
     status: 503,
     message: "Authentication is temporarily unavailable."
@@ -393,7 +363,7 @@ function toAppError(error, logger, logError) {
     return unavailable();
   }
   logger?.warn("request rejected", { reason: error.reason });
-  return new AppError({
+  return new AppError2({
     code: error.reason === "expired" ? "auth.token_expired" : "auth.token_invalid",
     status: 401,
     message: error.reason === "expired" ? "The access token has expired." : "The access token is not valid."
@@ -533,22 +503,30 @@ function createLogger(options) {
 import { z as z3 } from "zod";
 var ENVIRONMENTS = ["local", "dev", "staging", "prod"];
 var environmentSchema = z3.enum(ENVIRONMENTS);
-function isSentryDsn(value) {
-  try {
-    const url = new URL(value);
-    const projectId = url.pathname.split("/").filter(Boolean).at(-1) ?? "";
-    return (url.protocol === "https:" || url.protocol === "http:") && url.username !== "" && url.hostname !== "" && /^[0-9]+$/.test(projectId);
-  } catch {
-    return false;
-  }
+var DSN_PATTERN = /^(https?):\/\/(\w+)(?::(\w+))?@(\[[:.%\w]+\]|[\w.-]+)(?::(\d+))?\/(?:[\w.-]+\/)*(\d+)$/;
+var MAX_DSN_LENGTH = 1024;
+function hasDsnShape(value) {
+  return value.length <= MAX_DSN_LENGTH ? DSN_PATTERN.exec(value) : null;
 }
-var sentryDsnSchema = z3.preprocess((value) => typeof value === "string" && value.trim() === "" ? undefined : value, z3.string().refine(isSentryDsn, { message: "SENTRY_DSN must look like https://<key>@<host>/<project id>" }).optional());
+function isSentryDsn(value, environment) {
+  const match = hasDsnShape(value);
+  return match !== null && (match[1] === "https" || environment === "local");
+}
+var sentryDsnSchema = z3.preprocess((value) => typeof value === "string" && value.trim() === "" ? undefined : value, z3.string().refine((value) => hasDsnShape(value) !== null, {
+  message: "SENTRY_DSN must look like https://<key>@<host>/<project id>"
+}).optional());
 function requireSentryDsn(env, ctx) {
   if (env.ENVIRONMENT !== "local" && env.SENTRY_DSN === undefined) {
     ctx.addIssue({
       code: "custom",
       path: ["SENTRY_DSN"],
       message: `SENTRY_DSN is required when ENVIRONMENT is ${env.ENVIRONMENT}`
+    });
+  } else if (env.SENTRY_DSN !== undefined && hasDsnShape(env.SENTRY_DSN) !== null && !isSentryDsn(env.SENTRY_DSN, env.ENVIRONMENT)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["SENTRY_DSN"],
+      message: `SENTRY_DSN must use https when ENVIRONMENT is ${env.ENVIRONMENT}`
     });
   }
 }
@@ -558,7 +536,8 @@ var NOOP = Object.freeze({
   capture: () => {
     return;
   },
-  flush: () => Promise.resolve(true)
+  flush: () => Promise.resolve(true),
+  close: () => Promise.resolve(true)
 });
 function createNoopErrorReporter() {
   return NOOP;
@@ -646,7 +625,6 @@ function scrubEvent(event) {
 var MAX_TAGS = 20;
 var MAX_TAG_VALUE = 200;
 var MAX_FLUSH_MS = 60000;
-var CLOSE_MS = 250;
 var DATA_COLLECTION_OFF = {
   userInfo: false,
   cookies: false,
@@ -661,6 +639,23 @@ var DATA_COLLECTION_OFF = {
   frameContextLines: 0
 };
 var TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/;
+var MAX_MESSAGE = 8192;
+var MAX_NAME = 200;
+var MAX_LINKED_ERRORS = 6;
+var MAX_GROUP_CHILDREN = 5;
+var MAX_STACK_SOURCE_MESSAGE = 1048576;
+var MAX_STACK_TAIL = 16384;
+var MAX_STRING_VALUE = 512;
+var KEPT_EVENT_KEYS = new Set([
+  "event_id",
+  "timestamp",
+  "platform",
+  "exception",
+  "release",
+  "environment",
+  "sdk",
+  "debug_meta"
+]);
 function text(value, max) {
   return scrubText2(String(value)).slice(0, max);
 }
@@ -690,7 +685,7 @@ function buildTags(base, context, error) {
   if (typeof context.status === "number" && Number.isFinite(context.status)) {
     tags.http_status = String(Math.trunc(context.status));
   }
-  if (isAppError(error)) {
+  if (isAppError2(error)) {
     tags.error_code = error.code;
   }
   return tags;
@@ -707,6 +702,99 @@ function buildRequestContext(context) {
     out.status = Math.trunc(context.status);
   }
   return out;
+}
+function read(get) {
+  try {
+    return get();
+  } catch {
+    return;
+  }
+}
+function isErrorLike(value) {
+  return value instanceof Error || typeof value === "object" && value !== null && Object.prototype.toString.call(value) === "[object Error]";
+}
+function framesOf(stack) {
+  if (typeof stack !== "string") {
+    return "";
+  }
+  const tail = stack.length > MAX_STACK_TAIL ? stack.slice(-MAX_STACK_TAIL) : stack;
+  const lines = tail.split(`
+`);
+  if (tail !== stack) {
+    lines.shift();
+  }
+  return lines.filter((line) => /^\s+at /.test(line)).join(`
+`);
+}
+function define(target, key, value) {
+  Object.defineProperty(target, key, { value, configurable: true, writable: true });
+}
+function boundedCopy(source, budget) {
+  budget.left--;
+  const rawMessage = read(() => source.message);
+  const rawName = read(() => source.name);
+  const message = typeof rawMessage === "string" ? cutText2(rawMessage, MAX_MESSAGE) : "the error message could not be read";
+  const name = typeof rawName === "string" && rawName !== "" ? cutText2(rawName, MAX_NAME).replace(/[\r\n]+/g, " ") : "Error";
+  const copy = new Error(message);
+  define(copy, "name", name);
+  const header = `${name}: ${message.split(`
+`, 1)[0]}`;
+  const frames = typeof rawMessage === "string" && rawMessage.length > MAX_STACK_SOURCE_MESSAGE ? "" : framesOf(read(() => source.stack));
+  define(copy, "stack", frames === "" ? header : `${header}
+${frames}`);
+  if (budget.left > 0) {
+    const cause = read(() => source.cause);
+    if (isErrorLike(cause)) {
+      define(copy, "cause", boundedCopy(cause, budget));
+    }
+  }
+  if (budget.left > 0) {
+    const errors = read(() => source.errors);
+    if (Array.isArray(errors)) {
+      const children = [];
+      const count = Math.min(errors.length, MAX_GROUP_CHILDREN);
+      for (let i = 0;i < count && budget.left > 0; i++) {
+        const child = read(() => errors[i]);
+        if (isErrorLike(child)) {
+          children.push(boundedCopy(child, budget));
+        }
+      }
+      define(copy, "errors", children);
+    }
+  }
+  return copy;
+}
+function toReportable(value) {
+  try {
+    if (isErrorLike(value)) {
+      return boundedCopy(value, { left: MAX_LINKED_ERRORS });
+    }
+    const type = value === null ? "null" : typeof value;
+    if (typeof value === "string") {
+      return new Error(`non-Error value thrown (string): ${cutText2(scrubText2(value), MAX_STRING_VALUE)}`);
+    }
+    return new Error(`non-Error value thrown (${type})`);
+  } catch {
+    return new Error("an error that could not be read was thrown");
+  }
+}
+function confine(event, hint) {
+  const own = hint.data;
+  const kept = {};
+  for (const [key, value] of Object.entries(event)) {
+    if (KEPT_EVENT_KEYS.has(key)) {
+      kept[key] = value;
+    }
+  }
+  kept.level = "error";
+  kept.tags = own?.tags ?? {};
+  const runtime = event.contexts?.runtime;
+  kept.contexts = {
+    ...runtime === undefined ? {} : { runtime },
+    ...own === undefined ? {} : { closeline: own.closeline }
+  };
+  hint.attachments = [];
+  return kept;
 }
 function withDeadline(work, ms) {
   return new Promise((resolve) => {
@@ -725,7 +813,7 @@ function boundedTimeout(timeoutMs) {
 }
 function createSentryReporter(options) {
   const client = new NodeClient({
-    dsn: isSentryDsn(options.dsn) ? options.dsn : undefined,
+    dsn: isSentryDsn(options.dsn, options.environment) ? options.dsn : undefined,
     release: options.release,
     environment: options.environment,
     stackParser: defaultStackParser,
@@ -738,7 +826,13 @@ function createSentryReporter(options) {
     sendClientReports: false,
     traceLifecycle: "static",
     enableRuntimeChannelInjection: false,
-    beforeSend: (event) => scrubEvent(event)
+    beforeSend: (event, hint) => {
+      try {
+        return scrubEvent(confine(event, hint));
+      } catch {
+        return null;
+      }
+    }
   });
   client.init();
   const integrations = client.getOptions().integrations.map((integration) => integration.name);
@@ -753,43 +847,59 @@ function createSentryReporter(options) {
     } catch {}
   };
   if (client.getDsn() === undefined) {
-    warn("error reporting is off: SENTRY_DSN is not a valid Sentry DSN");
+    warn("error reporting is off: SENTRY_DSN is not a valid Sentry DSN (https is required outside local)");
   }
+  let closed = false;
+  let closing;
   const reporter = {
     client,
     integrations,
     capture(error, context) {
       try {
-        if (!shouldReportError2(error)) {
+        if (closed || !shouldReportError2(error)) {
           return;
         }
         const scope = new Scope;
+        let tags = base;
+        let closeline = {};
         try {
           const given = context ?? {};
-          scope.setTags(buildTags(base, given, error));
-          scope.setContext("closeline", buildRequestContext(given));
+          tags = buildTags(base, given, error);
+          closeline = buildRequestContext(given);
         } catch {
           warn("error reporter could not read the error context");
-          scope.setTags(base);
         }
-        client.captureException(error, {
-          originalException: error,
-          ...error instanceof Error ? {} : { syntheticException: new Error("not an Error") }
-        }, scope);
+        scope.setTags(tags);
+        scope.setContext("closeline", closeline);
+        const data = { tags, closeline };
+        const reportable = toReportable(error);
+        client.captureException(reportable, { originalException: reportable, data }, scope);
       } catch {
         warn("error reporter failed to capture an error");
       }
     },
     flush(timeoutMs) {
       try {
+        if (closed) {
+          return Promise.resolve(false);
+        }
         const ms = boundedTimeout(timeoutMs);
         return withDeadline(Promise.resolve(client.flush(ms)), ms);
       } catch {
         return Promise.resolve(false);
       }
     },
-    async close() {
-      await withDeadline(Promise.resolve(client.close(1)), CLOSE_MS);
+    close(timeoutMs) {
+      closed = true;
+      if (closing === undefined) {
+        const ms = boundedTimeout(timeoutMs);
+        try {
+          closing = withDeadline(Promise.resolve(client.close(ms)), ms);
+        } catch {
+          closing = Promise.resolve(false);
+        }
+      }
+      return closing;
     }
   };
   return reporter;
@@ -807,17 +917,22 @@ function createErrorReporter(options) {
     }
     return createNoopErrorReporter();
   }
-  if (!isSentryDsn(dsn)) {
+  if (!isSentryDsn(dsn, options.environment)) {
     options.logger.warn("error reporting is off: SENTRY_DSN is not a valid Sentry DSN");
     return createNoopErrorReporter();
   }
-  return createSentryReporter({ ...options, dsn });
+  const reporter = createSentryReporter({ ...options, dsn });
+  if (reporter.client.getDsn() === undefined) {
+    reporter.close(1);
+    return createNoopErrorReporter();
+  }
+  return reporter;
 }
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
 export {
-  AppError,
+  AppError2 as AppError,
   ENVIRONMENTS,
   MAX_JWKS_BYTES,
   MAX_JWKS_KEYS,
@@ -833,13 +948,14 @@ export {
   createRemoteKeySet,
   createStaticKeySet,
   createTokenVerifier,
+  cutText2 as cutText,
   environmentSchema,
-  isAppError,
+  isAppError2 as isAppError,
   isSentryDsn,
   requireSentryDsn,
   scrubText2 as scrubText,
   sentryDsnSchema,
   shouldReportError2 as shouldReportError,
   systemClock2 as systemClock,
-  toErrorBody
+  toErrorBody2 as toErrorBody
 };

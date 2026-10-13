@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { z } from 'zod'
-import { ENVIRONMENTS, environmentSchema, requireSentryDsn, sentryDsnSchema } from './env'
+import {
+  ENVIRONMENTS,
+  environmentSchema,
+  isSentryDsn,
+  requireSentryDsn,
+  sentryDsnSchema,
+} from './env'
 
 const DSN = 'https://abc123@o1.ingest.sentry.io/42'
 
@@ -55,5 +61,80 @@ describe('SENTRY_DSN in a service env schema', () => {
 
   test('the environments are exactly local, dev, staging and prod', () => {
     expect([...ENVIRONMENTS]).toEqual(['local', 'dev', 'staging', 'prod'])
+  })
+})
+
+describe('SENTRY_DSN must be one the Sentry SDK accepts (review F2)', () => {
+  test.each([
+    ['a trailing slash', 'https://abc123@o1.ingest.sentry.io/42/'],
+    ['a dash in the key', 'https://ab-cd@o1.ingest.sentry.io/42'],
+    ['a leading space', ' https://abc123@o1.ingest.sentry.io/42'],
+    ['a trailing space', 'https://abc123@o1.ingest.sentry.io/42 '],
+    ['a trailing newline', 'https://abc123@o1.ingest.sentry.io/42\n'],
+    ['no project id', 'https://abc123@o1.ingest.sentry.io/'],
+    ['a project id that is not a number', 'https://abc123@o1.ingest.sentry.io/abc'],
+    ['a project id with a suffix', 'https://abc123@o1.ingest.sentry.io/42abc'],
+    ['a query string', 'https://abc123@o1.ingest.sentry.io/42?x=1'],
+    ['a port that is not a number', 'https://abc123@o1.ingest.sentry.io:port/42'],
+    ['an upper-case scheme', 'HTTPS://abc123@o1.ingest.sentry.io/42'],
+    ['no key', 'https://@o1.ingest.sentry.io/42'],
+    ['no host', 'https://abc123@/42'],
+    ['no path', 'https://abc123@o1.ingest.sentry.io'],
+    ['an ftp scheme', 'ftp://abc123@o1.ingest.sentry.io/42'],
+    ['a double slash in the path', 'https://abc123@o1.ingest.sentry.io//42'],
+    ['a path with a space', 'https://abc123@o1.ingest.sentry.io/a b/42'],
+  ])('%s is rejected', (_name, dsn) => {
+    expect(isSentryDsn(dsn, 'local')).toBe(false)
+    expect(isSentryDsn(dsn, 'prod')).toBe(false)
+    expect(serviceEnv.safeParse({ ENVIRONMENT: 'local', SENTRY_DSN: dsn, PORT: '1' }).success).toBe(
+      false
+    )
+  })
+
+  test.each([
+    'https://abc123@o1.ingest.sentry.io/42',
+    'https://abc123:secret@o1.ingest.sentry.io/42',
+    'https://abc123@o1.ingest.de.sentry.io:8443/42',
+    'https://abc123@sentry.internal.example.com/prefix/path/42',
+    'https://abc123@[::1]/42',
+    'https://AbC_123@o1.ingest.sentry.io/0',
+  ])('%s is accepted', (dsn) => {
+    expect(isSentryDsn(dsn, 'prod')).toBe(true)
+    expect(serviceEnv.safeParse({ ENVIRONMENT: 'prod', SENTRY_DSN: dsn, PORT: '1' }).success).toBe(
+      true
+    )
+  })
+})
+
+test('an empty string is not a DSN', () => {
+  expect(isSentryDsn('', 'local')).toBe(false)
+})
+
+describe('an http DSN is only for local (review F6)', () => {
+  const HTTP = 'http://abc123@localhost:9000/42'
+
+  test('is accepted in local', () => {
+    expect(isSentryDsn(HTTP, 'local')).toBe(true)
+    expect(
+      serviceEnv.safeParse({ ENVIRONMENT: 'local', SENTRY_DSN: HTTP, PORT: '1' }).success
+    ).toBe(true)
+  })
+
+  test.each(['dev', 'staging', 'prod'])(
+    'is rejected in %s, by the env schema and by the check',
+    (environment) => {
+      expect(isSentryDsn(HTTP, environment as 'dev')).toBe(false)
+      const result = serviceEnv.safeParse({ ENVIRONMENT: environment, SENTRY_DSN: HTTP, PORT: '1' })
+      expect(result.success).toBe(false)
+      expect(result.error?.issues[0]?.path).toEqual(['SENTRY_DSN'])
+      expect(result.error?.issues[0]?.message).toContain('https')
+      expect(JSON.stringify(result.error?.issues)).not.toContain('abc123')
+    }
+  )
+
+  test('an https DSN is accepted everywhere', () => {
+    for (const environment of ENVIRONMENTS) {
+      expect(isSentryDsn(DSN, environment)).toBe(true)
+    }
   })
 })

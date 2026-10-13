@@ -266,15 +266,18 @@ declare const environmentSchema: z2.ZodEnum<{
 	staging: "staging";
 }>;
 /**
-* True for a string shaped like a Sentry DSN: `http(s)://<public key>@<host>/<numeric project id>`.
-* It checks the shape only; whether the project exists, and in which data region, is Sentry's.
+* True for a string the Sentry SDK takes as a DSN: `https://<public key>@<host>/<project id>`, with
+* an optional secret, port and path prefix and no trailing slash. A DSN with the `http:` scheme
+* passes only when `environment` is `local`, so events and the project key are never sent in clear
+* text from a deployed service. It checks the shape only; whether the project exists, and in which
+* data region, is Sentry's.
 */
-declare function isSentryDsn(value: string): boolean;
+declare function isSentryDsn(value: string, environment: Environment): boolean;
 /** Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". */
 declare const sentryDsnSchema: z2.ZodPreprocess<z2.ZodOptional<z2.ZodString>, unknown>;
 /**
 * Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
-* `dev`, `staging` and `prod`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
+* `dev`, `staging` and `prod`, where it must use `https:`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
 * so boot fails when a deployed service has no error tracker.
 */
 declare function requireSentryDsn(env: {
@@ -305,6 +308,12 @@ interface ErrorReporter {
 	capture(error: unknown, context?: ErrorContext): void;
 	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
 	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
 }
 /** Options for createErrorReporter. */
 interface ErrorReporterOptions {
@@ -332,15 +341,22 @@ declare function shouldReportError(error: unknown): boolean;
 * deployment the DSN of a Sentry project in its own data region; the kit sends to whatever it is given.
 */
 declare function createErrorReporter(options: ErrorReporterOptions): ErrorReporter;
-/** Returns the reporter that sends nothing, used when no DSN is configured; it costs one empty call. */
+/** Returns the reporter that sends nothing, used when no DSN is configured; it costs one empty call. It is one shared object with no state, so `flush` after `close` is still true: there is nothing to deliver. */
 declare function createNoopErrorReporter(): ErrorReporter;
 /**
-* Masks secrets inside free text (an error message, a log message): bearer tokens, JWTs and common
-* API-key shapes, URL credentials, connection strings, and the value of any `key=value` or
-* `key: value` pair whose key the kit treats as sensitive. Input over 32 KiB is cut. Runs in time
-* linear in the input and never throws; if it somehow fails it returns a fixed placeholder.
+* Cuts text to at most `max` characters, drops a trailing partial word (it could be the front of a
+* secret) and marks the cut. Text that fits is returned as it is. Work is bounded by `max`.
+*/
+declare function cutText(text: string, max: number): string;
+/**
+* Masks secrets and personal data inside free text (an error message, a log message): bearer
+* tokens, JWTs and common API-key shapes, URL credentials, connection strings, the value in a
+* Postgres `Key (column)=(value)` detail, the value of any `key=value` or `key: value` pair whose
+* key the kit treats as sensitive (to the end of the line when unquoted), email addresses,
+* telephone numbers and payment card numbers. Input over 32 KiB is cut. Runs in time linear in the
+* input and never throws; if it somehow fails it returns a fixed placeholder.
 */
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };
+export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };

@@ -52,7 +52,7 @@ function sentry(): Subject {
       await reporter.flush(1000)
       return events.length
     },
-    close: () => reporter.close(),
+    close: () => reporter.close(50),
   }
 }
 
@@ -152,6 +152,27 @@ describe.each(ADAPTERS)('ErrorReporter behaviour: %s adapter', (_name, make) => 
   })
 })
 
+describe.each(ADAPTERS)('ErrorReporter close: %s adapter', (_name, make) => {
+  test('close resolves a boolean within its timeout', async () => {
+    const { reporter } = subjectFor(make)
+    const start = performance.now()
+    expect(typeof (await reporter.close(500))).toBe('boolean')
+    expect(performance.now() - start).toBeLessThan(450)
+  })
+
+  test('capture after close does not throw', async () => {
+    const { reporter } = subjectFor(make)
+    await reporter.close(50)
+    expect(() => reporter.capture(new Error('late'))).not.toThrow()
+  })
+
+  test('closing twice is harmless', async () => {
+    const { reporter } = subjectFor(make)
+    await reporter.close(50)
+    expect(typeof (await reporter.close(50))).toBe('boolean')
+  })
+})
+
 describe.each(ADAPTERS.filter(([name]) => name !== 'no-op'))(
   'what an ErrorReporter sends: %s adapter',
   (_name, make) => {
@@ -186,6 +207,11 @@ describe.each(ADAPTERS.filter(([name]) => name !== 'no-op'))(
 describe('the no-op reporter', () => {
   test('sends nothing and is one shared instance', async () => {
     expect(createNoopErrorReporter()).toBe(createNoopErrorReporter())
+    expect(await createNoopErrorReporter().flush(0)).toBe(true)
+  })
+
+  test('close resolves true, and flush after it is still true: there is nothing to deliver', async () => {
+    expect(await createNoopErrorReporter().close(0)).toBe(true)
     expect(await createNoopErrorReporter().flush(0)).toBe(true)
   })
 })

@@ -37,4 +37,19 @@ describe('createMemoryErrorReporter', () => {
     expect(await reporter.flush(10)).toBe(true)
     expect(reporter.flushes).toEqual([250, 10])
   })
+
+  test('close records its timeout and resolves true; flush after it resolves false', async () => {
+    const reporter = createMemoryErrorReporter()
+    expect(await reporter.close(250)).toBe(true)
+    expect(reporter.closes).toEqual([250])
+    expect(await reporter.flush(10)).toBe(false)
+  })
+
+  test('a closed reporter records nothing more, as the real adapter drops it', async () => {
+    const reporter = createMemoryErrorReporter()
+    reporter.capture(new Error('before'))
+    await reporter.close(10)
+    reporter.capture(new Error('after'))
+    expect(reporter.captured).toHaveLength(1)
+  })
 })

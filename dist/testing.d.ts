@@ -45,6 +45,12 @@ interface ErrorReporter {
 	capture(error: unknown, context?: ErrorContext): void;
 	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
 	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
 }
 /** One error a MemoryErrorReporter recorded, with the context it was reported with. */
 interface CapturedError {
@@ -57,6 +63,8 @@ interface MemoryErrorReporter extends ErrorReporter {
 	readonly captured: CapturedError[];
 	/** The timeout of every flush, in order. */
 	readonly flushes: number[];
+	/** The timeout of every close, in order. */
+	readonly closes: number[];
 }
 /** Creates an ErrorReporter that records reported errors in memory instead of sending them. */
 declare function createMemoryErrorReporter(): MemoryErrorReporter;

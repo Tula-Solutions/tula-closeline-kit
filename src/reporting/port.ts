@@ -1,4 +1,5 @@
 import type { Region } from 'tula-closeline-contract'
+import { isAppError } from '../errors'
 import type { Logger } from '../logger'
 import type { Environment } from './env'
 
@@ -27,6 +28,12 @@ export interface ErrorReporter {
   capture(error: unknown, context?: ErrorContext): void
   /** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
   flush(timeoutMs: number): Promise<boolean>
+  /**
+   * Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+   * reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+   * nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+   */
+  close(timeoutMs: number): Promise<boolean>
 }
 
 /** Options for createErrorReporter. */
@@ -60,7 +67,11 @@ function isAppErrorShaped(error: unknown): error is { status: number } {
  */
 export function shouldReportError(error: unknown): boolean {
   try {
-    // By shape as well as by class, so an AppError from a second copy of the kit still counts.
+    // By class first, whatever name a subclass gives itself, then by shape, so an AppError from a
+    // second copy of the kit still counts.
+    if (isAppError(error)) {
+      return error.status >= 500
+    }
     return !(isAppErrorShaped(error) && error.status < 500)
   } catch {
     return true

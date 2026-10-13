@@ -47,3 +47,34 @@ describe('shouldReportError', () => {
     expect(shouldReportError(Object.assign(new Error('m'), { status: 404 }))).toBe(true)
   })
 })
+
+describe('shouldReportError uses the class before the shape (review F7)', () => {
+  class NotFound extends AppError {
+    constructor() {
+      super({ code: 'core.not_found', status: 404, message: 'missing' })
+      this.name = 'NotFoundError'
+    }
+  }
+  class Unavailable extends AppError {
+    constructor() {
+      super({ code: 'core.down', status: 503, message: 'down' })
+      this.name = 'UnavailableError'
+    }
+  }
+
+  test('a subclass that sets its own name is still expected at 4xx', () => {
+    const error = new NotFound()
+    expect(error.name).toBe('NotFoundError')
+    expect(shouldReportError(error)).toBe(false)
+  })
+
+  test('a subclass that sets its own name is reported at 5xx', () => {
+    expect(shouldReportError(new Unavailable())).toBe(true)
+  })
+
+  test('a subclass whose name is deleted is still recognised', () => {
+    const error = new NotFound()
+    Object.defineProperty(error, 'name', { value: undefined })
+    expect(shouldReportError(error)).toBe(false)
+  })
+})

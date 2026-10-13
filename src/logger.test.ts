@@ -270,6 +270,16 @@ describe('credential-shaped keys', () => {
     'secretKey',
     'privateKey',
     'authorizationHeader',
+    'pass',
+    'pwd',
+    'passwd',
+    'auth',
+    'signature',
+    'sig',
+    'sid',
+    'session',
+    'session_id',
+    'AWS_SECRET_ACCESS_KEY',
   ])('%s is redacted', (key) => {
     const { logger, lines } = capture()
     logger.info('x', { [key]: 'SECRET-VALUE', visible: 'ok' })
@@ -287,7 +297,8 @@ describe('credential-shaped keys', () => {
     'address',
     'class',
     'keys',
-    'pass',
+    'passenger',
+    'bypass',
   ])('%s is not redacted', (key) => {
     const { logger, lines } = capture()
     logger.info('x', { [key]: 'KEEP-VALUE' })
@@ -675,7 +686,8 @@ describe('secrets inside message strings', () => {
   test('a secret in the log message is masked', () => {
     const { logger, lines, parsed } = capture()
     logger.info('login failed password=hunter2 for ann')
-    expect(parsed()[0]?.msg).toBe('login failed password=[redacted] for ann')
+    // An unquoted value runs to the end of the line, so the words after it are masked too.
+    expect(parsed()[0]?.msg).toBe('login failed password=[redacted]')
     expect(lines.join('')).not.toContain('hunter2')
   })
 

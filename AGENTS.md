@@ -29,11 +29,15 @@ Other scripts are in `package.json`.
   the same median and tail budgets, about 5x what it measures. Any change to it re-runs the
   benchmark.
 
-- `ErrorReporter.capture` with the no-op reporter (`src/reporting/noop.ts`) sits on every error
-  path, and `scrubText` (`src/scrub.ts`) runs on every log message and error message. `capture` is
-  an empty call and `scrubText` is O(message length), linear with a 32 KiB cap. Budgets in
-  `bench/reporting.bench.ts`: no-op `capture` mean 0.001 ms, an ordinary message mean 0.005 ms and
-  a message with secrets mean 0.015 ms, each with a median and best-batch p95 budget as above.
+- `ErrorReporter.capture` sits on every error path, and `scrubText` (`src/scrub.ts`) runs on every
+  log message and error message. With the no-op reporter (`src/reporting/noop.ts`) `capture` is an
+  empty call. With the Sentry adapter (`src/reporting/sentry.ts`) it copies the error with bounds
+  (8 KiB per message, six errors, 16 KiB of stack each), builds the event and scrubs it, all
+  before returning: O(message length + frames) with those caps, about 0.08 ms. `scrubText` is
+  O(message length), linear with a 32 KiB cap (about 0.6 ms at the cap). Budgets in
+  `bench/reporting.bench.ts`: no-op `capture` mean 0.001 ms, Sentry `capture` mean 0.4 ms, an
+  ordinary message mean 0.008 ms, a message with secrets mean 0.015 ms and a 32 KiB input mean
+  3 ms, each with a median and best-batch p95 budget as above.
 
 ## Issues
 

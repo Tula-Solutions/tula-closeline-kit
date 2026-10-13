@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
-import { getClient } from '@sentry/bun'
+import { getClient, getCurrentScope, getGlobalScope, getIsolationScope } from '@sentry/bun'
 import { AppError } from '../errors'
 import { createMemoryLogger } from '../testing'
+import { isSentryDsn } from './env'
 import { createSentryReporter, type SentryReporter, type SentryReporterOptions } from './sentry'
 
 const DSN = 'https://abc123publickey@o123.ingest.de.sentry.io/456'
@@ -23,12 +24,15 @@ interface SentryEvent {
   request?: unknown
   breadcrumbs?: unknown[]
   modules?: unknown
+  extra?: unknown
+  fingerprint?: unknown
+  level?: string
 }
 type TransportFactory = NonNullable<SentryReporterOptions['transport']>
 
 const open: SentryReporter[] = []
 afterEach(async () => {
-  await Promise.all(open.splice(0).map((reporter) => reporter.close()))
+  await Promise.all(open.splice(0).map((reporter) => reporter.close(50)))
 })
 
 /** A transport whose sends never finish and whose flush ignores its timeout. */
@@ -455,4 +459,366 @@ describe('a DSN that is not valid', () => {
       )
     }
   )
+})
+
+describe('a thrown value that is not an Error is never handed to the SDK (review F1)', () => {
+  const OBJECT = {
+    status: 502,
+    text: 'Hi Jane, my SSN is 123-45-6789, call me on 4155550199',
+    content: 'transcript of the call with Acme about pricing',
+    email: 'jane@acme.com',
+    nested: { deep: 'DEEP-VALUE-9931' },
+  }
+
+  test('none of its fields reach the wire, and no __serialized__ extra is added', async () => {
+    const h = harness()
+    h.reporter.capture(OBJECT)
+    const events = await h.events()
+    expect(events).toHaveLength(1)
+    const wire = h.wire()
+    for (const part of [
+      'Jane',
+      '123-45-6789',
+      '4155550199',
+      'transcript of the call',
+      'pricing',
+      'jane@acme.com',
+      'DEEP-VALUE-9931',
+      '__serialized__',
+      'nested',
+      'content',
+    ]) {
+      expect(wire).not.toContain(part)
+    }
+    expect(events[0]?.extra).toBeUndefined()
+    expect(events[0]?.exception.values[0]?.value).toBe('non-Error value thrown (object)')
+  })
+
+  test.each([
+    ['null', null, 'null'],
+    ['undefined', undefined, 'undefined'],
+    ['a number', 42, 'number'],
+    ['a boolean', true, 'boolean'],
+    ['a bigint', 10n, 'bigint'],
+    ['a symbol', Symbol('Jane'), 'symbol'],
+    ['a function', () => 'Jane', 'function'],
+    ['an array', ['Jane', 'jane@acme.com'], 'object'],
+  ])('%s is reported as its type only', async (_name, value, type) => {
+    const h = harness()
+    h.reporter.capture(value)
+    const events = await h.events()
+    expect(events[0]?.exception.values[0]?.value).toBe(`non-Error value thrown (${type})`)
+    expect(h.wire()).not.toContain('Jane')
+    expect(h.wire()).not.toContain('jane@acme.com')
+  })
+
+  test('a string is kept after scrubText and cut to a bounded length', async () => {
+    const h = harness()
+    h.reporter.capture('upstream failed for jane@acme.com with Bearer abc123def456ghi')
+    h.reporter.capture(`${'long text '.repeat(20_000)}`)
+    const values = (await h.events()).map((event) => event.exception.values[0]?.value ?? '')
+    expect(values).toContain(
+      'non-Error value thrown (string): upstream failed for [redacted] with Bearer [redacted]'
+    )
+    for (const value of values) {
+      expect(value.length).toBeLessThan(600)
+    }
+    expect(h.wire()).not.toContain('abc123def456ghi')
+  })
+
+  test('a Proxy that throws on every access is reported as its type', async () => {
+    const h = harness()
+    const hostile = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error('no')
+        },
+        ownKeys: () => {
+          throw new Error('no')
+        },
+        getPrototypeOf: () => {
+          throw new Error('no')
+        },
+      }
+    )
+    expect(() => h.reporter.capture(hostile)).not.toThrow()
+    expect(await h.events()).toHaveLength(1)
+  })
+
+  test('an Error is copied: its own properties, details and extra fields are not sent', async () => {
+    const h = harness()
+    const error = Object.assign(new TypeError('boom'), {
+      details: { transcript: 'DETAILS-VALUE-4412' },
+      customer: 'CUSTOMER-NAME-5521',
+    })
+    h.reporter.capture(error)
+    const event = (await h.events())[0]
+    expect(h.wire()).not.toContain('DETAILS-VALUE-4412')
+    expect(h.wire()).not.toContain('CUSTOMER-NAME-5521')
+    expect(event?.exception.values[0]?.type).toBe('TypeError')
+    expect(event?.exception.values[0]?.value).toBe('boom')
+    expect(event?.exception.values[0]?.stacktrace.frames.length).toBeGreaterThan(0)
+  })
+})
+
+describe('a DSN the SDK would reject is caught before the SDK sees it (review F2)', () => {
+  const LEAKY = 'KEYPART9981'
+  const CASES = [
+    `https://${LEAKY}@o1.ingest.sentry.io/42/`,
+    `https://${LEAKY.slice(0, 4)}-${LEAKY.slice(4)}@o1.ingest.sentry.io/42`,
+    ` https://${LEAKY}@o1.ingest.sentry.io/42`,
+    `https://${LEAKY}@o1.ingest.sentry.io/42abc`,
+    `https://${LEAKY}@o1.ingest.sentry.io/`,
+    `HTTPS://${LEAKY}@o1.ingest.sentry.io/42`,
+    `https://${LEAKY}@o1.ingest.sentry.io:port/42`,
+  ]
+
+  test.each(CASES)('%p sends nothing, warns once, and prints no part of the key', async (dsn) => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => undefined)
+    const consoleWarn = spyOn(console, 'warn').mockImplementation(() => undefined)
+    const consoleLog = spyOn(console, 'log').mockImplementation(() => undefined)
+    try {
+      const logger = createMemoryLogger()
+      const reporter = createSentryReporter({
+        dsn,
+        service: 'core',
+        environment: 'dev',
+        region: 'us',
+        logger,
+      })
+      open.push(reporter)
+      reporter.capture(new Error('boom'))
+      expect(await reporter.flush(50)).toBe(true)
+      expect(reporter.client.getDsn()).toBeUndefined()
+      expect(logger.entries.filter((entry) => entry.level === 'warn')).toHaveLength(1)
+      expect(JSON.stringify(logger.entries)).not.toContain(LEAKY.slice(0, 4))
+      for (const spy of [consoleError, consoleWarn, consoleLog]) {
+        expect(JSON.stringify(spy.mock.calls)).not.toContain(LEAKY.slice(0, 4))
+        expect(JSON.stringify(spy.mock.calls)).not.toContain(LEAKY.slice(4))
+      }
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+      consoleWarn.mockRestore()
+      consoleLog.mockRestore()
+    }
+  })
+
+  test.each([
+    'https://abc123@o1.ingest.sentry.io/42',
+    'https://abc123:secret@o1.ingest.sentry.io/42',
+    'https://abc123@o1.ingest.de.sentry.io:8443/42',
+    'https://abc123@sentry.internal.example.com/prefix/path/42',
+    'https://abc123@[::1]/42',
+    'https://AbC_123@o1.ingest.sentry.io/0',
+  ])('%p is accepted by the check and by the SDK', (dsn) => {
+    expect(isSentryDsn(dsn, 'prod')).toBe(true)
+    const h = harness({ dsn })
+    expect(h.reporter.client.getDsn()).toBeDefined()
+    expect(h.logger.entries).toEqual([])
+  })
+
+  test('an http DSN gives a client only in local', () => {
+    const http = 'http://abc123@localhost:9000/42'
+    expect(harness({ dsn: http, environment: 'local' }).reporter.client.getDsn()).toBeDefined()
+    const prod = harness({ dsn: http, environment: 'prod' })
+    expect(prod.reporter.client.getDsn()).toBeUndefined()
+    expect(prod.logger.entries.filter((entry) => entry.level === 'warn')).toHaveLength(1)
+  })
+})
+
+describe('capture does bounded work whatever it is given (review F4)', () => {
+  const LIMIT_MS = 20
+
+  /** Captures once to warm the SDK paths, then times the call under test. */
+  function timed(h: ReturnType<typeof harness>, error: unknown): number {
+    h.reporter.capture(new Error('warm up'))
+    const start = performance.now()
+    h.reporter.capture(error)
+    return performance.now() - start
+  }
+
+  test('a 10 million line message returns in under 20 ms and is cut', async () => {
+    const h = harness()
+    const error = new Error('x\n'.repeat(10_000_000))
+    expect(timed(h, error)).toBeLessThan(LIMIT_MS)
+    const events = await h.events()
+    expect(events).toHaveLength(2)
+    expect((events[1]?.exception.values[0]?.value ?? '').length).toBeLessThan(9_000)
+  })
+
+  test('a very long message with a long stack is cut and keeps its frames', async () => {
+    const h = harness()
+    const error = new Error('word '.repeat(50_000))
+    expect(timed(h, error)).toBeLessThan(LIMIT_MS)
+    const value = (await h.events())[1]?.exception.values[0]
+    expect((value?.value ?? '').length).toBeLessThan(9_000)
+    expect(value?.value.endsWith('[truncated]')).toBe(true)
+    expect(value?.stacktrace.frames.length).toBeGreaterThan(0)
+  })
+
+  test('an AggregateError of 20,000 children returns in under 20 ms and sends a few', async () => {
+    const h = harness()
+    const children = Array.from({ length: 20_000 }, (_, i) => new Error(`child ${i}`))
+    const error = new AggregateError(children, 'many failed')
+    expect(timed(h, error)).toBeLessThan(LIMIT_MS)
+    const events = await h.events()
+    expect(events[1]?.exception.values.length).toBeLessThanOrEqual(7)
+  })
+
+  test('a cause chain 100,000 deep returns in under 20 ms and sends a few', async () => {
+    const h = harness()
+    let error = new Error('root')
+    for (let i = 0; i < 100_000; i++) {
+      error = new Error(`level ${i}`, { cause: error })
+    }
+    expect(timed(h, error)).toBeLessThan(LIMIT_MS)
+    expect((await h.events())[1]?.exception.values.length).toBeLessThanOrEqual(7)
+  })
+
+  test('a cause cycle returns at once', async () => {
+    const h = harness()
+    const a = new Error('a')
+    const b = new Error('b', { cause: a })
+    Object.defineProperty(a, 'cause', { value: b })
+    expect(timed(h, a)).toBeLessThan(LIMIT_MS)
+    expect((await h.events())[1]?.exception.values.length).toBeLessThanOrEqual(7)
+  })
+
+  test('an Error whose message, name, stack and cause getters throw is still sent', async () => {
+    const h = harness()
+    const error = new Error('x')
+    for (const key of ['message', 'name', 'stack', 'cause', 'errors']) {
+      Object.defineProperty(error, key, {
+        get() {
+          throw new Error(`${key} exploded`)
+        },
+      })
+    }
+    expect(() => h.reporter.capture(error)).not.toThrow()
+    const events = await h.events()
+    expect(events).toHaveLength(1)
+    expect(events[0]?.exception.values[0]?.type).toBe('Error')
+  })
+
+  test('a stack that is huge is read from its end only', async () => {
+    const h = harness()
+    const error = new Error('boom')
+    error.stack = `Error: boom\n${'    at filler (/app/filler.ts:1:1)\n'.repeat(500_000)}    at last (/app/last.ts:9:9)`
+    expect(timed(h, error)).toBeLessThan(LIMIT_MS)
+    const frames = (await h.events())[1]?.exception.values[0]?.stacktrace.frames ?? []
+    expect(frames.length).toBeGreaterThan(0)
+  })
+})
+
+describe('nothing set by other Sentry users in the process rides along (review F5)', () => {
+  function pollute(): void {
+    for (const scope of [getGlobalScope(), getIsolationScope(), getCurrentScope()]) {
+      scope.setTag('leak_tag', 'LEAK-TAG-1')
+      scope.setExtra('leak_extra', 'LEAK-EXTRA-2')
+      scope.setUser({ email: 'leak@user.test', id: 'LEAK-USER-3' })
+      scope.setContext('leak_context', { value: 'LEAK-CONTEXT-4' })
+      scope.setFingerprint(['LEAK-FINGERPRINT-5'])
+      scope.addBreadcrumb({ message: 'LEAK-BREADCRUMB-6' })
+      scope.addAttachment({ filename: 'leak.txt', data: 'LEAK-ATTACHMENT-7' })
+      scope.setTransactionName('LEAK-TRANSACTION-8')
+      scope.setLevel('fatal')
+    }
+  }
+
+  function cleanUp(): void {
+    for (const scope of [getGlobalScope(), getIsolationScope(), getCurrentScope()]) {
+      scope.setTags({ leak_tag: undefined })
+      scope.setExtras({ leak_extra: undefined })
+      scope.setUser(null)
+      scope.setContext('leak_context', null)
+      scope.setFingerprint([])
+      scope.clearBreadcrumbs()
+      scope.clearAttachments()
+      scope.setTransactionName(undefined)
+      scope.setLevel('error')
+    }
+  }
+
+  test('tags, extra data, user, contexts, breadcrumbs, fingerprint and attachments are not sent', async () => {
+    const h = harness()
+    pollute()
+    try {
+      h.reporter.capture(new Error('boom'), { requestId: 'req_1' })
+      const events = await h.events()
+      expect(events).toHaveLength(1)
+      expect(h.wire()).not.toContain('LEAK')
+      expect(h.wire()).not.toContain('leak@user.test')
+      expect(events[0]?.level).toBe('error')
+      expect(Object.keys(events[0]?.contexts ?? {}).sort()).toEqual(['closeline', 'runtime'])
+      expect(Object.keys(events[0]?.tags ?? {}).sort()).toEqual([
+        'environment',
+        'region',
+        'request_id',
+        'service',
+      ])
+      const itemTypes = h.envelopes.flatMap((envelope) => envelope[1].map(([item]) => item.type))
+      expect(itemTypes).toEqual(['event'])
+    } finally {
+      cleanUp()
+    }
+  })
+
+  test('a thrown object captured while the scopes are polluted sends nothing of them either', async () => {
+    const h = harness()
+    pollute()
+    try {
+      h.reporter.capture({ anything: true })
+      await h.events()
+      expect(h.wire()).not.toContain('LEAK')
+    } finally {
+      cleanUp()
+    }
+  })
+
+  test('closing a reporter removes the process listeners the SDK added', async () => {
+    const before = process.listenerCount('beforeExit')
+    const h = harness()
+    await h.reporter.close(100)
+    expect(process.listenerCount('beforeExit')).toBe(before)
+  })
+
+  test('creating a reporter adds at most the SDK two beforeExit listeners, none of ours', () => {
+    const before = process.listenerCount('beforeExit')
+    harness()
+    expect(process.listenerCount('beforeExit') - before).toBeLessThanOrEqual(2)
+  })
+})
+
+describe('close (review F5)', () => {
+  test('delivers what is pending and resolves true', async () => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'))
+    expect(await h.reporter.close(1000)).toBe(true)
+    expect(h.envelopes).toHaveLength(1)
+  })
+
+  test('flush after close resolves false and capture after close sends nothing', async () => {
+    const h = harness()
+    await h.reporter.close(100)
+    expect(await h.reporter.flush(100)).toBe(false)
+    h.reporter.capture(new Error('late'))
+    await Bun.sleep(10)
+    expect(h.envelopes).toHaveLength(0)
+  })
+
+  test('closing twice is harmless and gives the same answer', async () => {
+    const h = harness()
+    const first = await h.reporter.close(100)
+    expect(await h.reporter.close(100)).toBe(first)
+  })
+
+  test('gives up at its timeout when the transport never answers', async () => {
+    const h = harness({ transport: stuckTransport })
+    h.reporter.capture(new Error('boom'))
+    const start = performance.now()
+    expect(await h.reporter.close(60)).toBe(false)
+    expect(performance.now() - start).toBeLessThan(400)
+  })
 })

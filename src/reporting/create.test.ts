@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { NodeClient } from '@sentry/bun'
 import { createMemoryLogger } from '../testing'
 import { createErrorReporter } from './create'
 import { createNoopErrorReporter } from './noop'
@@ -39,6 +40,87 @@ describe('createErrorReporter', () => {
     expect(reporter).toBe(createNoopErrorReporter())
     expect(logger.entries).toMatchObject([{ level: 'warn' }])
     expect(JSON.stringify(logger.entries)).not.toContain('garbage')
+  })
+})
+
+describe('createErrorReporter and the DSN rules (review F2, F6)', () => {
+  test.each([
+    'https://abc123@o1.ingest.sentry.io/42/',
+    'https://ab-cd@o1.ingest.sentry.io/42',
+    'https://abc123@o1.ingest.sentry.io/',
+  ])('%p gives the no-op reporter, one warning, and no console output', (dsn) => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      const logger = createMemoryLogger()
+      const reporter = createErrorReporter({ ...base, environment: 'prod', dsn, logger })
+      expect(reporter).toBe(createNoopErrorReporter())
+      expect(logger.entries).toMatchObject([{ level: 'warn' }])
+      expect(JSON.stringify(logger.entries)).not.toContain('abc123')
+      expect(JSON.stringify(logger.entries)).not.toContain('ab-cd')
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  test.each(['dev', 'staging', 'prod'] as const)(
+    'an http DSN gives the no-op reporter in %s',
+    (environment) => {
+      const logger = createMemoryLogger()
+      const reporter = createErrorReporter({
+        ...base,
+        environment,
+        dsn: 'http://abc123@sentry.example.com/42',
+        logger,
+      })
+      expect(reporter).toBe(createNoopErrorReporter())
+      expect(logger.entries).toMatchObject([{ level: 'warn' }])
+    }
+  )
+
+  test('a DSN the check accepts but the SDK does not take gives the no-op reporter and one warning', () => {
+    const before = process.listenerCount('beforeExit')
+    const getDsn = spyOn(NodeClient.prototype, 'getDsn').mockReturnValue(undefined)
+    try {
+      const logger = createMemoryLogger()
+      const reporter = createErrorReporter({
+        ...base,
+        environment: 'prod',
+        dsn: 'https://abc123@o1.ingest.sentry.io/42',
+        logger,
+      })
+      expect(reporter).toBe(createNoopErrorReporter())
+      expect(logger.entries).toMatchObject([{ level: 'warn' }])
+      expect(JSON.stringify(logger.entries)).not.toContain('abc123')
+    } finally {
+      getDsn.mockRestore()
+    }
+    // The client that was built is closed, so it leaves no listeners behind.
+    return Bun.sleep(20).then(() => expect(process.listenerCount('beforeExit')).toBe(before))
+  })
+
+  test('an http DSN gives the Sentry reporter in local', async () => {
+    const logger = createMemoryLogger()
+    const reporter = createErrorReporter({
+      ...base,
+      environment: 'local',
+      dsn: 'http://abc123@localhost:9000/42',
+      logger,
+    })
+    expect(reporter).not.toBe(createNoopErrorReporter())
+    expect(logger.entries).toEqual([])
+    await reporter.close(50)
+  })
+
+  test('a DSN with spaces around it is trimmed and accepted', async () => {
+    const reporter = createErrorReporter({
+      ...base,
+      environment: 'dev',
+      dsn: '  https://abc123@o1.ingest.sentry.io/42\n',
+      logger: createMemoryLogger(),
+    })
+    expect(reporter).not.toBe(createNoopErrorReporter())
+    await reporter.close(50)
   })
 })
 

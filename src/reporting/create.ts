@@ -19,10 +19,17 @@ export function createErrorReporter(options: ErrorReporterOptions): ErrorReporte
     }
     return createNoopErrorReporter()
   }
-  if (!isSentryDsn(dsn)) {
+  if (!isSentryDsn(dsn, options.environment)) {
     // The DSN is not logged: it holds the project's public key.
     options.logger.warn('error reporting is off: SENTRY_DSN is not a valid Sentry DSN')
     return createNoopErrorReporter()
   }
-  return createSentryReporter({ ...options, dsn })
+  const reporter = createSentryReporter({ ...options, dsn })
+  if (reporter.client.getDsn() === undefined) {
+    // The SDK did not take a DSN the check accepted. It has already warned, without the DSN; release
+    // its resources and send nothing.
+    void reporter.close(1)
+    return createNoopErrorReporter()
+  }
+  return reporter
 }

@@ -12,6 +12,8 @@ export interface MemoryErrorReporter extends ErrorReporter {
   readonly captured: CapturedError[]
   /** The timeout of every flush, in order. */
   readonly flushes: number[]
+  /** The timeout of every close, in order. */
+  readonly closes: number[]
 }
 
 function copyContext(context: ErrorContext | undefined): ErrorContext {
@@ -30,16 +32,23 @@ function copyContext(context: ErrorContext | undefined): ErrorContext {
 export function createMemoryErrorReporter(): MemoryErrorReporter {
   const captured: CapturedError[] = []
   const flushes: number[] = []
+  const closes: number[] = []
   return {
     captured,
     flushes,
+    closes,
     capture(error, context) {
-      if (shouldReportError(error)) {
+      // Like the real adapter, a closed reporter drops what it is given.
+      if (closes.length === 0 && shouldReportError(error)) {
         captured.push({ error, context: copyContext(context) })
       }
     },
     flush(timeoutMs) {
       flushes.push(timeoutMs)
+      return Promise.resolve(closes.length === 0)
+    },
+    close(timeoutMs) {
+      closes.push(timeoutMs)
       return Promise.resolve(true)
     },
   }

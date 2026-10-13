@@ -1,8 +1,9 @@
 // Compared after lowercasing and dropping `_` and `-`, so `apiKey`, `API_KEY` and `api-key` match.
 // A key is sensitive when it, or it without one trailing `s`, is a listed word or ends with a
 // suffix (`clientSecret`, `set-cookie`, `x-api-key`, `cookies`, `secretKey`, `requestBody`,
-// `messageBodies`). `recording` and `transcript` only match as a whole key, so `recordingUrl` and
-// `isRecording` stay readable.
+// `messageBodies`, `X-Amz-Signature`, `AWS_SECRET_ACCESS_KEY`). `recording`, `transcript` and the
+// short words (`pass`, `pwd`, `auth`, `sig`, `sid`, `session`) only match as a whole key, so
+// `recordingUrl`, `isRecording`, `bypass`, `author` and `sessionCount` stay readable.
 const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'password',
   'token',
@@ -15,6 +16,17 @@ const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'recording',
   'transcript',
   'body',
+  'pass',
+  'pwd',
+  'passwd',
+  'passphrase',
+  'auth',
+  'sig',
+  'sid',
+  'session',
+  'sessionid',
+  'sessid',
+  'signature',
 ])
 const SENSITIVE_SUFFIXES = [
   'token',
@@ -25,6 +37,11 @@ const SENSITIVE_SUFFIXES = [
   'authorization',
   'secretkey',
   'privatekey',
+  'secretaccesskey',
+  'signature',
+  'passwd',
+  'sessionid',
+  'sessid',
   'authorizationheader',
   'body',
   // The irregular plural: stripping one `s` from `bodies` does not give `body`.

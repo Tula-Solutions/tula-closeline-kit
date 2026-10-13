@@ -3,7 +3,7 @@ import {
   scrubText2,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-2mcekygv.js";
+} from "./shared/chunk-f8qftbbb.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -20,16 +20,22 @@ function copyContext(context) {
 function createMemoryErrorReporter() {
   const captured = [];
   const flushes = [];
+  const closes = [];
   return {
     captured,
     flushes,
+    closes,
     capture(error, context) {
-      if (shouldReportError2(error)) {
+      if (closes.length === 0 && shouldReportError2(error)) {
         captured.push({ error, context: copyContext(context) });
       }
     },
     flush(timeoutMs) {
       flushes.push(timeoutMs);
+      return Promise.resolve(closes.length === 0);
+    },
+    close(timeoutMs) {
+      closes.push(timeoutMs);
       return Promise.resolve(true);
     }
   };
