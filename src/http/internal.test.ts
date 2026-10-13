@@ -907,6 +907,7 @@ describe('failure kinds', () => {
   function describeKind(kind: InternalCallFailure): string {
     switch (kind) {
       case 'connection':
+      case 'stale_connection':
       case 'timeout':
       case 'aborted':
       case 'redirect':

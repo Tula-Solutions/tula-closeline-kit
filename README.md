@@ -43,8 +43,9 @@ bearer token and never through an HTTP proxy.
 request to the proxy named by `HTTP_PROXY`/`http_proxy` (for `http:` URLs) or
 `HTTPS_PROXY`/`https_proxy` (for `https:` URLs), that `ALL_PROXY` is ignored, that a per-request
 `proxy: ''` does not turn it off, and that `NO_PROXY` exempts a host only by matching it. The
-client uses `node:http` and `node:https` with `agent: false`, which read no proxy variable at all,
-so there is nothing to configure and no boot check to keep correct. The probe stays in the suite:
+client uses `node:http` and `node:https` with its own `Agent`, which reads no proxy variable at all
+(the probe checks a keep-alive `Agent` too), so there is nothing to configure and no boot check to
+keep correct. The probe stays in the suite:
 a Bun upgrade that changes a row fails it.
 
 ```ts
@@ -58,8 +59,12 @@ const core = createInternalClient({
   userAgent: 'closeline-auth',
   timeoutMs: 2_000,                 // one attempt; default 5 000
   retry: { maxAttempts: 2 },        // default 3 attempts; see below
+  maxSockets: 32,                   // connections at once; default 32
+  maxFreeSockets: 8,                // idle connections kept; default 8
+  idleTimeoutMs: 4_000,             // idle connection kept this long; default 4 000
   logger,
 })
+// on shutdown, or at the end of a test: core.close()
 
 const { status, json } = await core.request({
   method: 'POST',
@@ -78,7 +83,7 @@ const { status, json } = await core.request({
   milliseconds and uncapped, so a caller that cannot retry itself (a sign-up that must tell the
   user to wait) applies its own cap; no other header is exposed. `request` rejects with
   `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`, `redirect`,
-  `response_too_large`, `response_invalid`), which carries `method`, `path` (no query), `status`
+  `response_too_large`, `response_invalid`, `stale_connection`), which carries `method`, `path` (no query), `status`
   and `attempts`, and never the secret, a body or the underlying error. `response_invalid`,
   `response_too_large` and `redirect` are not retried.
 - Retries: only a connection failure, a timeout, 429, 502, 503 and 504, and only when the method is
@@ -95,8 +100,25 @@ const { status, json } = await core.request({
 - Numbers are checked when the client is built (and `timeoutMs` per call): `retry.maxAttempts` is an
   integer from 1 to 10, `timeoutMs` and `maxResponseBytes` are finite and above zero, and the retry
   delays are finite and not negative; anything else is a `TypeError`.
-- Cost per call: one new connection (and one TLS handshake for https), no keep-alive, no allocation
-  beyond the bounded response. It is not a hot path, so there is no benchmark.
+- Connections are reused (keep-alive). Each client owns a private `Agent`: never the global one,
+  never one passed in, nothing shared between two clients. At most `maxSockets` (32) connections
+  are open at once and at most `maxFreeSockets` (8) idle ones are kept, each for `idleTimeoutMs`
+  (4 s, under the 5 s keep-alive of a Node server and far under a load balancer's 60 s or more, so
+  the client closes an idle connection first). A call beyond `maxSockets` queues in the client and
+  the wait counts against its `timeoutMs`; an aborted or timed-out waiter never reaches the wire
+  and no extra connection is opened. Idle connections do not keep the process alive; `close()`
+  destroys them all, fails calls in flight or waiting with `aborted`, and makes later calls throw
+  a `TypeError`.
+- `stale_connection`: a kept connection the receiver had already closed failed with `ECONNRESET`
+  or `EPIPE` before any byte of an answer. The request may have reached the receiver, so the
+  kit cannot know it is safe to resend. It is retried at once (no pause, one attempt used) on a
+  fresh connection only where a `connection` failure is retried (a safe method or an
+  `idempotencyKey`, and attempts left); otherwise it is surfaced, and a caller that knows its
+  request is idempotent may send it again.
+- Cost per call, on loopback (`bench/internal.bench.ts`, part of `bun run bench`): over http about
+  0.05 ms with a warm pool against 0.15 to 0.23 ms for a new connection each time (3x to 4x); over
+  https about 0.1 ms against 1.25 ms (12x), the TLS handshake being most of the difference. A real
+  network adds round trips to every new connection, so the saving there is larger.
 - Outbound calls to vendors are not internal calls: they may use `fetch` and a proxy set on purpose.
 
 **Replacing auth's transport.** In `src/adapters/http/membership.ts` drop the `fetch` option,

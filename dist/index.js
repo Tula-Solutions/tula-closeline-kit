@@ -492,11 +492,14 @@ function createTokenVerifier(options) {
   };
 }
 // src/http/internal.ts
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, request as httpRequest } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { isIPv4 } from "node:net";
 var INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
 var INTERNAL_DEFAULT_TIMEOUT_MS = 5000;
+var INTERNAL_DEFAULT_MAX_SOCKETS = 32;
+var INTERNAL_DEFAULT_MAX_FREE_SOCKETS = 8;
+var INTERNAL_DEFAULT_IDLE_TIMEOUT_MS = 4000;
 var INTERNAL_DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 var INTERNAL_MAX_REQUEST_BYTES = 1024 * 1024;
 var INTERNAL_DEFAULT_RETRY = {
@@ -517,6 +520,7 @@ var FORBIDDEN_HEADERS = new Set([
 ]);
 var INTERNAL_CALL_FAILURES = [
   "connection",
+  "stale_connection",
   "timeout",
   "aborted",
   "redirect",
@@ -625,21 +629,89 @@ function createInternalClient(options) {
   if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
     throw new TypeError("timeoutMs and maxResponseBytes must be finite numbers above zero");
   }
+  const maxSockets = options.maxSockets ?? INTERNAL_DEFAULT_MAX_SOCKETS;
+  if (!Number.isInteger(maxSockets) || maxSockets < 1) {
+    throw new TypeError("maxSockets must be an integer of 1 or more");
+  }
+  const maxFreeSockets = options.maxFreeSockets ?? Math.min(INTERNAL_DEFAULT_MAX_FREE_SOCKETS, maxSockets);
+  if (!Number.isInteger(maxFreeSockets) || maxFreeSockets < 1 || maxFreeSockets > maxSockets) {
+    throw new TypeError("maxFreeSockets must be an integer from 1 to maxSockets");
+  }
+  const idleTimeoutMs = options.idleTimeoutMs ?? INTERNAL_DEFAULT_IDLE_TIMEOUT_MS;
+  if (!isPositive(idleTimeoutMs)) {
+    throw new TypeError("idleTimeoutMs must be a finite number above zero");
+  }
   const sleep = options.sleep ?? timerSleep;
   const random = options.random ?? Math.random;
   const send = base.secure ? httpsRequest : httpRequest;
-  const attempt = (method, target, headers, body, signal) => new Promise((resolve, reject) => {
+  const agent = new (base.secure ? HttpsAgent : HttpAgent)({
+    keepAlive: true,
+    maxSockets,
+    maxFreeSockets,
+    timeout: idleTimeoutMs,
+    scheduling: "lifo",
+    ...base.secure ? { rejectUnauthorized: true } : {},
+    ...options.ca === undefined ? {} : { ca: options.ca }
+  });
+  const lifetime = new AbortController;
+  let active = 0;
+  const waiting = [];
+  const acquire = (signal) => new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Failure("timeout"));
+      return;
+    }
+    const grant = () => {
+      active += 1;
+      let released = false;
+      resolve(() => {
+        if (!released) {
+          released = true;
+          active -= 1;
+          waiting.shift()?.();
+        }
+      });
+    };
+    if (active < maxSockets) {
+      grant();
+      return;
+    }
+    const turn = () => {
+      signal.removeEventListener("abort", leave);
+      grant();
+    };
+    const leave = () => {
+      const at = waiting.indexOf(turn);
+      if (at !== -1) {
+        waiting.splice(at, 1);
+      }
+      reject(new Failure("timeout"));
+    };
+    signal.addEventListener("abort", leave, { once: true });
+    waiting.push(turn);
+  });
+  const attempt = async (method, target, headers, body, signal) => {
+    const release = await acquire(signal);
+    try {
+      return await onWire(method, target, headers, body, signal);
+    } finally {
+      release();
+    }
+  };
+  const onWire = (method, target, headers, body, signal) => new Promise((resolve, reject) => {
+    let answered = false;
     const outgoing = send({
       host: base.host,
       port: base.port,
       path: target,
       method,
       headers,
-      agent: false,
+      agent,
       signal,
       ...base.secure ? { rejectUnauthorized: true } : {},
       ...options.ca === undefined ? {} : { ca: options.ca }
     }, (response) => {
+      answered = true;
       const status = response.statusCode ?? 0;
       const retryAfter = retryAfterMs(response.headers["retry-after"]);
       if (status >= 300 && status < 400) {
@@ -671,11 +743,21 @@ function createInternalClient(options) {
       response.on("error", broken);
       response.on("aborted", broken);
     });
-    outgoing.on("error", () => reject(new Failure(signal.aborted ? "timeout" : "connection")));
+    outgoing.on("error", (error) => {
+      const reset = error.code === "ECONNRESET" || error.code === "EPIPE";
+      reject(new Failure(signal.aborted ? "timeout" : !answered && outgoing.reusedSocket && reset ? "stale_connection" : "connection"));
+    });
     outgoing.end(body);
   });
   return {
+    close() {
+      lifetime.abort();
+      agent.destroy();
+    },
     async request(call) {
+      if (lifetime.signal.aborted) {
+        throw new TypeError("the internal client is closed");
+      }
       checkPath(call.path);
       if (call.body !== undefined && (call.method === "GET" || call.method === "HEAD")) {
         throw new TypeError("a GET or HEAD internal call has no body");
@@ -720,7 +802,7 @@ function createInternalClient(options) {
           throw fail("aborted");
         }
         const timeout = AbortSignal.timeout(perAttempt);
-        const signal = call.signal ? AbortSignal.any([call.signal, timeout]) : timeout;
+        const signal = AbortSignal.any(call.signal ? [call.signal, timeout, lifetime.signal] : [timeout, lifetime.signal]);
         let retryAfter;
         let reason;
         try {
@@ -740,11 +822,11 @@ function createInternalClient(options) {
           retryAfter = wire.retryAfter;
           reason = `HTTP ${wire.status}`;
         } catch (caught) {
-          if (call.signal?.aborted) {
+          if (call.signal?.aborted || lifetime.signal.aborted) {
             throw fail("aborted");
           }
           const failure = caught instanceof Failure ? caught : new Failure("connection");
-          const retryable = failure.kind === "connection" || failure.kind === "timeout";
+          const retryable = failure.kind === "connection" || failure.kind === "stale_connection" || failure.kind === "timeout";
           if (!retryable) {
             throw fail(failure.kind, failure.status);
           }
@@ -754,7 +836,7 @@ function createInternalClient(options) {
           reason = failure.kind;
         }
         const ceiling = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempts - 1));
-        const delay = retryAfter === undefined ? Math.floor(random() * ceiling) : Math.min(retryAfter, retry.retryAfterCapMs);
+        const delay = reason === "stale_connection" ? 0 : retryAfter === undefined ? Math.floor(random() * ceiling) : Math.min(retryAfter, retry.retryAfterCapMs);
         options.logger?.warn("internal call failed, retrying", {
           method: call.method,
           path,
@@ -1472,7 +1554,10 @@ export {
   AppError2 as AppError,
   ENVIRONMENTS,
   INTERNAL_CALL_FAILURES,
+  INTERNAL_DEFAULT_IDLE_TIMEOUT_MS,
+  INTERNAL_DEFAULT_MAX_FREE_SOCKETS,
   INTERNAL_DEFAULT_MAX_RESPONSE_BYTES,
+  INTERNAL_DEFAULT_MAX_SOCKETS,
   INTERNAL_DEFAULT_RETRY,
   INTERNAL_DEFAULT_TIMEOUT_MS,
   INTERNAL_IDEMPOTENCY_HEADER,

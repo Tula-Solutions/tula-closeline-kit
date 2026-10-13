@@ -291,6 +291,17 @@ declare function requireSentryDsn(env: {
 declare const INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
 /** The default bound on one attempt, connecting to the last byte of the answer. */
 declare const INTERNAL_DEFAULT_TIMEOUT_MS = 5e3;
+/** The default most connections one client keeps open to its receiver; calls beyond it queue. */
+declare const INTERNAL_DEFAULT_MAX_SOCKETS = 32;
+/** The default most idle connections one client keeps for reuse. */
+declare const INTERNAL_DEFAULT_MAX_FREE_SOCKETS = 8;
+/**
+* The default time an idle connection is kept before the client closes it. It is below the 5 s
+* keep-alive timeout of a Node `http` server (and of Bun's, which is 10 s), and far below a load
+* balancer's (60 s on an AWS ALB, 75 s on nginx), so the client, not the server, ends an idle
+* connection and a reused one is rarely dead.
+*/
+declare const INTERNAL_DEFAULT_IDLE_TIMEOUT_MS = 4e3;
 /** The default largest answer that is read; a longer one fails the call, it is not truncated. */
 declare const INTERNAL_DEFAULT_MAX_RESPONSE_BYTES: number;
 /** The largest request body the client will send. */
@@ -307,8 +318,12 @@ declare const INTERNAL_RETRY_STATUSES: readonly number[];
 /**
 * Every way {@link InternalClient.request} can reject. `response_invalid` is a 2xx answer whose
 * non-empty body is not JSON (an HTML error or login page); it is never retried.
+* `stale_connection` is a kept connection that the receiver had already closed: the write failed
+* with `ECONNRESET` or `EPIPE` before any byte of an answer. The request may or may not have
+* reached the receiver, so it is retried only like a `connection` failure (a safe method or an
+* idempotency key), at once on a fresh connection; otherwise the caller sees it and decides.
 */
-declare const INTERNAL_CALL_FAILURES: readonly ["connection", "timeout", "aborted", "redirect", "response_too_large", "response_invalid"];
+declare const INTERNAL_CALL_FAILURES: readonly ["connection", "stale_connection", "timeout", "aborted", "redirect", "response_too_large", "response_invalid"];
 /** The most attempts a call may be given, the first included. */
 declare const INTERNAL_MAX_ATTEMPTS = 10;
 /** The HTTP methods the client sends. */
@@ -359,6 +374,19 @@ type InternalClientOptions = {
 	timeoutMs?: number;
 	/** The largest answer read; defaults to {@link INTERNAL_DEFAULT_MAX_RESPONSE_BYTES}. */
 	maxResponseBytes?: number;
+	/**
+	* The most connections kept open to the receiver at once: an integer of 1 or more; defaults to
+	* {@link INTERNAL_DEFAULT_MAX_SOCKETS}. A call beyond it waits for a free one, and the wait
+	* counts against its timeout; it never opens another connection.
+	*/
+	maxSockets?: number;
+	/**
+	* The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is refused);
+	* defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
+	*/
+	maxFreeSockets?: number;
+	/** How long an idle connection is kept; defaults to {@link INTERNAL_DEFAULT_IDLE_TIMEOUT_MS}. */
+	idleTimeoutMs?: number;
 	/** The retry policy; see {@link InternalRetryPolicy}. */
 	retry?: InternalRetryPolicy;
 	/** Extra certificate authority (PEM) to trust besides the system's. Verification stays on. */
@@ -409,18 +437,30 @@ interface InternalClient {
 	* a timeout, 429, 502, 503 and 504, and only when the method is idempotent or a key is given.
 	*/
 	request(call: InternalRequest): Promise<InternalResponse>;
+	/**
+	* Closes every connection this client holds, fails calls in flight or waiting for a connection
+	* with `aborted`, and refuses later calls with a `TypeError`. Safe to call more than once. A
+	* process need not call it to exit (idle connections do not hold it open), but a test or a
+	* graceful shutdown should.
+	*/
+	close(): void;
 }
 /**
 * Builds the client for calls from this service to one other service (ADR 0013).
 *
-* It uses `node:http` and `node:https` with `agent: false`, never `fetch`: Bun's `fetch` sends a
+* It uses `node:http` and `node:https` with its own `Agent`, never `fetch`: Bun's `fetch` sends a
 * request to the proxy named by `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and their lower-case
 * forms) unless `NO_PROXY` names the host, and the bearer secret would travel with it. The
 * `node:` transport reads no proxy variable, so nothing in the environment can reroute a call.
 * `proxy.test.ts` pins this for the Bun version in use.
 *
-* Cost per call: one new connection (plus one TLS handshake for https), one request, no
-* keep-alive; memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
+* Connections are reused. The client owns one private keep-alive `Agent` (never the global one,
+* never one passed in; an `Agent` reads no proxy variable either), capped at `maxSockets`
+* connections with `maxFreeSockets` kept idle for `idleTimeoutMs`. The cap is enforced by the
+* client's own queue, so a call waiting for a connection is bounded by its timeout and an aborted
+* one never reaches the wire. Two clients share nothing. A kept connection the receiver closed
+* fails as `stale_connection` (see {@link INTERNAL_CALL_FAILURES}). Call `close()` to end them.
+* Memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
 * certificates are verified: every https request sets `rejectUnauthorized: true` itself, so
 * `NODE_TLS_REJECT_UNAUTHORIZED=0` has no effect on it, and the client is not built at all
 * while that variable is `0` outside `local`. `NODE_EXTRA_CA_CERTS` still adds trusted
@@ -864,4 +904,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, PreviousVersion, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, PreviousVersion, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
