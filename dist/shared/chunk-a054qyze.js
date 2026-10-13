@@ -1,6 +1,7 @@
 import {
+  AppError2,
   isAppError2
-} from "./chunk-pzmynk9n.js";
+} from "./chunk-tya44yhr.js";
 
 // src/pii.ts
 var MAX_LOCAL_PART = 64;
@@ -931,4 +932,42 @@ function shouldReportError2(error) {
   }
 }
 
-export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2 };
+// src/vector/errors.ts
+var VECTOR_ERROR_CODES2 = {
+  invalidRequest: "vector.invalid_request",
+  dimensionMismatch: "vector.dimension_mismatch",
+  rejected: "vector.rejected",
+  unavailable: "vector.unavailable",
+  badResponse: "vector.bad_response"
+};
+var STATUS = {
+  "vector.invalid_request": 400,
+  "vector.dimension_mismatch": 422,
+  "vector.rejected": 500,
+  "vector.unavailable": 503,
+  "vector.bad_response": 502
+};
+
+class VectorError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "VectorError";
+  }
+}
+
+// src/vector/port.ts
+var MAX_UPSERT_BATCH2 = 500;
+var MAX_DELETE_BATCH2 = 500;
+var MAX_VECTOR_ID_LENGTH2 = 64;
+var MAX_TOP_K2 = 100;
+var MAX_DIMENSIONS2 = 4096;
+var MAX_ATTRIBUTES2 = 16;
+var MAX_ATTRIBUTE_STRING2 = 512;
+
+export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

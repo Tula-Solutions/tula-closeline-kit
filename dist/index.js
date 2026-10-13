@@ -4,21 +4,38 @@ import {
   scrubText2,
   redactFields,
   prepareFields,
-  shouldReportError2
-} from "./shared/chunk-x863z57h.js";
+  shouldReportError2,
+  VECTOR_ERROR_CODES2,
+  VectorError2,
+  MAX_UPSERT_BATCH2,
+  MAX_DELETE_BATCH2,
+  MAX_VECTOR_ID_LENGTH2,
+  MAX_TOP_K2,
+  MAX_DIMENSIONS2,
+  MAX_ATTRIBUTES2,
+  MAX_ATTRIBUTE_STRING2
+} from "./shared/chunk-a054qyze.js";
 import {
   systemClock2,
   createFixedClock2,
-  AppError2,
-  isAppError2,
-  toErrorBody2,
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   INVALID_REASONS2,
   createMessageRegistry2
-} from "./shared/chunk-pzmynk9n.js";
+} from "./shared/chunk-mjkmsg3r.js";
+import {
+  STORAGE_ERROR_CODES2,
+  StorageError2,
+  MAX_KEY_BYTES2,
+  MAX_KEY_SEGMENTS2,
+  DEFAULT_MAX_OBJECT_BYTES2,
+  MAX_OBJECT_BYTES_LIMIT2,
+  DEFAULT_LIST_LIMIT2,
+  MAX_LIST_LIMIT2,
+  DEFAULT_CONTENT_TYPE2
+} from "./shared/chunk-r2rshw7g.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -27,7 +44,12 @@ import {
   assertVisibility2,
   assertBatchCount2,
   systemSleep2
-} from "./shared/chunk-pkdp60t0.js";
+} from "./shared/chunk-dpkegc79.js";
+import {
+  AppError2,
+  isAppError2,
+  toErrorBody2
+} from "./shared/chunk-tya44yhr.js";
 
 // src/auth/claims.ts
 import {
@@ -1573,6 +1595,9 @@ function createErrorReporter(options) {
 var PACKAGE = "tula-closeline-kit";
 export {
   AppError2 as AppError,
+  DEFAULT_CONTENT_TYPE2 as DEFAULT_CONTENT_TYPE,
+  DEFAULT_LIST_LIMIT2 as DEFAULT_LIST_LIMIT,
+  DEFAULT_MAX_OBJECT_BYTES2 as DEFAULT_MAX_OBJECT_BYTES,
   ENVIRONMENTS,
   INTERNAL_CALL_FAILURES,
   INTERNAL_DEFAULT_IDLE_TIMEOUT_MS,
@@ -1587,17 +1612,32 @@ export {
   INTERNAL_RETRY_STATUSES,
   INVALID_REASONS2 as INVALID_REASONS,
   InternalCallError,
+  MAX_ATTRIBUTES2 as MAX_ATTRIBUTES,
+  MAX_ATTRIBUTE_STRING2 as MAX_ATTRIBUTE_STRING,
   MAX_BATCH_SIZE2 as MAX_BATCH_SIZE,
+  MAX_DELETE_BATCH2 as MAX_DELETE_BATCH,
+  MAX_DIMENSIONS2 as MAX_DIMENSIONS,
   MAX_JWKS_BYTES,
   MAX_JWKS_KEYS,
+  MAX_KEY_BYTES2 as MAX_KEY_BYTES,
+  MAX_KEY_SEGMENTS2 as MAX_KEY_SEGMENTS,
+  MAX_LIST_LIMIT2 as MAX_LIST_LIMIT,
   MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
+  MAX_OBJECT_BYTES_LIMIT2 as MAX_OBJECT_BYTES_LIMIT,
   MAX_TOKEN_LENGTH,
+  MAX_TOP_K2 as MAX_TOP_K,
+  MAX_UPSERT_BATCH2 as MAX_UPSERT_BATCH,
+  MAX_VECTOR_ID_LENGTH2 as MAX_VECTOR_ID_LENGTH,
   MAX_VISIBILITY_SECONDS2 as MAX_VISIBILITY_SECONDS,
   MAX_WAIT_SECONDS2 as MAX_WAIT_SECONDS,
   PACKAGE,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
+  STORAGE_ERROR_CODES2 as STORAGE_ERROR_CODES,
+  StorageError2 as StorageError,
   TokenVerificationError,
+  VECTOR_ERROR_CODES2 as VECTOR_ERROR_CODES,
+  VectorError2 as VectorError,
   accessTokenClaimsSchema,
   assertBatchCount2 as assertBatchCount,
   assertReceiveOptions2 as assertReceiveOptions,

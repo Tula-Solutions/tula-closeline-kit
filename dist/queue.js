@@ -1,8 +1,11 @@
 import {
+  reduceAwsCause
+} from "./shared/chunk-3xpsbhky.js";
+import {
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-pzmynk9n.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -11,7 +14,7 @@ import {
   assertVisibility2,
   assertBatchCount2,
   systemSleep2
-} from "./shared/chunk-pkdp60t0.js";
+} from "./shared/chunk-dpkegc79.js";
 
 // src/queue/aws.ts
 import {
@@ -19,9 +22,27 @@ import {
   DeleteMessageCommand,
   ReceiveMessageCommand,
   SendMessageBatchCommand,
-  SendMessageCommand,
-  SQSClient
+  SendMessageCommand
 } from "@aws-sdk/client-sqs";
+
+// src/queue/client.ts
+import { SQSClient } from "@aws-sdk/client-sqs";
+function createSqsClient(settings) {
+  return new SQSClient({
+    region: settings.region,
+    ...settings.endpoint === undefined ? {} : { endpoint: settings.endpoint },
+    ...settings.environment === "local" ? {} : { ignoreConfiguredEndpointUrls: true },
+    maxAttempts: settings.maxAttempts,
+    retryMode: "standard",
+    requestHandler: {
+      connectionTimeout: settings.timeoutMs,
+      requestTimeout: settings.timeoutMs,
+      throwOnRequestTimeout: true
+    }
+  });
+}
+
+// src/queue/aws.ts
 var SQS_DEFAULT_TIMEOUT_MS = 5000;
 var SQS_DEFAULT_MAX_ATTEMPTS = 3;
 function bytesOf(body) {
@@ -31,11 +52,11 @@ function mapFailure(operation, error) {
   const fault = error;
   if (fault?.$fault === "client" && fault.$retryable === undefined) {
     return new QueueError2(QUEUE_ERROR_CODES2.rejected, `the queue refused ${operation}`, {
-      cause: error
+      cause: reduceAwsCause(error)
     });
   }
   return new QueueError2(QUEUE_ERROR_CODES2.unavailable, `the queue did not complete ${operation}`, {
-    cause: error
+    cause: reduceAwsCause(error)
   });
 }
 var STALE_RECEIPT_NAMES = new Set(["ReceiptHandleIsInvalid", "MessageNotInflight"]);
@@ -66,16 +87,12 @@ function createSqsQueue(options) {
     throw new TypeError("maxAttempts must be a whole number from 1 to 10");
   }
   const { registry, queueUrl } = options;
-  const client = options.client ?? new SQSClient({
+  const client = options.client ?? createSqsClient({
     region: options.region,
-    ...options.endpoint === undefined ? {} : { endpoint: options.endpoint },
-    maxAttempts,
-    retryMode: "standard",
-    requestHandler: {
-      connectionTimeout: timeoutMs,
-      requestTimeout: timeoutMs,
-      throwOnRequestTimeout: true
-    }
+    environment: options.environment,
+    endpoint: options.endpoint,
+    timeoutMs,
+    maxAttempts
   });
   function encodeChecked(envelope) {
     const body = registry.encode(envelope);
@@ -97,7 +114,7 @@ function createSqsQueue(options) {
     } catch (error) {
       if (isStaleReceipt(error)) {
         throw new QueueError2(QUEUE_ERROR_CODES2.receiptInvalid, "the message is not in flight", {
-          cause: error
+          cause: reduceAwsCause(error)
         });
       }
       throw mapFailure("a visibility change", error);

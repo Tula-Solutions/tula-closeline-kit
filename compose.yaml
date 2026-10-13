@@ -1,5 +1,6 @@
-# ElasticMQ, an SQS-compatible stand-in, for `bun run test:integration` (the SQS adapter's run of the
-# shared behaviour suite). Same image and digest as the hub's compose.dev.yaml. CI starts this file
+# Stand-ins for `bun run test:integration`: ElasticMQ, an SQS-compatible one (the SQS adapter's run of
+# the shared behaviour suite), and S3Mock, an S3-compatible one (the S3 adapter's). Same images and
+# digests as the hub's compose.dev.yaml. CI starts this file
 # before the integration step; locally: `docker compose up -d --wait`, then `bun run test:integration`.
 services:
   queue:
@@ -15,3 +16,20 @@ services:
       timeout: 3s
       retries: 20
       start_period: 3s
+
+  storage:
+    image: adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+    # The image runs as an unprivileged user that cannot write to a fresh mount.
+    user: root
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: closeline-kit-test
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /data
+    ports: ['127.0.0.1:9090:9090']
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:9090/ || exit 1']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s

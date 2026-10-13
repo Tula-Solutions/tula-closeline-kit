@@ -437,6 +437,200 @@ type TestDefinition = typeof testPing | typeof testNote;
 type TestEnvelope = EnvelopeOf<TestDefinition>;
 /** Creates a registry of {@link testPing} and {@link testNote}. */
 declare function createTestRegistry(options?: Parameters<typeof createMessageRegistry>[1]): MessageRegistry<TestDefinition>;
+/** Decides whether a string is an Organization id this deployment accepts. */
+type OrganizationIdCheck = (value: string) => boolean;
+/** What a listing says about one object. */
+interface ObjectEntry {
+	/** The key, relative to the Organization. */
+	key: string;
+	/** The size in bytes. */
+	size: number;
+	/** When the object was last written. */
+	lastModified: Date;
+}
+/** What {@link ObjectStore.head} says about one object. */
+interface ObjectInfo extends ObjectEntry {
+	/**
+	* The content type as the store holds it, which is what the writer gave except that a store may
+	* normalise insignificant whitespace in the parameters (`text/plain; charset=utf-8` can come back
+	* as `text/plain;charset=utf-8`). Never compare it as a raw string, and never use it to decide
+	* behaviour: it is informational and untrusted.
+	*/
+	contentType: string;
+}
+/** An object with its body. */
+interface StoredObject extends ObjectInfo {
+	/** The bytes. A copy: changing it does not change the store. */
+	body: Uint8Array;
+}
+/** Options of {@link ObjectStore.put}. */
+interface PutOptions {
+	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
+	contentType?: string;
+}
+/** Options of {@link ObjectStore.list}. */
+interface ListOptions {
+	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface ListPage {
+	/** Objects in ascending key order. */
+	items: ObjectEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Object storage scoped by Organization. Every call takes the Organization id first and can reach
+* only that Organization's objects: the adapter derives the real location from the validated id,
+* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
+* id that starts with another id) can name another Organization's data. Keys are relative to the
+* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
+* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
+* keeps the content type as given (returned as the store holds it, see {@link ObjectInfo}) and never looks at the content. Bodies are held in memory, so an
+* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
+* {@link StorageError}; only `storage.unavailable` is worth retrying.
+*/
+interface ObjectStore {
+	/**
+	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
+	* same object. O(object size).
+	*/
+	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/** Reads an object, or returns `undefined` when there is none. O(object size). */
+	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
+	/**
+	* Reads an object's metadata, or returns `undefined` when there is none. O(1). On S3 a HEAD of a
+	* bucket that does not exist also reads as `undefined`, because a HEAD response carries no error
+	* body to tell the two apart; `get`, `put`, `delete` and `list` do report a missing bucket as
+	* `storage.rejected`.
+	*/
+	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
+	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
+	delete(organizationId: string, key: string): Promise<void>;
+	/**
+	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
+	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
+	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
+	*/
+	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
+}
+/** Options for {@link createMemoryObjectStore}. */
+interface MemoryObjectStoreOptions {
+	/** Time source for `lastModified`; default the system clock. */
+	clock?: Clock;
+	/** Largest object in bytes; default 25 MiB. */
+	maxObjectBytes?: number;
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck;
+}
+/** An {@link ObjectStore} that keeps everything in the process, for tests. Not for production. */
+type MemoryObjectStore = ObjectStore;
+/**
+* Creates an {@link ObjectStore} in memory. Each Organization has its own map, so no key can reach
+* another Organization's objects. Bodies are copied on the way in and out. Complexity: put and get
+* O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
+*/
+declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
+/** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
+type AttributeValue = string | number | boolean;
+/**
+* Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`.
+* Names are lower-case snake_case; `id` and `vector` are reserved. A name should always carry the
+* same kind of value (string, number or boolean): a vendor that infers a column's type from its
+* first value refuses a later value of another type.
+*/
+type VectorAttributes = Readonly<Record<string, AttributeValue>>;
+/** A vector to store. */
+interface VectorRecord {
+	/** Unique within the Organization, 1 to 64 of letters, digits, `.`, `_`, `:` and `-`; storing an id again replaces the vector. */
+	id: string;
+	/** Exactly the store's `dimensions` finite numbers, not all zero. */
+	vector: ArrayLike<number>;
+	/** Optional attributes (at most 16). */
+	attributes?: VectorAttributes;
+}
+/** A similarity search. */
+interface SearchQuery {
+	/** The query vector, the store's `dimensions` long. */
+	vector: ArrayLike<number>;
+	/** How many hits at most, 1 to 100. */
+	topK: number;
+	/** Keep only vectors whose attributes equal every entry here. */
+	filter?: VectorAttributes;
+}
+/** One search result. */
+interface SearchHit {
+	/** The vector's id. */
+	id: string;
+	/** Cosine similarity to the query, -1 to 1; higher is closer. */
+	score: number;
+	/** The vector's attributes (empty when it had none). */
+	attributes: VectorAttributes;
+}
+/**
+* Vector storage scoped by Organization. Every call takes the Organization id first and reaches
+* only that Organization's vectors: an adapter derives its namespace or filter from the validated
+* id, never from a caller's string, so a search, an upsert or a delete cannot touch another
+* Organization. A store is created for one embedding model's dimension count; a vector of any
+* other length is `vector.dimension_mismatch`, which no retry fixes. Scores are cosine similarity.
+* Throws {@link VectorError}; only `vector.unavailable` is worth retrying. Text and vectors are
+* data, never instructions, and no operation logs them.
+*/
+interface VectorStore {
+	/** The length every vector and query must have. */
+	readonly dimensions: number;
+	/**
+	* Tells the store to get an Organization's index ready for low-latency search, as ADR 0010
+	* wants done when a call starts. Resolves when the hint is accepted, not when the index is warm.
+	* Never changes data; harmless to repeat or to send for an Organization with no vectors. O(1).
+	*/
+	warm(organizationId: string): Promise<void>;
+	/**
+	* Deletes every vector the Organization has (offboarding). Idempotent: an Organization with
+	* none resolves. Work proportional to the Organization's size: call it from a queued job.
+	*/
+	deleteAll(organizationId: string): Promise<void>;
+	/**
+	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
+	* leaves the same data. Everything is validated before anything is written, so a bad record
+	* writes nothing. Memory adapter O(batch × dimensions).
+	*/
+	upsert(organizationId: string, records: readonly VectorRecord[]): Promise<void>;
+	/**
+	* Returns the `topK` closest vectors that match the filter, best first (the order of equal scores is not promised). Memory
+	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
+	*/
+	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
+	delete(organizationId: string, ids: readonly string[]): Promise<void>;
+	/**
+	* Deletes every vector whose attributes equal every entry of `filter` (at least one entry, so it
+	* cannot empty an Organization by accident). Idempotent. Memory adapter O(n). Work proportional
+	* to the Organization's size: call it from a queued job, not a request.
+	*/
+	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
+}
+/** Options for {@link createMemoryVectorStore}. */
+interface MemoryVectorStoreOptions {
+	/** The dimension count of the embedding model, 1 to 4096. */
+	dimensions: number;
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck;
+}
+/** A {@link VectorStore} that keeps everything in the process, for tests. Not for production. */
+type MemoryVectorStore = VectorStore;
+/**
+* Creates a {@link VectorStore} in memory. Each Organization has its own map, so no query can
+* reach another Organization's vectors. Complexity: upsert O(batch × dimensions); search
+* O(n × dimensions + n log n) in the Organization's n vectors, an exact scan; delete O(ids);
+* deleteByFilter O(n); warm O(1); deleteAll O(1).
+*/
+declare function createMemoryVectorStore(options: MemoryVectorStoreOptions): MemoryVectorStore;
 /** One recorded log call, with fields already redacted. */
 interface LogEntry {
 	level: "debug" | "info" | "warn" | "error";
@@ -458,4 +652,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryQueue, MemoryQueueOptions, MintTokenOptions, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryQueue, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

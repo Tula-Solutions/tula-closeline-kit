@@ -200,7 +200,32 @@ describe('publish', () => {
     expect(error).toMatchObject({ code: 'queue.unavailable', status: 503 })
     expect((error as Error).message).not.toContain(secret)
     expect(JSON.stringify((error as { details?: unknown }).details ?? {})).not.toContain(secret)
-    expect((error as Error).cause).toBeInstanceOf(Error)
+    expect((error as Error).cause).toEqual({ name: 'ServiceUnavailable' })
+  })
+
+  test('the cause never holds the queue URL, the message body or the SDK error', async () => {
+    const secret = 'SECRET-PAYLOAD'
+    const sdkError = Object.assign(named('InvalidMessageContents', `bad ${secret} for q`), {
+      $fault: 'client' as const,
+      $metadata: { httpStatusCode: 400, requestId: 'REQ-9' },
+      $response: { body: secret },
+      QueueUrl: 'http://queue.test/000000000000/q',
+    })
+    const s = stub(() => sdkError)
+    const error = (await adapter(s.client)
+      .publish(note(secret))
+      .catch((caught: unknown) => caught)) as Error
+    expect(error.cause).not.toBe(sdkError)
+    expect(error.cause).toEqual({
+      name: 'InvalidMessageContents',
+      httpStatus: 400,
+      requestId: 'REQ-9',
+      fault: 'client',
+    })
+    const everything =
+      JSON.stringify(error, Object.getOwnPropertyNames(error)) + JSON.stringify(error.cause)
+    expect(everything).not.toContain(secret)
+    expect(everything).not.toContain('queue.test')
   })
 })
 

@@ -6,9 +6,10 @@ import {
   SendMessageBatchCommand,
   type SendMessageBatchCommandOutput,
   SendMessageCommand,
-  SQSClient,
 } from '@aws-sdk/client-sqs'
+import { reduceAwsCause } from '../aws-failure'
 import type { Environment } from '../reporting/env'
+import { createSqsClient } from './client'
 import {
   type AnyDefinition,
   type EnvelopeOf,
@@ -88,11 +89,11 @@ function mapFailure(operation: string, error: unknown): QueueError {
   const fault = error as { $fault?: unknown; $retryable?: unknown } | null
   if (fault?.$fault === 'client' && fault.$retryable === undefined) {
     return new QueueError(QUEUE_ERROR_CODES.rejected, `the queue refused ${operation}`, {
-      cause: error,
+      cause: reduceAwsCause(error),
     })
   }
   return new QueueError(QUEUE_ERROR_CODES.unavailable, `the queue did not complete ${operation}`, {
-    cause: error,
+    cause: reduceAwsCause(error),
   })
 }
 
@@ -160,18 +161,12 @@ export function createSqsQueue<const D extends AnyDefinition>(
   const { registry, queueUrl } = options
   const client: SqsSender =
     options.client ??
-    new SQSClient({
+    createSqsClient({
       region: options.region,
-      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+      environment: options.environment,
+      endpoint: options.endpoint,
+      timeoutMs,
       maxAttempts,
-      retryMode: 'standard',
-      // Without throwOnRequestTimeout the handler only logs a warning when a request is slow and
-      // keeps waiting, so a hung connection would never end.
-      requestHandler: {
-        connectionTimeout: timeoutMs,
-        requestTimeout: timeoutMs,
-        throwOnRequestTimeout: true,
-      },
     })
 
   function encodeChecked(envelope: EnvelopeOf<D>): string {
@@ -197,7 +192,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
     } catch (error) {
       if (isStaleReceipt(error)) {
         throw new QueueError(QUEUE_ERROR_CODES.receiptInvalid, 'the message is not in flight', {
-          cause: error,
+          cause: reduceAwsCause(error),
         })
       }
       throw mapFailure('a visibility change', error)

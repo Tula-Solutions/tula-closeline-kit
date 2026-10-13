@@ -1,22 +1,37 @@
 import {
   scrubText2,
   prepareFields,
-  shouldReportError2
-} from "./shared/chunk-x863z57h.js";
+  shouldReportError2,
+  VECTOR_ERROR_CODES2,
+  VectorError2,
+  MAX_UPSERT_BATCH2,
+  MAX_DELETE_BATCH2,
+  MAX_TOP_K2,
+  MAX_DIMENSIONS2,
+  MAX_ATTRIBUTES2,
+  MAX_ATTRIBUTE_STRING2
+} from "./shared/chunk-a054qyze.js";
 import {
+  systemClock2,
   createFixedClock2,
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-pzmynk9n.js";
+} from "./shared/chunk-mjkmsg3r.js";
+import {
+  createOrganizationIdGuard,
+  encodeCursor,
+  createStorageValidator
+} from "./shared/chunk-jstn60a3.js";
+import"./shared/chunk-r2rshw7g.js";
 import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2,
   systemSleep2
-} from "./shared/chunk-pkdp60t0.js";
+} from "./shared/chunk-dpkegc79.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -339,6 +354,281 @@ function createTestRegistry(options = {}) {
     ...options
   });
 }
+// src/storage/memory.ts
+function createMemoryObjectStore(options = {}) {
+  const clock = options.clock ?? systemClock2;
+  const check = createStorageValidator({
+    maxObjectBytes: options.maxObjectBytes,
+    isOrganizationId: options.isOrganizationId
+  });
+  const organizations = new Map;
+  const info = (key, entry) => ({
+    key,
+    size: entry.body.byteLength,
+    contentType: entry.contentType,
+    lastModified: new Date(entry.lastModified)
+  });
+  return {
+    async put(organizationId, key, body, putOptions) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const bytes = check.body(body);
+      const contentType = check.contentType(putOptions?.contentType);
+      let objects = organizations.get(org);
+      if (objects === undefined) {
+        objects = new Map;
+        organizations.set(org, objects);
+      }
+      objects.set(name, { body: bytes.slice(), contentType, lastModified: clock.now() });
+    },
+    async get(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const entry = organizations.get(org)?.get(name);
+      if (entry === undefined) {
+        return;
+      }
+      const stored = { ...info(name, entry), body: entry.body.slice() };
+      return stored;
+    },
+    async head(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const entry = organizations.get(org)?.get(name);
+      return entry === undefined ? undefined : info(name, entry);
+    },
+    async delete(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      organizations.get(org)?.delete(name);
+    },
+    async list(organizationId, listOptions) {
+      const org = check.organization(organizationId);
+      const { prefix, after, limit } = check.list(listOptions);
+      const matches = [];
+      for (const pair of organizations.get(org) ?? []) {
+        if (pair[0].startsWith(prefix) && (after === undefined || pair[0] > after)) {
+          matches.push(pair);
+        }
+      }
+      matches.sort((x, y) => x[0] < y[0] ? -1 : 1);
+      const items = matches.slice(0, limit).map(([name, entry]) => {
+        const { key, size, lastModified } = info(name, entry);
+        return { key, size, lastModified };
+      });
+      const last = items.at(-1);
+      const result = { items };
+      if (matches.length > limit && last !== undefined) {
+        result.nextCursor = encodeCursor(last.key);
+      }
+      return result;
+    }
+  };
+}
+// src/vector/validate.ts
+var VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+var ATTRIBUTE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+var RESERVED_ATTRIBUTE_NAMES = new Set(["id", "vector"]);
+var bad = (message) => new VectorError2(VECTOR_ERROR_CODES2.invalidRequest, message);
+function attributesMatch(attributes, filter) {
+  for (const name of Object.keys(filter)) {
+    if (!Object.hasOwn(attributes, name) || attributes[name] !== filter[name]) {
+      return false;
+    }
+  }
+  return true;
+}
+function createVectorValidator(options) {
+  const { dimensions } = options;
+  if (!Number.isInteger(dimensions) || dimensions < 1 || dimensions > MAX_DIMENSIONS2) {
+    throw new TypeError("dimensions must be a whole number from 1 to 4096");
+  }
+  const isOrganization = createOrganizationIdGuard(options.isOrganizationId);
+  function vector(value) {
+    if (typeof value !== "object" || value === null || typeof value.length !== "number") {
+      throw bad("a vector must be an array of numbers");
+    }
+    const source = value;
+    if (source.length !== dimensions) {
+      throw new VectorError2(VECTOR_ERROR_CODES2.dimensionMismatch, `a vector must have ${dimensions} dimensions`, { details: { expected: dimensions, actual: source.length } });
+    }
+    const out = new Float32Array(dimensions);
+    let norm = 0;
+    for (let i = 0;i < dimensions; i++) {
+      const x = source[i];
+      if (typeof x !== "number") {
+        throw bad("a vector holds only finite numbers");
+      }
+      out[i] = x;
+      const stored = out[i];
+      if (!Number.isFinite(stored)) {
+        throw bad("a vector holds only finite numbers");
+      }
+      norm += stored * stored;
+    }
+    if (!(norm > 0) || !Number.isFinite(norm)) {
+      throw bad("a vector must not be all zeros or too large to compare");
+    }
+    return out;
+  }
+  function attributes(value, what) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw bad(`${what} must be an object`);
+    }
+    const names = Object.keys(value);
+    if (names.length > MAX_ATTRIBUTES2) {
+      throw bad(`${what} has at most 16 entries`);
+    }
+    const out = {};
+    for (const name of names) {
+      const item = value[name];
+      const okValue = typeof item === "boolean" || typeof item === "number" && Number.isFinite(item) || typeof item === "string" && item.length <= MAX_ATTRIBUTE_STRING2;
+      if (!ATTRIBUTE_NAME.test(name) || RESERVED_ATTRIBUTE_NAMES.has(name) || !okValue) {
+        throw bad(`${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters; "id" and "vector" are reserved`);
+      }
+      out[name] = item;
+    }
+    return out;
+  }
+  function id(value) {
+    if (typeof value !== "string" || !VECTOR_ID.test(value)) {
+      throw bad('a vector id is 1 to 64 letters, digits, ".", "_", ":" or "-"');
+    }
+    return value;
+  }
+  return {
+    dimensions,
+    organization(value) {
+      if (!isOrganization(value)) {
+        throw bad("the Organization id is not valid");
+      }
+      return value;
+    },
+    records(value) {
+      if (!Array.isArray(value) || value.length < 1 || value.length > MAX_UPSERT_BATCH2) {
+        throw bad("an upsert takes 1 to 500 records");
+      }
+      const seen = new Set;
+      return value.map((record) => {
+        if (typeof record !== "object" || record === null) {
+          throw bad("a record must be an object");
+        }
+        const raw = record;
+        const recordId = id(raw.id);
+        if (seen.has(recordId)) {
+          throw bad("an upsert holds each id once");
+        }
+        seen.add(recordId);
+        return {
+          id: recordId,
+          vector: vector(raw.vector),
+          attributes: raw.attributes === undefined ? {} : attributes(raw.attributes, "attributes")
+        };
+      });
+    },
+    query(value) {
+      if (typeof value !== "object" || value === null) {
+        throw bad("a search must be an object");
+      }
+      const raw = value;
+      if (typeof raw.topK !== "number" || !Number.isInteger(raw.topK) || raw.topK < 1 || raw.topK > MAX_TOP_K2) {
+        throw bad("topK must be a whole number from 1 to 100");
+      }
+      return {
+        vector: vector(raw.vector),
+        topK: raw.topK,
+        filter: raw.filter === undefined ? {} : attributes(raw.filter, "filter")
+      };
+    },
+    ids(value) {
+      if (!Array.isArray(value) || value.length < 1 || value.length > MAX_DELETE_BATCH2) {
+        throw bad("a delete takes 1 to 500 ids");
+      }
+      return value.map(id);
+    },
+    nonEmptyFilter(value) {
+      const filter = attributes(value, "filter");
+      if (Object.keys(filter).length === 0) {
+        throw bad("the filter must have at least one entry");
+      }
+      return filter;
+    }
+  };
+}
+
+// src/vector/memory.ts
+function normalise(vector) {
+  let norm = 0;
+  for (const x of vector) {
+    norm += x * x;
+  }
+  const scale = 1 / Math.sqrt(norm);
+  return vector.map((x) => x * scale);
+}
+function createMemoryVectorStore(options) {
+  const check = createVectorValidator(options);
+  const organizations = new Map;
+  return {
+    dimensions: check.dimensions,
+    async warm(organizationId) {
+      check.organization(organizationId);
+    },
+    async deleteAll(organizationId) {
+      organizations.delete(check.organization(organizationId));
+    },
+    async upsert(organizationId, records) {
+      const org = check.organization(organizationId);
+      const checked = check.records(records);
+      let vectors = organizations.get(org);
+      if (vectors === undefined) {
+        vectors = new Map;
+        organizations.set(org, vectors);
+      }
+      for (const record of checked) {
+        vectors.set(record.id, {
+          unit: normalise(record.vector),
+          attributes: { ...record.attributes }
+        });
+      }
+    },
+    async search(organizationId, query) {
+      const org = check.organization(organizationId);
+      const { vector, topK, filter } = check.query(query);
+      const unit = normalise(vector);
+      const hits = [];
+      for (const [id, stored] of organizations.get(org) ?? []) {
+        if (!attributesMatch(stored.attributes, filter)) {
+          continue;
+        }
+        let dot = 0;
+        for (let i = 0;i < unit.length; i++) {
+          dot += unit[i] * stored.unit[i];
+        }
+        hits.push({ id, score: dot, attributes: { ...stored.attributes } });
+      }
+      hits.sort((x, y) => y.score - x.score || (x.id < y.id ? -1 : 1));
+      return hits.slice(0, topK);
+    },
+    async delete(organizationId, ids) {
+      const org = check.organization(organizationId);
+      const checked = check.ids(ids);
+      const vectors = organizations.get(org);
+      for (const id of checked) {
+        vectors?.delete(id);
+      }
+    },
+    async deleteByFilter(organizationId, filter) {
+      const org = check.organization(organizationId);
+      const checked = check.nonEmptyFilter(filter);
+      const vectors = organizations.get(org);
+      for (const [id, stored] of vectors ?? []) {
+        if (attributesMatch(stored.attributes, checked)) {
+          vectors?.delete(id);
+        }
+      }
+    }
+  };
+}
 
 // src/testing.ts
 function build(entries, bound) {
@@ -373,7 +663,9 @@ export {
   DEFAULT_TEST_USER_ID,
   createMemoryErrorReporter,
   createMemoryLogger,
+  createMemoryObjectStore,
   createMemoryQueue,
+  createMemoryVectorStore,
   createTestDeps,
   createTestJwks,
   createTestKeyPair,

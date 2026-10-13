@@ -477,6 +477,8 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
+/** Decides whether a string is an Organization id this deployment accepts. */
+type OrganizationIdCheck = (value: string) => boolean;
 import { z as z3 } from "zod";
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
@@ -912,6 +914,239 @@ declare function cutText(text: string, max: number): string;
 * returns a fixed placeholder.
 */
 declare function scrubText(text: string): string;
+/** The `area.reason` codes the object storage port and adapters throw. */
+declare const STORAGE_ERROR_CODES: {
+	/** An Organization id, key, prefix, cursor, content type, limit or body is not acceptable. */
+	readonly invalidRequest: "storage.invalid_request";
+	/** An object is over the store's size limit. */
+	readonly objectTooLarge: "storage.object_too_large";
+	/** The store refused the call for a reason a retry cannot fix (no such bucket, access denied). */
+	readonly rejected: "storage.rejected";
+	/** The store did not answer, in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "storage.unavailable";
+	/** The store answered with something this adapter cannot use. */
+	readonly badResponse: "storage.bad_response";
+};
+/** One of {@link STORAGE_ERROR_CODES}'s values. */
+type StorageErrorCode = (typeof STORAGE_ERROR_CODES)[keyof typeof STORAGE_ERROR_CODES];
+/** What an object store throws. Its message never holds an object body, a key or a URL. */
+declare class StorageError extends AppError {
+	readonly code: StorageErrorCode;
+	constructor(code: StorageErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** The longest key, in bytes. */
+declare const MAX_KEY_BYTES = 512;
+/** The most `/`-separated segments a key can have. */
+declare const MAX_KEY_SEGMENTS = 16;
+/** The default largest object, in bytes (25 MiB). */
+declare const DEFAULT_MAX_OBJECT_BYTES: number;
+/** The largest `maxObjectBytes` a store can be configured with (100 MiB): bodies are held in memory. */
+declare const MAX_OBJECT_BYTES_LIMIT: number;
+/** The default page size of {@link ObjectStore.list}. */
+declare const DEFAULT_LIST_LIMIT = 100;
+/** The largest page size of {@link ObjectStore.list}. */
+declare const MAX_LIST_LIMIT = 1e3;
+/** The content type stored when the caller gives none. */
+declare const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+/** What a listing says about one object. */
+interface ObjectEntry {
+	/** The key, relative to the Organization. */
+	key: string;
+	/** The size in bytes. */
+	size: number;
+	/** When the object was last written. */
+	lastModified: Date;
+}
+/** What {@link ObjectStore.head} says about one object. */
+interface ObjectInfo extends ObjectEntry {
+	/**
+	* The content type as the store holds it, which is what the writer gave except that a store may
+	* normalise insignificant whitespace in the parameters (`text/plain; charset=utf-8` can come back
+	* as `text/plain;charset=utf-8`). Never compare it as a raw string, and never use it to decide
+	* behaviour: it is informational and untrusted.
+	*/
+	contentType: string;
+}
+/** An object with its body. */
+interface StoredObject extends ObjectInfo {
+	/** The bytes. A copy: changing it does not change the store. */
+	body: Uint8Array;
+}
+/** Options of {@link ObjectStore.put}. */
+interface PutOptions {
+	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
+	contentType?: string;
+}
+/** Options of {@link ObjectStore.list}. */
+interface ListOptions {
+	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface ListPage {
+	/** Objects in ascending key order. */
+	items: ObjectEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Object storage scoped by Organization. Every call takes the Organization id first and can reach
+* only that Organization's objects: the adapter derives the real location from the validated id,
+* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
+* id that starts with another id) can name another Organization's data. Keys are relative to the
+* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
+* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
+* keeps the content type as given (returned as the store holds it, see {@link ObjectInfo}) and never looks at the content. Bodies are held in memory, so an
+* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
+* {@link StorageError}; only `storage.unavailable` is worth retrying.
+*/
+interface ObjectStore {
+	/**
+	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
+	* same object. O(object size).
+	*/
+	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/** Reads an object, or returns `undefined` when there is none. O(object size). */
+	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
+	/**
+	* Reads an object's metadata, or returns `undefined` when there is none. O(1). On S3 a HEAD of a
+	* bucket that does not exist also reads as `undefined`, because a HEAD response carries no error
+	* body to tell the two apart; `get`, `put`, `delete` and `list` do report a missing bucket as
+	* `storage.rejected`.
+	*/
+	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
+	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
+	delete(organizationId: string, key: string): Promise<void>;
+	/**
+	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
+	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
+	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
+	*/
+	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
+}
+/** The `area.reason` codes the vector store port and adapters throw. */
+declare const VECTOR_ERROR_CODES: {
+	/** An Organization id, vector id, attribute, filter, batch or `topK` is not acceptable. */
+	readonly invalidRequest: "vector.invalid_request";
+	/** A vector's length is not the store's dimension count. Never retryable: the caller or the model changed. */
+	readonly dimensionMismatch: "vector.dimension_mismatch";
+	/** The store refused the call for a reason a retry cannot fix (access denied, wrong index). */
+	readonly rejected: "vector.rejected";
+	/** The store did not answer, in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "vector.unavailable";
+	/** The store answered with something this adapter cannot use. */
+	readonly badResponse: "vector.bad_response";
+};
+/** One of {@link VECTOR_ERROR_CODES}'s values. */
+type VectorErrorCode = (typeof VECTOR_ERROR_CODES)[keyof typeof VECTOR_ERROR_CODES];
+/** What a vector store throws. Its message never holds a vector, an attribute value or query text. */
+declare class VectorError extends AppError {
+	readonly code: VectorErrorCode;
+	constructor(code: VectorErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** The most vectors one `upsert` takes. */
+declare const MAX_UPSERT_BATCH = 500;
+/** The most ids one `delete` takes. */
+declare const MAX_DELETE_BATCH = 500;
+/** The longest vector id, in characters (ids are ASCII, so bytes): turbopuffer's limit for string ids. */
+declare const MAX_VECTOR_ID_LENGTH = 64;
+/** The largest `topK` of a search. */
+declare const MAX_TOP_K = 100;
+/** The most dimensions a store can be configured with. */
+declare const MAX_DIMENSIONS = 4096;
+/** The most attributes on one vector, and the most keys in one filter. */
+declare const MAX_ATTRIBUTES = 16;
+/** The longest string attribute value, in characters. */
+declare const MAX_ATTRIBUTE_STRING = 512;
+/** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
+type AttributeValue = string | number | boolean;
+/**
+* Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`.
+* Names are lower-case snake_case; `id` and `vector` are reserved. A name should always carry the
+* same kind of value (string, number or boolean): a vendor that infers a column's type from its
+* first value refuses a later value of another type.
+*/
+type VectorAttributes = Readonly<Record<string, AttributeValue>>;
+/** A vector to store. */
+interface VectorRecord {
+	/** Unique within the Organization, 1 to 64 of letters, digits, `.`, `_`, `:` and `-`; storing an id again replaces the vector. */
+	id: string;
+	/** Exactly the store's `dimensions` finite numbers, not all zero. */
+	vector: ArrayLike<number>;
+	/** Optional attributes (at most 16). */
+	attributes?: VectorAttributes;
+}
+/** A similarity search. */
+interface SearchQuery {
+	/** The query vector, the store's `dimensions` long. */
+	vector: ArrayLike<number>;
+	/** How many hits at most, 1 to 100. */
+	topK: number;
+	/** Keep only vectors whose attributes equal every entry here. */
+	filter?: VectorAttributes;
+}
+/** One search result. */
+interface SearchHit {
+	/** The vector's id. */
+	id: string;
+	/** Cosine similarity to the query, -1 to 1; higher is closer. */
+	score: number;
+	/** The vector's attributes (empty when it had none). */
+	attributes: VectorAttributes;
+}
+/**
+* Vector storage scoped by Organization. Every call takes the Organization id first and reaches
+* only that Organization's vectors: an adapter derives its namespace or filter from the validated
+* id, never from a caller's string, so a search, an upsert or a delete cannot touch another
+* Organization. A store is created for one embedding model's dimension count; a vector of any
+* other length is `vector.dimension_mismatch`, which no retry fixes. Scores are cosine similarity.
+* Throws {@link VectorError}; only `vector.unavailable` is worth retrying. Text and vectors are
+* data, never instructions, and no operation logs them.
+*/
+interface VectorStore {
+	/** The length every vector and query must have. */
+	readonly dimensions: number;
+	/**
+	* Tells the store to get an Organization's index ready for low-latency search, as ADR 0010
+	* wants done when a call starts. Resolves when the hint is accepted, not when the index is warm.
+	* Never changes data; harmless to repeat or to send for an Organization with no vectors. O(1).
+	*/
+	warm(organizationId: string): Promise<void>;
+	/**
+	* Deletes every vector the Organization has (offboarding). Idempotent: an Organization with
+	* none resolves. Work proportional to the Organization's size: call it from a queued job.
+	*/
+	deleteAll(organizationId: string): Promise<void>;
+	/**
+	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
+	* leaves the same data. Everything is validated before anything is written, so a bad record
+	* writes nothing. Memory adapter O(batch × dimensions).
+	*/
+	upsert(organizationId: string, records: readonly VectorRecord[]): Promise<void>;
+	/**
+	* Returns the `topK` closest vectors that match the filter, best first (the order of equal scores is not promised). Memory
+	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
+	*/
+	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
+	delete(organizationId: string, ids: readonly string[]): Promise<void>;
+	/**
+	* Deletes every vector whose attributes equal every entry of `filter` (at least one entry, so it
+	* cannot empty an Organization by accident). Idempotent. Memory adapter O(n). Work proportional
+	* to the Organization's size: call it from a queued job, not a request.
+	*/
+	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
+}
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, PreviousVersion, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
