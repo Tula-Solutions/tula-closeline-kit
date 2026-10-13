@@ -18,6 +18,14 @@
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
+    },
+    "./queue": {
+      "types": "./dist/queue.d.ts",
+      "import": "./dist/queue.js"
+    },
+    "./testing/behaviour": {
+      "types": "./dist/behaviour.d.ts",
+      "import": "./dist/behaviour.js"
     }
   },
   "scripts": {
@@ -32,7 +40,8 @@
     "precommit:dist": "bunup && git add dist",
     "verify": "bun run check && bun run typecheck && bun run test:coverage && bun run bench && bun run dist:check && bun run shared:check",
     "verify:changed": "biome check --changed --no-errors-on-unmatched src scripts && bun run typecheck && bun run test",
-    "bench": "bun run bench/verify.bench.ts && bun run bench/reporting.bench.ts && bun run bench/queue.bench.ts"
+    "bench": "bun run bench/verify.bench.ts && bun run bench/reporting.bench.ts && bun run bench/queue.bench.ts",
+    "test:integration": "QUEUE_TEST_ENDPOINT=http://127.0.0.1:9324 bun test ./src/queue/aws.integration.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
