@@ -1,3 +1,4 @@
+import { setDefaultTimeout } from 'bun:test'
 import {
   CreateQueueCommand,
   DeleteQueueCommand,
@@ -35,8 +36,12 @@ if (endpoint === undefined || endpoint === '') {
 } else if (!LOCAL_ENDPOINT.test(endpoint)) {
   throw new Error('QUEUE_TEST_ENDPOINT must be a local http endpoint, never AWS')
 } else {
+  // These cases wait on real visibility timeouts and long polls. Bun's 5 s default is too tight for
+  // them (the first CI run timed out three at 5004 ms, after which the queue was deleted under the
+  // still-running test and a QueueDoesNotExist surfaced); no assertion looks at elapsed time.
+  setDefaultTimeout(30_000)
   const MAX_RECEIVE_COUNT = 3
-  const VISIBILITY_SECONDS = 2
+  const VISIBILITY_SECONDS = 1
   const credentials = { accessKeyId: 'test', secretAccessKey: 'test' }
   const admin = new SQSClient({ region: 'eu-west-1', endpoint, credentials })
   // ElasticMQ builds queue URLs from its own node address, which can differ from the address the
@@ -83,7 +88,7 @@ if (endpoint === undefined || endpoint === '') {
       maxReceiveCount: MAX_RECEIVE_COUNT,
       // Real time: the queue's clock is not ours. The margin covers ElasticMQ's own timer; the
       // suite's receives retry for a few seconds, so a late redelivery is waited for, not missed.
-      pass: (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000 + 1000)),
+      pass: (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000 + 500)),
       injectRaw: async (body) => {
         await admin.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: body }))
       },
