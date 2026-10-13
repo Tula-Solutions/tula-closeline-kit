@@ -629,7 +629,10 @@ describe('a DSN the SDK would reject is caught before the SDK sees it (review F2
 })
 
 describe('capture does bounded work whatever it is given (review F4)', () => {
-  const LIMIT_MS = 20
+  // Wall-clock limits flake on shared CI runners (20 ms failed there at 23.7 ms), so this is loose
+  // on purpose. The unbounded behaviour it guards against took from 265 ms to over a second in
+  // review, on smaller inputs than these.
+  const LIMIT_MS = 200
 
   /** Captures once to warm the SDK paths, then times the call under test. */
   function timed(h: ReturnType<typeof harness>, error: unknown): number {

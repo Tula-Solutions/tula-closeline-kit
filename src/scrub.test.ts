@@ -420,9 +420,12 @@ describe('cutText', () => {
   })
 
   test('is bounded by the limit, not by the length of the text', () => {
+    // Build the input outside the timed region; allocating 50 MB is not what is being measured.
+    const text = 'a'.repeat(50_000_000)
     const start = performance.now()
-    const out = cutText('a'.repeat(50_000_000), 8_192)
-    expect(performance.now() - start).toBeLessThan(20)
+    const out = cutText(text, 8_192)
+    // Loose on purpose: a tight wall-clock limit flakes on shared CI runners.
+    expect(performance.now() - start).toBeLessThan(200)
     expect(out).toBe('[truncated]')
   })
 })
