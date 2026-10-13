@@ -1,10 +1,13 @@
 import { createFixedClock } from '../src/clock'
+import { createLogger } from '../src/logger'
+import { createConsumer } from '../src/queue/consumer'
 import { createMemoryQueue } from '../src/queue/memory'
+import { createMemoryProcessedStore } from '../src/queue/store'
 import { createTestRegistry } from '../src/queue/testing'
 
 /**
  * Benchmark: the queue's envelope validation and the memory adapter's publish, receive and
- * acknowledge, in three legs. The SQS adapter's cost is one HTTP round trip and is not measured
+ * acknowledge, in four legs. The SQS adapter's cost is one HTTP round trip and is not measured
  * here; what it adds on top is the same `encode` and `decode`.
  *
  * Input: 2,000 distinct messages per leg from a fixed sequence (no randomness), each timed alone.
@@ -17,9 +20,14 @@ import { createTestRegistry } from '../src/queue/testing'
  *   otherwise empty. Expected complexity O(1) for publish and acknowledge and O(messages stored)
  *   for receive, which is a scan, so the leg keeps the queue empty.
  *
- * Budgets, per call. Measured on one developer machine: 0.002 ms, 0.034 ms and 0.004 ms mean for
- * the three legs; each budget is 8x to 10x that, wide on purpose to catch an accidental
- * quadratic or an uncapped input, not a few percent.
+ * - `consumer cycle` is a publish and then one `pollOnce` of a consumer on the memory queue and
+ *   the memory store: receive, claim, a handler that does nothing, complete and acknowledge.
+ *   Expected complexity O(1) with the queue otherwise empty.
+ *
+ * Budgets, per call. Measured on one developer machine, mean: 0.003 ms, 0.02 to 0.03 ms, 0.003 ms
+ * and 0.013 ms for the four legs. The mean budget is about 5x that; the median and the best-batch
+ * p95 budgets sit close to it. They catch an accidental quadratic or an uncapped input, not a few
+ * percent.
  * The median and best-of-five-batches p95 are used as in `reporting.bench.ts`, so a single
  * scheduler stall cannot fail the check.
  */
@@ -34,13 +42,28 @@ interface Budget {
   medianMs: number
   tailMs: number
 }
-const SMALL_BUDGET: Budget = { meanMs: 0.02, medianMs: 0.015, tailMs: 0.03 }
-const BIG_BUDGET: Budget = { meanMs: 0.3, medianMs: 0.25, tailMs: 0.4 }
-const CYCLE_BUDGET: Budget = { meanMs: 0.03, medianMs: 0.025, tailMs: 0.05 }
+const SMALL_BUDGET: Budget = { meanMs: 0.015, medianMs: 0.01, tailMs: 0.015 }
+const BIG_BUDGET: Budget = { meanMs: 0.15, medianMs: 0.13, tailMs: 0.18 }
+const CONSUMER_BUDGET: Budget = { meanMs: 0.07, medianMs: 0.055, tailMs: 0.085 }
+const CYCLE_BUDGET: Budget = { meanMs: 0.02, medianMs: 0.016, tailMs: 0.025 }
 
 const clock = createFixedClock('2026-01-01T00:00:00.000Z')
 const registry = createTestRegistry({ clock })
 const queue = createMemoryQueue({ registry, clock })
+const consumerQueue = createMemoryQueue({ registry, clock })
+let handled = 0
+const consumer = createConsumer({
+  name: 'bench.consumer',
+  queue: consumerQueue,
+  store: createMemoryProcessedStore({ clock }),
+  logger: createLogger({ service: 'bench', level: 'silent' }),
+  concurrency: 1,
+  handlers: {
+    'test.ping': async () => {
+      handled += 1
+    },
+  },
+})
 
 const small = Array.from({ length: CALLS + WARMUP }, (_, i) =>
   registry.create({
@@ -116,6 +139,18 @@ const legs: Array<Leg<unknown>> = [
       await queue.acknowledge(got.receipt)
     },
   },
+  {
+    name: 'consumer cycle (publish, claim, handler, complete, acknowledge)',
+    budget: CONSUMER_BUDGET,
+    inputs: small,
+    warmup: WARMUP,
+    run: async (input) => {
+      await consumerQueue.publish(input as (typeof small)[number])
+      if ((await consumer.pollOnce()) !== 1) {
+        throw new Error('nothing received')
+      }
+    },
+  },
 ]
 
 /** The q-th quantile of the samples (0 to 1), by nearest rank. */
@@ -161,6 +196,9 @@ for (const leg of legs) {
       `${leg.name}: best p95 of ${BATCHES} batches ${tail.toFixed(4)} ms > ${leg.budget.tailMs} ms`
     )
   }
+}
+if (handled === 0) {
+  failures.push('the consumer leg never ran a handler')
 }
 if (failures.length > 0) {
   process.stderr.write(`bench failed: ${failures.join('; ')}\n`)
