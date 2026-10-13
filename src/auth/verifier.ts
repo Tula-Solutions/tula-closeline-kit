@@ -83,10 +83,12 @@ export function createTokenVerifier(options: TokenVerifierOptions): TokenVerifie
       if (typeof token !== 'string' || token.length === 0 || token.length > MAX_TOKEN_LENGTH) {
         return reject()
       }
-      const key = await keys.getKey(readKid(token))
+      const kid = readKid(token)
+      const key = await keys.getKey(kid)
       if (key === undefined) {
-        // An unknown kid on keys we hold is a bad token; without loaded keys it is our outage.
-        return reject(keys.available() ? 'invalid' : 'unavailable')
+        // A bad token only if the issuer last answered in full and lacked this kid; otherwise a
+        // forged kid cannot be told from a newly rotated key, so it is our outage.
+        return reject(keys.confirmsAbsent(kid) ? 'invalid' : 'unavailable')
       }
       const now = clock.now()
       let payload: unknown

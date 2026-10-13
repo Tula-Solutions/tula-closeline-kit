@@ -21,7 +21,7 @@ const clock = createFixedClock('2026-06-01T12:00:00.000Z')
 let pair: TestKeyPair
 let verifier: TokenVerifier
 
-function build(v: TokenVerifier = verifier) {
+function build(v: TokenVerifier = verifier, logClock = clock) {
   const logger = createMemoryLogger()
   const app = new Hono<AuthEnv>()
   app.onError((error, c) => {
@@ -32,7 +32,7 @@ function build(v: TokenVerifier = verifier) {
     }
     return c.newResponse('internal', 500)
   })
-  app.use('*', createAuthMiddleware({ verifier: v, logger }))
+  app.use('*', createAuthMiddleware({ verifier: v, logger, clock: logClock }))
   app.get('/me', (c) =>
     c.json({
       organizationId: c.get('organizationId'),
@@ -242,5 +242,85 @@ describe('an authenticated request', () => {
     const t = build()
     await t.app.request('/me', bearer(await mintTestToken({ keyPair: pair, clock })))
     expect(t.logger.entries).toEqual([])
+  })
+})
+
+describe('the outage log under a flood', () => {
+  const down: TokenVerifier = {
+    verify: async () => {
+      throw new TokenVerificationError('unavailable')
+    },
+  }
+  const errorLines = (t: ReturnType<typeof build>) =>
+    t.logger.entries.filter((e) => e.level === 'error')
+
+  test('1,000 requests inside a second write one error line, and every one still gets a 503', async () => {
+    const t = build(down, createFixedClock('2026-06-01T12:00:00.000Z'))
+    for (let i = 0; i < 1_000; i++) {
+      await expectRejected(await t.app.request('/me', bearer('a.b.c')), 'auth.unavailable', 503)
+    }
+    expect(errorLines(t)).toHaveLength(1)
+    expect(errorLines(t)[0]?.fields).toEqual({ reason: 'unavailable' })
+  })
+
+  test('the next line after a second carries the count of lines that were held back', async () => {
+    const logClock = createFixedClock('2026-06-01T12:00:00.000Z')
+    const t = build(down, logClock)
+    for (let i = 0; i < 5; i++) {
+      await t.app.request('/me', bearer('a.b.c'))
+    }
+    logClock.advance('999ms')
+    await t.app.request('/me', bearer('a.b.c'))
+    expect(errorLines(t)).toHaveLength(1)
+    logClock.advance('1ms')
+    await t.app.request('/me', bearer('a.b.c'))
+    expect(errorLines(t)).toHaveLength(2)
+    expect(errorLines(t)[1]?.fields).toEqual({ reason: 'unavailable', suppressed: 5 })
+    logClock.advance('1s')
+    await t.app.request('/me', bearer('a.b.c'))
+    expect(errorLines(t)[2]?.fields).toEqual({ reason: 'unavailable' })
+  })
+
+  test('unexpected verifier failures share the limit and are still logged by class name only', async () => {
+    class Boom extends Error {}
+    const broken: TokenVerifier = {
+      verify: async () => {
+        throw new Boom('x')
+      },
+    }
+    const t = build(broken, createFixedClock('2026-06-01T12:00:00.000Z'))
+    for (let i = 0; i < 20; i++) {
+      await t.app.request('/me', bearer('a.b.c'))
+    }
+    expect(errorLines(t)).toEqual([
+      {
+        level: 'error',
+        message: 'token verification failed unexpectedly',
+        fields: { errorClass: 'Boom' },
+      },
+    ])
+  })
+
+  test('each middleware instance keeps its own limit, and warnings are not limited', async () => {
+    const logClock = createFixedClock('2026-06-01T12:00:00.000Z')
+    const a = build(down, logClock)
+    const b = build(down, logClock)
+    await a.app.request('/me', bearer('a.b.c'))
+    await b.app.request('/me', bearer('a.b.c'))
+    expect(errorLines(a)).toHaveLength(1)
+    expect(errorLines(b)).toHaveLength(1)
+    for (let i = 0; i < 10; i++) {
+      await a.app.request('/me')
+    }
+    expect(a.logger.entries.filter((e) => e.level === 'warn')).toHaveLength(10)
+  })
+
+  test('a clock that steps backwards does not silence the log', async () => {
+    const stepped = { t: Date.parse('2026-06-01T12:00:00.000Z') }
+    const t = build(down, { now: () => new Date(stepped.t) } as typeof clock)
+    await t.app.request('/me', bearer('a.b.c'))
+    stepped.t -= 60_000
+    await t.app.request('/me', bearer('a.b.c'))
+    expect(errorLines(t)).toHaveLength(2)
   })
 })

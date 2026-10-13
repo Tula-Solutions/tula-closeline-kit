@@ -641,3 +641,147 @@ describe('createRemoteKeySet with a verifier', () => {
     await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'unavailable' })
   })
 })
+
+describe('when an unknown kid is a bad token and when it is an outage', () => {
+  async function loadedVerifier(options: Partial<RemoteKeySetOptions> = {}) {
+    const t = setup({ retries: 0, ...options })
+    await t.keys.warm()
+    const verifier = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys: t.keys,
+      clock: t.clock,
+    })
+    return {
+      ...t,
+      verifier,
+      forged: () => mintTestToken({ keyPair: k3, clock: t.clock }),
+      valid: () => mintTestToken({ keyPair: k1, clock: t.clock }),
+    }
+  }
+
+  test('a failed refresh makes an unknown kid an outage; a later good one makes it invalid', async () => {
+    const t = await loadedVerifier()
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('31s')
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({
+      reason: 'unavailable',
+    })
+    t.respond(() => Response.json(createTestJwks(k1)))
+    t.clock.advance('31s')
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({ reason: 'invalid' })
+  })
+
+  test('a refresh cut off by the lookup deadline is an outage, not a bad token', async () => {
+    const clock = createFixedClock('2026-06-01T12:00:00.000Z')
+    let calls = 0
+    const keys = createRemoteKeySet({
+      url: URL_,
+      clock,
+      fetch: (async () => {
+        calls++
+        return calls === 1 ? Response.json(createTestJwks(k1)) : new Promise<Response>(() => {})
+      }) as unknown as typeof fetch,
+      timeoutMs: 60_000,
+      lookupDeadlineMs: 20,
+    })
+    await keys.warm()
+    clock.advance('31s')
+    const verifier = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys,
+      clock,
+    })
+    const forged = await mintTestToken({ keyPair: k3, clock })
+    await expect(verifier.verify(forged)).rejects.toMatchObject({ reason: 'unavailable' })
+    expect(calls).toBe(2)
+  })
+
+  test('a refresh blocked by the cooldown inherits the outcome of the attempt that started it', async () => {
+    const t = await loadedVerifier()
+    t.clock.advance('31s')
+    // The attempt that starts the cooldown succeeds and lacks the kid: invalid, then still invalid.
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({ reason: 'invalid' })
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({ reason: 'invalid' })
+    expect(t.calls).toHaveLength(2)
+    // The attempt that starts the next cooldown fails: unavailable, and still unavailable.
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('31s')
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({
+      reason: 'unavailable',
+    })
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({
+      reason: 'unavailable',
+    })
+    expect(t.calls).toHaveLength(3)
+  })
+
+  test('a failed warm-up leaves an unknown kid an outage even though keys were loaded before', async () => {
+    const t = await loadedVerifier()
+    t.respond(() => new Response('down', { status: 503 }))
+    await t.keys.warm()
+    await expect(t.verifier.verify(await t.forged())).rejects.toMatchObject({
+      reason: 'unavailable',
+    })
+  })
+
+  test('a flood of forged kids during an outage never turns cached-key traffic into 503s', async () => {
+    const t = await loadedVerifier()
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('31s')
+    const forged = await t.forged()
+    const valid = await t.valid()
+    const fetchesBefore = t.calls.length
+    for (let i = 0; i < 100; i++) {
+      await expect(t.verifier.verify(forged)).rejects.toMatchObject({ reason: 'unavailable' })
+      await expect(t.verifier.verify(valid)).resolves.toMatchObject({ role: 'rep' })
+    }
+    expect(t.calls.length - fetchesBefore).toBe(1)
+  })
+
+  test('the static key set always confirms that an unknown kid is absent', async () => {
+    const set = await createStaticKeySet(createTestJwks(k1))
+    expect(set.confirmsAbsent('nobody')).toBe(true)
+  })
+})
+
+describe('createRemoteKeySet bookkeeping', () => {
+  test('the lookup deadline timer is cleared when the refresh finishes first', async () => {
+    const deadlineMs = 1_234
+    const pending = new Set<unknown>()
+    const realSet = globalThis.setTimeout
+    const realClear = globalThis.clearTimeout
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      const id = realSet(fn, ms, ...rest)
+      if (ms === deadlineMs) {
+        pending.add(id)
+      }
+      return id
+    }) as unknown as typeof setTimeout
+    globalThis.clearTimeout = ((id?: Parameters<typeof clearTimeout>[0]) => {
+      pending.delete(id)
+      realClear(id)
+    }) as typeof clearTimeout
+    try {
+      const t = setup({ lookupDeadlineMs: deadlineMs })
+      expect(await t.keys.getKey('k1')).toBeDefined()
+      expect(pending.size).toBe(0)
+    } finally {
+      globalThis.setTimeout = realSet
+      globalThis.clearTimeout = realClear
+      for (const id of pending) {
+        realClear(id as Parameters<typeof clearTimeout>[0])
+      }
+    }
+  })
+
+  test('available() drops keys that have gone stale without any lookup in between', async () => {
+    const t = setup()
+    await t.keys.warm()
+    expect(t.keys.available()).toBe(true)
+    t.clock.advance('25h')
+    expect(t.keys.available()).toBe(false)
+    expect(t.logger.entries.map((e) => e.message)).toContain('jwks keys dropped as stale')
+  })
+})

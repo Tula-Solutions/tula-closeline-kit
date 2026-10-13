@@ -99,7 +99,11 @@ async function createStaticKeySet(jwks) {
     }
     keys.set(entry[0], entry[1]);
   }
-  return { getKey: async (kid) => keys.get(kid), available: () => true };
+  return {
+    getKey: async (kid) => keys.get(kid),
+    available: () => true,
+    confirmsAbsent: (kid) => !keys.has(kid)
+  };
 }
 
 class RetryableFetchError extends Error {
@@ -164,6 +168,7 @@ function createRemoteKeySet(options) {
   let keys = new Map;
   let loadedAt;
   let lastAttemptAt;
+  let lastAttemptSucceeded = false;
   let inflight;
   const now = () => options.clock.now().getTime();
   function log(level, message, fields) {
@@ -230,7 +235,9 @@ function createRemoteKeySet(options) {
       }
       keys = fresh.keys;
       loadedAt = now();
+      lastAttemptSucceeded = true;
     } catch (error) {
+      lastAttemptSucceeded = false;
       log("warn", "jwks refresh failed", {
         reason: error instanceof Error ? error.message : "unknown",
         keysServed: keys.size
@@ -239,6 +246,7 @@ function createRemoteKeySet(options) {
   }
   function startRefresh() {
     lastAttemptAt = now();
+    lastAttemptSucceeded = false;
     const run = refresh().finally(() => {
       if (inflight === run) {
         inflight = undefined;
@@ -286,7 +294,14 @@ function createRemoteKeySet(options) {
       }
       return keys.get(kid);
     },
-    available: () => loadedAt !== undefined && !isStale(),
+    available() {
+      dropIfStale();
+      return loadedAt !== undefined;
+    },
+    confirmsAbsent(kid) {
+      dropIfStale();
+      return loadedAt !== undefined && lastAttemptSucceeded && !inflight && !keys.has(kid);
+    },
     warm() {
       return inflight ?? startRefresh();
     }
@@ -345,13 +360,32 @@ function unavailable() {
     message: "Authentication is temporarily unavailable."
   });
 }
-function toAppError(error, logger) {
+var ERROR_LOG_INTERVAL_MS = 1000;
+function createErrorLimiter(logger, clock) {
+  let lastWrittenAt;
+  let suppressed = 0;
+  return (message, fields) => {
+    if (logger === undefined) {
+      return;
+    }
+    const now = clock.now().getTime();
+    const elapsed = lastWrittenAt === undefined ? Number.POSITIVE_INFINITY : now - lastWrittenAt;
+    if (elapsed >= 0 && elapsed < ERROR_LOG_INTERVAL_MS) {
+      suppressed++;
+      return;
+    }
+    lastWrittenAt = now;
+    logger.error(message, suppressed > 0 ? { ...fields, suppressed } : fields);
+    suppressed = 0;
+  };
+}
+function toAppError(error, logger, logError) {
   if (!(error instanceof TokenVerificationError)) {
-    logger?.error("token verification failed unexpectedly", { errorClass: errorClass(error) });
+    logError("token verification failed unexpectedly", { errorClass: errorClass(error) });
     return unavailable();
   }
   if (error.reason === "unavailable") {
-    logger?.error("token verification unavailable", { reason: error.reason });
+    logError("token verification unavailable", { reason: error.reason });
     return unavailable();
   }
   logger?.warn("request rejected", { reason: error.reason });
@@ -363,6 +397,7 @@ function toAppError(error, logger) {
 }
 function createAuthMiddleware(options) {
   const { verifier, logger } = options;
+  const logError = createErrorLimiter(logger, options.clock ?? systemClock2);
   return async (c, next) => {
     const header = c.req.header("authorization");
     const token = header !== undefined && header.length <= MAX_TOKEN_LENGTH + 7 ? BEARER.exec(header)?.[1] : undefined;
@@ -374,7 +409,7 @@ function createAuthMiddleware(options) {
     try {
       verified = await verifier.verify(token);
     } catch (error) {
-      throw toAppError(error, logger);
+      throw toAppError(error, logger, logError);
     }
     c.set("organizationId", verified.organizationId);
     c.set("userId", verified.userId);
@@ -425,9 +460,10 @@ function createTokenVerifier(options) {
       if (typeof token !== "string" || token.length === 0 || token.length > MAX_TOKEN_LENGTH) {
         return reject();
       }
-      const key = await keys.getKey(readKid(token));
+      const kid = readKid(token);
+      const key = await keys.getKey(kid);
       if (key === undefined) {
-        return reject(keys.available() ? "invalid" : "unavailable");
+        return reject(keys.confirmsAbsent(kid) ? "invalid" : "unavailable");
       }
       const now = clock.now();
       let payload;

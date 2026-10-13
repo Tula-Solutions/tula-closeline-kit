@@ -51,6 +51,7 @@ beforeAll(async () => {
       return inner.getKey(kid)
     },
     available: () => inner.available(),
+    confirmsAbsent: (kid) => inner.confirmsAbsent(kid),
   }
   verifier = createTokenVerifier({ issuer: ISSUER, audience: AUDIENCE, keys, clock })
 })
@@ -119,7 +120,7 @@ describe('an unavailable key set', () => {
     const v = createTokenVerifier({
       issuer: ISSUER,
       audience: AUDIENCE,
-      keys: { getKey: async () => undefined, available: () => false },
+      keys: { getKey: async () => undefined, available: () => false, confirmsAbsent: () => false },
       clock,
     })
     const error = await v.verify(await unknownKid()).catch((e: unknown) => e)
@@ -131,17 +132,27 @@ describe('an unavailable key set', () => {
     const v = createTokenVerifier({
       issuer: ISSUER,
       audience: AUDIENCE,
-      keys: { getKey: async () => undefined, available: () => true },
+      keys: { getKey: async () => undefined, available: () => true, confirmsAbsent: () => true },
       clock,
     })
     await expect(v.verify(await unknownKid())).rejects.toMatchObject({ reason: 'invalid' })
+  })
+
+  test('a loaded key set that cannot confirm the kid is absent is an outage, not a bad token', async () => {
+    const v = createTokenVerifier({
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      keys: { getKey: async () => undefined, available: () => true, confirmsAbsent: () => false },
+      clock,
+    })
+    await expect(v.verify(await unknownKid())).rejects.toMatchObject({ reason: 'unavailable' })
   })
 
   test('a token that was malformed anyway is invalid, whatever the key set is doing', async () => {
     const v = createTokenVerifier({
       issuer: ISSUER,
       audience: AUDIENCE,
-      keys: { getKey: async () => undefined, available: () => false },
+      keys: { getKey: async () => undefined, available: () => false, confirmsAbsent: () => false },
       clock,
     })
     await expect(v.verify('not.a.token')).rejects.toMatchObject({ reason: 'invalid' })

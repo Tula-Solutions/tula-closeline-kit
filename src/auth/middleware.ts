@@ -1,5 +1,6 @@
 import type { MiddlewareHandler } from 'hono'
 import type { OrganizationId, Region, Role, UserId } from 'tula-closeline-contract'
+import { type Clock, systemClock } from '../clock'
 import { AppError } from '../errors'
 import type { Logger } from '../logger'
 import { MAX_TOKEN_LENGTH } from './claims'
@@ -30,8 +31,11 @@ export interface AuthMiddlewareOptions {
   /**
    * Receives a warning with only a coarse reason for each rejected request, and an error for each
    * request that failed because verification was unavailable or threw (error class name only).
+   * Those errors are written at most once a second; the next line says how many were held back.
    */
   logger?: Logger
+  /** Time source for the error log limit; defaults to the system clock. */
+  clock?: Clock
 }
 
 const BEARER = /^Bearer ([^\s]+)$/i
@@ -57,13 +61,38 @@ function unavailable(): AppError {
   })
 }
 
-function toAppError(error: unknown, logger: Logger | undefined): AppError {
+const ERROR_LOG_INTERVAL_MS = 1_000
+
+/** Writes error lines at most once per interval, carrying the count of the lines it held back. */
+function createErrorLimiter(logger: Logger | undefined, clock: Clock) {
+  let lastWrittenAt: number | undefined
+  let suppressed = 0
+  return (message: string, fields: Record<string, unknown>): void => {
+    if (logger === undefined) {
+      return
+    }
+    const now = clock.now().getTime()
+    // A clock that stepped backwards counts as elapsed, so the log is never silenced for long.
+    const elapsed = lastWrittenAt === undefined ? Number.POSITIVE_INFINITY : now - lastWrittenAt
+    if (elapsed >= 0 && elapsed < ERROR_LOG_INTERVAL_MS) {
+      suppressed++
+      return
+    }
+    lastWrittenAt = now
+    logger.error(message, suppressed > 0 ? { ...fields, suppressed } : fields)
+    suppressed = 0
+  }
+}
+
+type ErrorLogger = ReturnType<typeof createErrorLimiter>
+
+function toAppError(error: unknown, logger: Logger | undefined, logError: ErrorLogger): AppError {
   if (!(error instanceof TokenVerificationError)) {
-    logger?.error('token verification failed unexpectedly', { errorClass: errorClass(error) })
+    logError('token verification failed unexpectedly', { errorClass: errorClass(error) })
     return unavailable()
   }
   if (error.reason === 'unavailable') {
-    logger?.error('token verification unavailable', { reason: error.reason })
+    logError('token verification unavailable', { reason: error.reason })
     return unavailable()
   }
   logger?.warn('request rejected', { reason: error.reason })
@@ -85,6 +114,7 @@ function toAppError(error: unknown, logger: Logger | undefined): AppError {
  */
 export function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv> {
   const { verifier, logger } = options
+  const logError = createErrorLimiter(logger, options.clock ?? systemClock)
   return async (c, next) => {
     const header = c.req.header('authorization')
     const token =
@@ -99,7 +129,7 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): Middleware
     try {
       verified = await verifier.verify(token)
     } catch (error) {
-      throw toAppError(error, logger)
+      throw toAppError(error, logger, logError)
     }
     c.set('organizationId', verified.organizationId)
     c.set('userId', verified.userId)

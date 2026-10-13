@@ -96,11 +96,15 @@ declare const MAX_JWKS_BYTES: number;
 interface KeySet {
 	/** Returns the key for `kid`, or undefined when it is unknown. Never throws. */
 	getKey(kid: string): Promise<CryptoKey | undefined>;
-	/**
-	* Whether the set currently holds a loaded, fresh answer from the issuer. When false, an
-	* unknown `kid` means the keys could not be loaded, not that the token is bad. Never throws.
-	*/
+	/** Whether the set currently holds loaded keys that are not stale. Never throws. */
 	available(): boolean;
+	/**
+	* Whether the issuer has answered in full, most recently, without `kid`: only then is a `kid`
+	* that getKey did not find a bad token. False means the set cannot tell a forged `kid` from a
+	* newly rotated key (no answer yet, the last refresh failed, or one is still running). Call it
+	* right after getKey. Never throws.
+	*/
+	confirmsAbsent(kid: string): boolean;
 }
 /** A JSON Web Key Set as published by the auth service. */
 interface Jwks {
@@ -150,6 +154,7 @@ interface RemoteKeySet extends KeySet {
 * unknown `kid` triggers at most one refresh per cooldown window, shared by concurrent callers,
 * and no lookup waits longer than the deadline. A failed refresh keeps serving the last good keys
 * until they are `maxStaleMs` old, after which they are dropped and `available()` is false.
+* `confirmsAbsent(kid)` is true only when the most recent refresh succeeded and lacked `kid`.
 */
 declare function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet;
 import { MiddlewareHandler } from "hono";
@@ -202,8 +207,11 @@ interface AuthMiddlewareOptions {
 	/**
 	* Receives a warning with only a coarse reason for each rejected request, and an error for each
 	* request that failed because verification was unavailable or threw (error class name only).
+	* Those errors are written at most once a second; the next line says how many were held back.
 	*/
 	logger?: Logger;
+	/** Time source for the error log limit; defaults to the system clock. */
+	clock?: Clock;
 }
 /**
 * Creates Hono middleware that requires a valid `Authorization: Bearer` access token. On success

@@ -12,11 +12,15 @@ export const MAX_JWKS_BYTES = 64 * 1024
 export interface KeySet {
   /** Returns the key for `kid`, or undefined when it is unknown. Never throws. */
   getKey(kid: string): Promise<CryptoKey | undefined>
-  /**
-   * Whether the set currently holds a loaded, fresh answer from the issuer. When false, an
-   * unknown `kid` means the keys could not be loaded, not that the token is bad. Never throws.
-   */
+  /** Whether the set currently holds loaded keys that are not stale. Never throws. */
   available(): boolean
+  /**
+   * Whether the issuer has answered in full, most recently, without `kid`: only then is a `kid`
+   * that getKey did not find a bad token. False means the set cannot tell a forged `kid` from a
+   * newly rotated key (no answer yet, the last refresh failed, or one is still running). Call it
+   * right after getKey. Never throws.
+   */
+  confirmsAbsent(kid: string): boolean
 }
 
 /** A JSON Web Key Set as published by the auth service. */
@@ -99,7 +103,11 @@ export async function createStaticKeySet(jwks: Jwks): Promise<KeySet> {
     }
     keys.set(entry[0], entry[1])
   }
-  return { getKey: async (kid) => keys.get(kid), available: () => true }
+  return {
+    getKey: async (kid) => keys.get(kid),
+    available: () => true,
+    confirmsAbsent: (kid) => !keys.has(kid),
+  }
 }
 
 /** Options for createRemoteKeySet. */
@@ -192,6 +200,7 @@ async function readBounded(response: Response): Promise<string> {
  * unknown `kid` triggers at most one refresh per cooldown window, shared by concurrent callers,
  * and no lookup waits longer than the deadline. A failed refresh keeps serving the last good keys
  * until they are `maxStaleMs` old, after which they are dropped and `available()` is false.
+ * `confirmsAbsent(kid)` is true only when the most recent refresh succeeded and lacked `kid`.
  */
 export function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet {
   const url = assertUrl(options.url, options.allowInsecureLocalhost === true)
@@ -213,6 +222,8 @@ export function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet {
   let keys: ReadonlyMap<string, CryptoKey> = new Map()
   let loadedAt: number | undefined
   let lastAttemptAt: number | undefined
+  // Whether the most recent attempt, the one that started the current cooldown, ended in a JWKS.
+  let lastAttemptSucceeded = false
   let inflight: Promise<void> | undefined
 
   const now = () => options.clock.now().getTime()
@@ -292,7 +303,9 @@ export function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet {
       }
       keys = fresh.keys
       loadedAt = now()
+      lastAttemptSucceeded = true
     } catch (error) {
+      lastAttemptSucceeded = false
       log('warn', 'jwks refresh failed', {
         reason: error instanceof Error ? error.message : 'unknown',
         keysServed: keys.size,
@@ -302,6 +315,8 @@ export function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet {
 
   function startRefresh(): Promise<void> {
     lastAttemptAt = now()
+    // Not an answer yet: a lookup cut off at its deadline must not read the previous one.
+    lastAttemptSucceeded = false
     const run = refresh().finally(() => {
       if (inflight === run) {
         inflight = undefined
@@ -360,7 +375,14 @@ export function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet {
       }
       return keys.get(kid)
     },
-    available: () => loadedAt !== undefined && !isStale(),
+    available() {
+      dropIfStale()
+      return loadedAt !== undefined
+    },
+    confirmsAbsent(kid) {
+      dropIfStale()
+      return loadedAt !== undefined && lastAttemptSucceeded && !inflight && !keys.has(kid)
+    },
     warm() {
       return inflight ?? startRefresh()
     },
