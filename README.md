@@ -34,6 +34,66 @@ the new `kid` until its cooldown (30 s) passes, because it cannot tell that toke
 one. Five minutes leaves every verifier's cooldown over before the first token with the new `kid`
 exists, so its first lookup refreshes and finds the key.
 
+## Calling another service (`createInternalClient`)
+
+Every service-to-service call goes through this client (ADR 0013). It sends the shared secret as a
+bearer token and never through an HTTP proxy.
+
+**Why not `fetch`.** The probe in `src/http/proxy.test.ts` shows that in Bun 1.4.2 `fetch` sends a
+request to the proxy named by `HTTP_PROXY`/`http_proxy` (for `http:` URLs) or
+`HTTPS_PROXY`/`https_proxy` (for `https:` URLs), that `ALL_PROXY` is ignored, that a per-request
+`proxy: ''` does not turn it off, and that `NO_PROXY` exempts a host only by matching it. The
+client uses `node:http` and `node:https` with `agent: false`, which read no proxy variable at all,
+so there is nothing to configure and no boot check to keep correct. The probe stays in the suite:
+a Bun upgrade that changes a row fails it.
+
+```ts
+import { createInternalClient, InternalCallError } from 'tula-closeline-kit'
+
+// src/container.ts, the only place adapters are built
+const core = createInternalClient({
+  baseUrl: env.CORE_URL,            // https, or http only for loopback or ENVIRONMENT=local
+  secret: env.CORE_INTERNAL_TOKEN,
+  environment: env.ENVIRONMENT,
+  userAgent: 'closeline-auth',
+  timeoutMs: 2_000,                 // one attempt; default 5 000
+  retry: { maxAttempts: 2 },        // default 3 attempts; see below
+  logger,
+})
+
+const { status, json } = await core.request({
+  method: 'POST',
+  path: '/internal/organizations',
+  body: { userId, organizationName },
+  idempotencyKey,                   // sent as Idempotency-Key; makes a POST safe to retry
+})
+```
+
+- `request` resolves with `{ status, json, attempts }` for every answer that is not a redirect,
+  4xx and 5xx included: the adapter maps statuses and validates `json` with the contract's schema.
+  `json` is parsed whatever the content type says and is `undefined` when the body is empty or not
+  JSON. It rejects with `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`,
+  `redirect`, `response_too_large`), which carries `method`, `path` (no query), `status` and
+  `attempts`, and never the secret, a body or the underlying error.
+- Retries: only a connection failure, a timeout, 429, 502, 503 and 504, and only when the method is
+  `GET`, `HEAD`, `PUT`, `DELETE` or `OPTIONS`, or an `idempotencyKey` is given. Never on another
+  status. Defaults: 3 attempts, full jitter (`random * min(2000, 100 * 2^(n-1))` ms), and a
+  `Retry-After` in seconds is used instead, cut to 5 s. Inject `sleep` and `random` in tests.
+- A redirect is an error and is never followed. A response over `maxResponseBytes` (1 MiB) fails.
+  TLS certificates are verified and there is no switch to turn that off; `ca` adds a trusted CA.
+- Cost per call: one new connection (and one TLS handshake for https), no keep-alive, no allocation
+  beyond the bounded response. It is not a hot path, so there is no benchmark.
+- Outbound calls to vendors are not internal calls: they may use `fetch` and a proxy set on purpose.
+
+**Replacing auth's transport.** In `src/adapters/http/membership.ts` drop the `fetch` option,
+`callCore`'s `doFetch(...)`, `readBounded` and `AttemptFailed` classification, and call
+`core.request({ method: 'POST', path, body, idempotencyKey, timeoutMs })` per attempt. Map an
+`InternalCallError` to `MembershipUnavailable`, `status` 401/403 to `CoreCredentialsRejected`, and
+validate `json` with the contract's schemas as today. Keep the adapter's concurrency limiter. The lookup sends a fresh `idempotencyKey` per lookup, so
+the client may retry it (`retry: { maxAttempts: 2 }`); the sign-up writes keep the flow's key and
+are retried by the flow, so pass `retry: { maxAttempts: 1 }` for them. The adapter's
+test then names a stand-in proxy in the environment of a child process, as `proxy.test.ts` does.
+
 ## Reporting errors
 
 Sentry is the error tracker for every Closeline service, and a service never imports a Sentry

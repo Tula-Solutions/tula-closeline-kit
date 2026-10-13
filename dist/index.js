@@ -474,6 +474,268 @@ function createTokenVerifier(options) {
     }
   };
 }
+// src/http/internal.ts
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIPv4 } from "node:net";
+var INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
+var INTERNAL_DEFAULT_TIMEOUT_MS = 5000;
+var INTERNAL_DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
+var INTERNAL_MAX_REQUEST_BYTES = 1024 * 1024;
+var INTERNAL_DEFAULT_RETRY = {
+  maxAttempts: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 2000,
+  retryAfterCapMs: 5000
+};
+var INTERNAL_RETRY_STATUSES = [429, 502, 503, 504];
+var IDEMPOTENT_METHODS = ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"];
+var FORBIDDEN_HEADERS = new Set([
+  "authorization",
+  "host",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "proxy-authorization"
+]);
+
+class InternalCallError extends Error {
+  failure;
+  method;
+  path;
+  status;
+  attempts;
+  constructor(init) {
+    const status = init.status === undefined ? "" : `, HTTP ${init.status}`;
+    super(`internal call ${init.method} ${init.path} failed (${init.failure}${status}, ` + `${init.attempts} attempt${init.attempts === 1 ? "" : "s"})`);
+    this.name = "InternalCallError";
+    this.failure = init.failure;
+    this.method = init.method;
+    this.path = init.path;
+    this.status = init.status;
+    this.attempts = init.attempts;
+  }
+}
+function isLoopbackHost(host) {
+  const bare = host.replace(/^\[|\]$/g, "");
+  return isIPv4(bare) && bare.startsWith("127.") || bare === "::1";
+}
+function parseBase(baseUrl, environment) {
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new TypeError("the internal base URL is not a URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new TypeError("the internal base URL must use http or https");
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new TypeError("the internal base URL must not carry a user name or password");
+  }
+  if (url.search !== "" || url.hash !== "" || baseUrl.includes("?") || baseUrl.includes("#")) {
+    throw new TypeError("the internal base URL must not have a query or a fragment");
+  }
+  if (url.hostname === "") {
+    throw new TypeError("the internal base URL has no host");
+  }
+  if (url.protocol === "http:" && environment !== "local" && !isLoopbackHost(url.hostname)) {
+    throw new TypeError("the internal base URL must use https outside the local environment and loopback");
+  }
+  return {
+    secure: url.protocol === "https:",
+    host: url.hostname.replace(/^\[|\]$/g, ""),
+    port: url.port === "" ? url.protocol === "https:" ? 443 : 80 : Number(url.port),
+    prefix: url.pathname.replace(/\/+$/, "")
+  };
+}
+function pathOnly(path) {
+  const cut = path.search(/[?#]/);
+  return cut === -1 ? path : path.slice(0, cut);
+}
+function checkPath(path) {
+  if (!path.startsWith("/") || path.startsWith("//") || /[\s#\\]/.test(path)) {
+    throw new TypeError('an internal call path must start with a single "/" and hold no spaces');
+  }
+}
+function retryAfterMs(value) {
+  const text = Array.isArray(value) ? value[0] : value;
+  if (text === undefined || !/^\d{1,9}$/.test(text.trim())) {
+    return;
+  }
+  return Number(text.trim()) * 1000;
+}
+function parseJson(text) {
+  if (text.trim() === "") {
+    return;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return;
+  }
+}
+function createInternalClient(options) {
+  const base = parseBase(options.baseUrl, options.environment);
+  if (!/^[\x21-\x7e]+$/.test(options.secret)) {
+    throw new TypeError("the internal secret must be a non-empty string of printable characters");
+  }
+  const authorization = `Bearer ${options.secret}`;
+  const retry = { ...INTERNAL_DEFAULT_RETRY, ...options.retry };
+  const maxAttempts = Math.max(1, Math.floor(retry.maxAttempts));
+  const timeoutMs = options.timeoutMs ?? INTERNAL_DEFAULT_TIMEOUT_MS;
+  const maxBytes = options.maxResponseBytes ?? INTERNAL_DEFAULT_MAX_RESPONSE_BYTES;
+  const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const random = options.random ?? Math.random;
+  const send = base.secure ? httpsRequest : httpRequest;
+  const attempt = (method, target, headers, body, signal) => new Promise((resolve, reject) => {
+    const outgoing = send({
+      host: base.host,
+      port: base.port,
+      path: target,
+      method,
+      headers,
+      agent: false,
+      signal,
+      ...options.ca === undefined ? {} : { ca: options.ca }
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      const retryAfter = retryAfterMs(response.headers["retry-after"]);
+      if (status >= 300 && status < 400) {
+        reject(new Failure("redirect", status));
+        response.destroy();
+        return;
+      }
+      const declared = Number(response.headers["content-length"]);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        reject(new Failure("response_too_large", status));
+        response.destroy();
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.byteLength;
+        if (bytes > maxBytes) {
+          reject(new Failure("response_too_large", status));
+          response.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => {
+        resolve({ status, text: Buffer.concat(chunks).toString("utf8"), retryAfter });
+      });
+      const broken = () => reject(new Failure(signal.aborted ? "timeout" : "connection"));
+      response.on("error", broken);
+      response.on("aborted", broken);
+    });
+    outgoing.on("error", () => reject(new Failure(signal.aborted ? "timeout" : "connection")));
+    outgoing.end(body);
+  });
+  return {
+    async request(call) {
+      checkPath(call.path);
+      if (call.body !== undefined && (call.method === "GET" || call.method === "HEAD")) {
+        throw new TypeError("a GET or HEAD internal call has no body");
+      }
+      const extra = {};
+      for (const [name, value] of Object.entries(call.headers ?? {})) {
+        if (FORBIDDEN_HEADERS.has(name.toLowerCase())) {
+          throw new TypeError(`the header ${name} is set by the client and cannot be passed`);
+        }
+        if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) {
+          throw new TypeError("a header holds a line break");
+        }
+        extra[name] = value;
+      }
+      if (call.idempotencyKey !== undefined) {
+        if (!/^[\x21-\x7e]{1,255}$/.test(call.idempotencyKey)) {
+          throw new TypeError("the idempotency key must be 1 to 255 printable characters");
+        }
+        extra[INTERNAL_IDEMPOTENCY_HEADER] = call.idempotencyKey;
+      }
+      const payload = call.body === undefined ? undefined : JSON.stringify(call.body);
+      if (payload !== undefined && Buffer.byteLength(payload) > INTERNAL_MAX_REQUEST_BYTES) {
+        throw new TypeError("the internal call body is too large");
+      }
+      const headers = {
+        accept: "application/json",
+        "user-agent": options.userAgent ?? "closeline-internal",
+        ...payload === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+        ...extra,
+        authorization
+      };
+      const target = `${base.prefix}${call.path}`;
+      const path = pathOnly(call.path);
+      const safeToRepeat = IDEMPOTENT_METHODS.includes(call.method) || call.idempotencyKey !== undefined;
+      const perAttempt = call.timeoutMs ?? timeoutMs;
+      for (let attempts = 1;; attempts += 1) {
+        const fail = (failure, status) => new InternalCallError({ failure, method: call.method, path, status, attempts });
+        if (call.signal?.aborted) {
+          throw fail("aborted");
+        }
+        const timeout = AbortSignal.timeout(perAttempt);
+        const signal = call.signal ? AbortSignal.any([call.signal, timeout]) : timeout;
+        let retryAfter;
+        let reason;
+        try {
+          const wire = await attempt(call.method, target, headers, payload, signal);
+          if (!INTERNAL_RETRY_STATUSES.includes(wire.status)) {
+            return { status: wire.status, json: parseJson(wire.text), attempts };
+          }
+          if (!safeToRepeat || attempts >= maxAttempts) {
+            return { status: wire.status, json: parseJson(wire.text), attempts };
+          }
+          retryAfter = wire.retryAfter;
+          reason = `HTTP ${wire.status}`;
+        } catch (caught) {
+          if (call.signal?.aborted) {
+            throw fail("aborted");
+          }
+          const failure = caught instanceof Failure ? caught : new Failure("connection");
+          const retryable = failure.kind === "connection" || failure.kind === "timeout";
+          if (!retryable) {
+            throw fail(failure.kind, failure.status);
+          }
+          if (!safeToRepeat || attempts >= maxAttempts) {
+            throw fail(failure.kind);
+          }
+          reason = failure.kind;
+        }
+        const ceiling = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempts - 1));
+        const delay = retryAfter === undefined ? Math.floor(random() * ceiling) : Math.min(retryAfter, retry.retryAfterCapMs);
+        options.logger?.warn("internal call failed, retrying", {
+          method: call.method,
+          path,
+          reason,
+          attempt: attempts,
+          delayMs: delay
+        });
+        await pauseOrAbort(sleep, delay, call.signal);
+      }
+    }
+  };
+}
+
+class Failure {
+  kind;
+  status;
+  constructor(kind, status) {
+    this.kind = kind;
+    this.status = status;
+  }
+}
+async function pauseOrAbort(sleep, ms, signal) {
+  if (signal === undefined) {
+    await sleep(ms);
+    return;
+  }
+  await Promise.race([
+    sleep(ms),
+    new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
+  ]);
+}
 // src/logger.ts
 import pino from "pino";
 function wrap(base) {
@@ -1057,6 +1319,13 @@ var PACKAGE = "tula-closeline-kit";
 export {
   AppError2 as AppError,
   ENVIRONMENTS,
+  INTERNAL_DEFAULT_MAX_RESPONSE_BYTES,
+  INTERNAL_DEFAULT_RETRY,
+  INTERNAL_DEFAULT_TIMEOUT_MS,
+  INTERNAL_IDEMPOTENCY_HEADER,
+  INTERNAL_MAX_REQUEST_BYTES,
+  INTERNAL_RETRY_STATUSES,
+  InternalCallError,
   MAX_JWKS_BYTES,
   MAX_JWKS_KEYS,
   MAX_TOKEN_LENGTH,
@@ -1066,6 +1335,7 @@ export {
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
+  createInternalClient,
   createLogger,
   createNoopErrorReporter,
   createRemoteKeySet,

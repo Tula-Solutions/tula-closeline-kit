@@ -252,7 +252,6 @@ declare class AppError extends Error {
 declare function isAppError(value: unknown): value is AppError;
 /** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
 declare function toErrorBody(error: AppError): ErrorBody;
-import { Region as Region3 } from "tula-closeline-contract";
 import { z as z2 } from "zod";
 /** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
 declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
@@ -288,6 +287,130 @@ declare function requireSentryDsn(env: {
 	ENVIRONMENT: Environment;
 	SENTRY_DSN?: string | undefined;
 }, ctx: z2.RefinementCtx): void;
+/** The header that carries a call's idempotency key. */
+declare const INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
+/** The default bound on one attempt, connecting to the last byte of the answer. */
+declare const INTERNAL_DEFAULT_TIMEOUT_MS = 5e3;
+/** The default largest answer that is read; a longer one fails the call, it is not truncated. */
+declare const INTERNAL_DEFAULT_MAX_RESPONSE_BYTES: number;
+/** The largest request body the client will send. */
+declare const INTERNAL_MAX_REQUEST_BYTES: number;
+/** The default retry policy of {@link createInternalClient}. */
+declare const INTERNAL_DEFAULT_RETRY: {
+	readonly maxAttempts: 3;
+	readonly baseDelayMs: 100;
+	readonly maxDelayMs: 2000;
+	readonly retryAfterCapMs: 5000;
+};
+/** The statuses an idempotent call is retried on. Other statuses are answers, not faults. */
+declare const INTERNAL_RETRY_STATUSES: readonly number[];
+/** The HTTP methods the client sends. */
+type InternalMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+/** Why an internal call produced no usable answer. */
+type InternalCallFailure = "connection" | "timeout" | "aborted" | "redirect" | "response_too_large" | "response_invalid";
+/**
+* An internal call that produced no answer. The message is fixed text plus the method, path (no
+* query), status and attempt count; the secret, the request body, the response body and the
+* underlying error are never kept, so nothing here can leak them into a log.
+*/
+declare class InternalCallError extends Error {
+	readonly failure: InternalCallFailure;
+	readonly method: string;
+	readonly path: string;
+	readonly status: number | undefined;
+	readonly attempts: number;
+	constructor(init: {
+		failure: InternalCallFailure;
+		method: string;
+		path: string;
+		status?: number;
+		attempts: number;
+	});
+}
+/** How a call is retried. Every field has a default in {@link INTERNAL_DEFAULT_RETRY}. */
+type InternalRetryPolicy = {
+	/** Attempts in all, the first included; `1` turns retries off. */
+	maxAttempts?: number;
+	/** The first pause's ceiling; each later pause doubles it, up to `maxDelayMs`. */
+	baseDelayMs?: number;
+	/** The largest ceiling of a jittered pause. */
+	maxDelayMs?: number;
+	/** The longest a `Retry-After` of seconds is honoured; a larger one is cut to this. */
+	retryAfterCapMs?: number;
+};
+/** Options for {@link createInternalClient}. */
+type InternalClientOptions = {
+	/** The receiver's origin, `http` or `https`, with no userinfo, query or fragment. */
+	baseUrl: string;
+	/** The shared secret sent as `Authorization: Bearer`. Never logged or put in an error. */
+	secret: string;
+	/** Where this deployment runs; plain `http` to a non-loopback host is allowed only in `local`. */
+	environment: Environment;
+	/** The caller's name, sent as `User-Agent`. */
+	userAgent?: string;
+	/** One attempt's bound; defaults to {@link INTERNAL_DEFAULT_TIMEOUT_MS}. */
+	timeoutMs?: number;
+	/** The largest answer read; defaults to {@link INTERNAL_DEFAULT_MAX_RESPONSE_BYTES}. */
+	maxResponseBytes?: number;
+	/** The retry policy; see {@link InternalRetryPolicy}. */
+	retry?: InternalRetryPolicy;
+	/** Extra certificate authority (PEM) to trust besides the system's. Verification stays on. */
+	ca?: string;
+	/** Where a retry is noted: fixed words, a status or failure kind and an attempt number only. */
+	logger?: Pick<Logger, "warn">;
+	/** Injected for tests; defaults to a timer. */
+	sleep?: (ms: number) => Promise<void>;
+	/** Injected for tests; a number in `[0, 1)`; defaults to `Math.random`. */
+	random?: () => number;
+};
+/** One call. */
+type InternalRequest = {
+	method: InternalMethod;
+	/** Starts with `/`; it is appended to the base URL. A query string is allowed. */
+	path: string;
+	/** Sent as JSON. Not allowed on `GET` and `HEAD`. */
+	body?: unknown;
+	/** Extra headers; `Authorization`, `Host` and the like are the client's and are refused. */
+	headers?: Record<string, string>;
+	/** Sent as `Idempotency-Key`, and makes a `POST` or `PATCH` safe to retry. */
+	idempotencyKey?: string;
+	/** This call's attempt bound instead of the client's. */
+	timeoutMs?: number;
+	/** Stops the call, retries and pauses included. */
+	signal?: AbortSignal;
+};
+/** What came back: the status, and the body parsed as JSON when it was JSON. */
+type InternalResponse = {
+	status: number;
+	/** The parsed body, or `undefined` when it was empty or not JSON, whatever its content type. */
+	json: unknown;
+	/** Attempts made, the first included. */
+	attempts: number;
+};
+/** A client for calls from one Closeline service to another. */
+interface InternalClient {
+	/**
+	* Sends the call and resolves with any answer that was not a redirect, including 4xx and 5xx.
+	* Rejects with {@link InternalCallError} when there is none. Retries only a connection failure,
+	* a timeout, 429, 502, 503 and 504, and only when the method is idempotent or a key is given.
+	*/
+	request(call: InternalRequest): Promise<InternalResponse>;
+}
+/**
+* Builds the client for calls from this service to one other service (ADR 0013).
+*
+* It uses `node:http` and `node:https` with `agent: false`, never `fetch`: Bun's `fetch` sends a
+* request to the proxy named by `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and their lower-case
+* forms) unless `NO_PROXY` names the host, and the bearer secret would travel with it. The
+* `node:` transport reads no proxy variable, so nothing in the environment can reroute a call.
+* `proxy.test.ts` pins this for the Bun version in use.
+*
+* Cost per call: one new connection (plus one TLS handshake for https), one request, no
+* keep-alive; memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
+* certificates are verified, and there is no switch to turn that off.
+*/
+declare function createInternalClient(options: InternalClientOptions): InternalClient;
+import { Region as Region3 } from "tula-closeline-contract";
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
 	/** The request's id, for finding the log lines. */
@@ -366,4 +489,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };
+export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };
