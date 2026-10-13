@@ -126,3 +126,180 @@ describe('create and encode', () => {
     expect(testPing.scope).toBe('organization')
   })
 })
+
+describe('what a rejected message may reveal (a body is untrusted and can hold personal data)', () => {
+  const people = defineMessage({
+    type: 'test.people',
+    version: 1,
+    scope: 'global',
+    payload: z.object({ byEmail: z.record(z.string(), z.number()) }),
+  })
+  const strict = createMessageRegistry([people])
+  const base = {
+    id: 'msg_1',
+    type: 'test.people',
+    version: 1,
+    occurredAt: '2026-01-01T00:00:00.000Z',
+    traceId: 't',
+  }
+
+  test('a payload path made of a record key that is an email is not echoed', () => {
+    const result = strict.decode(
+      JSON.stringify({ ...base, payload: { byEmail: { 'jane.doe@acme.com': 'x' } } })
+    )
+    expect(result).toMatchObject({ ok: false, reason: 'invalid_payload' })
+    expect(JSON.stringify(result)).not.toContain('jane.doe')
+    expect(JSON.stringify(result)).not.toContain('acme')
+  })
+
+  test('array indices and odd keys become *, ordinary field names stay', () => {
+    const list = defineMessage({
+      type: 'test.list',
+      version: 1,
+      scope: 'global',
+      payload: z.object({ items: z.array(z.number()) }),
+    })
+    const result = createMessageRegistry([list]).decode(
+      JSON.stringify({ ...base, type: 'test.list', payload: { items: [1, 'x'] } })
+    )
+    expect(result).toMatchObject({ ok: false, issues: ['items.*: invalid_type'] })
+  })
+
+  test('an unknown type is never echoed, only its length', () => {
+    const result = strict.decode(JSON.stringify({ ...base, type: 'SECRET-xyz', payload: {} }))
+    expect(result).toMatchObject({ ok: false, reason: 'unknown_type' })
+    expect(JSON.stringify(result)).not.toContain('SECRET')
+    expect(JSON.stringify(result)).toContain('10')
+  })
+
+  test.each(['jane@acme.com', 'has space', 'x'.repeat(129), 'ünï'])(
+    'a message id that fails the id pattern (%s) is not returned',
+    (id) => {
+      const result = strict.decode(JSON.stringify({ ...base, id, payload: { byEmail: {} } }))
+      expect(result.ok).toBe(false)
+      expect(JSON.stringify(result)).not.toContain('acme')
+      expect(JSON.stringify(result)).not.toContain('messageId')
+    }
+  )
+
+  test('a trace id that is not a plain identifier is malformed', () => {
+    const result = strict.decode(
+      JSON.stringify({ ...base, traceId: 'jane@acme.com', payload: { byEmail: {} } })
+    )
+    expect(result).toMatchObject({ ok: false, reason: 'malformed' })
+  })
+})
+
+describe('the Organization id is the system id shape', () => {
+  const scoped = defineMessage({
+    type: 'test.scoped',
+    version: 1,
+    scope: 'organization',
+    payload: z.object({}),
+  })
+  const strict = createMessageRegistry([scoped])
+  const good = `org_${'0123456789abcdef'.repeat(2)}`
+  const body = (organizationId: string) =>
+    JSON.stringify({
+      id: 'm1',
+      type: 'test.scoped',
+      version: 1,
+      occurredAt: '2026-01-01T00:00:00.000Z',
+      organizationId,
+      traceId: 't',
+      payload: {},
+    })
+
+  test('the contract shape is accepted', () => {
+    expect(strict.decode(body(good)).ok).toBe(true)
+  })
+
+  test.each([
+    'org_a',
+    'org_',
+    `org_${'A'.repeat(32)}`,
+    `usr_${'a'.repeat(32)}`,
+    `org_${'a'.repeat(33)}`,
+    "org_'; drop table",
+  ])('%s is invalid_scope and never reaches a handler', (id) => {
+    expect(strict.decode(body(id))).toMatchObject({ ok: false, reason: 'invalid_scope' })
+    expect(JSON.stringify(strict.decode(body(id)))).not.toContain('drop')
+  })
+
+  test('create and encode refuse a bad id too', () => {
+    expect(() =>
+      strict.create({ type: 'test.scoped', payload: {}, organizationId: 'org_a', traceId: 't' })
+    ).toThrow(expect.objectContaining({ code: 'queue.invalid_message' }))
+  })
+
+  test('the schema can be replaced', () => {
+    const lenient = createMessageRegistry([scoped], { organizationIdSchema: z.string().min(1) })
+    expect(lenient.decode(body('org_a')).ok).toBe(true)
+  })
+})
+
+describe('versions during a rolling deploy', () => {
+  const v1 = z.object({ name: z.string() })
+  const v2 = z.object({ firstName: z.string(), lastName: z.string() })
+  const renamed = defineMessage({
+    type: 'test.renamed',
+    version: 2,
+    scope: 'global',
+    payload: v2,
+    previous: [
+      {
+        version: 1,
+        payload: v1,
+        upcast: (old) => {
+          const [firstName = '', lastName = ''] = (old as { name: string }).name.split(' ')
+          return { firstName, lastName }
+        },
+      },
+    ],
+  })
+  const registry = createMessageRegistry([renamed])
+  const wire = (version: number, payload: unknown) =>
+    JSON.stringify({
+      id: 'm1',
+      type: 'test.renamed',
+      version,
+      occurredAt: '2026-01-01T00:00:00.000Z',
+      traceId: 't',
+      payload,
+    })
+
+  test('an older accepted version is upcast to the current shape', () => {
+    const result = registry.decode(wire(1, { name: 'Ada Lovelace' }))
+    expect(result).toMatchObject({
+      ok: true,
+      envelope: { version: 2, payload: { firstName: 'Ada', lastName: 'Lovelace' } },
+    })
+  })
+
+  test('an older version whose payload fails its own schema is invalid_payload', () => {
+    expect(registry.decode(wire(1, { firstName: 'x' }))).toMatchObject({
+      ok: false,
+      reason: 'invalid_payload',
+    })
+  })
+
+  test('a version nobody listed is unsupported', () => {
+    expect(registry.decode(wire(3, {}))).toMatchObject({ ok: false, reason: 'unsupported_version' })
+    expect(registry.decode(wire(0 + 4, {}))).toMatchObject({
+      ok: false,
+      reason: 'unsupported_version',
+    })
+  })
+
+  test('a previous entry that repeats the current version is a mistake', () => {
+    expect(() =>
+      defineMessage({
+        type: 'test.bad',
+        version: 1,
+        scope: 'global',
+        payload: v1,
+        previous: [{ version: 1, payload: v1, upcast: (old) => old }],
+      })
+    ).toThrow(TypeError)
+  })
+})

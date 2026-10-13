@@ -1,3 +1,4 @@
+import { organizationIdSchema as contractOrganizationIdSchema } from 'tula-closeline-contract'
 import { z } from 'zod'
 import { type Clock, systemClock } from '../clock'
 import { QUEUE_ERROR_CODES, QueueError } from './errors'
@@ -18,6 +19,23 @@ export interface MessageDefinition<
   readonly version: number
   readonly scope: S
   readonly payload: P
+  /** Older versions this consumer still accepts, each upcast to the current payload shape. */
+  readonly previous?: readonly PreviousVersion[]
+}
+
+/**
+ * An older version of a message that is still accepted, so a rolling deploy does not bounce the
+ * messages in flight. The payload is validated with `payload` (the old shape), turned into the
+ * current shape by `upcast`, and then validated again with the current schema. The handler only
+ * ever sees the current shape, and the envelope it gets says the current version.
+ */
+export interface PreviousVersion {
+  /** The older version number; must differ from the definition's own. */
+  version: number
+  /** The payload schema of that version. */
+  payload: z.ZodType
+  /** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
+  upcast: (payload: unknown) => unknown
 }
 
 /** A definition of any type, for code that accepts every kind. */
@@ -28,19 +46,34 @@ const TYPE_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/
 /**
  * Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
  * `version` is a positive integer you raise when the payload changes incompatibly. A consumer
- * accepts only the version its registry holds, so a newer message waits in the queue (and reaches
- * the dead-letter queue) until the consumer is deployed with the new definition.
+ * accepts its current version and the `previous` versions it lists (each upcast to the current
+ * shape); any other version waits in the queue with a growing delay, and reaches the dead-letter
+ * queue if no consumer that understands it is deployed in time. Roll out a new version by deploying
+ * consumers that list it as current (or the old one as `previous`) before publishers send it.
  */
 export function defineMessage<
   const T extends string,
   P extends z.ZodType,
   const S extends MessageScope,
->(definition: { type: T; version: number; scope: S; payload: P }): MessageDefinition<T, P, S> {
+>(definition: {
+  type: T
+  version: number
+  scope: S
+  payload: P
+  previous?: readonly PreviousVersion[]
+}): MessageDefinition<T, P, S> {
   if (!TYPE_PATTERN.test(definition.type)) {
     throw new TypeError(`message type must look like "area.event_name", got "${definition.type}"`)
   }
   if (!Number.isInteger(definition.version) || definition.version < 1) {
     throw new TypeError(`message version must be a positive integer, got ${definition.version}`)
+  }
+  const seen = new Set<number>([definition.version])
+  for (const older of definition.previous ?? []) {
+    if (!Number.isInteger(older.version) || older.version < 1 || seen.has(older.version)) {
+      throw new TypeError(`previous version ${older.version} is invalid or repeated`)
+    }
+    seen.add(older.version)
   }
   return Object.freeze({ ...definition })
 }
@@ -138,23 +171,40 @@ export interface MessageRegistryOptions {
   clock?: Clock
   /** Id source; defaults to `crypto.randomUUID`. */
   newId?: () => string
+  /**
+   * The shape of an Organization id, checked for `organization` messages on the way in and out.
+   * Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
+   */
+  organizationIdSchema?: z.ZodType<string>
 }
 
+/** The pattern ids and trace ids on the wire must match: they are written to logs, so no free text. */
+const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
+const SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/
+
 const envelopeSchema = z.object({
-  id: z.string().min(1).max(128),
+  id: z.string().regex(ID_PATTERN),
   type: z.string().min(1).max(128),
   version: z.number().int().min(1),
   occurredAt: z.iso.datetime(),
   organizationId: z.string().min(1).max(128).optional(),
-  traceId: z.string().min(1).max(128),
+  traceId: z.string().regex(ID_PATTERN),
   payload: z.unknown(),
 })
 
-/** Field paths and codes of a ZodError, with no values (a payload can hold personal data). */
+/**
+ * Field paths and codes of a ZodError, with no values. A path segment is kept only if it looks like
+ * a field name; a record key, an array index or anything else (an email, a name) becomes `*`.
+ */
 function issuesOf(error: z.ZodError): string[] {
-  return error.issues
-    .slice(0, 20)
-    .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.code}`)
+  return error.issues.slice(0, 20).map((issue) => {
+    const path = issue.path
+      .map((segment) =>
+        typeof segment === 'string' && SEGMENT_PATTERN.test(segment) ? segment : '*'
+      )
+      .join('.')
+    return `${path || '(root)'}: ${issue.code}`
+  })
 }
 
 function invalid(reason: string, issues: string[]): QueueError {
@@ -180,6 +230,7 @@ export function createMessageRegistry<const D extends AnyDefinition>(
   }
   const clock = options.clock ?? systemClock
   const newId = options.newId ?? (() => crypto.randomUUID())
+  const orgSchema: z.ZodType<string> = options.organizationIdSchema ?? contractOrganizationIdSchema
 
   function check(candidate: unknown): DecodeResult<EnvelopeOf<D>> {
     const shape = envelopeSchema.safeParse(candidate)
@@ -192,7 +243,7 @@ export function createMessageRegistry<const D extends AnyDefinition>(
         ok: false,
         reason: 'malformed',
         issues: issuesOf(shape.error),
-        ...(typeof id === 'string' && id.length <= 128 ? { messageId: id } : {}),
+        ...(typeof id === 'string' && ID_PATTERN.test(id) ? { messageId: id } : {}),
       }
     }
     const value = shape.data
@@ -202,11 +253,15 @@ export function createMessageRegistry<const D extends AnyDefinition>(
       return {
         ok: false,
         reason: 'unknown_type',
-        issues: [`type: ${value.type.slice(0, 64)}`],
+        issues: [`type: unknown, ${value.type.length} characters`],
         ...base,
       }
     }
-    if (value.version !== definition.version) {
+    const older =
+      value.version === definition.version
+        ? undefined
+        : definition.previous?.find((entry) => entry.version === value.version)
+    if (value.version !== definition.version && older === undefined) {
       return {
         ok: false,
         reason: 'unsupported_version',
@@ -214,10 +269,14 @@ export function createMessageRegistry<const D extends AnyDefinition>(
         ...base,
       }
     }
-    if (definition.scope === 'organization' && value.organizationId === undefined) {
-      return { ok: false, reason: 'invalid_scope', issues: ['organizationId: required'], ...base }
-    }
-    if (definition.scope === 'global' && value.organizationId !== undefined) {
+    if (definition.scope === 'organization') {
+      if (value.organizationId === undefined) {
+        return { ok: false, reason: 'invalid_scope', issues: ['organizationId: required'], ...base }
+      }
+      if (!orgSchema.safeParse(value.organizationId).success) {
+        return { ok: false, reason: 'invalid_scope', issues: ['organizationId: invalid'], ...base }
+      }
+    } else if (value.organizationId !== undefined) {
       return {
         ok: false,
         reason: 'invalid_scope',
@@ -225,17 +284,28 @@ export function createMessageRegistry<const D extends AnyDefinition>(
         ...base,
       }
     }
-    const payload = definition.payload.safeParse(value.payload)
+    const payload = (older?.payload ?? definition.payload).safeParse(value.payload)
     if (!payload.success) {
       return { ok: false, reason: 'invalid_payload', issues: issuesOf(payload.error), ...base }
+    }
+    let current: z.ZodSafeParseResult<unknown> = payload
+    if (older !== undefined) {
+      try {
+        current = definition.payload.safeParse(older.upcast(payload.data))
+      } catch {
+        return { ok: false, reason: 'invalid_payload', issues: ['upcast: failed'], ...base }
+      }
+      if (!current.success) {
+        return { ok: false, reason: 'invalid_payload', issues: issuesOf(current.error), ...base }
+      }
     }
     const envelope: AnyEnvelope = {
       id: value.id,
       type: value.type,
-      version: value.version,
+      version: definition.version,
       occurredAt: value.occurredAt,
       traceId: value.traceId,
-      payload: payload.data,
+      payload: current.data,
     }
     if (value.organizationId !== undefined) {
       envelope.organizationId = value.organizationId

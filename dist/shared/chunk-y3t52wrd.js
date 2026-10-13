@@ -1008,6 +1008,7 @@ class QueueError2 extends AppError2 {
 }
 
 // src/queue/envelope.ts
+import { organizationIdSchema as contractOrganizationIdSchema } from "tula-closeline-contract";
 import { z } from "zod";
 var MAX_MESSAGE_BYTES2 = 262144;
 var TYPE_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
@@ -1018,6 +1019,13 @@ function defineMessage2(definition) {
   if (!Number.isInteger(definition.version) || definition.version < 1) {
     throw new TypeError(`message version must be a positive integer, got ${definition.version}`);
   }
+  const seen = new Set([definition.version]);
+  for (const older of definition.previous ?? []) {
+    if (!Number.isInteger(older.version) || older.version < 1 || seen.has(older.version)) {
+      throw new TypeError(`previous version ${older.version} is invalid or repeated`);
+    }
+    seen.add(older.version);
+  }
   return Object.freeze({ ...definition });
 }
 var INVALID_REASONS2 = [
@@ -1027,17 +1035,22 @@ var INVALID_REASONS2 = [
   "invalid_scope",
   "invalid_payload"
 ];
+var ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+var SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
 var envelopeSchema = z.object({
-  id: z.string().min(1).max(128),
+  id: z.string().regex(ID_PATTERN),
   type: z.string().min(1).max(128),
   version: z.number().int().min(1),
   occurredAt: z.iso.datetime(),
   organizationId: z.string().min(1).max(128).optional(),
-  traceId: z.string().min(1).max(128),
+  traceId: z.string().regex(ID_PATTERN),
   payload: z.unknown()
 });
 function issuesOf(error) {
-  return error.issues.slice(0, 20).map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.code}`);
+  return error.issues.slice(0, 20).map((issue) => {
+    const path = issue.path.map((segment) => typeof segment === "string" && SEGMENT_PATTERN.test(segment) ? segment : "*").join(".");
+    return `${path || "(root)"}: ${issue.code}`;
+  });
 }
 function invalid(reason, issues) {
   return new QueueError2(QUEUE_ERROR_CODES2.invalidMessage, `message is not valid: ${reason}`, {
@@ -1054,6 +1067,7 @@ function createMessageRegistry2(definitions, options = {}) {
   }
   const clock = options.clock ?? systemClock2;
   const newId = options.newId ?? (() => crypto.randomUUID());
+  const orgSchema = options.organizationIdSchema ?? contractOrganizationIdSchema;
   function check(candidate) {
     const shape = envelopeSchema.safeParse(candidate);
     if (!shape.success) {
@@ -1062,7 +1076,7 @@ function createMessageRegistry2(definitions, options = {}) {
         ok: false,
         reason: "malformed",
         issues: issuesOf(shape.error),
-        ...typeof id === "string" && id.length <= 128 ? { messageId: id } : {}
+        ...typeof id === "string" && ID_PATTERN.test(id) ? { messageId: id } : {}
       };
     }
     const value = shape.data;
@@ -1072,11 +1086,12 @@ function createMessageRegistry2(definitions, options = {}) {
       return {
         ok: false,
         reason: "unknown_type",
-        issues: [`type: ${value.type.slice(0, 64)}`],
+        issues: [`type: unknown, ${value.type.length} characters`],
         ...base
       };
     }
-    if (value.version !== definition.version) {
+    const older = value.version === definition.version ? undefined : definition.previous?.find((entry) => entry.version === value.version);
+    if (value.version !== definition.version && older === undefined) {
       return {
         ok: false,
         reason: "unsupported_version",
@@ -1084,10 +1099,14 @@ function createMessageRegistry2(definitions, options = {}) {
         ...base
       };
     }
-    if (definition.scope === "organization" && value.organizationId === undefined) {
-      return { ok: false, reason: "invalid_scope", issues: ["organizationId: required"], ...base };
-    }
-    if (definition.scope === "global" && value.organizationId !== undefined) {
+    if (definition.scope === "organization") {
+      if (value.organizationId === undefined) {
+        return { ok: false, reason: "invalid_scope", issues: ["organizationId: required"], ...base };
+      }
+      if (!orgSchema.safeParse(value.organizationId).success) {
+        return { ok: false, reason: "invalid_scope", issues: ["organizationId: invalid"], ...base };
+      }
+    } else if (value.organizationId !== undefined) {
       return {
         ok: false,
         reason: "invalid_scope",
@@ -1095,17 +1114,28 @@ function createMessageRegistry2(definitions, options = {}) {
         ...base
       };
     }
-    const payload = definition.payload.safeParse(value.payload);
+    const payload = (older?.payload ?? definition.payload).safeParse(value.payload);
     if (!payload.success) {
       return { ok: false, reason: "invalid_payload", issues: issuesOf(payload.error), ...base };
+    }
+    let current = payload;
+    if (older !== undefined) {
+      try {
+        current = definition.payload.safeParse(older.upcast(payload.data));
+      } catch {
+        return { ok: false, reason: "invalid_payload", issues: ["upcast: failed"], ...base };
+      }
+      if (!current.success) {
+        return { ok: false, reason: "invalid_payload", issues: issuesOf(current.error), ...base };
+      }
     }
     const envelope = {
       id: value.id,
       type: value.type,
-      version: value.version,
+      version: definition.version,
       occurredAt: value.occurredAt,
       traceId: value.traceId,
-      payload: payload.data
+      payload: current.data
     };
     if (value.organizationId !== undefined) {
       envelope.organizationId = value.organizationId;

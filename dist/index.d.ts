@@ -436,14 +436,32 @@ interface MessageDefinition<
 	readonly version: number;
 	readonly scope: S;
 	readonly payload: P;
+	/** Older versions this consumer still accepts, each upcast to the current payload shape. */
+	readonly previous?: readonly PreviousVersion[];
+}
+/**
+* An older version of a message that is still accepted, so a rolling deploy does not bounce the
+* messages in flight. The payload is validated with `payload` (the old shape), turned into the
+* current shape by `upcast`, and then validated again with the current schema. The handler only
+* ever sees the current shape, and the envelope it gets says the current version.
+*/
+interface PreviousVersion {
+	/** The older version number; must differ from the definition's own. */
+	version: number;
+	/** The payload schema of that version. */
+	payload: z3.ZodType;
+	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
+	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
 type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
 /**
 * Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
 * `version` is a positive integer you raise when the payload changes incompatibly. A consumer
-* accepts only the version its registry holds, so a newer message waits in the queue (and reaches
-* the dead-letter queue) until the consumer is deployed with the new definition.
+* accepts its current version and the `previous` versions it lists (each upcast to the current
+* shape); any other version waits in the queue with a growing delay, and reaches the dead-letter
+* queue if no consumer that understands it is deployed in time. Roll out a new version by deploying
+* consumers that list it as current (or the old one as `previous`) before publishers send it.
 */
 declare function defineMessage<
 	const T extends string,
@@ -454,6 +472,7 @@ declare function defineMessage<
 	version: number;
 	scope: S;
 	payload: P;
+	previous?: readonly PreviousVersion[];
 }): MessageDefinition<T, P, S>;
 /** The fields every envelope has. */
 interface EnvelopeBase<
@@ -538,6 +557,11 @@ interface MessageRegistryOptions {
 	clock?: Clock;
 	/** Id source; defaults to `crypto.randomUUID`. */
 	newId?: () => string;
+	/**
+	* The shape of an Organization id, checked for `organization` messages on the way in and out.
+	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
+	*/
+	organizationIdSchema?: z3.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -963,4 +987,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, Consumer, ConsumerOptions, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, HandlerContext, Handlers, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, SQS_DEFAULT_MAX_ATTEMPTS, SQS_DEFAULT_TIMEOUT_MS, Sleep, SqsQueueOptions, SqsSender, StopResult, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createConsumer, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createSqsQueue, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, Consumer, ConsumerOptions, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, HandlerContext, Handlers, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, PreviousVersion, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, SQS_DEFAULT_MAX_ATTEMPTS, SQS_DEFAULT_TIMEOUT_MS, Sleep, SqsQueueOptions, SqsSender, StopResult, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createConsumer, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createSqsQueue, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };

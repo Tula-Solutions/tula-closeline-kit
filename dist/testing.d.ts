@@ -141,6 +141,22 @@ interface MessageDefinition<
 	readonly version: number;
 	readonly scope: S;
 	readonly payload: P;
+	/** Older versions this consumer still accepts, each upcast to the current payload shape. */
+	readonly previous?: readonly PreviousVersion[];
+}
+/**
+* An older version of a message that is still accepted, so a rolling deploy does not bounce the
+* messages in flight. The payload is validated with `payload` (the old shape), turned into the
+* current shape by `upcast`, and then validated again with the current schema. The handler only
+* ever sees the current shape, and the envelope it gets says the current version.
+*/
+interface PreviousVersion {
+	/** The older version number; must differ from the definition's own. */
+	version: number;
+	/** The payload schema of that version. */
+	payload: z2.ZodType;
+	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
+	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
 type AnyDefinition = MessageDefinition<string, z2.ZodType, MessageScope>;
@@ -227,6 +243,11 @@ interface MessageRegistryOptions {
 	clock?: Clock;
 	/** Id source; defaults to `crypto.randomUUID`. */
 	newId?: () => string;
+	/**
+	* The shape of an Organization id, checked for `organization` messages on the way in and out.
+	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
+	*/
+	organizationIdSchema?: z2.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same

@@ -12,7 +12,7 @@ import {
   assertBatchCount2,
   systemSleep2,
   shouldReportError2
-} from "./shared/chunk-ssb6j420.js";
+} from "./shared/chunk-y3t52wrd.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -321,7 +321,10 @@ var testNote = defineMessage2({
   payload: z.object({ text: z.string() })
 });
 function createTestRegistry(options = {}) {
-  return createMessageRegistry2([testPing, testNote], options);
+  return createMessageRegistry2([testPing, testNote], {
+    organizationIdSchema: z.string().min(1).max(64),
+    ...options
+  });
 }
 
 // src/testing.ts

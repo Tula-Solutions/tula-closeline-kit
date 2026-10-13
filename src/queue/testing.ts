@@ -100,5 +100,9 @@ export type TestEnvelope = EnvelopeOf<TestDefinition>
 export function createTestRegistry(
   options: Parameters<typeof createMessageRegistry>[1] = {}
 ): MessageRegistry<TestDefinition> {
-  return createMessageRegistry<TestDefinition>([testPing, testNote], options)
+  return createMessageRegistry<TestDefinition>([testPing, testNote], {
+    // Tests use short ids such as `org_a`; the real shape is tested in envelope.test.ts.
+    organizationIdSchema: z.string().min(1).max(64),
+    ...options,
+  })
 }
