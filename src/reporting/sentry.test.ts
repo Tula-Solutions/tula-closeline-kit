@@ -867,7 +867,7 @@ describe('ids in tags are sent as they are (N1)', () => {
     ['a prefixed ULID', 'org_01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
     ['a request id with digits', 'req_984757662552'],
     ['a short id', 'a'],
-    ['a 64 character id', 'a'.repeat(64)],
+    ['a 64 character id', 'x'.repeat(64)],
   ])('%s is kept', async (_name, id) => {
     const h = harness()
     h.reporter.capture(new Error('boom'), { organizationId: id, requestId: id })
@@ -915,11 +915,32 @@ describe('ids in tags are sent as they are (N1)', () => {
     }
   )
 
-  test('a 64 character hex digest is an id like any other and is sent as it was given', async () => {
-    const digest = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c148f4c1ab0'
+  test.each([
+    [
+      'a 64 character hex value',
+      '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c148f4c1ab0',
+    ],
+    ['a 40 character hex value', 'a94a8fe5ccb19ba61c4c0873d391e987982fbbd3'],
+  ])('%s is replaced by the fixed marker: no id of ours is a bare digest', async (_n, value) => {
     const h = harness()
-    h.reporter.capture(new Error('boom'), { requestId: digest })
-    expect((await h.events())[0]?.tags.request_id).toBe(digest)
+    h.reporter.capture(new Error('boom'), { organizationId: value, requestId: value })
+    const tags = (await h.events())[0]?.tags
+    expect(tags?.organization_id).toBe('[invalid]')
+    expect(tags?.request_id).toBe('[invalid]')
+    expect(h.wire()).not.toContain(value)
+  })
+
+  test.each([
+    ['a 32 character hex trace id', '4bf92f3577b34da6a3ce929d0e0e4736'],
+    ['a dashed UUID', 'ae506499-d871-4815-9301-322b14037713'],
+    ['a ULID', '01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
+    ['a prefixed id', 'req_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b'],
+  ])('%s is still sent as given', async (_n, value) => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'), { organizationId: value, requestId: value })
+    const tags = (await h.events())[0]?.tags
+    expect(tags?.organization_id).toBe(value)
+    expect(tags?.request_id).toBe(value)
   })
 
   test('a free-form tag under a sensitive key is still redacted', async () => {

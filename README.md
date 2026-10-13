@@ -197,6 +197,8 @@ For callers of the logger and `scrubText` before this version:
 - **Tags set from typed context** (`organization_id`, `request_id`) are sent as they are when they
   match `[A-Za-z0-9_.:-]{1,64}` and hold nothing `scrubText` would mask, and as `[invalid]`
   otherwise.
+- **A bare hex value of 40 or more characters** as `organization_id` or `request_id` is sent as
+  `[invalid]`; a 32-hex trace id, a UUID, a ULID or a prefixed id is unchanged.
 - **More field names are redacted**: `passwordHash`, `sessionKey`, `accessKey`, `connectionString`,
   `dsn`, `credential(s)`, `otp`, `cvv` and `X-Hub-Signature-256`. `accessKeyId` stays readable.
 - **A number group written with a trunk zero** is a telephone number only if the zero is followed

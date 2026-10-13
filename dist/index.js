@@ -644,6 +644,7 @@ var DATA_COLLECTION_OFF = {
 var TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/;
 var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/;
 var INVALID_IDENTIFIER = "[invalid]";
+var BARE_DIGEST = /^[0-9a-fA-F]{40,}$/;
 var MASK = "[redacted]";
 var MAX_MESSAGE = 8192;
 var MAX_NAME = 200;
@@ -662,7 +663,7 @@ function text(value, max) {
   return scrubText2(String(value)).slice(0, max);
 }
 function identifier(value) {
-  return typeof value === "string" && IDENTIFIER.test(value) && scrubText2(value) === value ? value : INVALID_IDENTIFIER;
+  return typeof value === "string" && IDENTIFIER.test(value) && !BARE_DIGEST.test(value) && scrubText2(value) === value ? value : INVALID_IDENTIFIER;
 }
 function pathWithoutQuery(path) {
   const end = path.search(/[?#]/);

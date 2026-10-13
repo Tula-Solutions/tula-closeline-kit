@@ -42,6 +42,9 @@ const TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/
 // outside this charset and length is not an id and is replaced by a fixed marker.
 const IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/
 const INVALID_IDENTIFIER = '[invalid]'
+// Neither id is ever a bare digest here (ids are prefixed, UUIDs or 32-hex trace ids), and a long
+// run of hex in an id field is as likely a session secret as a hash.
+const BARE_DIGEST = /^[0-9a-fA-F]{40,}$/
 const MASK = '[redacted]'
 
 // What `capture` hands the SDK is bounded, so the work it does before returning is too, whatever it
@@ -91,7 +94,10 @@ function text(value: unknown, max: number): string {
 function identifier(value: unknown): string {
   // An id that `scrubText` would change looks like a secret or a card number: it is dropped, not
   // masked, so what is sent is always exactly what was given.
-  return typeof value === 'string' && IDENTIFIER.test(value) && scrubText(value) === value
+  return typeof value === 'string' &&
+    IDENTIFIER.test(value) &&
+    !BARE_DIGEST.test(value) &&
+    scrubText(value) === value
     ? value
     : INVALID_IDENTIFIER
 }
