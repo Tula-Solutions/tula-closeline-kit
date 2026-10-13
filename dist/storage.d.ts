@@ -1,4 +1,17 @@
 import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand } from "@aws-sdk/client-s3";
+/** Structured logger that redacts secrets, tokens, recordings and message bodies. */
+interface Logger {
+	/** Logs detail useful only while debugging. */
+	debug(message: string, fields?: Record<string, unknown>): void;
+	/** Logs a normal event. */
+	info(message: string, fields?: Record<string, unknown>): void;
+	/** Logs something unexpected that the service recovered from. */
+	warn(message: string, fields?: Record<string, unknown>): void;
+	/** Logs a failure. */
+	error(message: string, fields?: Record<string, unknown>): void;
+	/** Returns a logger that adds `fields` to every entry. */
+	child(fields: Record<string, unknown>): Logger;
+}
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
 /** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
@@ -118,6 +131,8 @@ interface S3ObjectStoreOptions {
 	deadlineMs?: number;
 	/** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
 	maxAttempts?: number;
+	/** Where `list` reports, by number, the keys it skipped; nothing else is logged. */
+	logger?: Logger;
 	/** A replacement for the SDK client, for unit tests with no network. */
 	client?: S3Sender;
 }

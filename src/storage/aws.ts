@@ -10,12 +10,15 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3'
 import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
+import type { Logger } from '../logger'
 import type { OrganizationIdCheck } from '../organization'
 import type { Environment } from '../reporting/env'
 import { STORAGE_ERROR_CODES, StorageError } from './errors'
 import {
   DEFAULT_CONTENT_TYPE,
   type ListPage,
+  MAX_LIST_LIMIT,
+  type ObjectEntry,
   type ObjectInfo,
   type ObjectStore,
   type StoredObject,
@@ -61,6 +64,8 @@ export interface S3ObjectStoreOptions {
   deadlineMs?: number
   /** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
   maxAttempts?: number
+  /** Where `list` reports, by number, the keys it skipped; nothing else is logged. */
+  logger?: Logger
   /** A replacement for the SDK client, for unit tests with no network. */
   client?: S3Sender
 }
@@ -76,6 +81,9 @@ export const S3_DEFAULT_MAX_ATTEMPTS = 3
 
 /** Every object of every Organization lives under this prefix, then `<organizationId>/`. */
 export const S3_KEY_PREFIX = 'orgs/'
+
+/** The most requests one `list` makes while it skips keys the port cannot name. */
+const LIST_MAX_ROUNDS = 10
 
 const ENDPOINT_VARIABLES = ['AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_S3'] as const
 const MISSING = new Set(['NoSuchKey', 'NotFound'])
@@ -165,7 +173,7 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     maxObjectBytes: options.maxObjectBytes,
     isOrganizationId: options.isOrganizationId,
   })
-  const { bucket } = options
+  const { bucket, logger } = options
   const client: S3Sender =
     options.client ??
     new S3Client({
@@ -311,48 +319,79 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     async list(organizationId, listOptions) {
       const root = prefixOf(check.organization(organizationId))
       const { prefix, after, limit } = check.list(listOptions)
-      let output: ListObjectsV2CommandOutput
-      try {
-        output = (await send(
-          new ListObjectsV2Command({
-            Bucket: bucket,
-            Prefix: root + prefix,
-            MaxKeys: limit,
-            ...(after === undefined ? {} : { StartAfter: root + after }),
-          })
-        )) as ListObjectsV2CommandOutput
-      } catch (error) {
-        throw mapFailure('a list', error)
-      }
-      const contents = output.Contents ?? []
-      if (contents.length > limit) {
-        throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned too many keys')
-      }
-      const items = contents.map((entry) => {
-        if (
-          entry.Key === undefined ||
-          !entry.Key.startsWith(root) ||
-          entry.Size === undefined ||
-          entry.LastModified === undefined
-        ) {
+      const items: ObjectEntry[] = []
+      let startAfter = after === undefined ? undefined : root + after
+      let skipped = 0
+      let more = false
+      for (let round = 1; round <= LIST_MAX_ROUNDS; round++) {
+        let output: ListObjectsV2CommandOutput
+        try {
+          output = (await send(
+            new ListObjectsV2Command({
+              Bucket: bucket,
+              Prefix: root + prefix,
+              // The first request asks for what the caller wants; later ones only happen because
+              // keys were skipped, so they read ahead in bigger steps.
+              MaxKeys: round === 1 ? limit : MAX_LIST_LIMIT,
+              ...(startAfter === undefined ? {} : { StartAfter: startAfter }),
+            })
+          )) as ListObjectsV2CommandOutput
+        } catch (error) {
+          throw mapFailure('a list', error)
+        }
+        const contents = output.Contents ?? []
+        if (contents.length > (round === 1 ? limit : MAX_LIST_LIMIT)) {
           throw new StorageError(
             STORAGE_ERROR_CODES.badResponse,
-            'the store returned a key outside the Organization or without a size'
+            'the store returned too many keys'
           )
         }
-        const key = entry.Key.slice(root.length)
-        try {
-          check.key(key)
-        } catch (error) {
-          throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned an odd key', {
-            cause: error,
-          })
+        let overflow = false
+        for (const entry of contents) {
+          if (
+            entry.Key === undefined ||
+            !entry.Key.startsWith(root) ||
+            entry.Size === undefined ||
+            entry.LastModified === undefined
+          ) {
+            throw new StorageError(
+              STORAGE_ERROR_CODES.badResponse,
+              'the store returned a key outside the Organization or without a size'
+            )
+          }
+          startAfter = entry.Key
+          const key = entry.Key.slice(root.length)
+          if (!check.isKey(key)) {
+            // Made outside this adapter (a console folder marker, a name with a space): it cannot
+            // be named through the port, so it is not listed.
+            skipped += 1
+            continue
+          }
+          if (items.length < limit) {
+            items.push({ key, size: entry.Size, lastModified: entry.LastModified })
+          } else {
+            overflow = true
+            break
+          }
         }
-        return { key, size: entry.Size, lastModified: entry.LastModified }
-      })
+        more = overflow || output.IsTruncated === true
+        if (items.length >= limit || output.IsTruncated !== true) {
+          break
+        }
+        if (round === LIST_MAX_ROUNDS && items.length === 0) {
+          throw new StorageError(
+            STORAGE_ERROR_CODES.badResponse,
+            'the listing holds too many keys that cannot be listed'
+          )
+        }
+      }
+      if (skipped > 0) {
+        logger?.debug('storage.list_skipped_keys', { skippedKeys: skipped })
+      }
       const result: ListPage = { items }
       const last = items.at(-1)
-      if (output.IsTruncated === true && last !== undefined) {
+      // The cursor is always the last key handed out, which is a valid key, never a raw store key.
+      if (more && last !== undefined) {
         result.nextCursor = encodeCursor(last.key)
       }
       return result

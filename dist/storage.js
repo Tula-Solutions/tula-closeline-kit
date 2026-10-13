@@ -5,12 +5,13 @@ import {
 import {
   STORAGE_ERROR_CODES2,
   StorageError2,
+  MAX_LIST_LIMIT2,
   DEFAULT_CONTENT_TYPE2
 } from "./shared/chunk-r2rshw7g.js";
 import {
   encodeCursor,
   createStorageValidator
-} from "./shared/chunk-kjet3m0h.js";
+} from "./shared/chunk-jstn60a3.js";
 
 // src/storage/aws.ts
 import {
@@ -25,6 +26,7 @@ var S3_DEFAULT_TIMEOUT_MS = 5000;
 var S3_DEFAULT_DEADLINE_MS = 60000;
 var S3_DEFAULT_MAX_ATTEMPTS = 3;
 var S3_KEY_PREFIX = "orgs/";
+var LIST_MAX_ROUNDS = 10;
 var ENDPOINT_VARIABLES = ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"];
 var MISSING = new Set(["NoSuchKey", "NotFound"]);
 function mapFailure(operation, error) {
@@ -78,7 +80,7 @@ function createS3ObjectStore(options) {
     maxObjectBytes: options.maxObjectBytes,
     isOrganizationId: options.isOrganizationId
   });
-  const { bucket } = options;
+  const { bucket, logger } = options;
   const client = options.client ?? new S3Client({
     region: options.region,
     maxAttempts,
@@ -192,38 +194,58 @@ function createS3ObjectStore(options) {
     async list(organizationId, listOptions) {
       const root = prefixOf(check.organization(organizationId));
       const { prefix, after, limit } = check.list(listOptions);
-      let output;
-      try {
-        output = await send(new ListObjectsV2Command({
-          Bucket: bucket,
-          Prefix: root + prefix,
-          MaxKeys: limit,
-          ...after === undefined ? {} : { StartAfter: root + after }
-        }));
-      } catch (error) {
-        throw mapFailure("a list", error);
-      }
-      const contents = output.Contents ?? [];
-      if (contents.length > limit) {
-        throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned too many keys");
-      }
-      const items = contents.map((entry) => {
-        if (entry.Key === undefined || !entry.Key.startsWith(root) || entry.Size === undefined || entry.LastModified === undefined) {
-          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned a key outside the Organization or without a size");
-        }
-        const key = entry.Key.slice(root.length);
+      const items = [];
+      let startAfter = after === undefined ? undefined : root + after;
+      let skipped = 0;
+      let more = false;
+      for (let round = 1;round <= LIST_MAX_ROUNDS; round++) {
+        let output;
         try {
-          check.key(key);
+          output = await send(new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: root + prefix,
+            MaxKeys: round === 1 ? limit : MAX_LIST_LIMIT2,
+            ...startAfter === undefined ? {} : { StartAfter: startAfter }
+          }));
         } catch (error) {
-          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned an odd key", {
-            cause: error
-          });
+          throw mapFailure("a list", error);
         }
-        return { key, size: entry.Size, lastModified: entry.LastModified };
-      });
+        const contents = output.Contents ?? [];
+        if (contents.length > (round === 1 ? limit : MAX_LIST_LIMIT2)) {
+          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned too many keys");
+        }
+        let overflow = false;
+        for (const entry of contents) {
+          if (entry.Key === undefined || !entry.Key.startsWith(root) || entry.Size === undefined || entry.LastModified === undefined) {
+            throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned a key outside the Organization or without a size");
+          }
+          startAfter = entry.Key;
+          const key = entry.Key.slice(root.length);
+          if (!check.isKey(key)) {
+            skipped += 1;
+            continue;
+          }
+          if (items.length < limit) {
+            items.push({ key, size: entry.Size, lastModified: entry.LastModified });
+          } else {
+            overflow = true;
+            break;
+          }
+        }
+        more = overflow || output.IsTruncated === true;
+        if (items.length >= limit || output.IsTruncated !== true) {
+          break;
+        }
+        if (round === LIST_MAX_ROUNDS && items.length === 0) {
+          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the listing holds too many keys that cannot be listed");
+        }
+      }
+      if (skipped > 0) {
+        logger?.debug("storage.list_skipped_keys", { skippedKeys: skipped });
+      }
       const result = { items };
       const last = items.at(-1);
-      if (output.IsTruncated === true && last !== undefined) {
+      if (more && last !== undefined) {
         result.nextCursor = encodeCursor(last.key);
       }
       return result;

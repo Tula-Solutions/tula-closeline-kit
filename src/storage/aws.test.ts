@@ -8,6 +8,7 @@ import type {
   PutObjectCommand,
 } from '@aws-sdk/client-s3'
 import { createLogger } from '../logger'
+import { createMemoryLogger } from '../testing'
 import { createS3ObjectStore, type S3Sender } from './aws'
 import { encodeCursor } from './validate'
 
@@ -508,12 +509,95 @@ describe('listing', () => {
   test.each([
     ['a key of another Organization', [entry(`orgs/${OTHER}/x`)]],
     ['a key of an Organization whose id starts with this one', [entry(`orgs/${ORG}ff/x`)]],
-    ['a key with an odd shape', [entry(`orgs/${ORG}/a//b`)]],
     ['no size', [{ Key: `orgs/${ORG}/a`, LastModified: new Date() }]],
     ['no key', [{ Size: 1, LastModified: new Date() }]],
   ])('a listing that holds %s is a bad response', async (_label, Contents) => {
     const { client } = stub(() => ({ Contents }))
     await expect(adapter(client).list(ORG)).rejects.toMatchObject({ code: 'storage.bad_response' })
+  })
+
+  describe('keys the rules do not allow, such as a console folder marker or a name with a space', () => {
+    /** A fake bucket listing: sorted raw keys, honouring Prefix, StartAfter and MaxKeys. */
+    function bucket(rawKeys: string[]) {
+      const sorted = [...rawKeys].sort()
+      return stub((command) => {
+        const input = (command as unknown as ListObjectsV2Command).input
+        const after = input.StartAfter ?? ''
+        const matching = sorted.filter((key) => key.startsWith(input.Prefix ?? '') && key > after)
+        const page = matching.slice(0, input.MaxKeys)
+        return {
+          Contents: page.map((Key) => entry(Key)),
+          IsTruncated: matching.length > page.length,
+        }
+      })
+    }
+    const raw = (...names: string[]) => names.map((name) => `orgs/${ORG}/${name}`)
+
+    test('are skipped, and paging goes on past them across a page boundary', async () => {
+      const { client } = bucket(raw('a', 'b', 'docs/', 'has space.txt', 'c', 'd'))
+      const store = adapter(client)
+      const first = await store.list(ORG, { limit: 2 })
+      expect(first.items.map((item) => item.key)).toEqual(['a', 'b'])
+      expect(first.nextCursor).toBe(encodeCursor('b'))
+      const second = await store.list(ORG, { limit: 2, cursor: first.nextCursor as string })
+      expect(second.items.map((item) => item.key)).toEqual(['c', 'd'])
+      // The store says more follows; what follows is only keys that cannot be listed.
+      const third = await store.list(ORG, { limit: 2, cursor: second.nextCursor as string })
+      expect(third.items).toEqual([])
+      expect(third.nextCursor).toBeUndefined()
+    })
+
+    test('at the start of a page are passed over inside one call until the page is full', async () => {
+      const { calls, client } = bucket(raw('a/', 'b space', 'c//', 'd', 'e'))
+      const page = await adapter(client).list(ORG, { limit: 2 })
+      expect(page.items.map((item) => item.key)).toEqual(['d', 'e'])
+      expect(page.nextCursor).toBeUndefined()
+      expect(calls.length).toBeLessThanOrEqual(3)
+    })
+
+    test('never give a cursor that is not a valid key', async () => {
+      const { client } = bucket(raw('a', 'zz/', 'b'))
+      const store = adapter(client)
+      const page = await store.list(ORG, { limit: 1 })
+      expect(page.nextCursor).toBe(encodeCursor('a'))
+      const rest = await store.list(ORG, { limit: 1, cursor: page.nextCursor as string })
+      expect(rest.items.map((item) => item.key)).toEqual(['b'])
+    })
+
+    test('are counted in a debug log by number only', async () => {
+      const logger = createMemoryLogger()
+      const { client } = bucket(raw('a', 'secret folder/', 'secret name.txt', 'b'))
+      await adapter(client, { logger }).list(ORG, { limit: 10 })
+      expect(logger.entries).toHaveLength(1)
+      expect(logger.entries[0]?.level).toBe('debug')
+      expect(logger.entries[0]?.fields).toEqual({ skippedKeys: 2 })
+      expect(JSON.stringify(logger.entries)).not.toContain('secret')
+      expect(JSON.stringify(logger.entries)).not.toContain(ORG)
+    })
+
+    test('stop a listing that is nothing but such keys after a bounded number of requests', async () => {
+      let n = 0
+      const { calls, client } = stub(() => ({
+        Contents: [entry(`orgs/${ORG}/bad name ${n++}`)],
+        IsTruncated: true,
+      }))
+      await expect(adapter(client).list(ORG, { limit: 5 })).rejects.toMatchObject({
+        code: 'storage.bad_response',
+      })
+      expect(calls.length).toBeLessThanOrEqual(10)
+    })
+
+    test('do not excuse a key outside the Organization', async () => {
+      const { client } = bucket([...raw('a', 'b space'), `orgs/${OTHER}/x`])
+      // The fake bucket honours Prefix, so force the foreign key into the answer.
+      const forced = stub(() => ({
+        Contents: [entry(`orgs/${ORG}/a`), entry(`orgs/${OTHER}/x`)],
+      }))
+      void client
+      await expect(adapter(forced.client).list(ORG)).rejects.toMatchObject({
+        code: 'storage.bad_response',
+      })
+    })
   })
 
   test('a listing with more keys than asked for is a bad response', async () => {

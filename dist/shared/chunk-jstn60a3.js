@@ -83,6 +83,14 @@ function createStorageValidator(options = {}) {
       return value;
     },
     key,
+    isKey(value) {
+      try {
+        key(value);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     body(value) {
       if (!(value instanceof Uint8Array)) {
         throw bad("the body must be a Uint8Array");

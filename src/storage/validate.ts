@@ -34,6 +34,8 @@ export interface StorageValidator {
   organization(organizationId: unknown): string
   /** Throws unless `key` is a valid key; returns it. */
   key(key: unknown): string
+  /** True when `key` passes the key rules (what `key` checks, without throwing). */
+  isKey(key: string): boolean
   /** Throws unless `body` is a Uint8Array within the size limit. */
   body(body: unknown): Uint8Array
   /** Throws unless the content type is valid; returns it, or the default. */
@@ -133,6 +135,14 @@ export function createStorageValidator(options: StorageValidatorOptions = {}): S
       return value
     },
     key,
+    isKey(value) {
+      try {
+        key(value)
+        return true
+      } catch {
+        return false
+      }
+    },
     body(value) {
       if (!(value instanceof Uint8Array)) {
         throw bad('the body must be a Uint8Array')
