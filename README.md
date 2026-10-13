@@ -491,7 +491,9 @@ ignores them, but the chain needs some, so export any `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`. Every call has a connect and request timeout (`timeoutMs`, default 5 s; a
 long poll adds its wait) and the SDK's own retry (`maxAttempts`, default 3, `standard` mode with
 jittered exponential back-off); there is no second retry layer, so worst case for one call is
-`maxAttempts` times (timeout plus back-off). Message bodies are never logged. **Proxies:** the
+`maxAttempts` times (timeout plus back-off). Message bodies are never logged, and an error's `cause` is a plain description (`name`, `httpStatus`,
+`requestId`, `fault`), never the SDK error, which can repeat the queue URL or a body. Outside `local`
+the client ignores an `endpoint_url` in the shared AWS config file. **Proxies:** the
 adapter ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms; queue traffic
 never goes through a proxy named in the environment (ADR 0013), and `aws-proxy.test.ts` proves it.
 There is no option for a deliberate proxy yet. The dead-letter queue and its `maxReceiveCount`
@@ -659,18 +661,34 @@ returns it as stored, and a type without parameters always comes back byte for b
 a content type as a raw string, and never use a stored content type to decide behaviour or to
 serve an object; check the bytes yourself. An object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most): bodies are
 held in memory, so there is no streaming. A larger object is `storage.object_too_large` on `put`
-and on `get` (the S3 adapter checks the announced length before it reads).
+and on `get` (the S3 adapter checks the announced length before it reads, and closes the response
+so the connection is released).
 
 **Failures and retries.** Errors are `StorageError` with codes `storage.invalid_request`,
-`object_too_large`, `rejected` (a retry cannot fix it: access denied, no such bucket),
-`unavailable` (the only retryable one) and `bad_response`. A missing object is `undefined`, not an
-error. The S3 adapter bounds every attempt (`timeoutMs`, default 5 s, connect and idle), the whole
+`object_too_large`, `rejected` (a retry cannot fix it: access denied, no such bucket, missing
+credentials), `unavailable` (the only retryable one) and `bad_response`. A missing object is
+`undefined`, not an error; so is `head` of a bucket that does not exist, because a HEAD response
+has no error body to tell the two apart (`get`, `put`, `delete` and `list` report it as
+`storage.rejected`). An error with no HTTP status counts as retryable only when it is a named
+timeout, abort or connection failure (`ECONNRESET` and the like); anything else, such as a
+credentials provider that found nothing, is `rejected`. An error's `cause` is a plain description
+(`name`, `httpStatus`, `requestId`, `fault`, `code`), never the SDK error, which carries the key,
+so logging the cause cannot write an Organization id or a file name. The S3 adapter bounds every attempt (`timeoutMs`, default 5 s, connect and idle), the whole
 operation (`deadlineMs`, default 60 s, retries included) and the attempts (`maxAttempts`, default
 3, the SDK's `standard` mode with jittered exponential back-off, only for failures it calls
 retryable). Put and delete are idempotent, so the retry is safe. Nothing logs bodies, keys or
 URLs. Credentials come only from the SDK's default chain; `endpoint` (S3Mock,
 `http://127.0.0.1:9090`) throws unless `ENVIRONMENT=local`, as do `AWS_ENDPOINT_URL` and
-`AWS_ENDPOINT_URL_S3` outside `local`. The proxy variables are ignored, as for the queue.
+`AWS_ENDPOINT_URL_S3` outside `local`; outside `local` the client is also built to ignore an
+`endpoint_url` in the shared AWS config file (the SQS client too), and `src/aws-config.test.ts`
+proves it with a scratch `AWS_CONFIG_FILE`. The proxy variables are ignored, as for the queue.
+
+**Keys the port cannot name.** An object made outside the adapter (a console folder marker such
+as `docs/`, a name with a space) is not listed: `list` skips such keys, reads on for up to ten
+requests until the page is full, and returns a cursor that is always the last key it handed out,
+so a caller's cursor still has to be a valid key. Pass `logger` to count the skipped keys at debug
+level (a number, never a name). A key outside the Organization's prefix is still a
+`storage.bad_response`.
 
 Not in 0.8.0: presigned URLs (the playbook service uploads through the service, so none is
 needed yet; add them with a short lifetime and a key and method binding when a browser must
@@ -708,7 +726,9 @@ It is a follow-up that needs a dev-account API key (CI secret) and a scratch nam
 `vectorStoreBehaviour` is the acceptance test it has to pass.
 
 ```ts
-const store = createMemoryVectorStore({ dimensions: 1536 }) // the embedding model's dimension count
+const store = createMemoryVectorStore({ dimensions: 1536 })
+warm(organizationId): Promise<void> // a hint that the index will be searched soon (ADR 0010: when a call starts)
+deleteAll(organizationId): Promise<void> // everything the Organization has; offboarding, from a queued job // the embedding model's dimension count
 upsert(organizationId, [{ id, vector, attributes? }]): Promise<void> // 1 to 500, replaces by id, idempotent
 search(organizationId, { vector, topK /*1-100*/, filter? }): Promise<{ id; score; attributes }[]>
 delete(organizationId, ids): Promise<void> // 1 to 500, unknown ids ignored, idempotent
@@ -725,12 +745,29 @@ large for a 32-bit float and all-zero vectors are `vector.invalid_request`, and 
 validated whole before anything is written. Scores are cosine similarity, higher is closer; the
 order of equal scores is not promised by the port (memory orders them by id). A `filter` keeps
 vectors whose attributes equal every entry. Attributes are flat: at most 16, lower-case snake_case
-names, values that are booleans, finite numbers or strings of at most 512 characters. Use them for
-ids you will filter or delete by (`document_id`), not for text. Ids are 1 to 128 of letters,
+names (`id` and `vector` are reserved), and a name should always carry the same kind of value, values that are booleans, finite numbers or strings of at most 512 characters. Use them for
+ids you will filter or delete by (`document_id`), not for text. Ids are 1 to 64 of letters,
 digits, `.`, `_`, `:` and `-`; use deterministic ids (`<documentId>:<chunk>`) so a re-run of an
 ingestion replaces instead of duplicating. Errors never hold vectors, attribute values or query
 text. As the ADR says, vectors from two models cannot be compared: record the model name and
 dimension count with each Organization's index, and re-embed on a switch.
+
+**Checked against turbopuffer's documentation** (turbopuffer.com/docs/limits, /docs/write,
+/docs/query, /docs/warm-cache, /docs/delete-namespace, read when 0.8.0 was reviewed): string ids
+are at most 64 bytes, so the port allows 64; a namespace name is `[A-Za-z0-9-_.]{1,128}`, which
+an Organization id fits; `id` is the document id and an attribute named `vector` is inferred as a
+vector, hence both are reserved; filter values are strings, integers or booleans with `Eq`;
+attribute names are at most 128 characters and filterable values at most 4 KiB; an upsert may be
+512 MB and a repeated id in one request is a 400 (the port refuses it too); delete by filter is
+capped at 5 million documents per request (`rows_remaining` says more match); `top_k` goes to
+10,000 (the port stops at 100); cache warming is `GET /v1/namespaces/:namespace/hint_cache_warm`,
+free if the namespace is ready, else billed as an empty query; a namespace is removed with
+`DELETE /v2/namespaces/:namespace` (the page does not say whether a missing one is an error, so
+the adapter must treat 404 as done). For the adapter ticket: scores come back as distances, so
+convert to the port's cosine similarity; an attribute's type is fixed by its first value, so write
+numbers as one kind (float); loop `deleteByFilter` while `rows_remaining`; keep one namespace per
+Organization named from the validated id plus a fixed prefix; map HTTP 429 and 5xx to
+`vector.unavailable`, 409 (index not built) to a retry too, and other 4xx to `vector.rejected`.
 
 Complexity: the memory adapter's search is an exact scan, O(n x dimensions + n log n) in the
 Organization's n vectors, for tests only; `bench/stores.bench.ts` budgets it.

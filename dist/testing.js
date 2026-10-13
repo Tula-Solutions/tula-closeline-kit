@@ -10,7 +10,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-wvahtrty.js";
+} from "./shared/chunk-a054qyze.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -426,8 +426,9 @@ function createMemoryObjectStore(options = {}) {
   };
 }
 // src/vector/validate.ts
-var VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+var VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 var ATTRIBUTE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+var RESERVED_ATTRIBUTE_NAMES = new Set(["id", "vector"]);
 var bad = (message) => new VectorError2(VECTOR_ERROR_CODES2.invalidRequest, message);
 function attributesMatch(attributes, filter) {
   for (const name of Object.keys(filter)) {
@@ -482,8 +483,8 @@ function createVectorValidator(options) {
     for (const name of names) {
       const item = value[name];
       const okValue = typeof item === "boolean" || typeof item === "number" && Number.isFinite(item) || typeof item === "string" && item.length <= MAX_ATTRIBUTE_STRING2;
-      if (!ATTRIBUTE_NAME.test(name) || !okValue) {
-        throw bad(`${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters`);
+      if (!ATTRIBUTE_NAME.test(name) || RESERVED_ATTRIBUTE_NAMES.has(name) || !okValue) {
+        throw bad(`${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters; "id" and "vector" are reserved`);
       }
       out[name] = item;
     }
@@ -491,7 +492,7 @@ function createVectorValidator(options) {
   }
   function id(value) {
     if (typeof value !== "string" || !VECTOR_ID.test(value)) {
-      throw bad('a vector id is 1 to 128 letters, digits, ".", "_", ":" or "-"');
+      throw bad('a vector id is 1 to 64 letters, digits, ".", "_", ":" or "-"');
     }
     return value;
   }
@@ -569,6 +570,12 @@ function createMemoryVectorStore(options) {
   const organizations = new Map;
   return {
     dimensions: check.dimensions,
+    async warm(organizationId) {
+      check.organization(organizationId);
+    },
+    async deleteAll(organizationId) {
+      organizations.delete(check.organization(organizationId));
+    },
     async upsert(organizationId, records) {
       const org = check.organization(organizationId);
       const checked = check.records(records);

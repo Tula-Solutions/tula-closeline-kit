@@ -1058,6 +1058,8 @@ declare class VectorError extends AppError {
 declare const MAX_UPSERT_BATCH = 500;
 /** The most ids one `delete` takes. */
 declare const MAX_DELETE_BATCH = 500;
+/** The longest vector id, in characters (ids are ASCII, so bytes): turbopuffer's limit for string ids. */
+declare const MAX_VECTOR_ID_LENGTH = 64;
 /** The largest `topK` of a search. */
 declare const MAX_TOP_K = 100;
 /** The most dimensions a store can be configured with. */
@@ -1068,11 +1070,16 @@ declare const MAX_ATTRIBUTES = 16;
 declare const MAX_ATTRIBUTE_STRING = 512;
 /** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
 type AttributeValue = string | number | boolean;
-/** Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`. */
+/**
+* Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`.
+* Names are lower-case snake_case; `id` and `vector` are reserved. A name should always carry the
+* same kind of value (string, number or boolean): a vendor that infers a column's type from its
+* first value refuses a later value of another type.
+*/
 type VectorAttributes = Readonly<Record<string, AttributeValue>>;
 /** A vector to store. */
 interface VectorRecord {
-	/** Unique within the Organization; storing an id again replaces the vector. */
+	/** Unique within the Organization, 1 to 64 of letters, digits, `.`, `_`, `:` and `-`; storing an id again replaces the vector. */
 	id: string;
 	/** Exactly the store's `dimensions` finite numbers, not all zero. */
 	vector: ArrayLike<number>;
@@ -1110,6 +1117,17 @@ interface VectorStore {
 	/** The length every vector and query must have. */
 	readonly dimensions: number;
 	/**
+	* Tells the store to get an Organization's index ready for low-latency search, as ADR 0010
+	* wants done when a call starts. Resolves when the hint is accepted, not when the index is warm.
+	* Never changes data; harmless to repeat or to send for an Organization with no vectors. O(1).
+	*/
+	warm(organizationId: string): Promise<void>;
+	/**
+	* Deletes every vector the Organization has (offboarding). Idempotent: an Organization with
+	* none resolves. Work proportional to the Organization's size: call it from a queued job.
+	*/
+	deleteAll(organizationId: string): Promise<void>;
+	/**
 	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
 	* leaves the same data. Everything is validated before anything is written, so a bad record
 	* writes nothing. Memory adapter O(batch × dimensions).
@@ -1131,4 +1149,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };

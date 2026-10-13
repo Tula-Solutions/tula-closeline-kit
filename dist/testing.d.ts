@@ -538,11 +538,16 @@ type MemoryObjectStore = ObjectStore;
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
 /** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
 type AttributeValue = string | number | boolean;
-/** Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`. */
+/**
+* Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`.
+* Names are lower-case snake_case; `id` and `vector` are reserved. A name should always carry the
+* same kind of value (string, number or boolean): a vendor that infers a column's type from its
+* first value refuses a later value of another type.
+*/
 type VectorAttributes = Readonly<Record<string, AttributeValue>>;
 /** A vector to store. */
 interface VectorRecord {
-	/** Unique within the Organization; storing an id again replaces the vector. */
+	/** Unique within the Organization, 1 to 64 of letters, digits, `.`, `_`, `:` and `-`; storing an id again replaces the vector. */
 	id: string;
 	/** Exactly the store's `dimensions` finite numbers, not all zero. */
 	vector: ArrayLike<number>;
@@ -580,6 +585,17 @@ interface VectorStore {
 	/** The length every vector and query must have. */
 	readonly dimensions: number;
 	/**
+	* Tells the store to get an Organization's index ready for low-latency search, as ADR 0010
+	* wants done when a call starts. Resolves when the hint is accepted, not when the index is warm.
+	* Never changes data; harmless to repeat or to send for an Organization with no vectors. O(1).
+	*/
+	warm(organizationId: string): Promise<void>;
+	/**
+	* Deletes every vector the Organization has (offboarding). Idempotent: an Organization with
+	* none resolves. Work proportional to the Organization's size: call it from a queued job.
+	*/
+	deleteAll(organizationId: string): Promise<void>;
+	/**
 	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
 	* leaves the same data. Everything is validated before anything is written, so a bad record
 	* writes nothing. Memory adapter O(batch × dimensions).
@@ -612,7 +628,7 @@ type MemoryVectorStore = VectorStore;
 * Creates a {@link VectorStore} in memory. Each Organization has its own map, so no query can
 * reach another Organization's vectors. Complexity: upsert O(batch × dimensions); search
 * O(n × dimensions + n log n) in the Organization's n vectors, an exact scan; delete O(ids);
-* deleteByFilter O(n).
+* deleteByFilter O(n); warm O(1); deleteAll O(1).
 */
 declare function createMemoryVectorStore(options: MemoryVectorStoreOptions): MemoryVectorStore;
 /** One recorded log call, with fields already redacted. */

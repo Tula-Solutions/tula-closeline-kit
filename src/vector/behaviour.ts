@@ -152,7 +152,7 @@ export function vectorStoreBehaviour(
       ['a slash', 'a/b'],
       ['a leading dot', '.x'],
       ['a space', 'a b'],
-      ['a long id', 'x'.repeat(129)],
+      ['a long id', 'x'.repeat(65)],
     ])('an id with %s is refused', async (_label, id) => {
       const s = await subject()
       const { a } = s.organizations
@@ -183,6 +183,9 @@ export function vectorStoreBehaviour(
     })
 
     test.each([
+      ['the reserved name id', { id: 'x' }],
+      ['the reserved name vector', { vector: 'x' }],
+      ['a name starting with a dollar sign', { $dist: 'x' }],
       ['an upper-case name', { Document: 'x' }],
       ['a name with a dot', { 'a.b': 'x' }],
       ['an array value', { tags: ['x'] as unknown as string }],
@@ -285,6 +288,41 @@ export function vectorStoreBehaviour(
       expect(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(['two'])
     })
 
+    test('an id of exactly 64 characters is accepted', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+      const id = 'x'.repeat(64)
+      await s.store.upsert(a, [{ id, vector: vec(s, 1) }])
+      expect(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id])
+    })
+
+    test('deleting everything an Organization has leaves other Organizations alone and can be repeated', async () => {
+      const s = await subject()
+      const { a, b, aExtended } = s.organizations
+      await seed(s, a)
+      await seed(s, b)
+      await seed(s, aExtended)
+      await s.store.deleteAll(a)
+      await s.store.deleteAll(a)
+      await s.store.deleteAll(`${a.slice(0, -1)}9`)
+      expect(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([])
+      expect(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4)
+      expect(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4)
+      await s.store.upsert(a, [{ id: 'again', vector: vec(s, 1) }])
+      expect(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(['again'])
+    })
+
+    test('warming an Organization changes nothing and works with or without data', async () => {
+      const s = await subject()
+      const { a, b } = s.organizations
+      await s.store.warm(b)
+      await seed(s, a)
+      await s.store.warm(a)
+      await s.store.warm(a)
+      expect(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4)
+      expect(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([])
+    })
+
     test.each([
       ['empty', ''],
       ['a path', 'org/../x'],
@@ -302,6 +340,8 @@ export function vectorStoreBehaviour(
       )
       await expect(s.store.delete(id, ['v'])).rejects.toMatchObject(invalid)
       await expect(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid)
+      await expect(s.store.deleteAll(id)).rejects.toMatchObject(invalid)
+      await expect(s.store.warm(id)).rejects.toMatchObject(invalid)
     })
   })
 }

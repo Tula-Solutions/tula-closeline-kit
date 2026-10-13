@@ -32,7 +32,7 @@ function normalise(vector: Float32Array): Float32Array {
  * Creates a {@link VectorStore} in memory. Each Organization has its own map, so no query can
  * reach another Organization's vectors. Complexity: upsert O(batch × dimensions); search
  * O(n × dimensions + n log n) in the Organization's n vectors, an exact scan; delete O(ids);
- * deleteByFilter O(n).
+ * deleteByFilter O(n); warm O(1); deleteAll O(1).
  */
 export function createMemoryVectorStore(options: MemoryVectorStoreOptions): MemoryVectorStore {
   const check = createVectorValidator(options)
@@ -40,6 +40,14 @@ export function createMemoryVectorStore(options: MemoryVectorStoreOptions): Memo
 
   return {
     dimensions: check.dimensions,
+
+    async warm(organizationId) {
+      check.organization(organizationId)
+    },
+
+    async deleteAll(organizationId) {
+      organizations.delete(check.organization(organizationId))
+    },
 
     async upsert(organizationId, records) {
       const org = check.organization(organizationId)

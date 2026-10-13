@@ -964,9 +964,10 @@ class VectorError2 extends AppError2 {
 // src/vector/port.ts
 var MAX_UPSERT_BATCH2 = 500;
 var MAX_DELETE_BATCH2 = 500;
+var MAX_VECTOR_ID_LENGTH2 = 64;
 var MAX_TOP_K2 = 100;
 var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

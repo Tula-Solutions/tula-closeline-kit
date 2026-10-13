@@ -14,8 +14,10 @@ import {
 
 // Internal: the checks both adapters share. Not exported from any entry of the package.
 
-const VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/
 const ATTRIBUTE_NAME = /^[a-z][a-z0-9_]{0,63}$/
+// turbopuffer treats `id` as the document id and infers an attribute named `vector` as a vector.
+const RESERVED_ATTRIBUTE_NAMES = new Set(['id', 'vector'])
 
 const bad = (message: string) => new VectorError(VECTOR_ERROR_CODES.invalidRequest, message)
 
@@ -126,9 +128,9 @@ export function createVectorValidator(options: VectorValidatorOptions): VectorVa
         typeof item === 'boolean' ||
         (typeof item === 'number' && Number.isFinite(item)) ||
         (typeof item === 'string' && item.length <= MAX_ATTRIBUTE_STRING)
-      if (!ATTRIBUTE_NAME.test(name) || !okValue) {
+      if (!ATTRIBUTE_NAME.test(name) || RESERVED_ATTRIBUTE_NAMES.has(name) || !okValue) {
         throw bad(
-          `${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters`
+          `${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters; "id" and "vector" are reserved`
         )
       }
       out[name] = item as AttributeValue
@@ -138,7 +140,7 @@ export function createVectorValidator(options: VectorValidatorOptions): VectorVa
 
   function id(value: unknown): string {
     if (typeof value !== 'string' || !VECTOR_ID.test(value)) {
-      throw bad('a vector id is 1 to 128 letters, digits, ".", "_", ":" or "-"')
+      throw bad('a vector id is 1 to 64 letters, digits, ".", "_", ":" or "-"')
     }
     return value
   }
