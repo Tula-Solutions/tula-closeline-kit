@@ -193,6 +193,11 @@ describe('scrubText is bounded and never throws', () => {
       '(415) ',
       '00 1 ',
       'a@',
+      '00442079460958 ',
+      '4111.1111.',
+      '+44(0)2 ',
+      '4222 2222 2222 2 ',
+      '0055 11 9 ',
     ]
     const counted: Array<[object, string]> = [
       [String.prototype, 'charCodeAt'],

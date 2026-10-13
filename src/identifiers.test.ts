@@ -149,7 +149,7 @@ const zeroPadded = (): string => {
   // Four groups of four after the first are written as a card is, and are read as one.
   const count = uniform && width === 4 ? int(3, 4) : int(3, 5)
   const groups = Array.from({ length: count }, () =>
-    uniform ? chars('0123456789', width) : chars('0123456789', int(2, 5))
+    uniform ? `0${chars('0123456789', width - 1)}` : chars('0123456789', int(2, 5))
   )
   groups[0] = uniform
     ? `00${chars('0123456789', width - 2)}`
@@ -160,7 +160,9 @@ const zeroPadded = (): string => {
 const longIdOutsideIssuers = (): string => {
   for (;;) {
     const value = digits(int(13, 19), false)
-    if (!startsInIssuerRange(value) && value[0] !== '1') {
+    // A bare run of `00`, a country code and a number is a telephone number as far as a scrubber can
+    // tell, so no id of that shape is generated.
+    if (!startsInIssuerRange(value) && value[0] !== '1' && !value.startsWith('00')) {
       return value
     }
   }

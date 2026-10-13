@@ -43,6 +43,27 @@ const NUMBERS: Array<[string, string]> = [
   ['French 00', '0033 6 12 34 56 78'],
   ['French 00, split prefix', '00 33 6 12 34 56 78'],
   ['Irish 00, three-digit code', '00353 1 234 5678'],
+  ['Singapore 00, spaces', '0065 6123 4567'],
+  ['Singapore 00, dashes', '0065-6123-4567'],
+  ['Singapore 00, dots', '0065.6123.4567'],
+  ['Danish 00', '0045 1234 5678'],
+  ['Norwegian 00', '0047 9123 4567'],
+  ['German 00, three groups of four', '0049 3012 3456'],
+  ['German 00, four groups of four', '0049 3012 3456 7890'],
+  ['UK 00, no separator', '00442079460958'],
+  ['US 00, no separator', '0014155550199'],
+  ['German 00, no separator', '004915123456789'],
+  ['UK 00 and a retained trunk zero', '0044 020 7946 0958'],
+  ['UK 00, country code then the number', '00 44 2079460958'],
+  ['French plus, dots', '+33.6.12.34.56.78'],
+  ['French plus, dots, landline', '+33.1.23.45.67.89'],
+  ['Australian plus, dots, mobile', '+61.412.345.678'],
+  ['French 00 with a dot after the prefix', '00.33.6.12.34.56.78'],
+  ['UK plus, parenthesis straight after the code', '+44(0)20 7946 0958'],
+  ['UK 00, parenthesis straight after the code', '0044(0)20 7946 0958'],
+  ['German 00 that reads like a date', '0049-30-12-34-56-78'],
+  ['Brazilian 00 with a lone digit inside', '0055 11 9 1234 5678'],
+  ['Brazilian plus with a lone digit inside', '+55 11 9 1234 5678'],
 ]
 
 const CONTEXTS: Array<[string, (n: string) => string, (n: string) => string]> = [
@@ -76,6 +97,7 @@ describe('scrubText leaves what only looks like a number alone', () => {
     ['groups led by 00', 'invoice 0012-3456-7890'],
     ['a zero-padded counter', 'order 0042 0017 0231'],
     ['a padded counter whose prefix is a country code', 'order 0044 0017 0231'],
+    ['a padded counter, dots', 'order 0044.0017.0231'],
     ['a padded counter, dashes', 'id=0020-0021-0022'],
     ['four zero-padded groups', 'seq 0001 0002 0003 0004'],
     ['two-digit groups led by 00', 'rows 00 11 22 33 44'],
@@ -86,6 +108,13 @@ describe('scrubText leaves what only looks like a number alone', () => {
     ['an amount', 'paid $1,000.00 and 100.00 USD'],
     ['a version', 'release 2026.10.25.564 and 1.2.3'],
     ['an IPv4 address', 'from 10.0.0.44'],
+    ['an IPv4 address of three-digit parts', 'from 192.168.100.200'],
+    ['a date with a time', 'on 2026-10-13 10:30'],
+    ['a bare 13 digit epoch', 'ts 1700000000123'],
+    ['a bare compact timestamp', 'at 20261013103045'],
+    ['a bare long id led by zeros', 'id 000000012345678'],
+    ['a 32 digit trace id', 'trace 00441234567890123456789012345678'],
+    ['a hash', 'sha 00442079460958a1b2c3d4'],
     ['a UUID', 'req ae506499-d871-4815-9301-322b14037713'],
     ['a digits-only UUID', 'req 00441234-1234-4234-8234-123456789012'],
     ['a prefixed id', 'org_00441234123442348234123456789012 gone'],
@@ -107,6 +136,20 @@ function seeded(seed: number): () => number {
   }
 }
 
+describe('scrubText masks cards however they are grouped', () => {
+  test.each([
+    ['dots, 16 digits', 'card 4111.1111.1111.1111 declined', 'card [redacted] declined'],
+    ['dots, 19 digits', 'card 6011.0000.0000.0000.001 x', 'card [redacted] x'],
+    ['13 digits as 4-4-4-1', 'card 4222 2222 2222 2 declined', 'card [redacted] declined'],
+    ['13 digits as 4-4-4-1, dashes', 'card 4222-2222-2222-2.', 'card [redacted].'],
+    ['13 digits as 4-4-4-1, dots', 'card 4222.2222.2222.2', 'card [redacted]'],
+    ['another 13 digit Visa', 'card 4074 1852 9630 9 ok', 'card [redacted] ok'],
+    ['16 digits and a lone digit after', 'card 4111 1111 1111 1111 7 ok', 'card [redacted] 7 ok'],
+  ])('%s', (_name, text, expected) => {
+    expect(scrubText(text)).toBe(expected)
+  })
+})
+
 describe('adversarial pass: generated numbers are all masked', () => {
   const rand = seeded(20261013)
   const int = (min: number, max: number): number => min + Math.floor(rand() * (max - min + 1))
@@ -119,29 +162,54 @@ describe('adversarial pass: generated numbers are all masked', () => {
     return out
   }
 
-  // Country code and the national number as groups, for the countries named in the brief.
-  const national: Array<() => [string, string[]]> = [
-    () => ['44', ['20', digits(4, 1), digits(4)]],
-    () => ['44', [`7${digits(3)}`, digits(6)]],
-    () => ['1', [`${int(2, 9)}${digits(2)}`, `${int(2, 9)}${digits(2)}`, digits(4)]],
-    () => ['49', [`${int(30, 89)}`, digits(int(7, 8), 1)]],
-    () => ['91', [`${int(6, 9)}${digits(4)}`, digits(5)]],
-    () => ['61', [`${int(2, 4)}`, digits(4, 1), digits(4)]],
-    () => ['61', [`4${digits(2)}`, digits(3), digits(3)]],
+  const CODES = [
+    ...['1', '7'],
+    ...['20', '33', '44', '45', '47', '49', '55', '61', '65', '81', '86', '91'],
+    ...['212', '353', '358', '880', '971'],
   ]
-  const seps = [' ', '-', '.']
+
+  /** Cuts a national number into groups: uniform, mixed, glued or with one lone digit. */
+  function group(national: string): string[] {
+    const style = pick(['uniform', 'mixed', 'glued', 'lone'])
+    if (style === 'glued') {
+      return [national]
+    }
+    const groups: string[] = []
+    let rest = national
+    const width = int(2, 4)
+    let lone = style === 'lone'
+    while (rest.length > 0) {
+      let size = style === 'uniform' ? width : int(2, 5)
+      if (lone && groups.length === 0 && rest.length > 3) {
+        size = 1
+        lone = false
+      }
+      // Never leave a lone digit at the end.
+      if (rest.length - size === 1) {
+        size = rest.length
+      }
+      groups.push(rest.slice(0, size))
+      rest = rest.slice(size)
+    }
+    return groups
+  }
 
   function phone(): string {
-    const [code, groups] = pick(national)()
-    const sep = pick(seps)
-    const lead = pick(['+', '00', '00 ', '+'])
-    const glued = lead === '00' ? `00${code}` : lead === '00 ' ? `00 ${code}` : `+${code}`
-    // A parenthesised area code only where the national number opens with a three-digit group.
-    const body =
-      code === '1' && rand() < 0.5
-        ? `(${groups[0]}) ${groups[1]}${sep === ' ' ? '-' : sep}${groups[2]}`
-        : groups.join(sep)
-    return `${glued}${code === '1' && body.startsWith('(') ? ' ' : sep}${body}`
+    const code = pick(CODES)
+    const national = digits(int(8, 12), 1)
+    // Fifteen digits is the most an international number has.
+    const trimmed = national.slice(0, 15 - code.length)
+    const lead = pick(['+', '+', '00', '00', '00.', '00 '])
+    const sep = pick([' ', '-', '.', ''])
+    const groups = group(trimmed)
+    const trunk = rand() < 0.2 ? `${pick(['', ' '])}(0)` : ''
+    const prefix = lead === '+' ? `+${code}` : lead === '00' ? `00${code}` : `${lead}${code}`
+    // With no separator at all the number is one run of digits.
+    const joined = groups.join(sep)
+    if (trunk !== '') {
+      return `${prefix}${trunk}${joined}`
+    }
+    return `${prefix}${sep}${joined}`
   }
 
   function luhnComplete(prefix: string, length: number): string {
@@ -161,40 +229,43 @@ describe('adversarial pass: generated numbers are all masked', () => {
   }
 
   function card(): string {
-    const style = int(0, 4)
-    if (style === 4) {
+    const style = int(0, 5)
+    if (style === 5) {
       const raw = luhnComplete(pick(['34', '37']), 15)
       return `${raw.slice(0, 4)}${pick([' ', '-'])}${raw.slice(4, 10)}${pick([' ', '-'])}${raw.slice(10)}`
     }
+    const length = style === 4 ? 13 : pick([16, 16, 16, 19])
     const raw = luhnComplete(
       pick(['4', '51', '55', '2221', '2720', '6011', '35', '36', '81']),
-      pick([16, 16, 16, 19])
+      length
     )
     if (style === 0) {
       return raw
     }
-    const sep = pick([' ', '-'])
-    return (raw.match(/\d{1,4}/g) as string[]).join(sep)
+    const sep = pick([' ', '-', '.'])
+    const grouped = (raw.match(/\d{1,4}/g) as string[]).join(sep)
+    // A lone digit after a 16 or 19 digit card is not part of it.
+    return style <= 3 && rand() < 0.15 ? `${grouped} ${int(0, 9)}` : grouped
   }
 
   const before = ['', 'call ', 'tel: ', '(', '"', 'number is ', 'a,', '[', 'Tel.']
   const after = ['', '.', ',', ')', '"', ' ok', ';', ']', '!']
 
-  test('400 telephone numbers written with + or 00 are masked', () => {
+  test('600 telephone numbers written with + or 00 are masked', () => {
     const misses: string[] = []
-    for (let i = 0; i < 400; i++) {
+    for (let i = 0; i < 600; i++) {
       const number = phone()
       const input = `${pick(before)}${number}${pick(after)}`
-      if (/\d{4}/.test(scrubText(input))) {
+      if (/\d{4}/.test(scrubText(input)) || /\d{3}/.test(scrubText(number))) {
         misses.push(input)
       }
     }
     expect(misses).toEqual([])
   })
 
-  test('400 card numbers are masked', () => {
+  test('600 card numbers (dots, 13 digits as 4-4-4-1, a lone digit after) are masked', () => {
     const misses: string[] = []
-    for (let i = 0; i < 400; i++) {
+    for (let i = 0; i < 600; i++) {
       const number = card()
       const input = `${pick(before.filter((b) => b !== 'Tel.'))}${number}${pick(after)}`
       if (/\d{4}/.test(scrubText(input))) {

@@ -155,18 +155,28 @@ function readRun(text: string, from: number, maxDigits: number): Run | null {
       sep += next
       k++
     }
+    if (text[k] === '(') {
+      // `+44(0)20 …`: a parenthesis straight after a group belongs to a `+` or `00` number only.
+      if (sep === '' && !(plus || doubleZero)) {
+        break
+      }
+      sep = sep === '' ? '(' : sep
+      k++
+    }
     if (sep === '') {
       break
-    }
-    if (text[k] === '(') {
-      k++
     }
     if (!isDigit(text.charCodeAt(k))) {
       break
     }
     // After the first group, a single digit does not belong to a telephone or card number (`1-1-1…`
     // is a list); stopping here also keeps a long chain of them from being rescanned at each digit.
-    if (!(plus || (doubleZero && run.groups.length <= 2)) && !isDigit(text.charCodeAt(k + 1))) {
+    // The last digit of a 13 digit card, written 4-4-4-1, is the one other lone digit.
+    const cardTail = run.groups.length === 3 && run.groups.every((length) => length === 4) && !paren
+    if (
+      !(plus || (doubleZero && run.groups.length <= 3) || cardTail) &&
+      !isDigit(text.charCodeAt(k + 1))
+    ) {
       break
     }
     run.seps.push(sep)
@@ -196,11 +206,20 @@ function digitsOf(text: string, run: Run): string {
   return text.slice(run.start, run.end).replace(/\D/g, '')
 }
 
-/** How many leading groups are an ISO date (`2024-05-12`) or an IPv4 address; 0 when neither. */
-function leadingNonPhoneGroups(run: Run): number {
+/**
+ * How many leading groups are an ISO date (`2024-05-12`, with a month 1 to 12 and a day 1 to 31) or
+ * an IPv4 address; 0 when neither. A run that opens with `+` or `00` is neither: no date has a year
+ * `00xx` and no address has a plus.
+ */
+function leadingNonPhoneGroups(text: string, run: Run): number {
+  if (run.plus || startsDoubleZero(text, run)) {
+    return 0
+  }
   const { groups, seps } = run
   if (groups[0] === 4 && groups[1] === 2 && groups[2] === 2 && seps[0] === '-' && seps[1] === '-') {
-    return 3
+    const month = Number(text.slice((run.groupEnds[0] as number) + 1, run.groupEnds[1]))
+    const day = Number(text.slice((run.groupEnds[1] as number) + 1, run.groupEnds[2]))
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31 ? 3 : 0
   }
   if (
     groups.length >= 4 &&
@@ -234,7 +253,11 @@ function attachedBefore(text: string, index: number, labelled: boolean): boolean
     // A number that opens with `+`, `00` or an area code after a label (`Tel.+44 …`, `ph-0044 …`) is
     // a number: only a digit before the dot or dash ties it to an id or a version.
     const two = index >= 2 ? text.charCodeAt(index - 2) : 0
-    return labelled ? isDigit(two) : isAlnum(two)
+    if (!labelled) {
+      return isAlnum(two)
+    }
+    // After a dash a hex letter ties it too: a UUID or a hash is written with them.
+    return isDigit(two) || (code === 45 && (two | 32) >= 97 && (two | 32) <= 102)
   }
   // `10:30:05.109-0800`: the seconds of a time are not a telephone number.
   return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2))
@@ -303,7 +326,10 @@ function isCard(text: string, run: Run): boolean {
   if (run.digits < 13 || run.digits > 19 || run.paren || run.plus) {
     return false
   }
-  if (!run.seps.every((sep) => sep === ' ' || sep === '-') || !isCardLayout(run.groups)) {
+  if (
+    !run.seps.every((sep) => sep === ' ' || sep === '-' || sep === '.') ||
+    !isCardLayout(run.groups)
+  ) {
     return false
   }
   const digits = digitsOf(text, run)
@@ -352,42 +378,98 @@ function startsDoubleZero(text: string, run: Run): boolean {
   )
 }
 
+/** Index of a group that is the optional trunk zero written `(0)` right after the country code; -1 if none. */
+function trunkParenAt(text: string, run: Run): number {
+  for (let i = 1; i <= 2 && i < run.groups.length; i++) {
+    const end = run.groupEnds[i] as number
+    if (
+      run.groups[i] === 1 &&
+      text.charCodeAt(end - 1) === 48 &&
+      text[end - 2] === '(' &&
+      text[end] === ')'
+    ) {
+      return i
+    }
+  }
+  return -1
+}
+
+/** Digits of a `+` or `00` number: the country code and the number, without a `(0)` trunk zero. */
+function numberDigits(text: string, run: Run): number {
+  return run.digits - (trunkParenAt(text, run) === -1 ? 0 : 1)
+}
+
+/** Length of the country code the digits open with (1 to 3), or 0 when they open with none. */
+function codeLength(digits: string): number {
+  if (digits[0] === '1' || digits[0] === '7') {
+    return 1
+  }
+  if (TWO_DIGIT_CODES.has(digits.slice(0, 2))) {
+    return 2
+  }
+  return digits.length >= 3 && THREE_DIGIT_PREFIXES.has(digits.slice(0, 2)) ? 3 : 0
+}
+
 /**
  * True when a run opening with `00` is written like an international number: the prefix is followed
- * by a country code, either glued to it (`0044 20 7946 0958`) or as a group of its own
- * (`00 44 20 …`). Padded counters and ids also open with `00` (`0042-0017-0231`, `0012-3456-7890`,
- * `00 11 22 33`), but their first group is wider than a code makes it, their groups are all one
- * width, or the digits after the zeros are no code, so they stay readable. Only one lone digit is
- * allowed, right after the code (`00 33 6 12 34 56 78`), and every other group has two or more.
- * Linear: it looks at the first two groups and the group widths once.
+ * by a country code, glued to the first group (`0044 20 7946 0958`) or as a group of its own
+ * (`00 44 20 …`), or with the national number glued on (`0044 2079460958`). A code is read exactly
+ * from a group of up to five digits (so `0042` and `0012`, which are no code, are not read as one)
+ * and as a prefix from a longer group. A padded counter (`0044 0017 0231`, `0020-0021-0022`) also
+ * opens that way, so a run whose every later group starts with `0` stays readable; everything
+ * else is a number, whatever its group widths. One lone digit is allowed after the code
+ * (`00 33 6 12 34 56 78`, `0055 11 9 1234 5678`), every other group has two or more digits.
+ * Linear: it looks at the first two groups and at each group's width and first digit once.
  */
 function opensAsInternational(text: string, run: Run): boolean {
-  const { groups } = run
+  const { groups, groupEnds } = run
   const first = groups[0] as number
-  let rest: number[]
+  let tail: number[]
   if (first === 2) {
-    const code = text.slice((run.groupEnds[0] as number) + 1, run.groupEnds[1])
-    if (groups.length < 3 || !isCountryCode(code)) {
+    const second = groups[1] as number
+    if (groups.length < 2) {
       return false
     }
-    rest = groups.slice(3)
-    if ((groups[2] as number) < 1) {
+    const digits = text.slice((groupEnds[0] as number) + 1, groupEnds[1])
+    if (second >= 4 ? codeLength(digits) === 0 : !isCountryCode(digits) || groups.length < 3) {
       return false
     }
+    tail = groups.slice(2)
   } else {
-    if (first < 3 || first > 5 || groups.length < 2) {
+    if (first < 3 || groups.length < 2) {
       return false
     }
-    if (!isCountryCode(text.slice(run.start + 2, run.groupEnds[0]))) {
+    const digits = text.slice(run.start + 2, groupEnds[0])
+    if (first > 5 ? codeLength(digits) === 0 : !isCountryCode(digits)) {
       return false
     }
-    rest = groups.slice(2)
+    tail = groups.slice(1)
   }
-  if (!rest.every((length) => length >= 2)) {
+  const trunk = trunkParenAt(text, run)
+  const lone = tail.filter(
+    (length, i) => length === 1 && i + (groups.length - tail.length) !== trunk
+  ).length
+  if (lone > 1) {
     return false
   }
-  // Padded counters: three or more groups of one width (3 or wider).
-  return !(groups.length >= 3 && first >= 3 && groups.every((length) => length === first))
+  // A padded counter: every group after the first starts with a zero.
+  for (let i = 1; i < groups.length; i++) {
+    if (text.charCodeAt((groupEnds[i] as number) - (groups[i] as number)) !== 48) {
+      return true
+    }
+  }
+  return false
+}
+
+/** True for one group of digits `00`, a country code and a number, with nothing written between. */
+function isGluedInternational(text: string, run: Run): boolean {
+  return (
+    startsDoubleZero(text, run) &&
+    run.groups.length === 1 &&
+    run.digits >= 10 &&
+    run.digits <= 17 &&
+    codeLength(text.slice(run.start + 2, run.end)) > 0
+  )
 }
 
 /**
@@ -421,11 +503,11 @@ function isPhone(text: string, run: Run): boolean {
     return false
   }
   if (run.plus) {
-    return run.digits >= 8 && run.digits <= 15
+    return numberDigits(text, run) >= 8 && numberDigits(text, run) <= 15
   }
   if (startsDoubleZero(text, run)) {
     // The digits after the `00` are the number, as they are after a `+`.
-    return run.digits >= 10 && run.digits <= 17
+    return numberDigits(text, run) >= 10 && numberDigits(text, run) <= 17
   }
   if (run.digits < 9 || run.digits > 15) {
     return false
@@ -445,7 +527,11 @@ function isPhone(text: string, run: Run): boolean {
 // run too long for either. A run that is too long for a telephone number and opens as one, or opens
 // as a card followed by more digits, is more than one number, so all of it goes.
 function isSeveralNumbers(text: string, run: Run): boolean {
-  if (run.digits < 16 || !run.groups.every((length, i) => i === 0 || length >= 2)) {
+  const trunk = trunkParenAt(text, run)
+  if (
+    numberDigits(text, run) < 16 ||
+    !run.groups.every((length, i) => i === 0 || length >= 2 || i === trunk)
+  ) {
     return false
   }
   if (hasPhoneLead(text, run)) {
@@ -501,7 +587,7 @@ export function maskNumbers(text: string, mask: string): string {
       i = run.end
       continue
     }
-    const skip = leadingNonPhoneGroups(run)
+    const skip = leadingNonPhoneGroups(text, run)
     if (skip > 0) {
       // The date or address is left as it is; what follows it is looked at on its own.
       i = run.groupEnds[skip - 1] as number
@@ -513,10 +599,10 @@ export function maskNumbers(text: string, mask: string): string {
     if (run.groups.length === 1 && !run.plus) {
       // Bare digits: only a card number, and not inside a longer token or after a decimal point.
       masked =
-        before !== 46 &&
-        !attachedBefore(text, i, false) &&
+        (before !== 46 || startsDoubleZero(text, run)) &&
+        !attachedBefore(text, i, startsDoubleZero(text, run)) &&
         !attachedAfter(text, run.end) &&
-        isCard(text, run)
+        (isCard(text, run) || isGluedInternational(text, run))
     } else if (!attachedBefore(text, i, labelled) && !attachedAfter(text, run.end)) {
       masked = isCard(text, run) || (!inside && (isPhone(text, run) || isSeveralNumbers(text, run)))
     }

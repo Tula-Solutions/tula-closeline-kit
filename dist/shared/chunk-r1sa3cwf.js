@@ -166,16 +166,21 @@ function readRun(text, from, maxDigits) {
       sep += next;
       k++;
     }
+    if (text[k] === "(") {
+      if (sep === "" && !(plus || doubleZero)) {
+        break;
+      }
+      sep = sep === "" ? "(" : sep;
+      k++;
+    }
     if (sep === "") {
       break;
-    }
-    if (text[k] === "(") {
-      k++;
     }
     if (!isDigit(text.charCodeAt(k))) {
       break;
     }
-    if (!(plus || doubleZero && run.groups.length <= 2) && !isDigit(text.charCodeAt(k + 1))) {
+    const cardTail = run.groups.length === 3 && run.groups.every((length) => length === 4) && !paren;
+    if (!(plus || doubleZero && run.groups.length <= 3 || cardTail) && !isDigit(text.charCodeAt(k + 1))) {
       break;
     }
     run.seps.push(sep);
@@ -202,10 +207,15 @@ function passesLuhn(digits) {
 function digitsOf(text, run) {
   return text.slice(run.start, run.end).replace(/\D/g, "");
 }
-function leadingNonPhoneGroups(run) {
+function leadingNonPhoneGroups(text, run) {
+  if (run.plus || startsDoubleZero(text, run)) {
+    return 0;
+  }
   const { groups, seps } = run;
   if (groups[0] === 4 && groups[1] === 2 && groups[2] === 2 && seps[0] === "-" && seps[1] === "-") {
-    return 3;
+    const month = Number(text.slice(run.groupEnds[0] + 1, run.groupEnds[1]));
+    const day = Number(text.slice(run.groupEnds[1] + 1, run.groupEnds[2]));
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31 ? 3 : 0;
   }
   if (groups.length >= 4 && groups.slice(0, 4).every((length) => length <= 3) && seps.slice(0, 3).every((sep) => sep === ".")) {
     return 4;
@@ -225,7 +235,10 @@ function attachedBefore(text, index, labelled) {
   }
   if (code === 45 || code === 46) {
     const two = index >= 2 ? text.charCodeAt(index - 2) : 0;
-    return labelled ? isDigit(two) : isAlnum(two);
+    if (!labelled) {
+      return isAlnum(two);
+    }
+    return isDigit(two) || code === 45 && (two | 32) >= 97 && (two | 32) <= 102;
   }
   return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2));
 }
@@ -271,7 +284,7 @@ function isCard(text, run) {
   if (run.digits < 13 || run.digits > 19 || run.paren || run.plus) {
     return false;
   }
-  if (!run.seps.every((sep) => sep === " " || sep === "-") || !isCardLayout(run.groups)) {
+  if (!run.seps.every((sep) => sep === " " || sep === "-" || sep === ".") || !isCardLayout(run.groups)) {
     return false;
   }
   const digits = digitsOf(text, run);
@@ -294,32 +307,65 @@ function isCountryCode(code) {
 function startsDoubleZero(text, run) {
   return !run.plus && !run.paren && text.charCodeAt(run.start) === 48 && text.charCodeAt(run.start + 1) === 48;
 }
-function opensAsInternational(text, run) {
-  const { groups } = run;
-  const first = groups[0];
-  let rest;
-  if (first === 2) {
-    const code = text.slice(run.groupEnds[0] + 1, run.groupEnds[1]);
-    if (groups.length < 3 || !isCountryCode(code)) {
-      return false;
+function trunkParenAt(text, run) {
+  for (let i = 1;i <= 2 && i < run.groups.length; i++) {
+    const end = run.groupEnds[i];
+    if (run.groups[i] === 1 && text.charCodeAt(end - 1) === 48 && text[end - 2] === "(" && text[end] === ")") {
+      return i;
     }
-    rest = groups.slice(3);
-    if (groups[2] < 1) {
-      return false;
-    }
-  } else {
-    if (first < 3 || first > 5 || groups.length < 2) {
-      return false;
-    }
-    if (!isCountryCode(text.slice(run.start + 2, run.groupEnds[0]))) {
-      return false;
-    }
-    rest = groups.slice(2);
   }
-  if (!rest.every((length) => length >= 2)) {
+  return -1;
+}
+function numberDigits(text, run) {
+  return run.digits - (trunkParenAt(text, run) === -1 ? 0 : 1);
+}
+function codeLength(digits) {
+  if (digits[0] === "1" || digits[0] === "7") {
+    return 1;
+  }
+  if (TWO_DIGIT_CODES.has(digits.slice(0, 2))) {
+    return 2;
+  }
+  return digits.length >= 3 && THREE_DIGIT_PREFIXES.has(digits.slice(0, 2)) ? 3 : 0;
+}
+function opensAsInternational(text, run) {
+  const { groups, groupEnds } = run;
+  const first = groups[0];
+  let tail;
+  if (first === 2) {
+    const second = groups[1];
+    if (groups.length < 2) {
+      return false;
+    }
+    const digits = text.slice(groupEnds[0] + 1, groupEnds[1]);
+    if (second >= 4 ? codeLength(digits) === 0 : !isCountryCode(digits) || groups.length < 3) {
+      return false;
+    }
+    tail = groups.slice(2);
+  } else {
+    if (first < 3 || groups.length < 2) {
+      return false;
+    }
+    const digits = text.slice(run.start + 2, groupEnds[0]);
+    if (first > 5 ? codeLength(digits) === 0 : !isCountryCode(digits)) {
+      return false;
+    }
+    tail = groups.slice(1);
+  }
+  const trunk = trunkParenAt(text, run);
+  const lone = tail.filter((length, i) => length === 1 && i + (groups.length - tail.length) !== trunk).length;
+  if (lone > 1) {
     return false;
   }
-  return !(groups.length >= 3 && first >= 3 && groups.every((length) => length === first));
+  for (let i = 1;i < groups.length; i++) {
+    if (text.charCodeAt(groupEnds[i] - groups[i]) !== 48) {
+      return true;
+    }
+  }
+  return false;
+}
+function isGluedInternational(text, run) {
+  return startsDoubleZero(text, run) && run.groups.length === 1 && run.digits >= 10 && run.digits <= 17 && codeLength(text.slice(run.start + 2, run.end)) > 0;
 }
 function hasPhoneLead(text, run) {
   if (run.plus) {
@@ -339,10 +385,10 @@ function isPhone(text, run) {
     return false;
   }
   if (run.plus) {
-    return run.digits >= 8 && run.digits <= 15;
+    return numberDigits(text, run) >= 8 && numberDigits(text, run) <= 15;
   }
   if (startsDoubleZero(text, run)) {
-    return run.digits >= 10 && run.digits <= 17;
+    return numberDigits(text, run) >= 10 && numberDigits(text, run) <= 17;
   }
   if (run.digits < 9 || run.digits > 15) {
     return false;
@@ -356,7 +402,8 @@ function isPhone(text, run) {
   return groups.every((length, i) => length <= limit && (i === 0 || length >= 2));
 }
 function isSeveralNumbers(text, run) {
-  if (run.digits < 16 || !run.groups.every((length, i) => i === 0 || length >= 2)) {
+  const trunk = trunkParenAt(text, run);
+  if (numberDigits(text, run) < 16 || !run.groups.every((length, i) => i === 0 || length >= 2 || i === trunk)) {
     return false;
   }
   if (hasPhoneLead(text, run)) {
@@ -394,7 +441,7 @@ function maskNumbers(text, mask) {
       i = run.end;
       continue;
     }
-    const skip = leadingNonPhoneGroups(run);
+    const skip = leadingNonPhoneGroups(text, run);
     if (skip > 0) {
       i = run.groupEnds[skip - 1];
       continue;
@@ -402,7 +449,7 @@ function maskNumbers(text, mask) {
     const labelled = run.plus || run.paren || startsDoubleZero(text, run);
     let masked = false;
     if (run.groups.length === 1 && !run.plus) {
-      masked = before !== 46 && !attachedBefore(text, i, false) && !attachedAfter(text, run.end) && isCard(text, run);
+      masked = (before !== 46 || startsDoubleZero(text, run)) && !attachedBefore(text, i, startsDoubleZero(text, run)) && !attachedAfter(text, run.end) && (isCard(text, run) || isGluedInternational(text, run));
     } else if (!attachedBefore(text, i, labelled) && !attachedAfter(text, run.end)) {
       masked = isCard(text, run) || !inside && (isPhone(text, run) || isSeveralNumbers(text, run));
     }

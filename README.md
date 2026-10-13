@@ -97,7 +97,9 @@ values, `event_id` must be 32 hex digits and `timestamp` a number. The `organiza
 `request_id` tags are sent only if they have a shape this system makes: `<prefix>_<32 lowercase hex>`
 with a 2 to 5 letter prefix (as `tula-closeline-contract` makes `org_`, `usr_`, `req_`), a UUID, or
 32 hex digits (a trace id). They are never masked, so anything else (a key, a token, a hash, a ULID,
-a card number passed by mistake) is sent as `[invalid]`.
+a card number passed by mistake) is sent as `[invalid]`. That includes a request id that is not
+one of those shapes, such as an AWS X-Ray trace id (`1-5759e988-bd862e3fe1be46a994272793`) or a
+ULID: put it in a free-form tag if it is needed, or pass the 32 hex digits.
 
 Every event then passes the kit's key-based redaction and `scrubText` on every string, in
 `beforeSend`. Only the fields this adapter set are kept: the SDK merges its process-wide global
@@ -133,10 +135,12 @@ It masks:
 - email addresses, including letters beyond ASCII (`jörg.müller@acme.de`, `田中@example.jp`);
 - telephone numbers written with a `+` (8 to 15 digits), with a parenthesised area code
   (`(415) 555-0199`, `+1 (415) 555-0199`), with the `00` international prefix and a country code
-  (`0044 20 7946 0958`, `00 33 6 12 34 56 78`, `001 415 555 0100`) or in the national trunk form, a
+  (`0044 20 7946 0958`, `00 33 6 12 34 56 78`, `001 415 555 0100`, `0065-6123-4567`,
+  `00442079460958`, `+44(0)20 7946 0958`, `+33.6.12.34.56.78`) or in the national trunk form, a
   first group that starts with `0` and has 2 to 5 digits (`020 7946 0958`, `06 12 34 56 78`,
   `0171-123-4567`);
-- payment card numbers: 13 to 19 digits, bare or written in the usual groups (4-4-4-4, 4-6-5), in a
+- payment card numbers: 13 to 19 digits, bare or written in the usual groups (4-4-4-4, 4-4-4-1, 4-6-5,
+  separated by spaces, dashes or dots), in a
   card issuer's range (3x, 4, 5, 6, 2221 to 2720) that pass the Luhn check. A run that starts with
   `1` (epoch timestamps in milliseconds, microseconds and nanoseconds do, and must stay readable) is
   a card only when it is written in four groups of four.
@@ -155,7 +159,12 @@ identifiers intact; the main protection is key-based redaction of structured fie
 data in fields, not in messages. These are not masked in free text:
 - telephone numbers written as bare digits, or with separators but without a `+`, a parenthesised
   area code, `00` or a trunk zero (`4155550199`, `415-555-0199`, `1-800-555-0199`, French dotted
-  `01.23.45.67.89`, which reads as an IPv4 address);
+  `01.23.45.67.89`, which reads as an IPv4 address). US and Canadian numbers written without a
+  `+`, `00` or a leading `0` (`1 415 555 0100`, `415-555-0100`) are not masked, by design: they
+  cannot be told from an id or a range;
+- international numbers separated by a tab or other whitespace, written one digit at a time, with
+  fewer than 8 digits after the `00`, or whose `00` groups all start with `0` after the first
+  (`0044 0079 0046 0958`);
 - IBANs and other bank account identifiers, and national ids;
 - postal addresses and names.
 
@@ -169,11 +178,16 @@ The places an id can still be altered, and the only ones:
 - digit groups of 9 to 15 digits written with one kind of separator whose first group has 2 to 5
   digits and starts with a single `0` followed by a non-zero digit, because that is how a national
   telephone number opens (`invoice 0123-4567-8901`);
-- a group run opening with `00` followed by a valid country code in the first group (or as the
-  second) is read as an international number, unless it has three or more groups of one width of
-  three or more digits. So `0044 0017 0231` and `0020-0021-0022` stay readable, and a real number
-  written that way (`0049 3012 3456 7890`) is not masked; padded counters whose first group is not
-  `00` and a country code (`0042-0017-0231`, `0012-3456-7890`) stay readable too.
+- a run opening with `00` and a valid country code (in the first group, as the second group, or
+  glued to the digits after it) is masked as an international number, with 10 to 17 digits, unless
+  every group after the first starts with `0`, as a padded counter's do: `0044 0017 0231` and
+  `0020-0021-0022` stay readable, and so does a real number that happens to be written that way. A
+  first group of three to five digits that is `00` plus something that is no country code
+  (`0042-0017-0231`, `0012-3456-7890`) is a counter too. The glued form with nothing between the
+  digits (`00442079460958`) is masked, so a bare run of 10 to 17 digits starting `00` and a country
+  code (an order number padded with zeros, say) is masked as well; that is the price of not leaking
+  a number written without spaces. A lone digit group after the code is allowed once
+  (`0055 11 9 1234 5678`);
 
 **It over-masks on purpose.** Prose after a sensitive key goes with the value, because a free-text
 value cannot be told from a secret: `Invalid token: expired` becomes `Invalid token: [redacted]`,

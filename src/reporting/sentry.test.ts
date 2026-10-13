@@ -947,6 +947,8 @@ describe('ids in tags are sent as they are (N1)', () => {
     ['a prefixed id with an upper-case body', `org_${HEX32.toUpperCase()}`],
     ['a prefix that is too long', `abcdef_${HEX32}`],
     ['a ULID', '01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
+    ['an AWS X-Ray trace id', '1-5759e988-bd862e3fe1be46a994272793'],
+    ['an AWS X-Ray trace header', 'Root=1-5759e988-bd862e3fe1be46a994272793'],
     ['a short id', 'a'],
     ['a long run of x', 'x'.repeat(64)],
     ['a trace id repeated twice', HEX32 + HEX32],
