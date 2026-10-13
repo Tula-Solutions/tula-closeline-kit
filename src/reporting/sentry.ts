@@ -38,13 +38,17 @@ const DATA_COLLECTION_OFF: NonNullable<BunOptions['dataCollection']> = {
 }
 const TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/
 // The ids the adapter sets from typed context are sent as they are, never through `scrubText`: an
-// operator filters on them, so a pattern that guesses wrong must not be able to change one. A value
-// outside this charset and length is not an id and is replaced by a fixed marker.
-const IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/
+// operator filters on them. An id is sent only if it has one of the shapes this system makes, and
+// anything else (a key, a token, a hash, a card number passed by mistake) becomes a fixed marker.
+// The shapes: `<prefix>_<32 lowercase hex>` with a 2 to 5 letter prefix (`org_`, `usr_`, `mem_`,
+// `req_`, `evt_` ... as `tula-closeline-contract` makes them), a UUID (dashed, either case), and
+// 32 hex digits (a UUID without dashes, a W3C trace id). Each check is a fixed-length match.
+const ID_SHAPES: readonly RegExp[] = [
+  /^[a-z]{2,5}_[0-9a-f]{32}$/,
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/,
+  /^[0-9a-fA-F]{32}$/,
+]
 const INVALID_IDENTIFIER = '[invalid]'
-// Neither id is ever a bare digest here (ids are prefixed, UUIDs or 32-hex trace ids), and a long
-// run of hex in an id field is as likely a session secret as a hash.
-const BARE_DIGEST = /^[0-9a-fA-F]{40,}$/
 const MASK = '[redacted]'
 
 // What `capture` hands the SDK is bounded, so the work it does before returning is too, whatever it
@@ -67,7 +71,11 @@ const MAX_STRING_VALUE = 512
 const EVENT_ID = /^[0-9a-f]{32}$/
 // The platform the SDK reports for this runtime.
 const PLATFORM = 'node'
-const MAX_VERSION_FIELD = 64
+// The runtime this adapter tells the SDK it runs on; also the only runtime context that is sent.
+const RUNTIME = Object.freeze({
+  name: 'bun',
+  version: typeof Bun === 'undefined' ? 'unknown' : Bun.version,
+})
 
 /** Options for createSentryReporter: the common ones plus the DSN, which is required. */
 export interface SentryReporterOptions extends ErrorReporterOptions {
@@ -90,14 +98,9 @@ function text(value: unknown, max: number): string {
   return scrubText(String(value)).slice(0, max)
 }
 
-/** An id as it was given when it has the shape of one and holds nothing secret-shaped, otherwise a fixed marker. */
+/** An id as it was given when it has one of the shapes in `ID_SHAPES`, otherwise a fixed marker. */
 function identifier(value: unknown): string {
-  // An id that `scrubText` would change looks like a secret or a card number: it is dropped, not
-  // masked, so what is sent is always exactly what was given.
-  return typeof value === 'string' &&
-    IDENTIFIER.test(value) &&
-    !BARE_DIGEST.test(value) &&
-    scrubText(value) === value
+  return typeof value === 'string' && ID_SHAPES.some((shape) => shape.test(value))
     ? value
     : INVALID_IDENTIFIER
 }
@@ -382,30 +385,6 @@ function ownException(exception: unknown): { values: Plain[] } | undefined {
   return { values }
 }
 
-/** A name or version string from the SDK or runtime, cut short; anything else is left out. */
-function label(value: unknown): string | undefined {
-  return typeof value === 'string' && /^[\x20-\x7e]*$/.test(value)
-    ? value.slice(0, MAX_VERSION_FIELD)
-    : undefined
-}
-
-/** An object holding the `name` and `version` of `source` that are strings, and nothing else. */
-function nameAndVersion(source: unknown): Plain | undefined {
-  if (!isPlain(source)) {
-    return undefined
-  }
-  const out: Plain = {}
-  const name = label(source.name)
-  const version = label(source.version)
-  if (name !== undefined) {
-    out.name = name
-  }
-  if (version !== undefined) {
-    out.version = version
-  }
-  return out
-}
-
 /**
  * Keeps only what this adapter put on the event, every field rebuilt or checked: the SDK merges the
  * process-wide global and isolation scopes into every event, and an application or another library
@@ -415,7 +394,11 @@ function nameAndVersion(source: unknown): Plain | undefined {
 function confine(
   event: Event,
   hint: EventHint,
-  expected: { release?: string | undefined; environment: string }
+  expected: {
+    release?: string | undefined
+    environment: string
+    sdk: { name: string; version: string } | undefined
+  }
 ): Event {
   const own = hint.data as OwnData | undefined
   const kept: Record<string, unknown> = {}
@@ -434,9 +417,10 @@ function confine(
     kept.release = expected.release
   }
   kept.environment = expected.environment
-  const sdk = nameAndVersion(event.sdk)
-  if (sdk !== undefined) {
-    kept.sdk = sdk
+  // Nothing is read from `event.sdk`: free text a processor wrote there would be sent. The SDK adds
+  // its package list after `beforeSend`.
+  if (expected.sdk !== undefined) {
+    kept.sdk = { name: expected.sdk.name, version: expected.sdk.version }
   }
   kept.level = 'error'
   kept.tags = own?.tags ?? {}
@@ -444,9 +428,8 @@ function confine(
   if (exception !== undefined) {
     kept.exception = exception
   }
-  const runtime = nameAndVersion((event.contexts as Plain | undefined)?.runtime)
   kept.contexts = {
-    ...(runtime === undefined ? {} : { runtime }),
+    runtime: RUNTIME,
     ...(own === undefined ? {} : { closeline: own.closeline }),
   }
   // Attachments skip `beforeSend` in the SDK; none is ever sent.
@@ -496,7 +479,7 @@ export function createSentryReporter(options: SentryReporterOptions): SentryRepo
     environment: options.environment,
     stackParser: defaultStackParser,
     transport: options.transport ?? makeFetchTransport,
-    runtime: { name: 'bun', version: typeof Bun === 'undefined' ? 'unknown' : Bun.version },
+    runtime: { ...RUNTIME },
     includeServerName: false,
     integrations: [linkedErrorsIntegration()],
     // Sentry 11 replaced `sendDefaultPii` with `dataCollection`; every category is switched off.
@@ -509,7 +492,12 @@ export function createSentryReporter(options: SentryReporterOptions): SentryRepo
       try {
         // The tags are the adapter's own and were checked or scrubbed one by one when they were
         // built; they skip `scrubEvent`, which would run its patterns over an id again.
-        const { tags, ...rest } = confine(event, hint, options)
+        const metadata = client.getOptions()._metadata?.sdk
+        const sdk =
+          typeof metadata?.name === 'string' && typeof metadata.version === 'string'
+            ? { name: metadata.name, version: metadata.version }
+            : undefined
+        const { tags, ...rest } = confine(event, hint, { ...options, sdk })
         const clean = scrubEvent(rest)
         return clean === null ? null : ({ ...clean, tags } as typeof event)
       } catch {

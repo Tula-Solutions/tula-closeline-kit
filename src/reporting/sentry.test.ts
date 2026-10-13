@@ -5,6 +5,8 @@ import { createMemoryLogger } from '../testing'
 import { isSentryDsn } from './env'
 import { createSentryReporter, type SentryReporter, type SentryReporterOptions } from './sentry'
 
+const ORG_ID = `org_${'0a1b2c3d'.repeat(4)}`
+const REQ_ID = `req_${'f9e8d7c6'.repeat(4)}`
 const DSN = 'https://abc123publickey@o123.ingest.de.sentry.io/456'
 
 type Envelope = [Record<string, unknown>, Array<[{ type: string }, Record<string, unknown>]>]
@@ -122,8 +124,8 @@ describe('tags, release and context', () => {
   test('carry service, environment, region, organization_id, request_id and the release', async () => {
     const h = harness()
     h.reporter.capture(new Error('boom'), {
-      requestId: 'req_01',
-      organizationId: 'org_01',
+      requestId: REQ_ID,
+      organizationId: ORG_ID,
       method: 'POST',
       path: '/v1/teams/team_01',
       status: 500,
@@ -133,8 +135,8 @@ describe('tags, release and context', () => {
       service: 'core',
       environment: 'staging',
       region: 'eu',
-      organization_id: 'org_01',
-      request_id: 'req_01',
+      organization_id: ORG_ID,
+      request_id: REQ_ID,
       http_method: 'POST',
       http_status: '500',
     })
@@ -150,7 +152,7 @@ describe('tags, release and context', () => {
   test('free-form tags are added but cannot replace the standard ones', async () => {
     const h = harness()
     h.reporter.capture(new Error('boom'), {
-      organizationId: 'org_01',
+      organizationId: ORG_ID,
       tags: {
         feature: 'import',
         service: 'forged',
@@ -164,7 +166,7 @@ describe('tags, release and context', () => {
       feature: 'import',
       service: 'core',
       region: 'eu',
-      organization_id: 'org_01',
+      organization_id: ORG_ID,
     })
     expect(Object.keys(tags ?? {})).not.toContain('bad key!')
   })
@@ -864,10 +866,14 @@ describe('ids in tags are sent as they are (N1)', () => {
 
   test.each([
     ['a UUID', 'ae506499-d871-4815-9301-322b14037713'],
-    ['a prefixed ULID', 'org_01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
-    ['a request id with digits', 'req_984757662552'],
-    ['a short id', 'a'],
-    ['a 64 character id', 'x'.repeat(64)],
+    ['an upper-case UUID', 'AE506499-D871-4815-9301-322B14037713'],
+    ['a UUID of digits only', '12345678-1234-4234-8234-123456789012'],
+    ['a prefixed id', ORG_ID],
+    ['a user id', `usr_${'0123456789abcdef'.repeat(2)}`],
+    ['an invoice id', `inv_${'1234567890'.repeat(3)}12`],
+    ['a membership id', `mem_${'ab'.repeat(16)}`],
+    ['a 32 character hex trace id', '4bf92f3577b34da6a3ce929d0e0e4736'],
+    ['a 32 digit trace id', '12345678901234567890123456789012'],
   ])('%s is kept', async (_name, id) => {
     const h = harness()
     h.reporter.capture(new Error('boom'), { organizationId: id, requestId: id })
@@ -915,32 +921,47 @@ describe('ids in tags are sent as they are (N1)', () => {
     }
   )
 
+  const HEX32 = '4bf92f3577b34da6a3ce929d0e0e4736'
+  // N1 (round 4): an id is sent only if it has one of the shapes this system makes
+  // (`<prefix>_<32 hex>`, a UUID, 32 hex digits); anything else is `[invalid]`.
   test.each([
+    ['a base64 blob', 'dGhpcyBpcyBhIHNlY3JldCBrZXkgdmFsdWU9'],
+    ['a 32 character base62 key', 'aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE'],
+    ['a 48 character base62 key', 'aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5hJ7kL9mN1pQ'],
+    ['a 39 digit hex value', HEX32.slice(0, 31) + HEX32.slice(0, 8)],
+    ['a mixed-case 39 digit hex value', 'AbCdEf0123456789aBcDeF0123456789AbCdEf0'],
+    ['a 31 digit hex value', HEX32.slice(1)],
+    ['a 33 digit hex value', `${HEX32}0`],
+    ['a 40 digit hex value', 'a94a8fe5ccb19ba61c4c0873d391e987982fbbd3'],
+    ['a 64 digit hex value', '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c148f4c1ab0'],
+    ['a webhook secret', 'whsec_AbCdEfGhIjKlMnOpQrStUvWx'],
+    ['a Slack token', 'xoxb-1234-abcd'],
     [
-      'a 64 character hex value',
-      '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c148f4c1ab0',
+      'a UUID with a key appended',
+      'ae506499-d871-4815-9301-322b14037713-sk_live_abcdefghijklmnop1',
     ],
-    ['a 40 character hex value', 'a94a8fe5ccb19ba61c4c0873d391e987982fbbd3'],
-  ])('%s is replaced by the fixed marker: no id of ours is a bare digest', async (_n, value) => {
+    ['a Slack webhook path', 'T00000000-B00000000-XXXXXXXXXXXXXXXXXXXXXXXX'],
+    ['a prefixed id with a short body', 'org_01'],
+    ['a prefixed ULID', 'org_01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
+    ['a prefixed id with a 40 digit hex body', `req_${'9f86d081884c7d659a2feaa0c55ad015a3bf4f1b'}`],
+    ['a prefixed id with an upper-case body', `org_${HEX32.toUpperCase()}`],
+    ['a prefix that is too long', `abcdef_${HEX32}`],
+    ['a ULID', '01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
+    ['a short id', 'a'],
+    ['a long run of x', 'x'.repeat(64)],
+    ['a trace id repeated twice', HEX32 + HEX32],
+    ['a card number', '4111111111111111'],
+    ['a trunk-form telephone number', '020-7946-0958'],
+    ['a UUID followed by a newline', 'ae506499-d871-4815-9301-322b14037713\n'],
+  ])('%s is replaced by the fixed marker: it has no id shape', async (_n, value) => {
     const h = harness()
     h.reporter.capture(new Error('boom'), { organizationId: value, requestId: value })
     const tags = (await h.events())[0]?.tags
     expect(tags?.organization_id).toBe('[invalid]')
     expect(tags?.request_id).toBe('[invalid]')
-    expect(h.wire()).not.toContain(value)
-  })
-
-  test.each([
-    ['a 32 character hex trace id', '4bf92f3577b34da6a3ce929d0e0e4736'],
-    ['a dashed UUID', 'ae506499-d871-4815-9301-322b14037713'],
-    ['a ULID', '01HZX3Q8W2M4N6P8R0T2V4X6Z8'],
-    ['a prefixed id', 'req_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b'],
-  ])('%s is still sent as given', async (_n, value) => {
-    const h = harness()
-    h.reporter.capture(new Error('boom'), { organizationId: value, requestId: value })
-    const tags = (await h.events())[0]?.tags
-    expect(tags?.organization_id).toBe(value)
-    expect(tags?.request_id).toBe(value)
+    if (value.length > 8) {
+      expect(h.wire()).not.toContain(value.trim())
+    }
   })
 
   test('a free-form tag under a sensitive key is still redacted', async () => {
@@ -1020,6 +1041,59 @@ describe('the exception is rebuilt from known fields (N5)', () => {
     const runtime = (event.contexts as { runtime: Record<string, unknown> }).runtime
     expect(Object.keys(runtime).sort()).toEqual(['name', 'version'])
     expect(typeof event.timestamp === 'number' || event.timestamp === undefined).toBe(true)
+  })
+
+  test('free text in sdk and runtime fields never reaches the wire (N3)', async () => {
+    const h = harness()
+    h.reporter.client.addEventProcessor((event) => {
+      Object.assign(event, {
+        sdk: { name: 'Hello Jane I am sick', version: 'diagnosis: cancer' },
+      })
+      Object.assign(event.contexts ?? {}, {
+        runtime: { name: 'patient-Jane', version: 'has cancer' },
+      })
+      return event
+    })
+    h.reporter.capture(new Error('boom'))
+    const event = (await h.events())[0] as unknown as Record<string, unknown>
+    for (const text of ['Jane', 'sick', 'cancer', 'diagnosis']) {
+      expect(h.wire()).not.toContain(text)
+    }
+    const own = h.reporter.client.getOptions()._metadata?.sdk
+    expect((event.sdk as { name: string }).name).toBe(own?.name as string)
+    expect((event.sdk as { version: string }).version).toBe(own?.version as string)
+    expect((event.contexts as { runtime: unknown }).runtime).toEqual({
+      name: 'bun',
+      version: Bun.version,
+    })
+  })
+
+  test('an event id the processors spoiled falls back to the one the SDK gave the hint', async () => {
+    const h = harness()
+    h.reporter.client.addEventProcessor((event) => {
+      Object.assign(event, { event_id: 'not-an-event-id' })
+      return event
+    })
+    h.reporter.capture(new Error('boom'))
+    const events = await h.events()
+    const id = (events[0] as unknown as { event_id?: string }).event_id
+    expect(id).toMatch(/^[0-9a-f]{32}$/)
+    expect(h.wire()).not.toContain('not-an-event-id')
+  })
+
+  test.each([
+    ['infinity', Number.POSITIVE_INFINITY],
+    ['not a number', Number.NaN],
+  ])('a timestamp that is %s is not sent as a number', async (_name, value) => {
+    const h = harness()
+    h.reporter.client.addEventProcessor((event) => {
+      Object.assign(event, { timestamp: value })
+      return event
+    })
+    h.reporter.capture(new Error('boom'))
+    const event = (await h.events())[0] as unknown as { timestamp?: unknown }
+    // JSON turns a non-finite number into `null`; nothing but a finite number or nothing is sent.
+    expect(event.timestamp === undefined || Number.isFinite(event.timestamp)).toBe(true)
   })
 
   test('a genuine event id, timestamp and platform pass through unchanged', async () => {
