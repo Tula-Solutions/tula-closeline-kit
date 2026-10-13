@@ -335,14 +335,26 @@ For callers of the logger and `scrubText` before this version:
 
 ### Behaviour changes in 0.8.1
 
-Log fields are copied with a shared budget of 5,000 objects and 20,000 nested values per entry.
-Before: once a large field spent it, every later object field was written as `[truncated]`, so a
-small `tenant: { organizationId }` after a big payload was lost. Now each top-level object field
-also gets its own allowance of 50 objects and 200 nested values after the shared budget is spent,
-whatever its position among the keys, so small context objects survive. Redaction of sensitive
-keys and scrubbing of error text apply to those fields as to any other. The most one entry can
-copy is now 5,000 + 200 x 50 objects and 20,000 + 200 x 200 values (200 top-level keys at most),
-against 5,000 and 20,000; `bench/redact.bench.ts` budgets a typical and an oversized entry.
+Log fields are copied within shared budgets per entry: 5,000 objects, 20,000 nested values (error
+fields count as values) and 1 MiB of text, counted in UTF-16 code units over string values, object
+and Map keys, and error name, message, stack and code. One string is cut at 16 KiB and one key at
+256 characters; a cut drops a trailing partial word and ends in `[truncated]`. Once the text budget
+is spent, strings become `[truncated]` and further keys are dropped with a `[+N more]` count.
+Redaction runs first (a redacted value costs only its marker) and error text is scrubbed before
+it is written, so a cut never leaves part of a secret.
+
+Before: once a large field spent the object budget, every later object field was written as
+`[truncated]`, so a small `tenant: { organizationId }` after a big payload was lost, and the text
+was not bounded at all (an entry could reach hundreds of megabytes). Now each top-level object
+field also gets its own allowance of 50 objects, 200 nested values and 1 KiB of text after the
+shared budgets are spent, whatever its position among the keys, so a small context object
+survives. The allowance only covers a field that fits in it: a larger field after the shared budget
+is spent is cut.
+
+Bounds, both counts and bytes: at most 5,000 + 200 x 50 objects and 20,000 + 200 x 200 nested
+values, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
+12 MB in the worst case (control characters, which escape to six bytes) and about 2 MB for ordinary
+text. `bench/redact.bench.ts` budgets a typical entry, an oversized one and the worst case.
 
 ### Wiring it into a service
 

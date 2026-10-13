@@ -2,7 +2,7 @@ import { prepareFields } from '../src/redact'
 
 /**
  * Benchmark: preparing the fields of one log entry (`prepareFields`: key redaction, bounded copy),
- * which the logger runs on every line that carries fields, in two legs.
+ * which the logger runs on every line that carries fields, in three legs.
  *
  * Input: 2,000 distinct entries per leg built from a fixed sequence (no randomness), each timed on
  * its own.
@@ -15,8 +15,15 @@ import { prepareFields } from '../src/redact'
  *   O(1) in the size of the input, bounded by 5,000 shared objects plus 50 per top-level field
  *   (at most 200 fields) and 20,000 shared values plus 200 per field.
  *
+ * - `worst case entry` is the shape that spends every budget: 200 top-level fields, each an array
+ *   of 100 objects with 200 short keys (the objects and values budgets) and two 20 KB strings (the
+ *   text budget), so every field hits its allowance and the shared pool is spent early. Expected
+ *   complexity O(1) in the input: bounded by the counts above and 1 MiB of text plus 1 KiB per
+ *   field; a serialised entry is about 2 MB.
+ *
  * Budgets, per call: mean, median, and the best p95 of five batches (see `reporting.bench.ts` for
- * why). About 5x what each leg measures on one developer machine.
+ * why), each about five times what the leg measures on one developer machine (typical 0.012 ms,
+ * oversized 4.1 ms, worst case 60 to 130 ms), so a loaded CI runner does not fail a healthy build.
  */
 const CALLS = 2_000
 const WARMUP = 200
@@ -27,8 +34,9 @@ interface Budget {
   medianMs: number
   tailMs: number
 }
-const TYPICAL_BUDGET: Budget = { meanMs: 0.02, medianMs: 0.015, tailMs: 0.04 }
-const OVERSIZED_BUDGET: Budget = { meanMs: 8, medianMs: 7, tailMs: 12 }
+const TYPICAL_BUDGET: Budget = { meanMs: 0.06, medianMs: 0.05, tailMs: 0.08 }
+const OVERSIZED_BUDGET: Budget = { meanMs: 20, medianMs: 20, tailMs: 25 }
+const WORST_BUDGET: Budget = { meanMs: 450, medianMs: 450, tailMs: 550 }
 
 function typical(i: number): Record<string, unknown> {
   return {
@@ -61,9 +69,29 @@ function oversized(i: number): Record<string, unknown> {
   return entry
 }
 
+function worst(i: number): Record<string, unknown> {
+  const text = `${'lorem ipsum '.repeat(1_700)}`.slice(0, 20_000)
+  const entry: Record<string, unknown> = { orgId: `org_${i % 50}` }
+  for (let k = 0; k < 200; k++) {
+    entry[`field${k}`] = Array.from({ length: 100 }, () => ({
+      ...Object.fromEntries(Array.from({ length: 200 }, (_, key) => [`k${key}`, key])),
+      note: text,
+      detail: text,
+    }))
+  }
+  return entry
+}
+
 const legs = [
-  { name: 'typical entry', budget: TYPICAL_BUDGET, make: typical },
-  { name: 'oversized entry', budget: OVERSIZED_BUDGET, make: oversized },
+  { name: 'typical entry', budget: TYPICAL_BUDGET, make: typical, calls: CALLS, warmup: WARMUP },
+  {
+    name: 'oversized entry',
+    budget: OVERSIZED_BUDGET,
+    make: oversized,
+    calls: CALLS,
+    warmup: WARMUP,
+  },
+  { name: 'worst case entry', budget: WORST_BUDGET, make: worst, calls: 50, warmup: 5 },
 ]
 
 /** The q-th quantile of the samples (0 to 1), by nearest rank. */
@@ -76,12 +104,12 @@ function percentile(values: number[], q: number): number {
 
 const failures: string[] = []
 for (const leg of legs) {
-  const inputs = Array.from({ length: CALLS + WARMUP }, (_, i) => leg.make(i))
-  for (const input of inputs.slice(0, WARMUP)) {
+  const inputs = Array.from({ length: leg.calls + leg.warmup }, (_, i) => leg.make(i))
+  for (const input of inputs.slice(0, leg.warmup)) {
     prepareFields(input)
   }
   const samples: number[] = []
-  for (const input of inputs.slice(WARMUP)) {
+  for (const input of inputs.slice(leg.warmup)) {
     const start = performance.now()
     prepareFields(input)
     samples.push(performance.now() - start)

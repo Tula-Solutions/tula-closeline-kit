@@ -731,7 +731,41 @@ var MAX_NODES = 5000;
 var MAX_VALUES = 20000;
 var FIELD_NODE_ALLOWANCE = 50;
 var FIELD_VALUE_ALLOWANCE = 200;
+var MAX_ENTRY_CHARS = 1048576;
+var MAX_STRING_CHARS = 16384;
+var MAX_KEY_CHARS = 256;
+var FIELD_CHAR_ALLOWANCE = 1024;
 var RESERVED_KEYS = ["level", "time", "msg", "service"];
+function startField(state) {
+  state.nodeReserve = FIELD_NODE_ALLOWANCE;
+  state.valueReserve = FIELD_VALUE_ALLOWANCE;
+  state.charReserve = FIELD_CHAR_ALLOWANCE;
+}
+function grant(state, wanted) {
+  const shared = Math.min(wanted, Math.max(0, MAX_ENTRY_CHARS - state.chars));
+  state.chars += shared;
+  const extra = Math.min(wanted - shared, state.charReserve);
+  state.charReserve -= extra;
+  return shared + extra;
+}
+function available(state) {
+  return Math.max(0, MAX_ENTRY_CHARS - state.chars) + state.charReserve;
+}
+function clip(state, text) {
+  const want = Math.min(text.length, MAX_STRING_CHARS);
+  if (want === 0) {
+    return text;
+  }
+  const got = grant(state, want);
+  if (got >= text.length) {
+    return text;
+  }
+  return got <= TRUNCATED2.length ? TRUNCATED2 : cutText2(text, got - TRUNCATED2.length);
+}
+function clipKey(state, key) {
+  const shown = key.length > MAX_KEY_CHARS ? `${key.slice(0, MAX_KEY_CHARS - TRUNCATED2.length)}${TRUNCATED2}` : key;
+  return grant(state, shown.length) < shown.length ? undefined : shown;
+}
 function spend(state, depth) {
   if (depth === 0) {
     return true;
@@ -779,22 +813,35 @@ function summarizeBinary(value) {
 function isBinary(value) {
   return ArrayBuffer.isView(value) || value instanceof ArrayBuffer || typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer;
 }
-function scrubbedErrorText(read) {
+function scrubbedErrorText(state, read) {
   const value = attempt(read);
-  return typeof value === "string" && value !== UNSERIALIZABLE ? scrubText2(value) : value;
+  if (typeof value !== "string" || value === UNSERIALIZABLE) {
+    return value;
+  }
+  const room = Math.min(MAX_STRING_CHARS, available(state));
+  if (room <= TRUNCATED2.length) {
+    return TRUNCATED2;
+  }
+  return clip(state, scrubText2(cutText2(value, room - TRUNCATED2.length)));
 }
 function redactError(error, state, ancestors, depth) {
   const out = {};
-  put(out, "name", attempt(() => error.name));
-  put(out, "message", scrubbedErrorText(() => error.message));
-  put(out, "stack", scrubbedErrorText(() => error.stack));
+  const field = (name, read) => {
+    put(out, name, spend(state, depth + 1) ? read() : TRUNCATED2);
+  };
+  field("name", () => {
+    const name = attempt(() => error.name);
+    return typeof name === "string" ? clip(state, name) : name;
+  });
+  field("message", () => scrubbedErrorText(state, () => error.message));
+  field("stack", () => scrubbedErrorText(state, () => error.stack));
   const code = attempt(() => error.code);
   if (code !== undefined) {
-    put(out, "code", redactValue(code, state, ancestors, depth + 1));
+    field("code", () => redactValue(code, state, ancestors, depth + 1));
   }
   const cause = attempt(() => error.cause);
   if (cause !== undefined) {
-    put(out, "cause", redactValue(cause, state, ancestors, depth + 1));
+    field("cause", () => redactValue(cause, state, ancestors, depth + 1));
   }
   return out;
 }
@@ -827,8 +874,13 @@ function redactMap(map, state, ancestors, depth) {
       put(out, "[more]", TRUNCATED2);
       return out;
     }
+    const shown = clipKey(state, name);
+    if (shown === undefined) {
+      put(out, "[more]", `[+${map.size - index} more]`);
+      return out;
+    }
     const hidden = isSensitiveKey(name) && !(mayBeTokenCount(name) && typeof value === "number");
-    put(out, name, hidden ? REDACTED : redactValue(value, state, ancestors, depth + 1));
+    put(out, shown, hidden ? REDACTED : redactValue(value, state, ancestors, depth + 1));
     index++;
   }
   if (map.size > MAX_OBJECT_KEYS) {
@@ -842,36 +894,46 @@ function redactRecord(record, state, ancestors, depth) {
   const out = {};
   const nested = [];
   let spent = false;
-  for (const key of kept) {
+  let dropped = 0;
+  for (const [position, key] of kept.entries()) {
+    if (depth === 0) {
+      startField(state);
+    }
     if (!spend(state, depth)) {
       spent = true;
       break;
     }
     const sensitive = isSensitiveKey(key);
+    const name = clipKey(state, key);
+    if (name === undefined) {
+      dropped = keys.length - position;
+      break;
+    }
     if (sensitive && !mayBeTokenCount(key)) {
-      put(out, key, REDACTED);
+      put(out, name, REDACTED);
       continue;
     }
     const value = attempt(() => record[key]);
     if (sensitive && typeof value !== "number") {
-      put(out, key, REDACTED);
+      put(out, name, REDACTED);
       continue;
     }
     if (typeof value === "object" && value !== null) {
-      put(out, key, undefined);
-      nested.push([key, value]);
+      put(out, name, undefined);
+      nested.push([name, value]);
     } else {
-      put(out, key, value);
+      put(out, name, typeof value === "string" ? clip(state, value) : value);
     }
   }
   for (const [key, value] of nested) {
     if (depth === 0) {
-      state.nodeReserve = FIELD_NODE_ALLOWANCE;
-      state.valueReserve = FIELD_VALUE_ALLOWANCE;
+      startField(state);
     }
     put(out, key, redactValue(value, state, ancestors, depth + 1));
   }
-  if (spent) {
+  if (dropped > 0) {
+    put(out, "[more]", `[+${dropped} more]`);
+  } else if (spent) {
     put(out, "[more]", TRUNCATED2);
   } else if (keys.length > MAX_OBJECT_KEYS) {
     put(out, "[more]", `[+${keys.length - MAX_OBJECT_KEYS} more]`);
@@ -904,6 +966,9 @@ function redactObject(value, state, ancestors, depth) {
   return redactRecord(value, state, ancestors, depth);
 }
 function redactValue(value, state, ancestors, depth) {
+  if (typeof value === "string") {
+    return clip(state, value);
+  }
   if (typeof value !== "object" || value === null) {
     return value;
   }
@@ -924,7 +989,7 @@ function redactValue(value, state, ancestors, depth) {
 }
 function redactFields(fields) {
   try {
-    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0 }, new Set([fields]), 0);
+    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0 }, new Set([fields]), 0);
   } catch {
     return { fields: UNSERIALIZABLE };
   }

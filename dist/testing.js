@@ -10,7 +10,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-m4k7r05f.js";
+} from "./shared/chunk-kz794qdc.js";
 import {
   systemClock2,
   createFixedClock2,

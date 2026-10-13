@@ -81,7 +81,7 @@ describe('total output', () => {
     expect(out.token).toBe('[redacted]')
   })
 
-  test('a Map reached after the value budget is spent keeps only its own allowance', () => {
+  test('a Map reached after the value budget is spent keeps exactly its own allowance', () => {
     const rows = Array.from({ length: 101 }, () =>
       Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`k${index}`, index]))
     )
@@ -92,9 +92,21 @@ describe('total output', () => {
       ])
     )
     const out = redactFields({ rows, late }).late as Record<string, unknown>
+    const entry = { apiKey: '[redacted]', a: 1 }
 
+    // The 200-value allowance: 1 for `password`, then 3 per entry (the entry and its two keys), so
+    // k1 to k66 are whole, k67 has its entry counted but not its keys, and k68 onward is cut.
+    expect(Object.keys(out)).toEqual([
+      'password',
+      ...Array.from({ length: 67 }, (_, index) => `k${index + 1}`),
+      '[more]',
+    ])
     expect(out.password).toBe('[redacted]')
-    expect(JSON.stringify(out)).toContain('[truncated]')
+    for (let index = 1; index <= 66; index++) {
+      expect(out[`k${index}`]).toEqual(entry)
+    }
+    expect(out.k67).toEqual({ '[more]': '[truncated]' })
+    expect(out['[more]']).toBe('[truncated]')
     expect(JSON.stringify(out)).not.toContain('hunter2')
   })
 
@@ -146,10 +158,15 @@ describe('small objects after a large field', () => {
 
   test('a large field cannot take another field allowance, but is itself cut', () => {
     const out = redactFields({ a: big(), b: big() })
-    const line = JSON.stringify(out)
+    const count = (value: unknown): number =>
+      typeof value === 'object' && value !== null
+        ? 1 + Object.values(value).reduce<number>((sum, item) => sum + count(item), 0)
+        : 0
 
-    expect(line).toContain('[truncated]')
-    expect(line.length).toBeLessThan(3_000_000)
+    // Changing either allowance constant by one changes one of these.
+    expect(count(out.a)).toBe(5_000 + 50)
+    expect(count(out.b)).toBe(50)
+    expect(JSON.stringify(out)).toContain('[truncated]')
   })
 
   test('the worst case stays within the stated bound', () => {
@@ -182,5 +199,142 @@ describe('small objects after a large field', () => {
     expect(objects).toBeLessThanOrEqual(5_000 + 200 * 50 + 200)
     expect(values).toBeLessThanOrEqual(20_000 + 200 * 200 + 200 * 100 + 5_000)
     expect(elapsed).toBeLessThan(1_000)
+  })
+})
+describe('text budget', () => {
+  const words = (length: number) => 'lorem ipsum '.repeat(Math.ceil(length / 12)).slice(0, length)
+  const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value))
+  const fields = (make: (index: number) => unknown): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    for (let index = 0; index < 200; index++) {
+      out[`f${index}`] = make(index)
+    }
+    return out
+  }
+  // Worst case counted in bytes: about 1.8 million units, at most 6 bytes each, plus structure.
+  const MAX_BYTES = 12_000_000
+  // Ordinary text is about one byte per unit; the three shapes measure 1.6 to 2.1 MB.
+  const MAX_TEXT_BYTES = 2_500_000
+
+  test('200 fields of 100 errors with 30,000 character messages and stacks', () => {
+    const out = redactFields(
+      fields(() =>
+        Array.from({ length: 100 }, () => {
+          const error = new Error(words(30_000))
+          error.stack = words(30_000)
+          return error
+        })
+      )
+    )
+
+    expect(bytes(out)).toBeLessThan(MAX_TEXT_BYTES)
+  })
+
+  test('200 fields of 100 objects holding 100 KB strings', () => {
+    const out = redactFields(
+      fields(() => Array.from({ length: 100 }, () => ({ a: words(100_000) })))
+    )
+
+    expect(bytes(out)).toBeLessThan(MAX_TEXT_BYTES)
+  })
+
+  test('200 keys of 10,000 characters', () => {
+    const input: Record<string, unknown> = {}
+    for (let index = 0; index < 200; index++) {
+      input[`k${index}`.padEnd(10_000, 'x')] = 1
+    }
+    const out = redactFields(input)
+
+    expect(Object.keys(out)).toHaveLength(200)
+    expect(Math.max(...Object.keys(out).map((key) => key.length))).toBeLessThanOrEqual(256)
+    expect(bytes(out)).toBeLessThan(MAX_TEXT_BYTES)
+  })
+
+  test('control characters, which escape to six bytes, stay under the worst case', () => {
+    const out = redactFields(
+      fields(() => Array.from({ length: 100 }, () => ({ a: '\u0001'.repeat(16_384) })))
+    )
+
+    expect(bytes(out)).toBeLessThan(MAX_BYTES)
+    expect(bytes(out)).toBeGreaterThan(MAX_TEXT_BYTES)
+  })
+
+  test('one string is cut at 16 KiB and marked', () => {
+    const out = redactFields({ note: words(100_000) })
+    const note = out.note as string
+
+    expect(note.length).toBeLessThanOrEqual(16_384)
+    expect(note.endsWith('[truncated]')).toBe(true)
+    expect(note.startsWith('lorem ipsum lorem')).toBe(true)
+  })
+
+  test('a huge string cannot starve the small fields after it', () => {
+    const out = redactFields({
+      big: Array.from({ length: 200 }, () => words(100_000)),
+      more: Array.from({ length: 200 }, () => words(100_000)),
+      tenant: { organizationId: 'org_1' },
+      ctx: { requestId: 'req_1' },
+      orgId: 'org_1',
+    })
+
+    expect(out.tenant).toEqual({ organizationId: 'org_1' })
+    expect(out.ctx).toEqual({ requestId: 'req_1' })
+    expect(out.orgId).toBe('org_1')
+  })
+
+  test('the ticket reproduction survives a 5 MB string in the big field', () => {
+    const out = redactFields({
+      big: [
+        words(5_000_000),
+        ...Array.from({ length: 100 }, () => Array.from({ length: 60 }, (_, index) => ({ index }))),
+      ],
+      tenant: { organizationId: 'org_1' },
+      ctx: { requestId: 'req_1' },
+    })
+
+    expect(out.tenant).toEqual({ organizationId: 'org_1' })
+    expect(out.ctx).toEqual({ requestId: 'req_1' })
+  })
+
+  test('keys past the text budget are dropped with a count', () => {
+    const big = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [`${'k'.repeat(200)}${index}`, 1])
+    )
+    const out = redactFields({ wide: Array.from({ length: 100 }, () => ({ ...big })) })
+    const last = (out.wide as Array<Record<string, unknown>>).at(-1) as Record<string, unknown>
+
+    expect(Object.keys(last).length).toBeLessThan(200)
+    expect(JSON.stringify(out)).toMatch(/\[\+\d+ more\]|\[truncated\]/)
+  })
+
+  test('a secret in long error text or under a sensitive key is not emitted in part', () => {
+    const secret = 'hunter2hunter2'
+    // The password sits where the 16 KiB cut falls, in every position around it.
+    for (let offset = 0; offset < 40; offset++) {
+      const text = `${words(16_384 - 40 + offset)} password=${secret} trailing`
+      const error = new Error(text)
+      error.stack = text
+      const line = JSON.stringify(
+        redactFields({ error, nested: { token: text, list: [error] }, password: text })
+      )
+
+      expect(line).not.toContain('hunter')
+      expect(line).not.toContain(secret.slice(0, 4))
+    }
+  })
+
+  test('the output is deterministic and the input is not changed', () => {
+    const make = () => ({
+      a: words(100_000),
+      list: Array.from({ length: 50 }, (_, index) => ({ [`k${index}`]: words(40_000) })),
+      error: new Error(words(40_000)),
+      tenant: { organizationId: 'org_1' },
+    })
+    const input = make()
+    const before = JSON.stringify(input)
+    const first = JSON.stringify(redactFields(input))
+
+    expect(JSON.stringify(redactFields(make()))).toBe(first)
+    expect(JSON.stringify(input)).toBe(before)
   })
 })
