@@ -202,6 +202,61 @@ describe('where an object lives', () => {
   })
 })
 
+describe('the deadline is for the whole call', () => {
+  /** Answers every request after `delayMs`, or fails with an abort when the call's signal fires. */
+  function slow(delayMs: number, respond: () => unknown) {
+    const calls: Call[] = []
+    const client: S3Sender = {
+      send: (command, options) => {
+        calls.push({ command, options })
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve(respond()), delayMs)
+          options?.abortSignal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer)
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            },
+            { once: true }
+          )
+        })
+      },
+    }
+    return { calls, client }
+  }
+
+  test('a listing that skips keys across many requests ends near one deadline, not ten', async () => {
+    let n = 0
+    // Each answer takes 60 ms, a little over a tenth of the 500 ms deadline, and holds only a key
+    // the port cannot name, so the listing keeps asking.
+    const { calls, client } = slow(60, () => ({
+      Contents: [{ Key: `orgs/${ORG}/junk ${n++}`, Size: 1, LastModified: new Date() }],
+      IsTruncated: true,
+    }))
+    const store = adapter(client, { timeoutMs: 100, deadlineMs: 500 })
+    const started = performance.now()
+    await expect(store.list(ORG, { limit: 5 })).rejects.toMatchObject({
+      code: 'storage.unavailable',
+    })
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(400)
+    expect(elapsed).toBeLessThan(1500)
+    expect(calls.length).toBeLessThan(10)
+    const signals = new Set(calls.map((call) => call.options?.abortSignal))
+    expect(signals.size).toBe(1)
+  })
+
+  test('each public call gets its own deadline, shared by its requests', async () => {
+    const { calls, client } = slow(1, () => ({}))
+    const store = adapter(client)
+    await store.put(ORG, 'k', new Uint8Array())
+    await store.delete(ORG, 'k')
+    const [first, second] = calls.map((call) => call.options?.abortSignal)
+    expect(first).toBeDefined()
+    expect(first).not.toBe(second)
+  })
+})
+
 describe('reading', () => {
   const okOutput = (body: Uint8Array, extra: Record<string, unknown> = {}) => ({
     Body: { transformToByteArray: async () => body },
@@ -585,6 +640,20 @@ describe('listing', () => {
         code: 'storage.bad_response',
       })
       expect(calls.length).toBeLessThanOrEqual(10)
+    })
+
+    test('more than about 9,000 in a row after the cursor make the listing fail, and the valid keys beyond stay out of reach', async () => {
+      const junk = Array.from({ length: 12_000 }, (_, i) => `junk ${String(i).padStart(5, '0')}`)
+      const { calls, client } = bucket(raw('a', 'b', ...junk, 'z'))
+      const store = adapter(client)
+      const first = await store.list(ORG, { limit: 2 })
+      expect(first.items.map((item) => item.key)).toEqual(['a', 'b'])
+      expect(first.nextCursor).toBe(encodeCursor('b'))
+      calls.length = 0
+      await expect(
+        store.list(ORG, { limit: 2, cursor: first.nextCursor as string })
+      ).rejects.toMatchObject({ code: 'storage.bad_response' })
+      expect(calls).toHaveLength(10)
     })
 
     test('do not excuse a key outside the Organization', async () => {

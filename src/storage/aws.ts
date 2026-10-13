@@ -60,7 +60,7 @@ export interface S3ObjectStoreOptions {
   isOrganizationId?: OrganizationIdCheck
   /** Bound on one attempt's connect and idle time, in ms; default 5000. */
   timeoutMs?: number
-  /** Bound on one operation including every attempt, in ms; default 60000. */
+  /** Bound on one public call (a `list` may make several requests) including every attempt, in ms; default 60000. */
   deadlineMs?: number
   /** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
   maxAttempts?: number
@@ -139,6 +139,13 @@ function isMissing(error: unknown): boolean {
  * Proxies: the SDK's Node HTTP handler is used with its default agents, which in Bun do not read
  * `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (see the SQS adapter's proof, `aws-proxy.test.ts`).
  *
+ * Keys the port cannot name (a console folder marker, a name with a space) are skipped by `list`,
+ * which reads ahead for at most ten requests: the first asks for the page size, the other nine for
+ * 1000 keys each. The cursor is the last key handed out, so more than about 9,000 such keys in a
+ * row after it (the page size plus 9,000) make every attempt to list past them fail with
+ * `storage.bad_response`, and the valid keys beyond the run cannot be reached through the port.
+ * Accepted by design: this adapter is the only writer under the prefix, and it never writes one.
+ *
  * Complexity: put and get O(object size); head and delete O(1); list O(limit); one HTTP call each.
  */
 export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore {
@@ -185,17 +192,20 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     })
 
   const prefixOf = (organization: string) => `${S3_KEY_PREFIX}${organization}/`
-  const send = (command: Parameters<S3Sender['send']>[0]) =>
+  // One deadline per public call, shared by every request the call makes (a listing may make ten).
+  const send = (deadline: AbortSignal, command: Parameters<S3Sender['send']>[0]) =>
     client.send(command, {
       requestTimeout: timeoutMs,
-      abortSignal: AbortSignal.timeout(deadlineMs),
+      abortSignal: deadline,
     })
 
   async function head(organizationId: string, key: string): Promise<ObjectInfo | undefined> {
+    const deadline = AbortSignal.timeout(deadlineMs)
     const location = prefixOf(check.organization(organizationId)) + check.key(key)
     let output: HeadObjectCommandOutput
     try {
       output = (await send(
+        deadline,
         new HeadObjectCommand({ Bucket: bucket, Key: location })
       )) as HeadObjectCommandOutput
     } catch (error) {
@@ -227,11 +237,13 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
 
   return {
     async put(organizationId, key, body, putOptions) {
+      const deadline = AbortSignal.timeout(deadlineMs)
       const location = prefixOf(check.organization(organizationId)) + check.key(key)
       const bytes = check.body(body)
       const contentType = check.contentType(putOptions?.contentType)
       try {
         await send(
+          deadline,
           new PutObjectCommand({
             Bucket: bucket,
             Key: location,
@@ -246,10 +258,12 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     },
 
     async get(organizationId, key) {
+      const deadline = AbortSignal.timeout(deadlineMs)
       const location = prefixOf(check.organization(organizationId)) + check.key(key)
       let output: GetObjectCommandOutput
       try {
         output = (await send(
+          deadline,
           new GetObjectCommand({ Bucket: bucket, Key: location })
         )) as GetObjectCommandOutput
       } catch (error) {
@@ -293,9 +307,10 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     head,
 
     async delete(organizationId, key) {
+      const deadline = AbortSignal.timeout(deadlineMs)
       const location = prefixOf(check.organization(organizationId)) + check.key(key)
       try {
-        await send(new DeleteObjectCommand({ Bucket: bucket, Key: location }))
+        await send(deadline, new DeleteObjectCommand({ Bucket: bucket, Key: location }))
       } catch (error) {
         // S3 answers 204 for a missing key; a stand-in that says not found has still left it gone.
         if (!isMissing(error)) {
@@ -305,6 +320,7 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     },
 
     async list(organizationId, listOptions) {
+      const deadline = AbortSignal.timeout(deadlineMs)
       const root = prefixOf(check.organization(organizationId))
       const { prefix, after, limit } = check.list(listOptions)
       const items: ObjectEntry[] = []
@@ -315,6 +331,7 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
         let output: ListObjectsV2CommandOutput
         try {
           output = (await send(
+            deadline,
             new ListObjectsV2Command({
               Bucket: bucket,
               Prefix: root + prefix,

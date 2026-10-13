@@ -112,15 +112,16 @@ function createS3ObjectStore(options) {
     maxAttempts
   });
   const prefixOf = (organization) => `${S3_KEY_PREFIX}${organization}/`;
-  const send = (command) => client.send(command, {
+  const send = (deadline, command) => client.send(command, {
     requestTimeout: timeoutMs,
-    abortSignal: AbortSignal.timeout(deadlineMs)
+    abortSignal: deadline
   });
   async function head(organizationId, key) {
+    const deadline = AbortSignal.timeout(deadlineMs);
     const location = prefixOf(check.organization(organizationId)) + check.key(key);
     let output;
     try {
-      output = await send(new HeadObjectCommand({ Bucket: bucket, Key: location }));
+      output = await send(deadline, new HeadObjectCommand({ Bucket: bucket, Key: location }));
     } catch (error) {
       if (isMissing(error)) {
         return;
@@ -142,11 +143,12 @@ function createS3ObjectStore(options) {
   }
   return {
     async put(organizationId, key, body, putOptions) {
+      const deadline = AbortSignal.timeout(deadlineMs);
       const location = prefixOf(check.organization(organizationId)) + check.key(key);
       const bytes = check.body(body);
       const contentType = check.contentType(putOptions?.contentType);
       try {
-        await send(new PutObjectCommand({
+        await send(deadline, new PutObjectCommand({
           Bucket: bucket,
           Key: location,
           Body: bytes,
@@ -158,10 +160,11 @@ function createS3ObjectStore(options) {
       }
     },
     async get(organizationId, key) {
+      const deadline = AbortSignal.timeout(deadlineMs);
       const location = prefixOf(check.organization(organizationId)) + check.key(key);
       let output;
       try {
-        output = await send(new GetObjectCommand({ Bucket: bucket, Key: location }));
+        output = await send(deadline, new GetObjectCommand({ Bucket: bucket, Key: location }));
       } catch (error) {
         if (isMissing(error)) {
           return;
@@ -196,9 +199,10 @@ function createS3ObjectStore(options) {
     },
     head,
     async delete(organizationId, key) {
+      const deadline = AbortSignal.timeout(deadlineMs);
       const location = prefixOf(check.organization(organizationId)) + check.key(key);
       try {
-        await send(new DeleteObjectCommand({ Bucket: bucket, Key: location }));
+        await send(deadline, new DeleteObjectCommand({ Bucket: bucket, Key: location }));
       } catch (error) {
         if (!isMissing(error)) {
           throw mapFailure("a delete", error);
@@ -206,6 +210,7 @@ function createS3ObjectStore(options) {
       }
     },
     async list(organizationId, listOptions) {
+      const deadline = AbortSignal.timeout(deadlineMs);
       const root = prefixOf(check.organization(organizationId));
       const { prefix, after, limit } = check.list(listOptions);
       const items = [];
@@ -215,7 +220,7 @@ function createS3ObjectStore(options) {
       for (let round = 1;round <= LIST_MAX_ROUNDS; round++) {
         let output;
         try {
-          output = await send(new ListObjectsV2Command({
+          output = await send(deadline, new ListObjectsV2Command({
             Bucket: bucket,
             Prefix: root + prefix,
             MaxKeys: round === 1 ? limit : MAX_LIST_LIMIT2,

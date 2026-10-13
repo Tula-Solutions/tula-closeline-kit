@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { S3Client } from '@aws-sdk/client-s3'
 import { SQSClient } from '@aws-sdk/client-sqs'
 import { createSqsClient } from './queue/client'
@@ -10,8 +12,7 @@ import { createS3Client } from './storage/client'
  * adapters' clients must ignore it. The check reads the host a request would be sent to without
  * sending it, and the control (a client built with no such setting) shows the file is honoured.
  */
-const DIR = new URL('./.aws-config-test', import.meta.url).pathname
-const FILE = `${DIR}/config`
+let dir = ''
 const saved = {
   config: process.env.AWS_CONFIG_FILE,
   profile: process.env.AWS_PROFILE,
@@ -20,15 +21,16 @@ const saved = {
 }
 
 beforeAll(() => {
-  mkdirSync(DIR, { recursive: true })
-  writeFileSync(FILE, '[default]\nendpoint_url = http://127.0.0.1:9\n')
-  process.env.AWS_CONFIG_FILE = FILE
+  dir = mkdtempSync(join(tmpdir(), 'kit-aws-config-'))
+  const file = join(dir, 'config')
+  writeFileSync(file, '[default]\nendpoint_url = http://127.0.0.1:9\n')
+  process.env.AWS_CONFIG_FILE = file
   delete process.env.AWS_PROFILE
   process.env.AWS_ACCESS_KEY_ID = 'test'
   process.env.AWS_SECRET_ACCESS_KEY = 'test'
 })
 afterAll(() => {
-  rmSync(DIR, { recursive: true, force: true })
+  rmSync(dir, { recursive: true, force: true })
   for (const [name, value] of [
     ['AWS_CONFIG_FILE', saved.config],
     ['AWS_PROFILE', saved.profile],

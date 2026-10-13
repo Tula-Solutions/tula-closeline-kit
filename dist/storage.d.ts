@@ -127,7 +127,7 @@ interface S3ObjectStoreOptions {
 	isOrganizationId?: OrganizationIdCheck;
 	/** Bound on one attempt's connect and idle time, in ms; default 5000. */
 	timeoutMs?: number;
-	/** Bound on one operation including every attempt, in ms; default 60000. */
+	/** Bound on one public call (a `list` may make several requests) including every attempt, in ms; default 60000. */
 	deadlineMs?: number;
 	/** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
 	maxAttempts?: number;
@@ -161,6 +161,13 @@ declare const S3_KEY_PREFIX = "orgs/";
 *
 * Proxies: the SDK's Node HTTP handler is used with its default agents, which in Bun do not read
 * `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (see the SQS adapter's proof, `aws-proxy.test.ts`).
+*
+* Keys the port cannot name (a console folder marker, a name with a space) are skipped by `list`,
+* which reads ahead for at most ten requests: the first asks for the page size, the other nine for
+* 1000 keys each. The cursor is the last key handed out, so more than about 9,000 such keys in a
+* row after it (the page size plus 9,000) make every attempt to list past them fail with
+* `storage.bad_response`, and the valid keys beyond the run cannot be reached through the port.
+* Accepted by design: this adapter is the only writer under the prefix, and it never writes one.
 *
 * Complexity: put and get O(object size); head and delete O(1); list O(limit); one HTTP call each.
 */

@@ -674,7 +674,7 @@ timeout, abort or connection failure (`ECONNRESET` and the like); anything else,
 credentials provider that found nothing, is `rejected`. An error's `cause` is a plain description
 (`name`, `httpStatus`, `requestId`, `fault`, `code`), never the SDK error, which carries the key,
 so logging the cause cannot write an Organization id or a file name. The S3 adapter bounds every attempt (`timeoutMs`, default 5 s, connect and idle), the whole
-operation (`deadlineMs`, default 60 s, retries included) and the attempts (`maxAttempts`, default
+public call (`deadlineMs`, default 60 s, retries and a listing's several requests included) and the attempts (`maxAttempts`, default
 3, the SDK's `standard` mode with jittered exponential back-off, only for failures it calls
 retryable). Put and delete are idempotent, so the retry is safe. Nothing logs bodies, keys or
 URLs. Credentials come only from the SDK's default chain; `endpoint` (S3Mock,
@@ -688,7 +688,11 @@ as `docs/`, a name with a space) is not listed: `list` skips such keys, reads on
 requests until the page is full, and returns a cursor that is always the last key it handed out,
 so a caller's cursor still has to be a valid key. Pass `logger` to count the skipped keys at debug
 level (a number, never a name). A key outside the Organization's prefix is still a
-`storage.bad_response`.
+`storage.bad_response`. Limit, by design: more than about 9,000 such keys in a row after the cursor
+(the page size plus 9,000: one request of the page size and nine of 1,000) make every attempt to
+list past them fail with `storage.bad_response`, and the valid keys beyond the run are out of
+reach through the port. The adapter is the only writer under the prefix and never writes such a
+key, so this needs someone to write 9,000 of them by hand.
 
 Not in 0.8.0: presigned URLs (the playbook service uploads through the service, so none is
 needed yet; add them with a short lifetime and a key and method binding when a browser must
