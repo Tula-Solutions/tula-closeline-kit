@@ -333,6 +333,17 @@ For callers of the logger and `scrubText` before this version:
 - **The Sentry event's `sdk` keeps a name and version** (the SDK adds its own package list after),
   and its `release`, `environment` and `platform` are always the adapter's own values.
 
+### Behaviour changes in 0.8.1
+
+Log fields are copied with a shared budget of 5,000 objects and 20,000 nested values per entry.
+Before: once a large field spent it, every later object field was written as `[truncated]`, so a
+small `tenant: { organizationId }` after a big payload was lost. Now each top-level object field
+also gets its own allowance of 50 objects and 200 nested values after the shared budget is spent,
+whatever its position among the keys, so small context objects survive. Redaction of sensitive
+keys and scrubbing of error text apply to those fields as to any other. The most one entry can
+copy is now 5,000 + 200 x 50 objects and 20,000 + 200 x 200 values (200 top-level keys at most),
+against 5,000 and 20,000; `bench/redact.bench.ts` budgets a typical and an oversized entry.
+
 ### Wiring it into a service
 
 In `src/env.ts`:

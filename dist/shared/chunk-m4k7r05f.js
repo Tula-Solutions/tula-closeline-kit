@@ -729,13 +729,33 @@ var MAX_ARRAY_ITEMS = 100;
 var MAX_OBJECT_KEYS = 200;
 var MAX_NODES = 5000;
 var MAX_VALUES = 20000;
+var FIELD_NODE_ALLOWANCE = 50;
+var FIELD_VALUE_ALLOWANCE = 200;
 var RESERVED_KEYS = ["level", "time", "msg", "service"];
 function spend(state, depth) {
   if (depth === 0) {
     return true;
   }
   state.values++;
-  return state.values <= MAX_VALUES;
+  if (state.values <= MAX_VALUES) {
+    return true;
+  }
+  if (state.valueReserve > 0) {
+    state.valueReserve--;
+    return true;
+  }
+  return false;
+}
+function visit(state) {
+  state.nodes++;
+  if (state.nodes <= MAX_NODES) {
+    return true;
+  }
+  if (state.nodeReserve > 0) {
+    state.nodeReserve--;
+    return true;
+  }
+  return false;
 }
 function attempt(read) {
   try {
@@ -845,6 +865,10 @@ function redactRecord(record, state, ancestors, depth) {
     }
   }
   for (const [key, value] of nested) {
+    if (depth === 0) {
+      state.nodeReserve = FIELD_NODE_ALLOWANCE;
+      state.valueReserve = FIELD_VALUE_ALLOWANCE;
+    }
     put(out, key, redactValue(value, state, ancestors, depth + 1));
   }
   if (spent) {
@@ -886,8 +910,7 @@ function redactValue(value, state, ancestors, depth) {
   if (ancestors.has(value)) {
     return CIRCULAR;
   }
-  state.nodes++;
-  if (state.nodes > MAX_NODES || depth >= MAX_DEPTH) {
+  if (!visit(state) || depth >= MAX_DEPTH) {
     return TRUNCATED2;
   }
   ancestors.add(value);
@@ -901,7 +924,7 @@ function redactValue(value, state, ancestors, depth) {
 }
 function redactFields(fields) {
   try {
-    return redactRecord(fields, { nodes: 0, values: 0 }, new Set([fields]), 0);
+    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0 }, new Set([fields]), 0);
   } catch {
     return { fields: UNSERIALIZABLE };
   }

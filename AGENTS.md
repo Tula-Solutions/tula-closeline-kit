@@ -62,6 +62,12 @@ Other scripts are in `package.json`.
   1,000 such vectors mean 2.7 ms, each with a median and best-batch p95 budget in
   `bench/stores.bench.ts`, about five times what it measures.
 
+- `prepareFields` / `redactFields` (`src/redact.ts`) copy the fields of every log line. O(fields +
+  objects walked), bounded by 5,000 shared objects and 20,000 shared nested values plus 50 objects
+  and 200 values per top-level field. Budgets in `bench/redact.bench.ts`: a typical entry mean
+  0.02 ms and an oversized one (a field that spends the shared budget, then 40 small objects) mean
+  8 ms, each with a median and best-batch p95 budget as above.
+
 ## Issues
 
 All tickets live in the hub: `gh issue list -R Tula-Solutions/tula-closeline --label repo:kit`.

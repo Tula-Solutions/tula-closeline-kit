@@ -16,6 +16,14 @@ const MAX_NODES = 5_000
 // entry. Top-level fields are exempt: they are what identifies the entry.
 const MAX_VALUES = 20_000
 
+// What each top-level field is guaranteed once the shared budgets above are spent, so a small
+// context object (a tenant, a request id) survives after a large earlier field. The allowance is
+// per field and independent of key order. Worst case per call: 5,000 + 200 x 50 objects and
+// 20,000 + 200 x 200 values (200 is the most top-level keys walked), against 5,000 and 20,000
+// before, still bounded and independent of the input size.
+const FIELD_NODE_ALLOWANCE = 50
+const FIELD_VALUE_ALLOWANCE = 200
+
 // Keys pino writes itself; a caller field with one of these names is renamed, not allowed to
 // overwrite it.
 const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
@@ -23,6 +31,10 @@ const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
 interface State {
   nodes: number
   values: number
+  /** Objects the current top-level field may still visit after the shared budget is spent. */
+  nodeReserve: number
+  /** Values the current top-level field may still write after the shared budget is spent. */
+  valueReserve: number
 }
 
 /** Counts one value written below the top level; false once the value budget is spent. */
@@ -31,7 +43,27 @@ function spend(state: State, depth: number): boolean {
     return true
   }
   state.values++
-  return state.values <= MAX_VALUES
+  if (state.values <= MAX_VALUES) {
+    return true
+  }
+  if (state.valueReserve > 0) {
+    state.valueReserve--
+    return true
+  }
+  return false
+}
+
+/** Counts one object visited; false once both the shared budget and the field's allowance are spent. */
+function visit(state: State): boolean {
+  state.nodes++
+  if (state.nodes <= MAX_NODES) {
+    return true
+  }
+  if (state.nodeReserve > 0) {
+    state.nodeReserve--
+    return true
+  }
+  return false
 }
 
 /** Runs a read that may throw (a getter, a Proxy trap) and returns a marker if it does. */
@@ -194,6 +226,10 @@ function redactRecord(
     }
   }
   for (const [key, value] of nested) {
+    if (depth === 0) {
+      state.nodeReserve = FIELD_NODE_ALLOWANCE
+      state.valueReserve = FIELD_VALUE_ALLOWANCE
+    }
     put(out, key, redactValue(value, state, ancestors, depth + 1))
   }
   if (spent) {
@@ -237,8 +273,7 @@ function redactValue(value: unknown, state: State, ancestors: Set<object>, depth
   if (ancestors.has(value)) {
     return CIRCULAR
   }
-  state.nodes++
-  if (state.nodes > MAX_NODES || depth >= MAX_DEPTH) {
+  if (!visit(state) || depth >= MAX_DEPTH) {
     return TRUNCATED
   }
   ancestors.add(value)
@@ -251,10 +286,19 @@ function redactValue(value: unknown, state: State, ancestors: Set<object>, depth
   }
 }
 
-/** Copies log fields with every sensitive key replaced by `[redacted]` at any depth; never throws. */
+/**
+ * Copies log fields with every sensitive key replaced by `[redacted]` at any depth; never throws.
+ * O(fields + objects walked): at most 5,000 objects and 20,000 nested values shared by the call,
+ * plus 50 objects and 200 values guaranteed to each top-level object field (bounded by 200 keys).
+ */
 export function redactFields(fields: Record<string, unknown>): Record<string, unknown> {
   try {
-    return redactRecord(fields, { nodes: 0, values: 0 }, new Set<object>([fields]), 0)
+    return redactRecord(
+      fields,
+      { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0 },
+      new Set<object>([fields]),
+      0
+    )
   } catch {
     return { fields: UNSERIALIZABLE }
   }
