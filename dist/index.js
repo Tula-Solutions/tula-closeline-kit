@@ -498,6 +498,14 @@ var FORBIDDEN_HEADERS = new Set([
   "connection",
   "proxy-authorization"
 ]);
+var INTERNAL_CALL_FAILURES = [
+  "connection",
+  "timeout",
+  "aborted",
+  "redirect",
+  "response_too_large"
+];
+var INTERNAL_MAX_ATTEMPTS = 10;
 
 class InternalCallError extends Error {
   failure;
@@ -581,11 +589,25 @@ function createInternalClient(options) {
     throw new TypeError("the internal secret must be a non-empty string of printable characters");
   }
   const authorization = `Bearer ${options.secret}`;
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && options.environment !== "local") {
+    throw new TypeError("NODE_TLS_REJECT_UNAUTHORIZED=0 turns off certificate checks; unset it outside local");
+  }
   const retry = { ...INTERNAL_DEFAULT_RETRY, ...options.retry };
-  const maxAttempts = Math.max(1, Math.floor(retry.maxAttempts));
+  const maxAttempts = retry.maxAttempts;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > INTERNAL_MAX_ATTEMPTS) {
+    throw new TypeError(`retry.maxAttempts must be an integer from 1 to ${INTERNAL_MAX_ATTEMPTS}`);
+  }
+  for (const name of ["baseDelayMs", "maxDelayMs", "retryAfterCapMs"]) {
+    if (!isNonNegative(retry[name])) {
+      throw new TypeError(`retry.${name} must be a finite number, zero or more`);
+    }
+  }
   const timeoutMs = options.timeoutMs ?? INTERNAL_DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxResponseBytes ?? INTERNAL_DEFAULT_MAX_RESPONSE_BYTES;
-  const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
+    throw new TypeError("timeoutMs and maxResponseBytes must be finite numbers above zero");
+  }
+  const sleep = options.sleep ?? timerSleep;
   const random = options.random ?? Math.random;
   const send = base.secure ? httpsRequest : httpRequest;
   const attempt = (method, target, headers, body, signal) => new Promise((resolve, reject) => {
@@ -597,6 +619,7 @@ function createInternalClient(options) {
       headers,
       agent: false,
       signal,
+      ...base.secure ? { rejectUnauthorized: true } : {},
       ...options.ca === undefined ? {} : { ca: options.ca }
     }, (response) => {
       const status = response.statusCode ?? 0;
@@ -670,6 +693,9 @@ function createInternalClient(options) {
       const path = pathOnly(call.path);
       const safeToRepeat = IDEMPOTENT_METHODS.includes(call.method) || call.idempotencyKey !== undefined;
       const perAttempt = call.timeoutMs ?? timeoutMs;
+      if (!isPositive(perAttempt)) {
+        throw new TypeError("timeoutMs must be a finite number above zero");
+      }
       for (let attempts = 1;; attempts += 1) {
         const fail = (failure, status) => new InternalCallError({ failure, method: call.method, path, status, attempts });
         if (call.signal?.aborted) {
@@ -726,15 +752,44 @@ class Failure {
     this.status = status;
   }
 }
+function isPositive(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function isNonNegative(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function timerSleep(ms, signal) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
 async function pauseOrAbort(sleep, ms, signal) {
   if (signal === undefined) {
     await sleep(ms);
     return;
   }
-  await Promise.race([
-    sleep(ms),
-    new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
-  ]);
+  const stop = new AbortController;
+  let onAbort;
+  try {
+    await Promise.race([
+      sleep(ms, stop.signal),
+      new Promise((resolve) => {
+        onAbort = () => resolve();
+        signal.addEventListener("abort", onAbort, { once: true });
+      })
+    ]);
+  } finally {
+    if (onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
+    stop.abort();
+  }
 }
 // src/logger.ts
 import pino from "pino";
@@ -1319,10 +1374,12 @@ var PACKAGE = "tula-closeline-kit";
 export {
   AppError2 as AppError,
   ENVIRONMENTS,
+  INTERNAL_CALL_FAILURES,
   INTERNAL_DEFAULT_MAX_RESPONSE_BYTES,
   INTERNAL_DEFAULT_RETRY,
   INTERNAL_DEFAULT_TIMEOUT_MS,
   INTERNAL_IDEMPOTENCY_HEADER,
+  INTERNAL_MAX_ATTEMPTS,
   INTERNAL_MAX_REQUEST_BYTES,
   INTERNAL_RETRY_STATUSES,
   InternalCallError,

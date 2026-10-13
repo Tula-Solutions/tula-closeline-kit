@@ -304,10 +304,17 @@ declare const INTERNAL_DEFAULT_RETRY: {
 };
 /** The statuses an idempotent call is retried on. Other statuses are answers, not faults. */
 declare const INTERNAL_RETRY_STATUSES: readonly number[];
+/**
+* Every way {@link InternalClient.request} can reject. A body that is empty or not JSON is not
+* one of them: `json` is `undefined` and the caller's schema check decides.
+*/
+declare const INTERNAL_CALL_FAILURES: readonly ["connection", "timeout", "aborted", "redirect", "response_too_large"];
+/** The most attempts a call may be given, the first included. */
+declare const INTERNAL_MAX_ATTEMPTS = 10;
 /** The HTTP methods the client sends. */
 type InternalMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
 /** Why an internal call produced no usable answer. */
-type InternalCallFailure = "connection" | "timeout" | "aborted" | "redirect" | "response_too_large" | "response_invalid";
+type InternalCallFailure = (typeof INTERNAL_CALL_FAILURES)[number];
 /**
 * An internal call that produced no answer. The message is fixed text plus the method, path (no
 * query), status and attempt count; the secret, the request body, the response body and the
@@ -329,7 +336,7 @@ declare class InternalCallError extends Error {
 }
 /** How a call is retried. Every field has a default in {@link INTERNAL_DEFAULT_RETRY}. */
 type InternalRetryPolicy = {
-	/** Attempts in all, the first included; `1` turns retries off. */
+	/** Attempts in all, the first included: an integer from 1 to {@link INTERNAL_MAX_ATTEMPTS}. */
 	maxAttempts?: number;
 	/** The first pause's ceiling; each later pause doubles it, up to `maxDelayMs`. */
 	baseDelayMs?: number;
@@ -359,7 +366,7 @@ type InternalClientOptions = {
 	/** Where a retry is noted: fixed words, a status or failure kind and an attempt number only. */
 	logger?: Pick<Logger, "warn">;
 	/** Injected for tests; defaults to a timer. */
-	sleep?: (ms: number) => Promise<void>;
+	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	/** Injected for tests; a number in `[0, 1)`; defaults to `Math.random`. */
 	random?: () => number;
 };
@@ -407,7 +414,10 @@ interface InternalClient {
 *
 * Cost per call: one new connection (plus one TLS handshake for https), one request, no
 * keep-alive; memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
-* certificates are verified, and there is no switch to turn that off.
+* certificates are verified: every https request sets `rejectUnauthorized: true` itself, so
+* `NODE_TLS_REJECT_UNAUTHORIZED=0` has no effect on it, and the client is not built at all
+* while that variable is `0` outside `local`. `NODE_EXTRA_CA_CERTS` still adds trusted
+* authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
 import { Region as Region3 } from "tula-closeline-contract";
@@ -489,4 +499,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };
+export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };

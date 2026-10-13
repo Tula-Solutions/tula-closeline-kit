@@ -71,7 +71,22 @@ async function probe(
   const output = (await new Response(child.stdout).text()).trim()
   await child.exited
   await Bun.sleep(25)
+  // Every run must reach its end: a child that crashed or exited early prints no `done`.
+  expect(output).toMatch(/^(ok \d+|error \w+)\ndone$/)
   return { hits, output }
+}
+
+/**
+ * What a run that went straight to its target prints: the answer for the live http target, and
+ * a refused connection for the https port where nothing listens (which proves the request ran).
+ */
+function expectDirect(output: string, scheme: 'http' | 'https') {
+  if (scheme === 'http') {
+    expect(output).toBe('ok 200\ndone')
+  } else {
+    expect(output).toMatch(/^error \w+\ndone$/)
+    expect(output).not.toContain('ok')
+  }
 }
 
 /** The variable that applies to a scheme: the others are ignored by Bun for that scheme. */
@@ -97,6 +112,7 @@ describe('probe: what honours proxy variables (the positive control)', () => {
   test('fetch with an empty per-request proxy option still reaches the proxy', async () => {
     const result = await probe('fetch-proxy-empty', 'http', 'HTTP_PROXY')
     expect(result.hits).toBeGreaterThan(0)
+    expect(result.output).toBe('ok 502\ndone')
   }, 20_000)
 
   test.each([
@@ -107,6 +123,7 @@ describe('probe: what honours proxy variables (the positive control)', () => {
     async (variable, scheme) => {
       const result = await probe('fetch', scheme, variable)
       expect(result.hits).toBe(0)
+      expectDirect(result.output, scheme)
     },
     20_000
   )
@@ -114,6 +131,7 @@ describe('probe: what honours proxy variables (the positive control)', () => {
   test('NO_PROXY naming the host stops fetch, which is why it is not the mechanism', async () => {
     const result = await probe('fetch', 'http', 'HTTP_PROXY', '127.0.0.1')
     expect(result.hits).toBe(0)
+    expectDirect(result.output, 'http')
   }, 20_000)
 })
 
@@ -128,9 +146,7 @@ describe('probe: what ignores them', () => {
       for (const noProxy of [undefined, '127.0.0.1']) {
         const result = await probe('node-agent-false', scheme, variable, noProxy)
         expect(result.hits).toBe(0)
-        if (scheme === 'http') {
-          expect(result.output).toBe('ok 200')
-        }
+        expectDirect(result.output, scheme)
       }
     },
     30_000
@@ -141,6 +157,7 @@ describe('probe: what ignores them', () => {
     async (variable, scheme) => {
       const result = await probe('node-keepalive-agent', scheme, variable)
       expect(result.hits).toBe(0)
+      expectDirect(result.output, scheme)
     },
     20_000
   )
@@ -157,9 +174,7 @@ describe('the internal client', () => {
       for (const noProxy of [undefined, '127.0.0.1', 'example.invalid']) {
         const result = await probe('internal-client', scheme, variable, noProxy)
         expect(result.hits).toBe(0)
-        if (scheme === 'http') {
-          expect(result.output).toBe('ok 200')
-        }
+        expectDirect(result.output, scheme)
       }
     },
     40_000

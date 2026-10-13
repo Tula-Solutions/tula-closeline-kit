@@ -1,11 +1,11 @@
 /**
  * Child process of the proxy probe (`proxy.test.ts`). Proxy variables are read at process start,
- * so each case runs in its own process with the variables in its environment. Prints one line:
- * `ok <status>` or `error <name>`. Not part of the public API.
+ * so each case runs in its own process with the variables in its environment. Prints `ok <status>` or
+ * `error <name>` and then `done`; a run without `done` never reached the end. Not part of the public API.
  */
 import { Agent, request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { createInternalClient } from './internal'
+import { createInternalClient, InternalCallError } from './internal'
 
 const [mode, rawUrl] = process.argv.slice(2)
 if (mode === undefined || rawUrl === undefined) {
@@ -36,6 +36,9 @@ function viaNode(agent: false | Agent): Promise<number> {
   })
 }
 
+/** A failure whose message is safe to print as the result line. */
+class Reported extends Error {}
+
 /** Runs the transport named by `mode` once against the URL. */
 async function run(): Promise<number> {
   switch (mode) {
@@ -63,6 +66,24 @@ async function run(): Promise<number> {
       })
       return (await client.request({ method: 'GET', path: '/' })).status
     }
+    case 'internal-client-tls': {
+      // A self-signed server and no `ca`: the request must fail verification.
+      const client = createInternalClient({
+        baseUrl: `${url.protocol}//${url.host}`,
+        secret: 'probe-secret-value',
+        environment: 'local',
+        timeoutMs: 3000,
+        retry: { maxAttempts: 1 },
+      })
+      try {
+        return (await client.request({ method: 'GET', path: '/' })).status
+      } catch (error) {
+        if (error instanceof InternalCallError) {
+          throw new Reported(`InternalCallError ${error.failure}`)
+        }
+        throw error
+      }
+    }
     default:
       throw new Error(`unknown mode ${mode}`)
   }
@@ -70,11 +91,13 @@ async function run(): Promise<number> {
 
 run().then(
   (status) => {
-    process.stdout.write(`ok ${status}\n`)
+    process.stdout.write(`ok ${status}\ndone\n`)
     process.exit(0)
   },
   (error: unknown) => {
-    process.stdout.write(`error ${error instanceof Error ? error.name : 'unknown'}\n`)
+    process.stdout.write(
+      `error ${error instanceof Reported ? error.message : error instanceof Error ? error.name : 'unknown'}\ndone\n`
+    )
     process.exit(0)
   }
 )

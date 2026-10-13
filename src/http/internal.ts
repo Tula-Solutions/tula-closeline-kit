@@ -40,17 +40,26 @@ const FORBIDDEN_HEADERS = new Set([
   'proxy-authorization',
 ])
 
+/**
+ * Every way {@link InternalClient.request} can reject. A body that is empty or not JSON is not
+ * one of them: `json` is `undefined` and the caller's schema check decides.
+ */
+export const INTERNAL_CALL_FAILURES = [
+  'connection',
+  'timeout',
+  'aborted',
+  'redirect',
+  'response_too_large',
+] as const
+
+/** The most attempts a call may be given, the first included. */
+export const INTERNAL_MAX_ATTEMPTS = 10
+
 /** The HTTP methods the client sends. */
 export type InternalMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 /** Why an internal call produced no usable answer. */
-export type InternalCallFailure =
-  | 'connection'
-  | 'timeout'
-  | 'aborted'
-  | 'redirect'
-  | 'response_too_large'
-  | 'response_invalid'
+export type InternalCallFailure = (typeof INTERNAL_CALL_FAILURES)[number]
 
 /**
  * An internal call that produced no answer. The message is fixed text plus the method, path (no
@@ -87,7 +96,7 @@ export class InternalCallError extends Error {
 
 /** How a call is retried. Every field has a default in {@link INTERNAL_DEFAULT_RETRY}. */
 export type InternalRetryPolicy = {
-  /** Attempts in all, the first included; `1` turns retries off. */
+  /** Attempts in all, the first included: an integer from 1 to {@link INTERNAL_MAX_ATTEMPTS}. */
   maxAttempts?: number
   /** The first pause's ceiling; each later pause doubles it, up to `maxDelayMs`. */
   baseDelayMs?: number
@@ -118,7 +127,7 @@ export type InternalClientOptions = {
   /** Where a retry is noted: fixed words, a status or failure kind and an attempt number only. */
   logger?: Pick<Logger, 'warn'>
   /** Injected for tests; defaults to a timer. */
-  sleep?: (ms: number) => Promise<void>
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   /** Injected for tests; a number in `[0, 1)`; defaults to `Math.random`. */
   random?: () => number
 }
@@ -249,7 +258,10 @@ type Wire = {
  *
  * Cost per call: one new connection (plus one TLS handshake for https), one request, no
  * keep-alive; memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
- * certificates are verified, and there is no switch to turn that off.
+ * certificates are verified: every https request sets `rejectUnauthorized: true` itself, so
+ * `NODE_TLS_REJECT_UNAUTHORIZED=0` has no effect on it, and the client is not built at all
+ * while that variable is `0` outside `local`. `NODE_EXTRA_CA_CERTS` still adds trusted
+ * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
  */
 export function createInternalClient(options: InternalClientOptions): InternalClient {
   const base = parseBase(options.baseUrl, options.environment)
@@ -257,11 +269,27 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
     throw new TypeError('the internal secret must be a non-empty string of printable characters')
   }
   const authorization = `Bearer ${options.secret}`
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0' && options.environment !== 'local') {
+    throw new TypeError(
+      'NODE_TLS_REJECT_UNAUTHORIZED=0 turns off certificate checks; unset it outside local'
+    )
+  }
   const retry = { ...INTERNAL_DEFAULT_RETRY, ...options.retry }
-  const maxAttempts = Math.max(1, Math.floor(retry.maxAttempts))
+  const maxAttempts = retry.maxAttempts
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > INTERNAL_MAX_ATTEMPTS) {
+    throw new TypeError(`retry.maxAttempts must be an integer from 1 to ${INTERNAL_MAX_ATTEMPTS}`)
+  }
+  for (const name of ['baseDelayMs', 'maxDelayMs', 'retryAfterCapMs'] as const) {
+    if (!isNonNegative(retry[name])) {
+      throw new TypeError(`retry.${name} must be a finite number, zero or more`)
+    }
+  }
   const timeoutMs = options.timeoutMs ?? INTERNAL_DEFAULT_TIMEOUT_MS
   const maxBytes = options.maxResponseBytes ?? INTERNAL_DEFAULT_MAX_RESPONSE_BYTES
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
+    throw new TypeError('timeoutMs and maxResponseBytes must be finite numbers above zero')
+  }
+  const sleep = options.sleep ?? timerSleep
   const random = options.random ?? Math.random
   const send = base.secure ? httpsRequest : httpRequest
 
@@ -283,6 +311,8 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           headers,
           agent: false,
           signal,
+          // Explicit, so NODE_TLS_REJECT_UNAUTHORIZED=0 in the environment cannot switch it off.
+          ...(base.secure ? { rejectUnauthorized: true } : {}),
           ...(options.ca === undefined ? {} : { ca: options.ca }),
         },
         (response) => {
@@ -362,6 +392,9 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
       const safeToRepeat =
         IDEMPOTENT_METHODS.includes(call.method) || call.idempotencyKey !== undefined
       const perAttempt = call.timeoutMs ?? timeoutMs
+      if (!isPositive(perAttempt)) {
+        throw new TypeError('timeoutMs must be a finite number above zero')
+      }
 
       for (let attempts = 1; ; attempts += 1) {
         const fail = (failure: InternalCallFailure, status?: number) =>
@@ -423,9 +456,35 @@ class Failure {
   ) {}
 }
 
-/** Sleeps, but gives up at once when the caller's signal aborts. */
+/** Whether `value` is a finite number above zero. */
+function isPositive(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+/** Whether `value` is a finite number, zero or more. */
+function isNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+/** The default pause: a timer that is cleared when `signal` aborts, and a listener that is dropped. */
+function timerSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+/**
+ * Pauses for `ms`, or returns at once when the caller's signal aborts. The listener on the
+ * caller's signal is removed, and the pause itself is told to stop, on every path.
+ */
 async function pauseOrAbort(
-  sleep: (ms: number) => Promise<void>,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
   ms: number,
   signal: AbortSignal | undefined
 ): Promise<void> {
@@ -433,10 +492,20 @@ async function pauseOrAbort(
     await sleep(ms)
     return
   }
-  await Promise.race([
-    sleep(ms),
-    new Promise<void>((resolve) =>
-      signal.addEventListener('abort', () => resolve(), { once: true })
-    ),
-  ])
+  const stop = new AbortController()
+  let onAbort: (() => void) | undefined
+  try {
+    await Promise.race([
+      sleep(ms, stop.signal),
+      new Promise<void>((resolve) => {
+        onAbort = () => resolve()
+        signal.addEventListener('abort', onAbort, { once: true })
+      }),
+    ])
+  } finally {
+    if (onAbort !== undefined) {
+      signal.removeEventListener('abort', onAbort)
+    }
+    stop.abort()
+  }
 }

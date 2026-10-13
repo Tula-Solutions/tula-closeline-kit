@@ -1,8 +1,15 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createInternalClient, InternalCallError, type InternalClientOptions } from './internal'
+import {
+  createInternalClient,
+  INTERNAL_CALL_FAILURES,
+  INTERNAL_MAX_ATTEMPTS,
+  InternalCallError,
+  type InternalCallFailure,
+  type InternalClientOptions,
+} from './internal'
 
 const SECRET = 'sekret-marker-7f3a9c'
 const BODY_MARKER = 'body-marker-51e2'
@@ -545,6 +552,7 @@ describe('TLS', () => {
   let key = ''
   let secure: ReturnType<typeof Bun.serve> | undefined
   let usable = false
+  const secureSeen: (string | null)[] = []
 
   beforeAll(async () => {
     dir = mkdtempSync(join(tmpdir(), 'kit-tls-'))
@@ -576,7 +584,10 @@ describe('TLS', () => {
       hostname: '127.0.0.1',
       port: 0,
       tls: { cert, key },
-      fetch: () => Response.json({ tls: true }),
+      fetch: (request) => {
+        secureSeen.push(request.headers.get('authorization'))
+        return Response.json({ tls: true })
+      },
     })
   })
   afterAll(async () => {
@@ -601,5 +612,228 @@ describe('TLS', () => {
 
     const trusted = createInternalClient({ ...base, ca: cert })
     expect((await trusted.request({ method: 'GET', path: '/' })).json).toEqual({ tls: true })
+  })
+
+  /** Runs the probe child against the self-signed server with extra environment. */
+  async function selfSigned(env: Record<string, string>) {
+    if (secure === undefined) {
+      throw new Error('openssl is needed to make a test certificate')
+    }
+    secureSeen.length = 0
+    const child = Bun.spawn(
+      [
+        'bun',
+        new URL('./probe-child.ts', import.meta.url).pathname,
+        'internal-client-tls',
+        `https://127.0.0.1:${secure.port}/`,
+      ],
+      {
+        env: { PATH: process.env.PATH ?? '', ...env },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 15_000,
+      }
+    )
+    const output = (await new Response(child.stdout).text()).trim()
+    await child.exited
+    return output
+  }
+
+  test('NODE_TLS_REJECT_UNAUTHORIZED=0 does not make the client accept a self-signed server', async () => {
+    const output = await selfSigned({ NODE_TLS_REJECT_UNAUTHORIZED: '0' })
+    expect(output).toBe('error InternalCallError connection\ndone')
+    expect(secureSeen).toEqual([])
+  }, 20_000)
+
+  test('without the variable the same server is refused too (control)', async () => {
+    expect(await selfSigned({})).toBe('error InternalCallError connection\ndone')
+    expect(secureSeen).toEqual([])
+  }, 20_000)
+
+  test('NODE_EXTRA_CA_CERTS adds a trusted authority, so the self-signed server is accepted', async () => {
+    const output = await selfSigned({ NODE_EXTRA_CA_CERTS: join(dir, 'c.pem') })
+    expect(output).toBe('ok 200\ndone')
+    expect(secureSeen).toEqual(['Bearer probe-secret-value'])
+  }, 20_000)
+
+  test.each(['dev', 'staging', 'prod'] as const)(
+    'the client is not built in %s while NODE_TLS_REJECT_UNAUTHORIZED is 0',
+    (environment) => {
+      const before = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+      try {
+        expect(() =>
+          createInternalClient({ baseUrl: 'https://core.internal', secret: SECRET, environment })
+        ).toThrow(/NODE_TLS_REJECT_UNAUTHORIZED/)
+        expect(() =>
+          createInternalClient({
+            baseUrl: 'https://core.internal',
+            secret: SECRET,
+            environment: 'local',
+          })
+        ).not.toThrow()
+      } finally {
+        if (before === undefined) {
+          delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+        } else {
+          process.env.NODE_TLS_REJECT_UNAUTHORIZED = before
+        }
+      }
+    }
+  )
+})
+
+describe('numeric options', () => {
+  const make = (extra: Partial<InternalClientOptions>) =>
+    createInternalClient({
+      baseUrl: 'https://core.internal',
+      secret: SECRET,
+      environment: 'prod',
+      ...extra,
+    })
+  const bad = [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5, '3']
+
+  test.each(bad)('maxAttempts %p is refused', (value) => {
+    expect(() => make({ retry: { maxAttempts: value as number } })).toThrow(TypeError)
+  })
+
+  test('maxAttempts is an integer from 1 to the ceiling', () => {
+    expect(INTERNAL_MAX_ATTEMPTS).toBe(10)
+    expect(() => make({ retry: { maxAttempts: INTERNAL_MAX_ATTEMPTS } })).not.toThrow()
+    expect(() => make({ retry: { maxAttempts: INTERNAL_MAX_ATTEMPTS + 1 } })).toThrow(TypeError)
+    expect(() => make({ retry: { maxAttempts: 1 } })).not.toThrow()
+  })
+
+  test.each(['timeoutMs', 'maxResponseBytes'] as const)(
+    '%s must be positive and finite',
+    (name) => {
+      for (const value of bad.filter((v) => v !== 1.5)) {
+        expect(() => make({ [name]: value })).toThrow(TypeError)
+      }
+    }
+  )
+
+  test.each(['baseDelayMs', 'maxDelayMs', 'retryAfterCapMs'] as const)(
+    'retry.%s must be finite and not negative',
+    (name) => {
+      for (const value of [Number.NaN, Number.POSITIVE_INFINITY, -1, '3']) {
+        expect(() => make({ retry: { [name]: value as number } })).toThrow(TypeError)
+      }
+      expect(() => make({ retry: { [name]: 0 } })).not.toThrow()
+    }
+  )
+
+  test('a per-call timeoutMs is checked the same way', async () => {
+    const receiver = stand()
+    const { client } = clientFor(receiver)
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      expect(client.request({ method: 'GET', path: '/x', timeoutMs: value })).rejects.toThrow(
+        TypeError
+      )
+    }
+    expect(receiver.seen).toHaveLength(0)
+  })
+})
+
+describe('pausing between attempts', () => {
+  test('the abort listener is removed after a pause that ran its course', async () => {
+    const receiver = stand((_r, count) =>
+      count === 1 ? new Response('x', { status: 503 }) : Response.json({})
+    )
+    const controller = new AbortController()
+    const add = spyOn(controller.signal, 'addEventListener')
+    const remove = spyOn(controller.signal, 'removeEventListener')
+    const { client } = clientFor(receiver)
+
+    await client.request({ method: 'GET', path: '/x', signal: controller.signal })
+
+    const added = add.mock.calls.filter(([type]) => type === 'abort').length
+    const removed = remove.mock.calls.filter(([type]) => type === 'abort').length
+    expect(added).toBeGreaterThan(0)
+    expect(removed).toBeGreaterThanOrEqual(added)
+  })
+
+  test('an abort during the pause stops the call and leaves no listener', async () => {
+    const receiver = stand(() => new Response('x', { status: 503 }))
+    const controller = new AbortController()
+    const remove = spyOn(controller.signal, 'removeEventListener')
+    const add = spyOn(controller.signal, 'addEventListener')
+    const h = harness()
+    const client = createInternalClient({
+      ...h.options,
+      baseUrl: receiver.url,
+      sleep: (_ms, signal) =>
+        new Promise<void>((resolve) => {
+          // Never ends by itself: only the abort can release the pause.
+          signal?.addEventListener('abort', () => resolve(), { once: true })
+          setTimeout(() => controller.abort(), 0)
+        }),
+    })
+
+    const error = await failure(
+      client.request({ method: 'GET', path: '/x', signal: controller.signal })
+    )
+
+    expect(error.failure).toBe('aborted')
+    expect(receiver.seen).toHaveLength(1)
+    const added = add.mock.calls.filter(([type]) => type === 'abort').length
+    const removed = remove.mock.calls.filter(([type]) => type === 'abort').length
+    expect(removed).toBeGreaterThanOrEqual(added)
+  })
+
+  test('the default pause clears its timer when the call is aborted', async () => {
+    const receiver = stand(
+      () => new Response('x', { status: 503, headers: { 'retry-after': '3' } })
+    )
+    const controller = new AbortController()
+    const clear = spyOn(globalThis, 'clearTimeout')
+    const client = createInternalClient({
+      baseUrl: receiver.url,
+      secret: SECRET,
+      environment: 'local',
+    })
+    setTimeout(() => controller.abort(), 50)
+    const error = await failure(
+      client.request({ method: 'GET', path: '/x', signal: controller.signal })
+    )
+    expect(error.failure).toBe('aborted')
+    expect(clear).toHaveBeenCalled()
+    clear.mockRestore()
+  })
+})
+
+describe('failure kinds', () => {
+  /** Exhaustive: adding a kind without handling it here is a type error. */
+  function describeKind(kind: InternalCallFailure): string {
+    switch (kind) {
+      case 'connection':
+      case 'timeout':
+      case 'aborted':
+      case 'redirect':
+      case 'response_too_large':
+        return kind
+      default: {
+        const unreachable: never = kind
+        return unreachable
+      }
+    }
+  }
+
+  test('the list matches the type, and the README names every kind', () => {
+    expect([...INTERNAL_CALL_FAILURES].map(describeKind)).toEqual([...INTERNAL_CALL_FAILURES])
+    const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8')
+    for (const kind of INTERNAL_CALL_FAILURES) {
+      expect(readme).toContain(`\`${kind}\``)
+    }
+    expect(readme).not.toContain('response_invalid')
+  })
+
+  test('a 2xx body that is not JSON is an answer with undefined json, not a failure', async () => {
+    const { client } = clientFor(stand(() => new Response('<html>')))
+    expect(await client.request({ method: 'GET', path: '/x' })).toEqual({
+      status: 200,
+      json: undefined,
+      attempts: 1,
+    })
   })
 })

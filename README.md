@@ -72,7 +72,7 @@ const { status, json } = await core.request({
 - `request` resolves with `{ status, json, attempts }` for every answer that is not a redirect,
   4xx and 5xx included: the adapter maps statuses and validates `json` with the contract's schema.
   `json` is parsed whatever the content type says and is `undefined` when the body is empty or not
-  JSON. It rejects with `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`,
+  JSON; that is an answer, not a failure, and the adapter's schema check decides. It rejects with `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`,
   `redirect`, `response_too_large`), which carries `method`, `path` (no query), `status` and
   `attempts`, and never the secret, a body or the underlying error.
 - Retries: only a connection failure, a timeout, 429, 502, 503 and 504, and only when the method is
@@ -80,7 +80,15 @@ const { status, json } = await core.request({
   status. Defaults: 3 attempts, full jitter (`random * min(2000, 100 * 2^(n-1))` ms), and a
   `Retry-After` in seconds is used instead, cut to 5 s. Inject `sleep` and `random` in tests.
 - A redirect is an error and is never followed. A response over `maxResponseBytes` (1 MiB) fails.
-  TLS certificates are verified and there is no switch to turn that off; `ca` adds a trusted CA.
+  TLS certificates are verified: every https request sets `rejectUnauthorized: true` itself, so
+  `NODE_TLS_REJECT_UNAUTHORIZED=0` in the environment does not weaken it, and the client refuses
+  to be built while that variable is `0` unless `ENVIRONMENT` is `local`. `ca` adds a trusted CA.
+  `NODE_EXTRA_CA_CERTS` is honoured, as in any Bun process: the authorities in that file are
+  trusted in addition to the system's, so an operator can add a private CA without a code change
+  (it cannot switch verification off). Keep it out of images that talk to anything but your own CA.
+- Numbers are checked when the client is built (and `timeoutMs` per call): `retry.maxAttempts` is an
+  integer from 1 to 10, `timeoutMs` and `maxResponseBytes` are finite and above zero, and the retry
+  delays are finite and not negative; anything else is a `TypeError`.
 - Cost per call: one new connection (and one TLS handshake for https), no keep-alive, no allocation
   beyond the bounded response. It is not a hot path, so there is no benchmark.
 - Outbound calls to vendors are not internal calls: they may use `fetch` and a proxy set on purpose.
