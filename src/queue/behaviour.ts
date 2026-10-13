@@ -11,6 +11,8 @@ export interface QueueSubject {
   registry: ReturnType<typeof createTestRegistry>
   /** The queue's visibility timeout for plain receives in the suite, in seconds (small). */
   visibilitySeconds: number
+  /** Seconds a receive that expects nothing waits: 0 is enough for memory; SQS needs a long poll to be sure. */
+  emptyWaitSeconds: number
   /** Deliveries before the dead-letter queue takes a message. */
   maxReceiveCount: number
   /** Lets `seconds` of the queue's time go by: advances a virtual clock, or really waits. */
@@ -75,7 +77,7 @@ export function queueBehaviour(
       await s.queue.receive({
         maxMessages: 10,
         visibilityTimeoutSeconds: s.visibilitySeconds,
-        waitSeconds: 0,
+        waitSeconds: s.emptyWaitSeconds,
       })
 
     test('publishing an envelope of an unknown type is refused and nothing is sent', async () => {
@@ -267,6 +269,20 @@ export function queueBehaviour(
       await s.queue.release((got as Delivery<TestEnvelope>).receipt)
       const [again] = await take(s, 1)
       expect(again?.receiveCount).toBe(2)
+    })
+
+    test('acknowledging with the receipt of an earlier delivery does not delete the redelivered message', async () => {
+      const s = await subject()
+      await s.queue.publish(ping(s, 1, 'org_a', 'msg_stale'))
+      const [first] = await take(s, 1)
+      await s.pass(s.visibilitySeconds + 1)
+      const [second] = await take(s, 1)
+      expect(second?.receiveCount).toBe(2)
+      await s.queue.acknowledge((first as Delivery<TestEnvelope>).receipt)
+      await s.queue.release((second as Delivery<TestEnvelope>).receipt)
+      const [third] = await take(s, 1)
+      expect(third?.kind === 'message' && third.envelope.id).toBe('msg_stale')
+      expect(third?.receiveCount).toBe(3)
     })
 
     test('an acknowledged message is not delivered again', async () => {

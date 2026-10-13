@@ -28,6 +28,12 @@ export interface MemoryQueueOptions<D extends AnyDefinition> {
   sleep?: Sleep
   /** Deliveries before a message moves to the dead-letter list; defaults to 5 like the dev queue. */
   maxReceiveCount?: number
+  /**
+   * Random in [0, 1). When given, receive picks among the visible messages at random instead of in
+   * publish order, which SQS does not promise either; tests use it to prove a consumer does not
+   * depend on order.
+   */
+  random?: () => number
 }
 
 /** A message the memory queue moved aside after `maxReceiveCount` deliveries. */
@@ -65,8 +71,10 @@ function bytesOf(body: string): number {
  * Creates the in-memory queue. It follows SQS where it matters to a consumer: a received message
  * is hidden until its visibility timeout passes on the injected clock, then comes back with a
  * higher receive count; after `maxReceiveCount` deliveries it goes to the dead-letter list; a
- * long poll returns when a message is published or the wait ends. It delivers in publish order,
- * which SQS does not promise. Complexity: publish O(message size); receive O(messages stored),
+ * long poll returns when a message is published or the wait ends. By default it delivers in
+ * publish order and a short poll always sees every visible message; SQS promises neither (order is
+ * best effort and a short poll samples some servers), so do not write a test that depends on
+ * either. Pass `random` to deliver in random order. Complexity: publish O(message size); receive O(messages stored),
  * because it scans for the visible ones (fine for tests).
  */
 export function createMemoryQueue<const D extends AnyDefinition>(
@@ -111,7 +119,16 @@ export function createMemoryQueue<const D extends AnyDefinition>(
   function take(max: number, visibilityTimeoutSeconds: number): Delivery<EnvelopeOf<D>>[] {
     const now = clock.now().getTime()
     const out: Delivery<EnvelopeOf<D>>[] = []
-    for (const entry of [...entries.values()]) {
+    const candidates = [...entries.values()]
+    if (options.random !== undefined) {
+      for (let i = candidates.length - 1; i > 0; i--) {
+        const j = Math.floor(options.random() * (i + 1))
+        const swap = candidates[i] as Entry
+        candidates[i] = candidates[j] as Entry
+        candidates[j] = swap
+      }
+    }
+    for (const entry of candidates) {
       if (out.length >= max) {
         break
       }
@@ -217,8 +234,10 @@ export function createMemoryQueue<const D extends AnyDefinition>(
       return found
     },
     async acknowledge(receipt) {
+      // Only the most recent delivery's receipt deletes: after a redelivery the older receipt is
+      // stale, and (as in SQS) acknowledging with it must not remove the message.
       const entry = findByReceipt(receipt)
-      if (entry !== undefined) {
+      if (entry !== undefined && entry.receiveCount === Number(receipt.split('.')[1])) {
         entries.delete(entry.id)
       }
     },

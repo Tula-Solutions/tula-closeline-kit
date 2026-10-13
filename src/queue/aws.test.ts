@@ -74,6 +74,40 @@ function named(name: string, message = name): Error {
 }
 
 describe('construction', () => {
+  describe('the SDK reads these variables, so outside local they are refused', () => {
+    const NAMES = ['AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_SQS']
+    const saved: Record<string, string | undefined> = {}
+    beforeEach(() => {
+      for (const name of NAMES) {
+        saved[name] = process.env[name]
+      }
+    })
+    afterEach(() => {
+      for (const name of NAMES) {
+        if (saved[name] === undefined) {
+          delete process.env[name]
+        } else {
+          process.env[name] = saved[name]
+        }
+      }
+    })
+
+    test.each(NAMES)('%s is refused in prod, with its name in the error', (name) => {
+      process.env[name] = 'http://evil.example'
+      expect(() => adapter(stub(() => ({})).client, { environment: 'prod' })).toThrow(name)
+    })
+
+    test('an empty value is not a setting', () => {
+      process.env.AWS_ENDPOINT_URL = ''
+      expect(() => adapter(stub(() => ({})).client, { environment: 'prod' })).not.toThrow()
+    })
+
+    test('in local they are allowed (ElasticMQ)', () => {
+      process.env.AWS_ENDPOINT_URL_SQS = 'http://127.0.0.1:9324'
+      expect(() => adapter(stub(() => ({})).client, { environment: 'local' })).not.toThrow()
+    })
+  })
+
   test.each(['dev', 'staging', 'prod'] as const)(
     'an endpoint override is refused in %s',
     (environment) => {
@@ -369,6 +403,60 @@ describe('receive', () => {
       expect(s.calls).toHaveLength(0)
     }
   )
+})
+
+describe('failures that retrying cannot fix', () => {
+  const clientFault = (name: string, message = name) =>
+    Object.assign(named(name, message), { $fault: 'client' as const })
+
+  test.each([
+    'QueueDoesNotExist',
+    'AccessDenied',
+    'InvalidMessageContents',
+    'AWS.SimpleQueueService.NonExistentQueue',
+  ])('%s is queue.rejected, not unavailable, on every operation', async (name) => {
+    const s = stub(() => clientFault(name))
+    const queue = adapter(s.client)
+    const args = { maxMessages: 1, visibilityTimeoutSeconds: 5, waitSeconds: 0 }
+    await expect(queue.publish(ping(1))).rejects.toMatchObject({ code: 'queue.rejected' })
+    await expect(queue.publishBatch([ping(1)])).rejects.toMatchObject({ code: 'queue.rejected' })
+    await expect(queue.receive(args)).rejects.toMatchObject({ code: 'queue.rejected' })
+    await expect(queue.acknowledge('h')).rejects.toMatchObject({ code: 'queue.rejected' })
+    await expect(queue.extendVisibility('h', 5)).rejects.toMatchObject({ code: 'queue.rejected' })
+  })
+
+  test('a client fault the SDK marks retryable (throttling) stays unavailable', async () => {
+    const throttled = Object.assign(clientFault('RequestThrottled'), {
+      $retryable: { throttling: true },
+    })
+    const s = stub(() => throttled)
+    await expect(adapter(s.client).publish(ping(1))).rejects.toMatchObject({
+      code: 'queue.unavailable',
+    })
+  })
+
+  test('a server fault is unavailable', async () => {
+    const s = stub(() => Object.assign(named('InternalError'), { $fault: 'server' }))
+    await expect(adapter(s.client).publish(ping(1))).rejects.toMatchObject({
+      code: 'queue.unavailable',
+    })
+  })
+
+  test('InvalidParameterValue about a receipt handle is a stale receipt; about anything else it is rejected', async () => {
+    const receipt = stub(() =>
+      clientFault('InvalidParameterValue', 'Value abc for parameter ReceiptHandle is invalid')
+    )
+    await expect(adapter(receipt.client).extendVisibility('h', 5)).rejects.toMatchObject({
+      code: 'queue.receipt_invalid',
+    })
+    await expect(adapter(receipt.client).acknowledge('h')).resolves.toBeUndefined()
+    const other = stub(() =>
+      clientFault('InvalidParameterValue', 'Value 99 for parameter VisibilityTimeout is invalid')
+    )
+    await expect(adapter(other.client).extendVisibility('h', 5)).rejects.toMatchObject({
+      code: 'queue.rejected',
+    })
+  })
 })
 
 describe('acknowledge, extend and release', () => {

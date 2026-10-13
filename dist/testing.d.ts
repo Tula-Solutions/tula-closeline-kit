@@ -370,6 +370,12 @@ interface MemoryQueueOptions<D extends AnyDefinition> {
 	sleep?: Sleep;
 	/** Deliveries before a message moves to the dead-letter list; defaults to 5 like the dev queue. */
 	maxReceiveCount?: number;
+	/**
+	* Random in [0, 1). When given, receive picks among the visible messages at random instead of in
+	* publish order, which SQS does not promise either; tests use it to prove a consumer does not
+	* depend on order.
+	*/
+	random?: () => number;
 }
 /** A message the memory queue moved aside after `maxReceiveCount` deliveries. */
 interface DeadLetter {
@@ -394,8 +400,10 @@ interface MemoryQueue<D extends AnyDefinition> extends Queue<EnvelopeOf<D>> {
 * Creates the in-memory queue. It follows SQS where it matters to a consumer: a received message
 * is hidden until its visibility timeout passes on the injected clock, then comes back with a
 * higher receive count; after `maxReceiveCount` deliveries it goes to the dead-letter list; a
-* long poll returns when a message is published or the wait ends. It delivers in publish order,
-* which SQS does not promise. Complexity: publish O(message size); receive O(messages stored),
+* long poll returns when a message is published or the wait ends. By default it delivers in
+* publish order and a short poll always sees every visible message; SQS promises neither (order is
+* best effort and a short poll samples some servers), so do not write a test that depends on
+* either. Pass `random` to deliver in random order. Complexity: publish O(message size); receive O(messages stored),
 * because it scans for the visible ones (fine for tests).
 */
 declare function createMemoryQueue<const D extends AnyDefinition>(options: MemoryQueueOptions<D>): MemoryQueue<D>;

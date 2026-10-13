@@ -12,6 +12,8 @@ export const QUEUE_ERROR_CODES = {
   invalidRequest: 'queue.invalid_request',
   /** The receipt is not for a message that is in flight any more. */
   receiptInvalid: 'queue.receipt_invalid',
+  /** The queue refused the call for a reason a retry cannot fix (no such queue, access denied). */
+  rejected: 'queue.rejected',
   /** The queue did not answer, in time or at all, after the bounded retries. */
   unavailable: 'queue.unavailable',
   /** The queue answered with something this adapter cannot use. */
@@ -27,6 +29,7 @@ const STATUS: Record<QueueErrorCode, number> = {
   'queue.batch_too_large': 413,
   'queue.invalid_request': 400,
   'queue.receipt_invalid': 409,
+  'queue.rejected': 500,
   'queue.unavailable': 503,
   'queue.bad_response': 502,
 }

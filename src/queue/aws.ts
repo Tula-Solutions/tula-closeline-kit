@@ -78,7 +78,19 @@ function bytesOf(body: string): number {
   return new TextEncoder().encode(body).length
 }
 
-function unavailable(operation: string, error: unknown): QueueError {
+/**
+ * Turns an SDK failure into a QueueError. A fault the SDK blames on the client and does not call
+ * retryable (no such queue, access denied, invalid contents) can never succeed on retry: it is
+ * `queue.rejected`, a configuration or code bug that should be reported. Everything else (server
+ * faults, timeouts, throttling, a dropped connection) is `queue.unavailable`.
+ */
+function mapFailure(operation: string, error: unknown): QueueError {
+  const fault = error as { $fault?: unknown; $retryable?: unknown } | null
+  if (fault?.$fault === 'client' && fault.$retryable === undefined) {
+    return new QueueError(QUEUE_ERROR_CODES.rejected, `the queue refused ${operation}`, {
+      cause: error,
+    })
+  }
   return new QueueError(QUEUE_ERROR_CODES.unavailable, `the queue did not complete ${operation}`, {
     cause: error,
   })
@@ -86,9 +98,21 @@ function unavailable(operation: string, error: unknown): QueueError {
 
 const STALE_RECEIPT_NAMES = new Set(['ReceiptHandleIsInvalid', 'MessageNotInflight'])
 
+/**
+ * True for the errors SQS (and ElasticMQ) give for a receipt that no longer names an in-flight
+ * message. `InvalidParameterValue` counts only when it is about the receipt handle.
+ */
 function isStaleReceipt(error: unknown): boolean {
-  return error instanceof Error && STALE_RECEIPT_NAMES.has(error.name)
+  if (!(error instanceof Error)) {
+    return false
+  }
+  return (
+    STALE_RECEIPT_NAMES.has(error.name) ||
+    (error.name === 'InvalidParameterValue' && /receipt ?handle/i.test(error.message))
+  )
 }
+
+const ENDPOINT_VARIABLES = ['AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_SQS'] as const
 
 /**
  * Creates the SQS adapter, built on the AWS SDK v3 SQS client.
@@ -114,6 +138,16 @@ export function createSqsQueue<const D extends AnyDefinition>(
     throw new TypeError(
       `an SQS endpoint override is only for ENVIRONMENT=local, not ${options.environment}`
     )
+  }
+  if (options.environment !== 'local') {
+    // The SDK reads these itself; they would send queue traffic anywhere without a code change.
+    for (const name of ENDPOINT_VARIABLES) {
+      if ((process.env[name] ?? '') !== '') {
+        throw new TypeError(
+          `${name} is set; an SQS endpoint override is only for ENVIRONMENT=local`
+        )
+      }
+    }
   }
   const timeoutMs = options.timeoutMs ?? SQS_DEFAULT_TIMEOUT_MS
   const maxAttempts = options.maxAttempts ?? SQS_DEFAULT_MAX_ATTEMPTS
@@ -166,7 +200,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
           cause: error,
         })
       }
-      throw unavailable('a visibility change', error)
+      throw mapFailure('a visibility change', error)
     }
   }
 
@@ -176,7 +210,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
       try {
         await client.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: body }))
       } catch (error) {
-        throw unavailable('a publish', error)
+        throw mapFailure('a publish', error)
       }
     },
 
@@ -202,7 +236,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
           })
         )) as SendMessageBatchCommandOutput
       } catch (error) {
-        throw unavailable('a batch publish', error)
+        throw mapFailure('a batch publish', error)
       }
       const accepted = new Set((output.Successful ?? []).map((entry) => entry.Id))
       const refused = new Map((output.Failed ?? []).map((entry) => [entry.Id, entry]))
@@ -252,7 +286,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
         if (signal?.aborted) {
           return []
         }
-        throw unavailable('a receive', error)
+        throw mapFailure('a receive', error)
       }
       const deliveries: Delivery<EnvelopeOf<D>>[] = []
       for (const message of output.Messages ?? []) {
@@ -292,7 +326,7 @@ export function createSqsQueue<const D extends AnyDefinition>(
       } catch (error) {
         // A receipt that no longer names an in-flight message is already settled: nothing to delete.
         if (!isStaleReceipt(error)) {
-          throw unavailable('an acknowledge', error)
+          throw mapFailure('an acknowledge', error)
         }
       }
     },

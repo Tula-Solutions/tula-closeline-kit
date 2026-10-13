@@ -15,6 +15,7 @@ queueBehaviour('memory adapter', async () => {
     queue,
     registry,
     visibilitySeconds: 5,
+    emptyWaitSeconds: 0,
     maxReceiveCount: 3,
     pass: (seconds) => time.advance(seconds * 1000),
     injectRaw: async (body) => queue.publishRaw(body),

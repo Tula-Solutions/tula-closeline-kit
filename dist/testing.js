@@ -1,18 +1,22 @@
 import {
-  createFixedClock2,
   scrubText2,
   prepareFields,
+  shouldReportError2
+} from "./shared/chunk-zhk9qr39.js";
+import {
+  createFixedClock2,
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2,
   defineMessage2,
-  createMessageRegistry2,
+  createMessageRegistry2
+} from "./shared/chunk-vk3tcs4x.js";
+import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2,
-  systemSleep2,
-  shouldReportError2
-} from "./shared/chunk-y3t52wrd.js";
+  systemSleep2
+} from "./shared/chunk-9f0bsnc4.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -131,7 +135,16 @@ function createMemoryQueue(options) {
   function take(max, visibilityTimeoutSeconds) {
     const now = clock.now().getTime();
     const out = [];
-    for (const entry of [...entries.values()]) {
+    const candidates = [...entries.values()];
+    if (options.random !== undefined) {
+      for (let i = candidates.length - 1;i > 0; i--) {
+        const j = Math.floor(options.random() * (i + 1));
+        const swap = candidates[i];
+        candidates[i] = candidates[j];
+        candidates[j] = swap;
+      }
+    }
+    for (const entry of candidates) {
       if (out.length >= max) {
         break;
       }
@@ -231,7 +244,7 @@ function createMemoryQueue(options) {
     },
     async acknowledge(receipt) {
       const entry = findByReceipt(receipt);
-      if (entry !== undefined) {
+      if (entry !== undefined && entry.receiveCount === Number(receipt.split(".")[1])) {
         entries.delete(entry.id);
       }
     },
