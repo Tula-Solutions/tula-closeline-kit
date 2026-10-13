@@ -838,6 +838,188 @@ function createLogger(options) {
   };
   return wrap(options.destination ? pino(config, options.destination) : pino(config));
 }
+// src/queue/aws.ts
+import {
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
+  ReceiveMessageCommand,
+  SendMessageBatchCommand,
+  SendMessageCommand,
+  SQSClient
+} from "@aws-sdk/client-sqs";
+var SQS_DEFAULT_TIMEOUT_MS = 5000;
+var SQS_DEFAULT_MAX_ATTEMPTS = 3;
+function bytesOf(body) {
+  return new TextEncoder().encode(body).length;
+}
+function unavailable2(operation, error) {
+  return new QueueError2(QUEUE_ERROR_CODES2.unavailable, `the queue did not complete ${operation}`, {
+    cause: error
+  });
+}
+var STALE_RECEIPT_NAMES = new Set(["ReceiptHandleIsInvalid", "MessageNotInflight"]);
+function isStaleReceipt(error) {
+  return error instanceof Error && STALE_RECEIPT_NAMES.has(error.name);
+}
+function createSqsQueue(options) {
+  if (options.endpoint !== undefined && options.environment !== "local") {
+    throw new TypeError(`an SQS endpoint override is only for ENVIRONMENT=local, not ${options.environment}`);
+  }
+  const timeoutMs = options.timeoutMs ?? SQS_DEFAULT_TIMEOUT_MS;
+  const maxAttempts = options.maxAttempts ?? SQS_DEFAULT_MAX_ATTEMPTS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) {
+    throw new TypeError("timeoutMs must be a whole number from 100 to 60000");
+  }
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new TypeError("maxAttempts must be a whole number from 1 to 10");
+  }
+  const { registry, queueUrl } = options;
+  const client = options.client ?? new SQSClient({
+    region: options.region,
+    ...options.endpoint === undefined ? {} : { endpoint: options.endpoint },
+    maxAttempts,
+    retryMode: "standard",
+    requestHandler: {
+      connectionTimeout: timeoutMs,
+      requestTimeout: timeoutMs,
+      throwOnRequestTimeout: true
+    }
+  });
+  function encodeChecked(envelope) {
+    const body = registry.encode(envelope);
+    if (bytesOf(body) > MAX_MESSAGE_BYTES2) {
+      throw new QueueError2(QUEUE_ERROR_CODES2.messageTooLarge, "the message is over 256 KiB", {
+        details: { limitBytes: MAX_MESSAGE_BYTES2 }
+      });
+    }
+    return body;
+  }
+  async function changeVisibility(receipt, seconds) {
+    assertVisibility2(seconds);
+    try {
+      await client.send(new ChangeMessageVisibilityCommand({
+        QueueUrl: queueUrl,
+        ReceiptHandle: receipt,
+        VisibilityTimeout: seconds
+      }));
+    } catch (error) {
+      if (isStaleReceipt(error)) {
+        throw new QueueError2(QUEUE_ERROR_CODES2.receiptInvalid, "the message is not in flight", {
+          cause: error
+        });
+      }
+      throw unavailable2("a visibility change", error);
+    }
+  }
+  return {
+    async publish(envelope) {
+      const body = encodeChecked(envelope);
+      try {
+        await client.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: body }));
+      } catch (error) {
+        throw unavailable2("a publish", error);
+      }
+    },
+    async publishBatch(envelopes) {
+      assertBatchCount2(envelopes.length);
+      const bodies = envelopes.map(encodeChecked);
+      const total = bodies.reduce((sum, body) => sum + bytesOf(body), 0);
+      if (total > MAX_MESSAGE_BYTES2) {
+        throw new QueueError2(QUEUE_ERROR_CODES2.batchTooLarge, "a batch is at most 256 KiB in total", {
+          details: { limitBytes: MAX_MESSAGE_BYTES2, totalBytes: total }
+        });
+      }
+      let output;
+      try {
+        output = await client.send(new SendMessageBatchCommand({
+          QueueUrl: queueUrl,
+          Entries: bodies.map((body, index) => ({ Id: String(index), MessageBody: body }))
+        }));
+      } catch (error) {
+        throw unavailable2("a batch publish", error);
+      }
+      const accepted = new Set((output.Successful ?? []).map((entry) => entry.Id));
+      const refused = new Map((output.Failed ?? []).map((entry) => [entry.Id, entry]));
+      const result = { sent: [], failed: [] };
+      envelopes.forEach((envelope, index) => {
+        const entryId = String(index);
+        const failure = refused.get(entryId);
+        if (failure !== undefined) {
+          const item = {
+            id: envelope.id,
+            code: failure.Code ?? "Unknown",
+            senderFault: failure.SenderFault === true
+          };
+          result.failed.push(item);
+        } else if (accepted.has(entryId)) {
+          result.sent.push(envelope.id);
+        } else {
+          result.failed.push({ id: envelope.id, code: "MissingFromResponse", senderFault: false });
+        }
+      });
+      return result;
+    },
+    async receive(receiveOptions) {
+      assertReceiveOptions2(receiveOptions);
+      const { maxMessages, visibilityTimeoutSeconds, waitSeconds, signal } = receiveOptions;
+      if (signal?.aborted) {
+        return [];
+      }
+      let output;
+      try {
+        output = await client.send(new ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: maxMessages,
+          VisibilityTimeout: visibilityTimeoutSeconds,
+          WaitTimeSeconds: waitSeconds,
+          MessageSystemAttributeNames: ["ApproximateReceiveCount"]
+        }), {
+          requestTimeout: waitSeconds * 1000 + timeoutMs,
+          ...signal === undefined ? {} : { abortSignal: signal }
+        });
+      } catch (error) {
+        if (signal?.aborted) {
+          return [];
+        }
+        throw unavailable2("a receive", error);
+      }
+      const deliveries = [];
+      for (const message of output.Messages ?? []) {
+        if (message.ReceiptHandle === undefined || message.Body === undefined) {
+          throw new QueueError2(QUEUE_ERROR_CODES2.badResponse, "the queue returned a message without a body or receipt");
+        }
+        const receiveCount = Number.parseInt(message.Attributes?.ApproximateReceiveCount ?? "1", 10);
+        const count = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
+        const decoded = registry.decode(message.Body);
+        deliveries.push(decoded.ok ? {
+          kind: "message",
+          envelope: decoded.envelope,
+          receipt: message.ReceiptHandle,
+          receiveCount: count
+        } : {
+          kind: "invalid",
+          reason: decoded.reason,
+          issues: decoded.issues,
+          ...decoded.messageId === undefined ? {} : { messageId: decoded.messageId },
+          receipt: message.ReceiptHandle,
+          receiveCount: count
+        });
+      }
+      return deliveries;
+    },
+    async acknowledge(receipt) {
+      try {
+        await client.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receipt }));
+      } catch (error) {
+        if (!isStaleReceipt(error)) {
+          throw unavailable2("an acknowledge", error);
+        }
+      }
+    },
+    extendVisibility: changeVisibility,
+    release: (receipt) => changeVisibility(receipt, 0)
+  };
+}
 // src/reporting/env.ts
 import { z as z3 } from "zod";
 var ENVIRONMENTS = ["local", "dev", "staging", "prod"];
@@ -1416,6 +1598,8 @@ export {
   PACKAGE,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
+  SQS_DEFAULT_MAX_ATTEMPTS,
+  SQS_DEFAULT_TIMEOUT_MS,
   TokenVerificationError,
   accessTokenClaimsSchema,
   assertBatchCount2 as assertBatchCount,
@@ -1429,6 +1613,7 @@ export {
   createMessageRegistry2 as createMessageRegistry,
   createNoopErrorReporter,
   createRemoteKeySet,
+  createSqsQueue,
   createStaticKeySet,
   createTokenVerifier,
   cutText2 as cutText,

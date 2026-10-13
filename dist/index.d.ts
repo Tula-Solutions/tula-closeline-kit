@@ -420,6 +420,7 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
+import { ChangeMessageVisibilityCommand, DeleteMessageCommand, ReceiveMessageCommand, SendMessageBatchCommand, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { z as z3 } from "zod";
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
@@ -543,33 +544,6 @@ interface MessageRegistryOptions {
 * type are a mistake and throw.
 */
 declare function createMessageRegistry<const D extends AnyDefinition>(definitions: readonly D[], options?: MessageRegistryOptions): MessageRegistry<D>;
-/** The `area.reason` codes the queue adapters throw. */
-declare const QUEUE_ERROR_CODES: {
-	/** An envelope failed validation before sending. */
-	readonly invalidMessage: "queue.invalid_message";
-	/** A message body is over the 256 KiB limit. */
-	readonly messageTooLarge: "queue.message_too_large";
-	/** A batch has more than 10 messages or more than 256 KiB in total. */
-	readonly batchTooLarge: "queue.batch_too_large";
-	/** A call argument is outside what the queue accepts (batch size, visibility, wait). */
-	readonly invalidRequest: "queue.invalid_request";
-	/** The receipt is not for a message that is in flight any more. */
-	readonly receiptInvalid: "queue.receipt_invalid";
-	/** The queue did not answer, in time or at all, after the bounded retries. */
-	readonly unavailable: "queue.unavailable";
-	/** The queue answered with something this adapter cannot use. */
-	readonly badResponse: "queue.bad_response";
-};
-/** One of {@link QUEUE_ERROR_CODES}'s values. */
-type QueueErrorCode = (typeof QUEUE_ERROR_CODES)[keyof typeof QUEUE_ERROR_CODES];
-/** What a queue port or adapter throws. Its message never holds a message body. */
-declare class QueueError extends AppError {
-	readonly code: QueueErrorCode;
-	constructor(code: QueueErrorCode, message: string, options?: {
-		cause?: unknown;
-		details?: Record<string, unknown>;
-	});
-}
 /** Opaque handle for one delivery of a message; pass it back to acknowledge or change visibility. */
 type Receipt = string;
 /** The largest batch SQS takes or gives. */
@@ -683,6 +657,88 @@ declare function assertReceiveOptions(options: ReceiveOptions): void;
 declare function assertVisibility(seconds: number): void;
 /** Throws the QueueError for a batch of 0 or more than 10 messages. */
 declare function assertBatchCount(count: number): void;
+/** The one SDK method the adapter uses; a test passes a stub with this shape. */
+interface SqsSender {
+	/** Sends one SDK command, with an optional per-call timeout and abort signal. */
+	send(command: SendMessageCommand | SendMessageBatchCommand | ReceiveMessageCommand | DeleteMessageCommand | ChangeMessageVisibilityCommand, options?: {
+		requestTimeout?: number;
+		abortSignal?: AbortSignal;
+	}): Promise<unknown>;
+}
+/** Options for {@link createSqsQueue}. */
+interface SqsQueueOptions<D extends AnyDefinition> {
+	/** The queue's URL. */
+	queueUrl: string;
+	/** The AWS Region of the queue; each Closeline Region has its own queues (ADR 0001). */
+	region: string;
+	/** The `ENVIRONMENT` the service runs in. */
+	environment: Environment;
+	/** The message types the queue accepts and delivers. */
+	registry: MessageRegistry<D>;
+	/**
+	* An endpoint to use instead of AWS, for ElasticMQ in local development (`http://127.0.0.1:9324`).
+	* Accepted only when `environment` is `local`; anywhere else it throws at construction, so a
+	* deployed service cannot be pointed away from AWS by a stray setting. Credentials are never an
+	* option: they come from the SDK's default chain (the task role in AWS; for ElasticMQ, any
+	* `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values).
+	*/
+	endpoint?: string;
+	/** Bound on one attempt's connect and request, in ms; default 5000. A long poll adds its wait. */
+	timeoutMs?: number;
+	/** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
+	maxAttempts?: number;
+	/** A replacement for the SDK client, for unit tests with no network. */
+	client?: SqsSender;
+}
+/** The default bound on one attempt, in milliseconds. */
+declare const SQS_DEFAULT_TIMEOUT_MS = 5e3;
+/** The default number of attempts per call. */
+declare const SQS_DEFAULT_MAX_ATTEMPTS = 3;
+/**
+* Creates the SQS adapter, built on the AWS SDK v3 SQS client.
+*
+* Timeouts: every attempt has a connect and a request timeout (`timeoutMs`; a long poll adds its
+* wait). Retries: the SDK's own, `maxAttempts` with the `standard` mode's jittered exponential
+* back-off and retry quota; the adapter adds no second layer. A failed publish after the retries
+* throws `queue.unavailable`; republishing the same envelope is safe because consumers dedupe on
+* its id. Limits are checked before anything is sent. Message bodies are never logged: the
+* adapter does not log, and its errors carry the SDK error as `cause` but never a body.
+*
+* Proxies: the SDK's Node HTTP handler is used with its default agents, which in Bun do not read
+* `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (proven by `aws-proxy.test.ts`). Queue traffic
+* therefore never goes through a proxy named in the environment (ADR 0013). There is no option for
+* a deliberate proxy yet; add one here, and a test, if infrastructure ever needs it.
+*
+* Complexity: publish O(message size); receive O(batch size); one HTTP call each.
+*/
+declare function createSqsQueue<const D extends AnyDefinition>(options: SqsQueueOptions<D>): Queue<EnvelopeOf<D>>;
+/** The `area.reason` codes the queue adapters throw. */
+declare const QUEUE_ERROR_CODES: {
+	/** An envelope failed validation before sending. */
+	readonly invalidMessage: "queue.invalid_message";
+	/** A message body is over the 256 KiB limit. */
+	readonly messageTooLarge: "queue.message_too_large";
+	/** A batch has more than 10 messages or more than 256 KiB in total. */
+	readonly batchTooLarge: "queue.batch_too_large";
+	/** A call argument is outside what the queue accepts (batch size, visibility, wait). */
+	readonly invalidRequest: "queue.invalid_request";
+	/** The receipt is not for a message that is in flight any more. */
+	readonly receiptInvalid: "queue.receipt_invalid";
+	/** The queue did not answer, in time or at all, after the bounded retries. */
+	readonly unavailable: "queue.unavailable";
+	/** The queue answered with something this adapter cannot use. */
+	readonly badResponse: "queue.bad_response";
+};
+/** One of {@link QUEUE_ERROR_CODES}'s values. */
+type QueueErrorCode = (typeof QUEUE_ERROR_CODES)[keyof typeof QUEUE_ERROR_CODES];
+/** What a queue port or adapter throws. Its message never holds a message body. */
+declare class QueueError extends AppError {
+	readonly code: QueueErrorCode;
+	constructor(code: QueueErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
 /**
 * Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
 * loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
@@ -769,4 +825,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, Clock, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, Clock, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, SQS_DEFAULT_MAX_ATTEMPTS, SQS_DEFAULT_TIMEOUT_MS, Sleep, SqsQueueOptions, SqsSender, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createSqsQueue, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
