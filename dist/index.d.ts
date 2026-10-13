@@ -712,40 +712,6 @@ declare const SQS_DEFAULT_MAX_ATTEMPTS = 3;
 * Complexity: publish O(message size); receive O(batch size); one HTTP call each.
 */
 declare function createSqsQueue<const D extends AnyDefinition>(options: SqsQueueOptions<D>): Queue<EnvelopeOf<D>>;
-/** The `area.reason` codes the queue adapters throw. */
-declare const QUEUE_ERROR_CODES: {
-	/** An envelope failed validation before sending. */
-	readonly invalidMessage: "queue.invalid_message";
-	/** A message body is over the 256 KiB limit. */
-	readonly messageTooLarge: "queue.message_too_large";
-	/** A batch has more than 10 messages or more than 256 KiB in total. */
-	readonly batchTooLarge: "queue.batch_too_large";
-	/** A call argument is outside what the queue accepts (batch size, visibility, wait). */
-	readonly invalidRequest: "queue.invalid_request";
-	/** The receipt is not for a message that is in flight any more. */
-	readonly receiptInvalid: "queue.receipt_invalid";
-	/** The queue did not answer, in time or at all, after the bounded retries. */
-	readonly unavailable: "queue.unavailable";
-	/** The queue answered with something this adapter cannot use. */
-	readonly badResponse: "queue.bad_response";
-};
-/** One of {@link QUEUE_ERROR_CODES}'s values. */
-type QueueErrorCode = (typeof QUEUE_ERROR_CODES)[keyof typeof QUEUE_ERROR_CODES];
-/** What a queue port or adapter throws. Its message never holds a message body. */
-declare class QueueError extends AppError {
-	readonly code: QueueErrorCode;
-	constructor(code: QueueErrorCode, message: string, options?: {
-		cause?: unknown;
-		details?: Record<string, unknown>;
-	});
-}
-/**
-* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
-* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
-*/
-type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
-/** The real {@link Sleep}, on `setTimeout`. */
-declare const systemSleep: Sleep;
 import { Region as Region3 } from "tula-closeline-contract";
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
@@ -799,6 +765,178 @@ interface ErrorReporterOptions {
 */
 declare function shouldReportError(error: unknown): boolean;
 /**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+/** The real {@link Sleep}, on `setTimeout`. */
+declare const systemSleep: Sleep;
+/** Identifies one message for one consumer: what "already processed" is recorded against. */
+interface ConsumedKey {
+	/** The consumer's name, so two consumers of different queues in one service do not collide. */
+	consumer: string;
+	/** The Organization the message belongs to, or null for a global message. Part of the key on purpose. */
+	organizationId: string | null;
+	/** The envelope id. */
+	messageId: string;
+}
+/** What {@link ProcessedStore.claim} answers. */
+type ClaimResult = {
+	status: "claimed";
+	token: string;
+} | {
+	status: "done";
+} | {
+	status: "busy";
+};
+/**
+* Where an idempotent consumer records which messages are done. In production it is a Postgres
+* table in the service's own schema (see the README), never process memory, so any instance can be
+* stopped and a redelivery to another instance is still recognised.
+*/
+interface ProcessedStore {
+	/**
+	* Tries to take the message for `leaseSeconds`. `claimed` returns a token that the claimant
+	* must pass to `complete` or `release`; `done` means it was completed before; `busy` means
+	* another claim is live. A claim whose lease ran out can be taken again, so a consumer that
+	* died mid-handler does not block the message forever. Must be atomic (one statement).
+	*/
+	claim(key: ConsumedKey, leaseSeconds: number): Promise<ClaimResult>;
+	/** Marks the message done. Returns false if the claim was lost (its lease ran out and another took it). */
+	complete(key: ConsumedKey, token: string): Promise<boolean>;
+	/** Gives up a claim without completing, so the next delivery can take it. A lost claim is ignored. */
+	release(key: ConsumedKey, token: string): Promise<void>;
+	/**
+	* Deletes completed records older than `before` and lapsed claims, at most `limit` rows, and
+	* returns how many. Call it from a periodic job. `before` must be older than the queue's message
+	* retention (14 days at most), or a very late redelivery would run twice.
+	*/
+	purge(before: Date, limit: number): Promise<number>;
+}
+/** A {@link ProcessedStore} in process memory, for tests and local runs of one instance. */
+declare function createMemoryProcessedStore(options: {
+	clock: Clock;
+	newToken?: () => string;
+}): ProcessedStore;
+/** What a handler is told about the delivery it is processing. */
+interface HandlerContext {
+	/**
+	* The Organization the message belongs to, taken from the validated envelope; undefined for a
+	* global message. Scope every read and write to it. The same value is part of the idempotency
+	* key, so another Organization's message with the same id is a different message.
+	*/
+	readonly organizationId: string | undefined;
+	/** The request or trace id that caused the message. */
+	readonly traceId: string;
+	/** How many times the queue has delivered this message, this delivery included. */
+	readonly receiveCount: number;
+	/**
+	* Aborts when the handler has run past `handlerTimeoutMs`, when the consumer lost the message
+	* (its visibility ran out and it was handed to someone else) or when shutdown gave up waiting.
+	* A handler checks it between steps and stops; one that ignores it may run alongside a retry.
+	*/
+	readonly signal: AbortSignal;
+}
+/** One handler per message type of the queue; the type of `message` follows the key. */
+type Handlers<E extends AnyEnvelope> = { [T in E["type"]]? : (message: Extract<E, {
+	type: T;
+}>, context: HandlerContext) => Promise<void> };
+/** Options for {@link createConsumer}. */
+interface ConsumerOptions<E extends AnyEnvelope> {
+	/** Names this consumer in the store and in logs, such as `playbook.ingestion`. */
+	name: string;
+	/** The queue to read. */
+	queue: Queue<E>;
+	/** Where finished messages are recorded; Postgres in production (see the README). */
+	store: ProcessedStore;
+	/** The handlers. A message whose type has none is treated like an invalid one. */
+	handlers: Handlers<E>;
+	/** Where problems are logged: ids, types and counts only, never a body or a payload. */
+	logger: Logger;
+	/** Where unexpected failures are reported; optional. */
+	errorReporter?: ErrorReporter;
+	/** Waits for the extend timer, the retry back-off and the shutdown deadline; defaults to real timers. */
+	sleep?: Sleep;
+	/** Random in [0, 1) for jitter; defaults to `Math.random`. */
+	random?: () => number;
+	/** Messages handled at once, 1 to 100; default 4. */
+	concurrency?: number;
+	/** Long-poll wait in seconds, 0 to 20; default 20. */
+	waitSeconds?: number;
+	/** Visibility timeout in seconds, 2 or more; default 30. The consumer extends it while a handler runs. */
+	visibilityTimeoutSeconds?: number;
+	/** How long one handler may run before its signal aborts, in ms; default 300000 (5 minutes). */
+	handlerTimeoutMs?: number;
+	/** First delay before a failed message is retried, in seconds; doubles per delivery; default 5. */
+	retryBaseSeconds?: number;
+	/** Longest retry delay in seconds; default 300. */
+	retryMaxSeconds?: number;
+	/** How long an invalid or unhandled message stays hidden before the next look, in seconds; default 60. */
+	invalidDelaySeconds?: number;
+}
+/** What {@link Consumer.stop} did with the messages in flight. */
+interface StopResult {
+	/** Messages whose handling ended before the deadline, over the consumer's life. */
+	finished: number;
+	/** Messages given back to the queue because the deadline passed. */
+	abandoned: number;
+}
+/** A running (or runnable) message loop. */
+interface Consumer {
+	/** Starts receiving in the background. Calling it twice does nothing. */
+	start(): void;
+	/**
+	* Stops receiving, waits up to `deadlineMs` for handlers in flight, then aborts their signals and
+	* hands what is left back to the queue (claims released, visibility 0). Resolves when that is done.
+	*/
+	stop(deadlineMs: number): Promise<StopResult>;
+	/** Receives one batch with no wait and handles it to the end; returns how many arrived. For tests and one-shot jobs. */
+	pollOnce(): Promise<number>;
+}
+/**
+* Wraps handlers so that each message has its effect once, on top of at-least-once delivery.
+*
+* Guarantees: a message completed before is acknowledged and not handled again; two consumers that
+* receive the same message do not both run it (the second finds the claim and backs off); a
+* handler that throws or times out leaves the message in the queue for a delayed retry, and the
+* queue's `maxReceiveCount` sends it to the dead-letter queue; an invalid message or one without
+* a handler is never acknowledged, never crashes the loop, and ends in the dead-letter queue; at
+* most `concurrency` handlers run at once; the Organization id is the envelope's own and is part
+* of the idempotency key.
+*
+* Not guaranteed: a crash between the handler's effect and `store.complete` runs the effect again
+* after the lease. Keep the effect and the store record in one database transaction where you can,
+* or make the effect itself idempotent.
+*/
+declare function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E>): Consumer;
+/** The `area.reason` codes the queue adapters throw. */
+declare const QUEUE_ERROR_CODES: {
+	/** An envelope failed validation before sending. */
+	readonly invalidMessage: "queue.invalid_message";
+	/** A message body is over the 256 KiB limit. */
+	readonly messageTooLarge: "queue.message_too_large";
+	/** A batch has more than 10 messages or more than 256 KiB in total. */
+	readonly batchTooLarge: "queue.batch_too_large";
+	/** A call argument is outside what the queue accepts (batch size, visibility, wait). */
+	readonly invalidRequest: "queue.invalid_request";
+	/** The receipt is not for a message that is in flight any more. */
+	readonly receiptInvalid: "queue.receipt_invalid";
+	/** The queue did not answer, in time or at all, after the bounded retries. */
+	readonly unavailable: "queue.unavailable";
+	/** The queue answered with something this adapter cannot use. */
+	readonly badResponse: "queue.bad_response";
+};
+/** One of {@link QUEUE_ERROR_CODES}'s values. */
+type QueueErrorCode = (typeof QUEUE_ERROR_CODES)[keyof typeof QUEUE_ERROR_CODES];
+/** What a queue port or adapter throws. Its message never holds a message body. */
+declare class QueueError extends AppError {
+	readonly code: QueueErrorCode;
+	constructor(code: QueueErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/**
 * Picks the error reporter for a service: the Sentry adapter when a DSN is given, otherwise the
 * no-op one, so `local` and tests run without Sentry. The DSN is per Region (ADR 0001): give each
 * deployment the DSN of a Sentry project in its own data region; the kit sends to whatever it is given.
@@ -825,4 +963,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, Clock, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, SQS_DEFAULT_MAX_ATTEMPTS, SQS_DEFAULT_TIMEOUT_MS, Sleep, SqsQueueOptions, SqsSender, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createSqsQueue, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, Consumer, ConsumerOptions, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, HandlerContext, Handlers, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, ProcessedStore, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, SQS_DEFAULT_MAX_ATTEMPTS, SQS_DEFAULT_TIMEOUT_MS, Sleep, SqsQueueOptions, SqsSender, StopResult, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createConsumer, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createSqsQueue, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
