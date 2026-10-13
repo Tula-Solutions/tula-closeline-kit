@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, test } from 'bun:test'
 import { Hono } from 'hono'
+import { ERRORS } from 'tula-closeline-contract'
 import { createFixedClock } from '../clock'
 import { isAppError, toErrorBody } from '../errors'
 import { createMemoryLogger } from '../testing'
@@ -196,6 +197,39 @@ describe('requests that must be turned away', () => {
     expect(t.logger.entries).toEqual([
       { level: 'warn', message: 'request rejected', fields: { reason: 'invalid' } },
     ])
+  })
+})
+
+describe("the codes it returns are the contract's", () => {
+  // Drives the middleware to each rejection it can produce and checks the code is registered in
+  // the contract with the status the middleware sends, so the two cannot drift.
+  test('every rejection code exists in the registry with the status the middleware uses', async () => {
+    const expired = await mintTestToken({ keyPair: pair, clock, expiresInSeconds: -300 })
+    const down: TokenVerifier = {
+      verify: async () => {
+        throw new TokenVerificationError('unavailable')
+      },
+    }
+    const cases: [string, () => Response | Promise<Response>][] = [
+      ['auth.unauthenticated', () => build().app.request('/me')],
+      ['auth.token_invalid', () => build().app.request('/me', bearer('not.a.token'))],
+      ['auth.token_expired', () => build().app.request('/me', bearer(expired))],
+      ['auth.unavailable', () => build(down).app.request('/me', bearer('a.b.c'))],
+    ]
+    expect(cases.map(([code]) => code).sort()).toEqual([
+      'auth.token_expired',
+      'auth.token_invalid',
+      'auth.unauthenticated',
+      'auth.unavailable',
+    ])
+    for (const [code, request] of cases) {
+      const definition = (ERRORS as Record<string, { status: number } | undefined>)[code]
+      expect(definition, `${code} is missing from the contract`).toBeDefined()
+      const res = await request()
+      const body = (await res.json()) as { error: { code: string } }
+      expect(body.error.code).toBe(code)
+      expect(res.status).toBe(definition?.status as number)
+    }
   })
 })
 

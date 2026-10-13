@@ -46,7 +46,7 @@
   "dependencies": {
     "jose": "^6.2.12",
     "pino": "^10.4.0",
-    "tula-closeline-contract": "git+ssh://git@github.com/Tula-Solutions/tula-closeline-contract.git#v0.2.0"
+    "tula-closeline-contract": "git+ssh://git@github.com/Tula-Solutions/tula-closeline-contract.git#v0.3.0"
   },
   "peerDependencies": {
     "hono": "^4.13.13",
