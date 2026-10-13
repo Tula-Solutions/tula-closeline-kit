@@ -439,6 +439,20 @@ describe('options', () => {
     ).toThrow(TypeError)
   })
 
+  test.each(['yes', 'true', 1, null] as const)(
+    'keepAlive: %p is refused, not read as off',
+    (value) => {
+      expect(() =>
+        createInternalClient({
+          baseUrl: 'http://127.0.0.1:1',
+          secret: 'x',
+          environment: 'local',
+          keepAlive: value as unknown as boolean,
+        })
+      ).toThrow(/keepAlive/)
+    }
+  )
+
   test('keep-alive is off by default: a connection per call, and no stale_connection', async () => {
     const target = await receiver()
     const { client } = clientFor(target, { keepAlive: undefined })

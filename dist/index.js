@@ -629,6 +629,9 @@ function createInternalClient(options) {
   if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
     throw new TypeError("timeoutMs and maxResponseBytes must be finite numbers above zero");
   }
+  if (options.keepAlive !== undefined && typeof options.keepAlive !== "boolean") {
+    throw new TypeError("keepAlive must be true or false");
+  }
   const keepAlive = options.keepAlive === true;
   if (!keepAlive && (options.maxSockets !== undefined || options.maxFreeSockets !== undefined || options.idleTimeoutMs !== undefined)) {
     throw new TypeError("maxSockets, maxFreeSockets and idleTimeoutMs need keepAlive: true");

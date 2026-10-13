@@ -222,34 +222,35 @@ describe('the internal client with keep-alive on', () => {
     cert?.remove()
   })
 
-  test.each(cases)(
-    'three calls on one client reach the live %s target over one kept connection, not the proxy named by %s',
-    async (variable, scheme) => {
-      if (scheme === 'https' && cert === undefined) {
-        return // openssl could not make a certificate; nothing to probe over TLS
-      }
-      hits = 0
-      connections = 0
-      const child = Bun.spawn(
-        ['bun', CHILD, 'internal-client-keepalive', `${scheme}://127.0.0.1:${ports[scheme]}/`],
-        {
-          env: {
-            PATH: process.env.PATH ?? '',
-            [variable]: `http://127.0.0.1:${proxyPort}`,
-            ...(cert === undefined ? {} : { PROBE_CA: cert.cert }),
-          },
-          stdout: 'pipe',
-          stderr: 'pipe',
-          timeout: 15_000,
-        }
-      )
-      const output = (await new Response(child.stdout).text()).trim()
-      await child.exited
-      await Bun.sleep(25)
-      expect(output).toBe('ok 200\ndone')
-      expect(hits).toBe(0)
-      expect(connections).toBe(1)
-    },
-    20_000
-  )
+  for (const [variable, scheme] of cases) {
+    // https shows as skipped, not passed, when openssl could not make a certificate
+    const run = scheme === 'https' && cert === undefined ? test.skip : test
+    run(
+      `three calls on one client reach the live ${scheme} target over one kept connection, not the proxy named by ${variable}`,
+      async () => {
+        hits = 0
+        connections = 0
+        const child = Bun.spawn(
+          ['bun', CHILD, 'internal-client-keepalive', `${scheme}://127.0.0.1:${ports[scheme]}/`],
+          {
+            env: {
+              PATH: process.env.PATH ?? '',
+              [variable]: `http://127.0.0.1:${proxyPort}`,
+              ...(cert === undefined ? {} : { PROBE_CA: cert.cert }),
+            },
+            stdout: 'pipe',
+            stderr: 'pipe',
+            timeout: 15_000,
+          }
+        )
+        const output = (await new Response(child.stdout).text()).trim()
+        await child.exited
+        await Bun.sleep(25)
+        expect(output).toBe('ok 200\ndone')
+        expect(hits).toBe(0)
+        expect(connections).toBe(1)
+      },
+      20_000
+    )
+  }
 })
