@@ -3,6 +3,53 @@ import {
   prepareFields
 } from "./shared/chunk-gxr4ppv8.js";
 
+// src/auth/testing.ts
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { formatId } from "tula-closeline-contract";
+var testUserId = (n = 1) => formatId("usr", n.toString(16).padStart(32, "0"));
+var testOrganizationId = (n = 1) => formatId("org", n.toString(16).padStart(32, "0"));
+async function createTestKeyPair(kid = "test-key-1") {
+  const { publicKey, privateKey } = await generateKeyPair("EdDSA", { crv: "Ed25519" });
+  const jwk = await exportJWK(publicKey);
+  if (jwk.x === undefined) {
+    throw new Error("Ed25519 public key has no x");
+  }
+  return {
+    kid,
+    privateKey,
+    publicJwk: { kty: "OKP", crv: "Ed25519", x: jwk.x, kid, use: "sig", alg: "EdDSA" }
+  };
+}
+function createTestJwks(...pairs) {
+  return { keys: pairs.map((pair) => pair.publicJwk) };
+}
+var DEFAULT_TEST_ORGANIZATION_ID = testOrganizationId(1);
+var DEFAULT_TEST_USER_ID = testUserId(1);
+async function mintTestToken(options) {
+  const nowSeconds = Math.floor(options.clock.now().getTime() / 1000);
+  const iat = nowSeconds + (options.issuedAtOffsetSeconds ?? 0);
+  const payload = {
+    iss: options.issuer ?? "https://auth.test",
+    aud: options.audience ?? "closeline",
+    sub: DEFAULT_TEST_USER_ID,
+    org: DEFAULT_TEST_ORGANIZATION_ID,
+    role: "rep",
+    region: "us",
+    iat,
+    exp: nowSeconds + (options.expiresInSeconds ?? 900),
+    ...options.notBeforeSeconds === undefined ? {} : { nbf: nowSeconds + options.notBeforeSeconds },
+    ...options.claims
+  };
+  const header = {
+    alg: "EdDSA",
+    kid: options.keyPair.kid,
+    ...options.header
+  };
+  const jwt = new SignJWT(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));
+  jwt.setProtectedHeader(Object.fromEntries(Object.entries(header).filter(([, value]) => value !== undefined)));
+  return jwt.sign(options.keyPair.privateKey);
+}
+
 // src/testing.ts
 function build(entries, bound) {
   const record = (level) => (message, fields) => {
@@ -27,6 +74,13 @@ function createTestDeps(overrides = {}) {
   };
 }
 export {
+  DEFAULT_TEST_ORGANIZATION_ID,
+  DEFAULT_TEST_USER_ID,
   createMemoryLogger,
-  createTestDeps
+  createTestDeps,
+  createTestJwks,
+  createTestKeyPair,
+  mintTestToken,
+  testOrganizationId,
+  testUserId
 };
