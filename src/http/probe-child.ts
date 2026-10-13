@@ -66,6 +66,24 @@ async function run(): Promise<number> {
       })
       return (await client.request({ method: 'GET', path: '/' })).status
     }
+    case 'internal-client-keepalive': {
+      // Keep-alive on, three sequential calls on one client: the second and third use a kept
+      // connection. `PROBE_CA` trusts the stub's throwaway certificate (https).
+      const client = createInternalClient({
+        baseUrl: `${url.protocol}//${url.host}`,
+        secret: 'probe-secret-value',
+        environment: 'local',
+        timeoutMs: 3000,
+        retry: { maxAttempts: 1 },
+        keepAlive: true,
+        ...(process.env.PROBE_CA ? { ca: process.env.PROBE_CA } : {}),
+      })
+      let status = 0
+      for (let call = 0; call < 3; call += 1) {
+        status = (await client.request({ method: 'GET', path: '/' })).status
+      }
+      return status
+    }
     case 'internal-client-tls': {
       // A self-signed server and no `ca`: the request must fail verification.
       const client = createInternalClient({

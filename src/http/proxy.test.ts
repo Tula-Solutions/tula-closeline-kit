@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { createServer as createHttpServer } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import net from 'node:net'
+import { makeTestCert } from './test-cert'
 
 /**
  * The probe behind ADR 0013 decision 4. It pins, for the Bun version in use, which transports
@@ -179,4 +182,75 @@ describe('the internal client', () => {
     },
     40_000
   )
+})
+
+describe('the internal client with keep-alive on', () => {
+  const cert = makeTestCert()
+  const cases = VARIABLES.flatMap((variable) =>
+    (['http', 'https'] as const).map((scheme) => [variable, scheme] as const)
+  )
+  let connections = 0
+  const stubs = {
+    http: createHttpServer((_q, r) => r.end('{"ok":true}')),
+    https:
+      cert === undefined
+        ? undefined
+        : createHttpsServer({ cert: cert.cert, key: cert.key }, (_q, r) => r.end('{"ok":true}')),
+  }
+  const ports = { http: 0, https: 0 }
+
+  beforeAll(async () => {
+    stubs.http.on('connection', () => {
+      connections += 1
+    })
+    stubs.https?.on('secureConnection', () => {
+      connections += 1
+    })
+    for (const scheme of ['http', 'https'] as const) {
+      const server = stubs[scheme]
+      await new Promise<void>((resolve) =>
+        server ? server.listen(0, '127.0.0.1', resolve) : resolve()
+      )
+      ports[scheme] = (server?.address() as net.AddressInfo | null)?.port ?? 0
+    }
+  })
+  afterAll(() => {
+    for (const server of [stubs.http, stubs.https]) {
+      server?.closeAllConnections()
+      server?.close()
+    }
+    cert?.remove()
+  })
+
+  for (const [variable, scheme] of cases) {
+    // https shows as skipped, not passed, when openssl could not make a certificate
+    const run = scheme === 'https' && cert === undefined ? test.skip : test
+    run(
+      `three calls on one client reach the live ${scheme} target over one kept connection, not the proxy named by ${variable}`,
+      async () => {
+        hits = 0
+        connections = 0
+        const child = Bun.spawn(
+          ['bun', CHILD, 'internal-client-keepalive', `${scheme}://127.0.0.1:${ports[scheme]}/`],
+          {
+            env: {
+              PATH: process.env.PATH ?? '',
+              [variable]: `http://127.0.0.1:${proxyPort}`,
+              ...(cert === undefined ? {} : { PROBE_CA: cert.cert }),
+            },
+            stdout: 'pipe',
+            stderr: 'pipe',
+            timeout: 15_000,
+          }
+        )
+        const output = (await new Response(child.stdout).text()).trim()
+        await child.exited
+        await Bun.sleep(25)
+        expect(output).toBe('ok 200\ndone')
+        expect(hits).toBe(0)
+        expect(connections).toBe(1)
+      },
+      20_000
+    )
+  }
 })

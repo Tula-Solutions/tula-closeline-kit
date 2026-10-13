@@ -1,5 +1,5 @@
-import { request as httpRequest } from 'node:http'
-import { request as httpsRequest } from 'node:https'
+import { Agent as HttpAgent, request as httpRequest } from 'node:http'
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import { isIPv4 } from 'node:net'
 import type { Logger } from '../logger'
 import type { Environment } from '../reporting/env'
@@ -9,6 +9,20 @@ export const INTERNAL_IDEMPOTENCY_HEADER = 'Idempotency-Key'
 
 /** The default bound on one attempt, connecting to the last byte of the answer. */
 export const INTERNAL_DEFAULT_TIMEOUT_MS = 5_000
+
+/** The default most connections one client keeps open to its receiver; calls beyond it queue. */
+export const INTERNAL_DEFAULT_MAX_SOCKETS = 32
+
+/** The default most idle connections one client keeps for reuse. */
+export const INTERNAL_DEFAULT_MAX_FREE_SOCKETS = 8
+
+/**
+ * The default time an idle connection is kept before the client closes it. It is below the 5 s
+ * keep-alive timeout of a Node `http` server (and of Bun's, which is 10 s), and far below a load
+ * balancer's (60 s on an AWS ALB, 75 s on nginx), so the client, not the server, ends an idle
+ * connection and a reused one is rarely dead.
+ */
+export const INTERNAL_DEFAULT_IDLE_TIMEOUT_MS = 4_000
 
 /** The default largest answer that is read; a longer one fails the call, it is not truncated. */
 export const INTERNAL_DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
@@ -43,9 +57,14 @@ const FORBIDDEN_HEADERS = new Set([
 /**
  * Every way {@link InternalClient.request} can reject. `response_invalid` is a 2xx answer whose
  * non-empty body is not JSON (an HTML error or login page); it is never retried.
+ * `stale_connection` is a kept connection that the receiver had already closed: the write failed
+ * with `ECONNRESET` or `EPIPE` before any byte of an answer. The request may or may not have
+ * reached the receiver, so it is retried only like a `connection` failure (a safe method or an
+ * idempotency key), at once on a fresh connection; otherwise the caller sees it and decides.
  */
 export const INTERNAL_CALL_FAILURES = [
   'connection',
+  'stale_connection',
   'timeout',
   'aborted',
   'redirect',
@@ -121,6 +140,27 @@ export type InternalClientOptions = {
   timeoutMs?: number
   /** The largest answer read; defaults to {@link INTERNAL_DEFAULT_MAX_RESPONSE_BYTES}. */
   maxResponseBytes?: number
+  /**
+   * Reuse connections (keep-alive). Off by default: every call then opens its own connection,
+   * as in 0.6, with no queue and no `stale_connection`. Turning it on changes how a service
+   * behaves under load and when a receiver restarts, so it is a decision for the consumer,
+   * made after measuring (`bench/internal.bench.ts`). The three options below are valid only
+   * when this is `true`; passing one without it is a `TypeError`.
+   */
+  keepAlive?: boolean
+  /**
+   * The most connections kept open to the receiver at once: an integer of 1 or more; defaults to
+   * {@link INTERNAL_DEFAULT_MAX_SOCKETS}. A call beyond it waits for a free one, and the wait
+   * counts against its timeout; it never opens another connection.
+   */
+  maxSockets?: number
+  /**
+   * The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is
+   * refused); defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
+   */
+  maxFreeSockets?: number
+  /** How long an idle connection is kept; defaults to {@link INTERNAL_DEFAULT_IDLE_TIMEOUT_MS}. */
+  idleTimeoutMs?: number
   /** The retry policy; see {@link InternalRetryPolicy}. */
   retry?: InternalRetryPolicy
   /** Extra certificate authority (PEM) to trust besides the system's. Verification stays on. */
@@ -174,6 +214,13 @@ export interface InternalClient {
    * a timeout, 429, 502, 503 and 504, and only when the method is idempotent or a key is given.
    */
   request(call: InternalRequest): Promise<InternalResponse>
+  /**
+   * Closes every connection this client holds, fails calls in flight or waiting for a connection
+   * with `aborted`, and refuses later calls with a `TypeError`. Safe to call more than once. A
+   * process need not call it to exit (idle connections do not hold it open), but a test or a
+   * graceful shutdown should.
+   */
+  close(): void
 }
 
 /** Whether `host` (as in a URL, brackets kept for IPv6) is a literal loopback address. */
@@ -258,14 +305,21 @@ type Wire = {
 /**
  * Builds the client for calls from this service to one other service (ADR 0013).
  *
- * It uses `node:http` and `node:https` with `agent: false`, never `fetch`: Bun's `fetch` sends a
+ * It uses `node:http` and `node:https` with its own `Agent`, never `fetch`: Bun's `fetch` sends a
  * request to the proxy named by `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and their lower-case
  * forms) unless `NO_PROXY` names the host, and the bearer secret would travel with it. The
  * `node:` transport reads no proxy variable, so nothing in the environment can reroute a call.
  * `proxy.test.ts` pins this for the Bun version in use.
  *
- * Cost per call: one new connection (plus one TLS handshake for https), one request, no
- * keep-alive; memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
+ * By default every call opens its own connection (`agent: false`). With `keepAlive: true`
+ * connections are reused: the client owns one private keep-alive `Agent` (never the global one,
+ * never one passed in; an `Agent` reads no proxy variable either, which the probe checks over
+ * several calls on one client), capped at `maxSockets`
+ * connections with `maxFreeSockets` kept idle for `idleTimeoutMs`. The cap is enforced by the
+ * client's own queue, so a call waiting for a connection is bounded by its timeout and an aborted
+ * one never reaches the wire. Two clients share nothing. A kept connection the receiver closed
+ * fails as `stale_connection` (see {@link INTERNAL_CALL_FAILURES}). Call `close()` to end them.
+ * Memory is bounded by `maxResponseBytes`. Redirects are never followed. TLS
  * certificates are verified: every https request sets `rejectUnauthorized: true` itself, so
  * `NODE_TLS_REJECT_UNAUTHORIZED=0` has no effect on it, and the client is not built at all
  * while that variable is `0` outside `local`. `NODE_EXTRA_CA_CERTS` still adds trusted
@@ -297,19 +351,119 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
   if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
     throw new TypeError('timeoutMs and maxResponseBytes must be finite numbers above zero')
   }
+  if (options.keepAlive !== undefined && typeof options.keepAlive !== 'boolean') {
+    throw new TypeError('keepAlive must be true or false')
+  }
+  const keepAlive = options.keepAlive === true
+  if (
+    !keepAlive &&
+    (options.maxSockets !== undefined ||
+      options.maxFreeSockets !== undefined ||
+      options.idleTimeoutMs !== undefined)
+  ) {
+    throw new TypeError('maxSockets, maxFreeSockets and idleTimeoutMs need keepAlive: true')
+  }
+  const maxSockets = options.maxSockets ?? INTERNAL_DEFAULT_MAX_SOCKETS
+  if (!Number.isInteger(maxSockets) || maxSockets < 1) {
+    throw new TypeError('maxSockets must be an integer of 1 or more')
+  }
+  const maxFreeSockets =
+    options.maxFreeSockets ?? Math.min(INTERNAL_DEFAULT_MAX_FREE_SOCKETS, maxSockets)
+  if (!Number.isInteger(maxFreeSockets) || maxFreeSockets < 1 || maxFreeSockets > maxSockets) {
+    throw new TypeError('maxFreeSockets must be an integer from 1 to maxSockets')
+  }
+  const idleTimeoutMs = options.idleTimeoutMs ?? INTERNAL_DEFAULT_IDLE_TIMEOUT_MS
+  if (!isPositive(idleTimeoutMs)) {
+    throw new TypeError('idleTimeoutMs must be a finite number above zero')
+  }
   const sleep = options.sleep ?? timerSleep
   const random = options.random ?? Math.random
   const send = base.secure ? httpsRequest : httpRequest
+  // Private to this client. `maxSockets` is also enforced below, so the agent never queues.
+  const agent = keepAlive
+    ? new (base.secure ? HttpsAgent : HttpAgent)({
+        keepAlive: true,
+        maxSockets,
+        maxFreeSockets,
+        timeout: idleTimeoutMs,
+        scheduling: 'lifo',
+        ...(base.secure ? { rejectUnauthorized: true } : {}),
+        ...(options.ca === undefined ? {} : { ca: options.ca }),
+      })
+    : undefined
+  const lifetime = new AbortController()
 
-  /** One attempt on the wire. Rejects with the failure kind only. */
-  const attempt = (
+  // The client's own queue for connections: a waiter leaves it when its signal aborts, which
+  // Bun's agent queue does not do (an aborted queued request still goes out later).
+  let active = 0
+  const waiting: Array<() => void> = []
+  const acquire = (signal: AbortSignal): Promise<() => void> =>
+    new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new Failure('timeout'))
+        return
+      }
+      const grant = () => {
+        active += 1
+        let released = false
+        resolve(() => {
+          if (!released) {
+            released = true
+            active -= 1
+            waiting.shift()?.()
+          }
+        })
+      }
+      if (active < maxSockets) {
+        grant()
+        return
+      }
+      const turn = () => {
+        signal.removeEventListener('abort', leave)
+        grant()
+      }
+      const leave = () => {
+        const at = waiting.indexOf(turn)
+        if (at !== -1) {
+          waiting.splice(at, 1)
+        }
+        reject(new Failure('timeout'))
+      }
+      signal.addEventListener('abort', leave, { once: true })
+      waiting.push(turn)
+    })
+
+  /** One attempt on the wire, once it holds a connection slot. Rejects with the failure kind only. */
+  const attempt = async (
     method: string,
     target: string,
     headers: Record<string, string | number>,
     body: string | undefined,
-    signal: AbortSignal
+    signal: AbortSignal,
+    fresh: boolean
+  ): Promise<Wire> => {
+    if (agent === undefined) {
+      return await onWire(method, target, headers, body, signal, false)
+    }
+    const release = await acquire(signal)
+    try {
+      return await onWire(method, target, headers, body, signal, fresh)
+    } finally {
+      release()
+    }
+  }
+
+  /** One attempt on the wire. */
+  const onWire = (
+    method: string,
+    target: string,
+    headers: Record<string, string | number>,
+    body: string | undefined,
+    signal: AbortSignal,
+    fresh: boolean
   ): Promise<Wire> =>
     new Promise((resolve, reject) => {
+      let answered = false
       const outgoing = send(
         {
           host: base.host,
@@ -317,13 +471,15 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           path: target,
           method,
           headers,
-          agent: false,
+          // `false` when not keeping connections, and for the one resend after a stale one.
+          agent: fresh || agent === undefined ? false : agent,
           signal,
           // Explicit, so NODE_TLS_REJECT_UNAUTHORIZED=0 in the environment cannot switch it off.
           ...(base.secure ? { rejectUnauthorized: true } : {}),
           ...(options.ca === undefined ? {} : { ca: options.ca }),
         },
         (response) => {
+          answered = true
           const status = response.statusCode ?? 0
           const retryAfter = retryAfterMs(response.headers['retry-after'])
           if (status >= 300 && status < 400) {
@@ -356,12 +512,30 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           response.on('aborted', broken)
         }
       )
-      outgoing.on('error', () => reject(new Failure(signal.aborted ? 'timeout' : 'connection')))
+      outgoing.on('error', (error: NodeJS.ErrnoException) => {
+        const reset = error.code === 'ECONNRESET' || error.code === 'EPIPE'
+        reject(
+          new Failure(
+            signal.aborted
+              ? 'timeout'
+              : !answered && agent !== undefined && outgoing.reusedSocket && reset
+                ? 'stale_connection'
+                : 'connection'
+          )
+        )
+      })
       outgoing.end(body)
     })
 
   return {
+    close() {
+      lifetime.abort()
+      agent?.destroy()
+    },
     async request(call) {
+      if (lifetime.signal.aborted) {
+        throw new TypeError('the internal client is closed')
+      }
       checkPath(call.path)
       if (call.body !== undefined && (call.method === 'GET' || call.method === 'HEAD')) {
         throw new TypeError('a GET or HEAD internal call has no body')
@@ -404,18 +578,24 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
         throw new TypeError('timeoutMs must be a finite number above zero')
       }
 
+      let staleResent = false
+      let fresh = false
       for (let attempts = 1; ; attempts += 1) {
         const fail = (failure: InternalCallFailure, status?: number) =>
           new InternalCallError({ failure, method: call.method, path, status, attempts })
-        if (call.signal?.aborted) {
+        if (call.signal?.aborted || lifetime.signal.aborted) {
           throw fail('aborted')
         }
+        const useFresh = fresh
+        fresh = false
         const timeout = AbortSignal.timeout(perAttempt)
-        const signal = call.signal ? AbortSignal.any([call.signal, timeout]) : timeout
+        const signal = AbortSignal.any(
+          call.signal ? [call.signal, timeout, lifetime.signal] : [timeout, lifetime.signal]
+        )
         let retryAfter: number | undefined
         let reason: string
         try {
-          const wire = await attempt(call.method, target, headers, payload, signal)
+          const wire = await attempt(call.method, target, headers, payload, signal, useFresh)
           const settled = (): InternalResponse => ({
             status: wire.status,
             json: answerJson(wire),
@@ -431,11 +611,21 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           retryAfter = wire.retryAfter
           reason = `HTTP ${wire.status}`
         } catch (caught) {
-          if (call.signal?.aborted) {
+          if (call.signal?.aborted || lifetime.signal.aborted) {
             throw fail('aborted')
           }
           const failure = caught instanceof Failure ? caught : new Failure('connection')
-          const retryable = failure.kind === 'connection' || failure.kind === 'timeout'
+          const retryable =
+            failure.kind === 'connection' ||
+            failure.kind === 'stale_connection' ||
+            failure.kind === 'timeout'
+          // One resend per call after a stale connection, on a connection made for it.
+          if (failure.kind === 'stale_connection' && safeToRepeat && !staleResent) {
+            staleResent = true
+            fresh = true
+          } else if (failure.kind === 'stale_connection') {
+            throw fail(failure.kind)
+          }
           if (!retryable) {
             throw fail(failure.kind, failure.status)
           }
@@ -446,9 +636,11 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
         }
         const ceiling = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempts - 1))
         const delay =
-          retryAfter === undefined
-            ? Math.floor(random() * ceiling)
-            : Math.min(retryAfter, retry.retryAfterCapMs)
+          reason === 'stale_connection'
+            ? 0
+            : retryAfter === undefined
+              ? Math.floor(random() * ceiling)
+              : Math.min(retryAfter, retry.retryAfterCapMs)
         options.logger?.warn('internal call failed, retrying', {
           method: call.method,
           path,
@@ -456,7 +648,7 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           attempt: attempts,
           delayMs: delay,
         })
-        await pauseOrAbort(sleep, delay, call.signal)
+        await pauseOrAbort(sleep, delay, call.signal, lifetime.signal)
       }
     },
   }
@@ -503,31 +695,33 @@ function timerSleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Pauses for `ms`, or returns at once when the caller's signal aborts. The listener on the
- * caller's signal is removed, and the pause itself is told to stop, on every path.
+ * Pauses for `ms`, or returns at once when the caller's signal or the client's lifetime signal
+ * aborts. Each listener is removed, and the pause itself is told to stop, on every path.
  */
 async function pauseOrAbort(
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
   ms: number,
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  lifetime: AbortSignal
 ): Promise<void> {
-  if (signal === undefined) {
-    await sleep(ms)
-    return
-  }
   const stop = new AbortController()
+  const watched = signal === undefined ? [lifetime] : [signal, lifetime]
   let onAbort: (() => void) | undefined
   try {
     await Promise.race([
       sleep(ms, stop.signal),
       new Promise<void>((resolve) => {
         onAbort = () => resolve()
-        signal.addEventListener('abort', onAbort, { once: true })
+        for (const watch of watched) {
+          watch.addEventListener('abort', onAbort, { once: true })
+        }
       }),
     ])
   } finally {
     if (onAbort !== undefined) {
-      signal.removeEventListener('abort', onAbort)
+      for (const watch of watched) {
+        watch.removeEventListener('abort', onAbort)
+      }
     }
     stop.abort()
   }
