@@ -141,14 +141,22 @@ export type InternalClientOptions = {
   /** The largest answer read; defaults to {@link INTERNAL_DEFAULT_MAX_RESPONSE_BYTES}. */
   maxResponseBytes?: number
   /**
+   * Reuse connections (keep-alive). Off by default: every call then opens its own connection,
+   * as in 0.6, with no queue and no `stale_connection`. Turning it on changes how a service
+   * behaves under load and when a receiver restarts, so it is a decision for the consumer,
+   * made after measuring (`bench/internal.bench.ts`). The three options below are valid only
+   * when this is `true`; passing one without it is a `TypeError`.
+   */
+  keepAlive?: boolean
+  /**
    * The most connections kept open to the receiver at once: an integer of 1 or more; defaults to
    * {@link INTERNAL_DEFAULT_MAX_SOCKETS}. A call beyond it waits for a free one, and the wait
    * counts against its timeout; it never opens another connection.
    */
   maxSockets?: number
   /**
-   * The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is refused);
-   * defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
+   * The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is
+   * refused); defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
    */
   maxFreeSockets?: number
   /** How long an idle connection is kept; defaults to {@link INTERNAL_DEFAULT_IDLE_TIMEOUT_MS}. */
@@ -303,8 +311,10 @@ type Wire = {
  * `node:` transport reads no proxy variable, so nothing in the environment can reroute a call.
  * `proxy.test.ts` pins this for the Bun version in use.
  *
- * Connections are reused. The client owns one private keep-alive `Agent` (never the global one,
- * never one passed in; an `Agent` reads no proxy variable either), capped at `maxSockets`
+ * By default every call opens its own connection (`agent: false`). With `keepAlive: true`
+ * connections are reused: the client owns one private keep-alive `Agent` (never the global one,
+ * never one passed in; an `Agent` reads no proxy variable either, which the probe checks over
+ * several calls on one client), capped at `maxSockets`
  * connections with `maxFreeSockets` kept idle for `idleTimeoutMs`. The cap is enforced by the
  * client's own queue, so a call waiting for a connection is bounded by its timeout and an aborted
  * one never reaches the wire. Two clients share nothing. A kept connection the receiver closed
@@ -341,6 +351,15 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
   if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
     throw new TypeError('timeoutMs and maxResponseBytes must be finite numbers above zero')
   }
+  const keepAlive = options.keepAlive === true
+  if (
+    !keepAlive &&
+    (options.maxSockets !== undefined ||
+      options.maxFreeSockets !== undefined ||
+      options.idleTimeoutMs !== undefined)
+  ) {
+    throw new TypeError('maxSockets, maxFreeSockets and idleTimeoutMs need keepAlive: true')
+  }
   const maxSockets = options.maxSockets ?? INTERNAL_DEFAULT_MAX_SOCKETS
   if (!Number.isInteger(maxSockets) || maxSockets < 1) {
     throw new TypeError('maxSockets must be an integer of 1 or more')
@@ -358,15 +377,17 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
   const random = options.random ?? Math.random
   const send = base.secure ? httpsRequest : httpRequest
   // Private to this client. `maxSockets` is also enforced below, so the agent never queues.
-  const agent = new (base.secure ? HttpsAgent : HttpAgent)({
-    keepAlive: true,
-    maxSockets,
-    maxFreeSockets,
-    timeout: idleTimeoutMs,
-    scheduling: 'lifo',
-    ...(base.secure ? { rejectUnauthorized: true } : {}),
-    ...(options.ca === undefined ? {} : { ca: options.ca }),
-  })
+  const agent = keepAlive
+    ? new (base.secure ? HttpsAgent : HttpAgent)({
+        keepAlive: true,
+        maxSockets,
+        maxFreeSockets,
+        timeout: idleTimeoutMs,
+        scheduling: 'lifo',
+        ...(base.secure ? { rejectUnauthorized: true } : {}),
+        ...(options.ca === undefined ? {} : { ca: options.ca }),
+      })
+    : undefined
   const lifetime = new AbortController()
 
   // The client's own queue for connections: a waiter leaves it when its signal aborts, which
@@ -415,11 +436,15 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
     target: string,
     headers: Record<string, string | number>,
     body: string | undefined,
-    signal: AbortSignal
+    signal: AbortSignal,
+    fresh: boolean
   ): Promise<Wire> => {
+    if (agent === undefined) {
+      return await onWire(method, target, headers, body, signal, false)
+    }
     const release = await acquire(signal)
     try {
-      return await onWire(method, target, headers, body, signal)
+      return await onWire(method, target, headers, body, signal, fresh)
     } finally {
       release()
     }
@@ -431,7 +456,8 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
     target: string,
     headers: Record<string, string | number>,
     body: string | undefined,
-    signal: AbortSignal
+    signal: AbortSignal,
+    fresh: boolean
   ): Promise<Wire> =>
     new Promise((resolve, reject) => {
       let answered = false
@@ -442,7 +468,8 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           path: target,
           method,
           headers,
-          agent,
+          // `false` when not keeping connections, and for the one resend after a stale one.
+          agent: fresh || agent === undefined ? false : agent,
           signal,
           // Explicit, so NODE_TLS_REJECT_UNAUTHORIZED=0 in the environment cannot switch it off.
           ...(base.secure ? { rejectUnauthorized: true } : {}),
@@ -488,7 +515,7 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           new Failure(
             signal.aborted
               ? 'timeout'
-              : !answered && outgoing.reusedSocket && reset
+              : !answered && agent !== undefined && outgoing.reusedSocket && reset
                 ? 'stale_connection'
                 : 'connection'
           )
@@ -500,7 +527,7 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
   return {
     close() {
       lifetime.abort()
-      agent.destroy()
+      agent?.destroy()
     },
     async request(call) {
       if (lifetime.signal.aborted) {
@@ -548,12 +575,16 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
         throw new TypeError('timeoutMs must be a finite number above zero')
       }
 
+      let staleResent = false
+      let fresh = false
       for (let attempts = 1; ; attempts += 1) {
         const fail = (failure: InternalCallFailure, status?: number) =>
           new InternalCallError({ failure, method: call.method, path, status, attempts })
-        if (call.signal?.aborted) {
+        if (call.signal?.aborted || lifetime.signal.aborted) {
           throw fail('aborted')
         }
+        const useFresh = fresh
+        fresh = false
         const timeout = AbortSignal.timeout(perAttempt)
         const signal = AbortSignal.any(
           call.signal ? [call.signal, timeout, lifetime.signal] : [timeout, lifetime.signal]
@@ -561,7 +592,7 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
         let retryAfter: number | undefined
         let reason: string
         try {
-          const wire = await attempt(call.method, target, headers, payload, signal)
+          const wire = await attempt(call.method, target, headers, payload, signal, useFresh)
           const settled = (): InternalResponse => ({
             status: wire.status,
             json: answerJson(wire),
@@ -585,6 +616,13 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
             failure.kind === 'connection' ||
             failure.kind === 'stale_connection' ||
             failure.kind === 'timeout'
+          // One resend per call after a stale connection, on a connection made for it.
+          if (failure.kind === 'stale_connection' && safeToRepeat && !staleResent) {
+            staleResent = true
+            fresh = true
+          } else if (failure.kind === 'stale_connection') {
+            throw fail(failure.kind)
+          }
           if (!retryable) {
             throw fail(failure.kind, failure.status)
           }
@@ -607,7 +645,7 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
           attempt: attempts,
           delayMs: delay,
         })
-        await pauseOrAbort(sleep, delay, call.signal)
+        await pauseOrAbort(sleep, delay, call.signal, lifetime.signal)
       }
     },
   }
@@ -654,31 +692,33 @@ function timerSleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Pauses for `ms`, or returns at once when the caller's signal aborts. The listener on the
- * caller's signal is removed, and the pause itself is told to stop, on every path.
+ * Pauses for `ms`, or returns at once when the caller's signal or the client's lifetime signal
+ * aborts. Each listener is removed, and the pause itself is told to stop, on every path.
  */
 async function pauseOrAbort(
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
   ms: number,
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  lifetime: AbortSignal
 ): Promise<void> {
-  if (signal === undefined) {
-    await sleep(ms)
-    return
-  }
   const stop = new AbortController()
+  const watched = signal === undefined ? [lifetime] : [signal, lifetime]
   let onAbort: (() => void) | undefined
   try {
     await Promise.race([
       sleep(ms, stop.signal),
       new Promise<void>((resolve) => {
         onAbort = () => resolve()
-        signal.addEventListener('abort', onAbort, { once: true })
+        for (const watch of watched) {
+          watch.addEventListener('abort', onAbort, { once: true })
+        }
       }),
     ])
   } finally {
     if (onAbort !== undefined) {
-      signal.removeEventListener('abort', onAbort)
+      for (const watch of watched) {
+        watch.removeEventListener('abort', onAbort)
+      }
     }
     stop.abort()
   }

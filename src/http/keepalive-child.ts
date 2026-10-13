@@ -5,6 +5,7 @@ const client = createInternalClient({
   baseUrl: process.env.TARGET ?? '',
   secret: 'child-secret',
   environment: 'local',
+  keepAlive: true,
 })
 const answer = await client.request({ method: 'GET', path: '/' })
 if (answer.status !== 200) {

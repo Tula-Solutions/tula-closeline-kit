@@ -1,18 +1,16 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { createInternalClient } from '../src/http/internal'
+import { makeTestCert } from '../src/http/test-cert'
 
 /**
  * Benchmark: what connection reuse saves in `createInternalClient`, against a local receiver.
  *
  * Input: sequential GET calls with a small JSON answer. Each leg runs twice:
- * - `new connection per call` builds a client, calls once and closes it, which is what the
- *   client did before keep-alive (one TCP connection per call, and one TLS handshake over https).
- * - `reused connection` is one client making every call, so after the first call a warm
+ * - `new connection per call` is the default (`keepAlive` off), which is what the client did
+ *   before 0.7: one TCP connection per call, and one TLS handshake over https.
+ * - `reused connection` is one client with `keepAlive: true` making every call, so after the first call a warm
  *   connection serves each one.
  * Expected complexity per call: O(1); no work grows with the number of calls, and the pool is
  * capped (32 sockets, 8 idle), so nothing accumulates. Loopback has no network latency, so the
@@ -55,53 +53,41 @@ async function httpTarget(): Promise<{ target: Target; stop: () => void }> {
 }
 
 async function httpsTarget(): Promise<{ target: Target; stop: () => void } | undefined> {
-  const dir = mkdtempSync(join(tmpdir(), 'kit-bench-tls-'))
-  const made = Bun.spawnSync([
-    'openssl',
-    'req',
-    '-x509',
-    '-newkey',
-    'rsa:2048',
-    '-nodes',
-    '-days',
-    '1',
-    '-keyout',
-    join(dir, 'k.pem'),
-    '-out',
-    join(dir, 'c.pem'),
-    '-subj',
-    '/CN=localhost',
-    '-addext',
-    'subjectAltName=DNS:localhost,IP:127.0.0.1',
-  ])
-  if (made.exitCode !== 0) {
-    rmSync(dir, { recursive: true, force: true })
+  const made = makeTestCert()
+  if (made === undefined) {
     return undefined
   }
-  const cert = readFileSync(join(dir, 'c.pem'), 'utf8')
-  const key = readFileSync(join(dir, 'k.pem'), 'utf8')
   let connections = 0
-  const server = createHttpsServer({ cert, key }, (_q, r) => r.end('{"ok":true}'))
-  server.on('secureConnection', () => {
-    connections += 1
-  })
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const server = createHttpsServer({ cert: made.cert, key: made.key }, (_q, r) =>
+    r.end('{"ok":true}')
+  )
+  const stop = () => {
+    server.closeAllConnections()
+    server.close()
+    made.remove()
+  }
+  try {
+    server.on('secureConnection', () => {
+      connections += 1
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  } catch (error) {
+    stop()
+    throw error
+  }
   return {
     target: {
       url: `https://127.0.0.1:${(server.address() as AddressInfo).port}`,
-      ca: cert,
+      ca: made.cert,
       connections: () => connections,
     },
-    stop: () => {
-      server.closeAllConnections()
-      server.close()
-      rmSync(dir, { recursive: true, force: true })
-    },
+    stop,
   }
 }
 
-function build(target: Target) {
+function build(target: Target, keepAlive: boolean) {
   return createInternalClient({
+    keepAlive,
     baseUrl: target.url,
     secret: 'bench-secret',
     environment: 'local',
@@ -132,7 +118,7 @@ async function leg(
 ) {
   const before = target.connections()
   const fresh = await measure(calls, async () => {
-    const client = build(target)
+    const client = build(target, false)
     try {
       await client.request({ method: 'GET', path: '/' })
     } finally {
@@ -140,7 +126,7 @@ async function leg(
     }
   })
   const freshConnections = target.connections() - before
-  const shared = build(target)
+  const shared = build(target, true)
   const mid = target.connections()
   const reused = await measure(calls, async () => {
     await shared.request({ method: 'GET', path: '/' })
@@ -165,8 +151,11 @@ async function leg(
 }
 
 const plain = await httpTarget()
-await leg('http', plain.target, HTTP_CALLS, HTTP_REUSED_MEAN_MS, HTTP_MIN_SPEEDUP)
-plain.stop()
+try {
+  await leg('http', plain.target, HTTP_CALLS, HTTP_REUSED_MEAN_MS, HTTP_MIN_SPEEDUP)
+} finally {
+  plain.stop()
+}
 
 const tls = await httpsTarget()
 if (tls === undefined) {
@@ -174,8 +163,11 @@ if (tls === undefined) {
     'internal client over https: skipped, openssl could not make a certificate\n'
   )
 } else {
-  await leg('https', tls.target, HTTPS_CALLS, HTTPS_REUSED_MEAN_MS, HTTPS_MIN_SPEEDUP)
-  tls.stop()
+  try {
+    await leg('https', tls.target, HTTPS_CALLS, HTTPS_REUSED_MEAN_MS, HTTPS_MIN_SPEEDUP)
+  } finally {
+    tls.stop()
+  }
 }
 if (failures.length > 0) {
   process.stderr.write(`bench failed: ${failures.join('; ')}\n`)

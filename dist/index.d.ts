@@ -375,14 +375,22 @@ type InternalClientOptions = {
 	/** The largest answer read; defaults to {@link INTERNAL_DEFAULT_MAX_RESPONSE_BYTES}. */
 	maxResponseBytes?: number;
 	/**
+	* Reuse connections (keep-alive). Off by default: every call then opens its own connection,
+	* as in 0.6, with no queue and no `stale_connection`. Turning it on changes how a service
+	* behaves under load and when a receiver restarts, so it is a decision for the consumer,
+	* made after measuring (`bench/internal.bench.ts`). The three options below are valid only
+	* when this is `true`; passing one without it is a `TypeError`.
+	*/
+	keepAlive?: boolean;
+	/**
 	* The most connections kept open to the receiver at once: an integer of 1 or more; defaults to
 	* {@link INTERNAL_DEFAULT_MAX_SOCKETS}. A call beyond it waits for a free one, and the wait
 	* counts against its timeout; it never opens another connection.
 	*/
 	maxSockets?: number;
 	/**
-	* The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is refused);
-	* defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
+	* The most idle connections kept for reuse: an integer from 1 to `maxSockets` (Bun treats 0 as no limit, so 0 is
+	* refused); defaults to {@link INTERNAL_DEFAULT_MAX_FREE_SOCKETS} or `maxSockets` if that is smaller.
 	*/
 	maxFreeSockets?: number;
 	/** How long an idle connection is kept; defaults to {@link INTERNAL_DEFAULT_IDLE_TIMEOUT_MS}. */
@@ -454,8 +462,10 @@ interface InternalClient {
 * `node:` transport reads no proxy variable, so nothing in the environment can reroute a call.
 * `proxy.test.ts` pins this for the Bun version in use.
 *
-* Connections are reused. The client owns one private keep-alive `Agent` (never the global one,
-* never one passed in; an `Agent` reads no proxy variable either), capped at `maxSockets`
+* By default every call opens its own connection (`agent: false`). With `keepAlive: true`
+* connections are reused: the client owns one private keep-alive `Agent` (never the global one,
+* never one passed in; an `Agent` reads no proxy variable either, which the probe checks over
+* several calls on one client), capped at `maxSockets`
 * connections with `maxFreeSockets` kept idle for `idleTimeoutMs`. The cap is enforced by the
 * client's own queue, so a call waiting for a connection is bounded by its timeout and an aborted
 * one never reaches the wire. Two clients share nothing. A kept connection the receiver closed

@@ -43,9 +43,11 @@ bearer token and never through an HTTP proxy.
 request to the proxy named by `HTTP_PROXY`/`http_proxy` (for `http:` URLs) or
 `HTTPS_PROXY`/`https_proxy` (for `https:` URLs), that `ALL_PROXY` is ignored, that a per-request
 `proxy: ''` does not turn it off, and that `NO_PROXY` exempts a host only by matching it. The
-client uses `node:http` and `node:https` with its own `Agent`, which reads no proxy variable at all
-(the probe checks a keep-alive `Agent` too), so there is nothing to configure and no boot check to
-keep correct. The probe stays in the suite:
+client uses `node:http` and `node:https` with `agent: false` (or, when `keepAlive: true` is asked
+for, its own private `Agent`), which read no proxy variable at all, so there is nothing to configure
+and no boot check to keep correct. The probe also runs the client with keep-alive on: three calls
+on one client, for http and https, with the stub proxy named by each variable, and asserts no proxy
+hit and one reused connection. The probe stays in the suite:
 a Bun upgrade that changes a row fails it.
 
 ```ts
@@ -59,9 +61,10 @@ const core = createInternalClient({
   userAgent: 'closeline-auth',
   timeoutMs: 2_000,                 // one attempt; default 5 000
   retry: { maxAttempts: 2 },        // default 3 attempts; see below
-  maxSockets: 32,                   // connections at once; default 32
-  maxFreeSockets: 8,                // idle connections kept; default 8
-  idleTimeoutMs: 4_000,             // idle connection kept this long; default 4 000
+  keepAlive: true,                  // opt-in; default false (a connection per call)
+  maxSockets: 32,                   // only with keepAlive; default 32
+  maxFreeSockets: 8,                // only with keepAlive; default 8
+  idleTimeoutMs: 4_000,             // only with keepAlive; default 4 000
   logger,
 })
 // on shutdown, or at the end of a test: core.close()
@@ -100,21 +103,29 @@ const { status, json } = await core.request({
 - Numbers are checked when the client is built (and `timeoutMs` per call): `retry.maxAttempts` is an
   integer from 1 to 10, `timeoutMs` and `maxResponseBytes` are finite and above zero, and the retry
   delays are finite and not negative; anything else is a `TypeError`.
-- Connections are reused (keep-alive). Each client owns a private `Agent`: never the global one,
-  never one passed in, nothing shared between two clients. At most `maxSockets` (32) connections
-  are open at once and at most `maxFreeSockets` (8) idle ones are kept, each for `idleTimeoutMs`
+- Connection reuse is opt-in: `keepAlive: true`. Off (the default), every call opens its own
+  connection with `agent: false`, exactly as 0.6 did, with no queue and no `stale_connection`.
+  How a service behaves under load and when a receiver restarts changes with it, so turning it on
+  is the consumer's decision, taken after measuring (`bench/internal.bench.ts`). `maxSockets`,
+  `maxFreeSockets` and `idleTimeoutMs` are valid only with it; without it they are a `TypeError`.
+- With `keepAlive: true` each client owns a private `Agent`: never the global one, never one passed
+  in, nothing shared between two clients. At most `maxSockets` (32) connections are open at once
+  and at most `maxFreeSockets` (8, at least 1) idle ones are kept, each for `idleTimeoutMs`
   (4 s, under the 5 s keep-alive of a Node server and far under a load balancer's 60 s or more, so
   the client closes an idle connection first). A call beyond `maxSockets` queues in the client and
   the wait counts against its `timeoutMs`; an aborted or timed-out waiter never reaches the wire
-  and no extra connection is opened. Idle connections do not keep the process alive; `close()`
-  destroys them all, fails calls in flight or waiting with `aborted`, and makes later calls throw
-  a `TypeError`.
-- `stale_connection`: a kept connection the receiver had already closed failed with `ECONNRESET`
-  or `EPIPE` before any byte of an answer. The request may have reached the receiver, so the
-  kit cannot know it is safe to resend. It is retried at once (no pause, one attempt used) on a
-  fresh connection only where a `connection` failure is retried (a safe method or an
-  `idempotencyKey`, and attempts left); otherwise it is surfaced, and a caller that knows its
-  request is idempotent may send it again.
+  and no extra connection is opened. Idle connections do not keep the process alive. `close()`
+  destroys them all, fails calls in flight, waiting for a connection or sleeping between retries
+  with `aborted`, and makes later calls throw a `TypeError`; it is also valid with keep-alive off.
+- `stale_connection` (keep-alive on only): a kept connection the receiver had already closed
+  failed with `ECONNRESET` or `EPIPE` before any byte of an answer. The request may have reached
+  the receiver, so the kit cannot know a resend is safe. Where a `connection` failure is retried
+  (a safe method or an `idempotencyKey`, attempts left) it is resent once per call, at once, on a
+  connection opened for the resend (never another kept one), using one attempt. Otherwise it is
+  surfaced. A server that closes an idle kept connection a beat before the next call is handled
+  without any error (the client drops the dead connection); a keyless `POST` that loses the race
+  in the same moment fails with `stale_connection` by design. A caller that treats `connection` as
+  retryable should treat `stale_connection` the same way.
 - Cost per call, on loopback (`bench/internal.bench.ts`, part of `bun run bench`): over http about
   0.05 ms with a warm pool against 0.15 to 0.23 ms for a new connection each time (3x to 4x); over
   https about 0.1 ms against 1.25 ms (12x), the TLS handshake being most of the difference. A real

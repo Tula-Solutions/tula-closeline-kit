@@ -1,5 +1,4 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -8,8 +7,6 @@ import {
 } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import type { AddressInfo, Socket } from 'node:net'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import {
   createInternalClient,
   INTERNAL_DEFAULT_IDLE_TIMEOUT_MS,
@@ -19,6 +16,7 @@ import {
   type InternalClient,
   type InternalClientOptions,
 } from './internal'
+import { makeTestCert } from './test-cert'
 
 type Handler = (request: IncomingMessage, response: ServerResponse, count: number) => void
 type Receiver = {
@@ -99,6 +97,7 @@ function clientFor(target: { url: string }, extra: Partial<InternalClientOptions
       pauses.push(ms)
     },
     random: () => 0.5,
+    keepAlive: true,
     ...extra,
   })
   clients.push(client)
@@ -267,6 +266,20 @@ describe('a kept connection the receiver closed', () => {
     expect(error.failure).toBe('stale_connection')
   })
 
+  test('three kept connections all dropped: one resend, on a new connection, succeeds', async () => {
+    const target = await receiver((_q, response) => {
+      setTimeout(() => response.end('{"ok":true}'), 30)
+    })
+    const { client, pauses } = clientFor(target)
+    await Promise.all(Array.from({ length: 3 }, () => client.request({ method: 'GET', path: '/' })))
+    expect(target.connections()).toBe(3)
+    dropKept(target)
+    const answer = await client.request({ method: 'GET', path: '/' })
+    expect(answer).toMatchObject({ status: 200, attempts: 2 })
+    expect(pauses).toEqual([0])
+    expect(target.connections()).toBe(4)
+  })
+
   test('a fresh connection that fails is a plain connection failure', async () => {
     const target = await receiver((_q, response) => {
       response.socket?.destroy()
@@ -289,6 +302,32 @@ describe('idle connections', () => {
     await client.request({ method: 'GET', path: '/' })
     expect(target.connections()).toBe(2)
   })
+
+  test.each(['destroy', 'resetAndDestroy'] as const)(
+    'a keyless POST after the server closed an idle kept socket (%s) succeeds quietly',
+    async (how) => {
+      const uncaught: unknown[] = []
+      const onError = (error: unknown) => uncaught.push(error)
+      process.on('uncaughtException', onError)
+      process.on('unhandledRejection', onError)
+      try {
+        const target = await receiver()
+        const { client } = clientFor(target)
+        await client.request({ method: 'GET', path: '/' })
+        for (const socket of target.sockets) {
+          socket[how]()
+        }
+        await Bun.sleep(150)
+        const answer = await client.request({ method: 'POST', path: '/x', body: { a: 1 } })
+        expect(answer).toMatchObject({ status: 200, attempts: 1 })
+        await Bun.sleep(50)
+        expect(uncaught).toEqual([])
+      } finally {
+        process.off('uncaughtException', onError)
+        process.off('unhandledRejection', onError)
+      }
+    }
+  )
 
   test('the default is shorter than a Node server keep-alive of 5 seconds', () => {
     expect(INTERNAL_DEFAULT_IDLE_TIMEOUT_MS).toBeLessThan(5_000)
@@ -323,6 +362,32 @@ describe('close()', () => {
     await expect(client.request({ method: 'GET', path: '/' })).rejects.toThrow(TypeError)
   })
 
+  test('settles a call sleeping between retries at once', async () => {
+    const target = await receiver((_q, response) => {
+      response.statusCode = 503
+      response.end('x')
+    })
+    const slept: number[] = []
+    const { client } = clientFor(target, {
+      // A backoff that lasts until its signal aborts, as the real timer does.
+      sleep: (ms, signal) =>
+        new Promise<void>((resolve) => {
+          slept.push(ms)
+          signal?.addEventListener('abort', () => resolve(), { once: true })
+        }),
+      retry: { baseDelayMs: 3_600_000, maxDelayMs: 3_600_000 },
+      random: () => 0.99,
+    })
+    const call = failureOf(client.request({ method: 'GET', path: '/' }))
+    await Bun.sleep(100)
+    expect(slept).toHaveLength(1)
+    const started = Date.now()
+    client.close()
+    expect((await call).failure).toBe('aborted')
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(target.requests()).toBe(1)
+  })
+
   test('fails a call in flight and a call waiting for a connection with aborted', async () => {
     const target = await receiver(() => undefined)
     const { client } = clientFor(target, { maxSockets: 1, retry: { maxAttempts: 3 } })
@@ -338,15 +403,15 @@ describe('close()', () => {
 
 describe('options', () => {
   test.each([
-    [{ maxSockets: 0 }],
-    [{ maxSockets: 1.5 }],
-    [{ maxSockets: Number.NaN }],
-    [{ maxFreeSockets: 0 }],
-    [{ maxFreeSockets: -1 }],
-    [{ maxFreeSockets: 1.5 }],
-    [{ maxSockets: 2, maxFreeSockets: 3 }],
-    [{ idleTimeoutMs: 0 }],
-    [{ idleTimeoutMs: Number.POSITIVE_INFINITY }],
+    [{ keepAlive: true, maxSockets: 0 }],
+    [{ keepAlive: true, maxSockets: 1.5 }],
+    [{ keepAlive: true, maxSockets: Number.NaN }],
+    [{ keepAlive: true, maxFreeSockets: 0 }],
+    [{ keepAlive: true, maxFreeSockets: -1 }],
+    [{ keepAlive: true, maxFreeSockets: 1.5 }],
+    [{ keepAlive: true, maxSockets: 2, maxFreeSockets: 3 }],
+    [{ keepAlive: true, idleTimeoutMs: 0 }],
+    [{ keepAlive: true, idleTimeoutMs: Number.POSITIVE_INFINITY }],
   ] as const)('%o is refused', (extra) => {
     expect(() =>
       createInternalClient({
@@ -358,6 +423,31 @@ describe('options', () => {
     ).toThrow(TypeError)
   })
 
+  test.each([
+    [{ maxSockets: 4 }],
+    [{ maxFreeSockets: 2 }],
+    [{ idleTimeoutMs: 1_000 }],
+    [{ keepAlive: false, maxSockets: 4 }],
+  ] as const)('%o without keepAlive: true is refused', (extra) => {
+    expect(() =>
+      createInternalClient({
+        baseUrl: 'http://127.0.0.1:1',
+        secret: 'x',
+        environment: 'local',
+        ...extra,
+      })
+    ).toThrow(TypeError)
+  })
+
+  test('keep-alive is off by default: a connection per call, and no stale_connection', async () => {
+    const target = await receiver()
+    const { client } = clientFor(target, { keepAlive: undefined })
+    for (let i = 0; i < 5; i += 1) {
+      await client.request({ method: 'GET', path: '/' })
+    }
+    expect(target.connections()).toBe(5)
+  })
+
   test('a small maxSockets lowers the default maxFreeSockets', async () => {
     const target = await receiver()
     const small = clientFor(target, { maxSockets: 2 })
@@ -365,43 +455,21 @@ describe('options', () => {
   })
 })
 
-describe('https', () => {
-  let dir = ''
+const tls = makeTestCert()
+afterAll(() => tls?.remove())
+
+describe.skipIf(tls === undefined)('https', () => {
   let secure: ReturnType<typeof createHttpsServer> | undefined
   let tlsConnections = 0
-  let cert = ''
   let url = ''
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), 'kit-tls-reuse-'))
-    const made = Bun.spawnSync([
-      'openssl',
-      'req',
-      '-x509',
-      '-newkey',
-      'rsa:2048',
-      '-nodes',
-      '-days',
-      '2',
-      '-keyout',
-      join(dir, 'k.pem'),
-      '-out',
-      join(dir, 'c.pem'),
-      '-subj',
-      '/CN=localhost',
-      '-addext',
-      'subjectAltName=DNS:localhost,IP:127.0.0.1',
-    ])
-    if (made.exitCode !== 0) {
-      throw new Error('openssl is needed to make a test certificate')
+    if (tls === undefined) {
+      return
     }
-    cert = readFileSync(join(dir, 'c.pem'), 'utf8')
-    secure = createHttpsServer(
-      { cert, key: readFileSync(join(dir, 'k.pem'), 'utf8') },
-      (_request, response) => {
-        response.end('{"tls":true}')
-      }
-    )
+    secure = createHttpsServer({ cert: tls.cert, key: tls.key }, (_request, response) => {
+      response.end('{"tls":true}')
+    })
     secure.on('secureConnection', () => {
       tlsConnections += 1
     })
@@ -411,11 +479,10 @@ describe('https', () => {
   afterAll(() => {
     secure?.closeAllConnections()
     secure?.close()
-    rmSync(dir, { recursive: true, force: true })
   })
 
   test('sequential calls share one TLS connection, and verification stays on', async () => {
-    const { client } = clientFor({ url }, { ca: cert })
+    const { client } = clientFor({ url }, { ca: tls?.cert })
     for (let i = 0; i < 10; i += 1) {
       expect((await client.request({ method: 'GET', path: '/' })).json).toEqual({ tls: true })
     }

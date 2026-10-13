@@ -629,6 +629,10 @@ function createInternalClient(options) {
   if (!isPositive(timeoutMs) || !isPositive(maxBytes)) {
     throw new TypeError("timeoutMs and maxResponseBytes must be finite numbers above zero");
   }
+  const keepAlive = options.keepAlive === true;
+  if (!keepAlive && (options.maxSockets !== undefined || options.maxFreeSockets !== undefined || options.idleTimeoutMs !== undefined)) {
+    throw new TypeError("maxSockets, maxFreeSockets and idleTimeoutMs need keepAlive: true");
+  }
   const maxSockets = options.maxSockets ?? INTERNAL_DEFAULT_MAX_SOCKETS;
   if (!Number.isInteger(maxSockets) || maxSockets < 1) {
     throw new TypeError("maxSockets must be an integer of 1 or more");
@@ -644,7 +648,7 @@ function createInternalClient(options) {
   const sleep = options.sleep ?? timerSleep;
   const random = options.random ?? Math.random;
   const send = base.secure ? httpsRequest : httpRequest;
-  const agent = new (base.secure ? HttpsAgent : HttpAgent)({
+  const agent = keepAlive ? new (base.secure ? HttpsAgent : HttpAgent)({
     keepAlive: true,
     maxSockets,
     maxFreeSockets,
@@ -652,7 +656,7 @@ function createInternalClient(options) {
     scheduling: "lifo",
     ...base.secure ? { rejectUnauthorized: true } : {},
     ...options.ca === undefined ? {} : { ca: options.ca }
-  });
+  }) : undefined;
   const lifetime = new AbortController;
   let active = 0;
   const waiting = [];
@@ -690,15 +694,18 @@ function createInternalClient(options) {
     signal.addEventListener("abort", leave, { once: true });
     waiting.push(turn);
   });
-  const attempt = async (method, target, headers, body, signal) => {
+  const attempt = async (method, target, headers, body, signal, fresh) => {
+    if (agent === undefined) {
+      return await onWire(method, target, headers, body, signal, false);
+    }
     const release = await acquire(signal);
     try {
-      return await onWire(method, target, headers, body, signal);
+      return await onWire(method, target, headers, body, signal, fresh);
     } finally {
       release();
     }
   };
-  const onWire = (method, target, headers, body, signal) => new Promise((resolve, reject) => {
+  const onWire = (method, target, headers, body, signal, fresh) => new Promise((resolve, reject) => {
     let answered = false;
     const outgoing = send({
       host: base.host,
@@ -706,7 +713,7 @@ function createInternalClient(options) {
       path: target,
       method,
       headers,
-      agent,
+      agent: fresh || agent === undefined ? false : agent,
       signal,
       ...base.secure ? { rejectUnauthorized: true } : {},
       ...options.ca === undefined ? {} : { ca: options.ca }
@@ -745,14 +752,14 @@ function createInternalClient(options) {
     });
     outgoing.on("error", (error) => {
       const reset = error.code === "ECONNRESET" || error.code === "EPIPE";
-      reject(new Failure(signal.aborted ? "timeout" : !answered && outgoing.reusedSocket && reset ? "stale_connection" : "connection"));
+      reject(new Failure(signal.aborted ? "timeout" : !answered && agent !== undefined && outgoing.reusedSocket && reset ? "stale_connection" : "connection"));
     });
     outgoing.end(body);
   });
   return {
     close() {
       lifetime.abort();
-      agent.destroy();
+      agent?.destroy();
     },
     async request(call) {
       if (lifetime.signal.aborted) {
@@ -796,17 +803,21 @@ function createInternalClient(options) {
       if (!isPositive(perAttempt)) {
         throw new TypeError("timeoutMs must be a finite number above zero");
       }
+      let staleResent = false;
+      let fresh = false;
       for (let attempts = 1;; attempts += 1) {
         const fail = (failure, status) => new InternalCallError({ failure, method: call.method, path, status, attempts });
-        if (call.signal?.aborted) {
+        if (call.signal?.aborted || lifetime.signal.aborted) {
           throw fail("aborted");
         }
+        const useFresh = fresh;
+        fresh = false;
         const timeout = AbortSignal.timeout(perAttempt);
         const signal = AbortSignal.any(call.signal ? [call.signal, timeout, lifetime.signal] : [timeout, lifetime.signal]);
         let retryAfter;
         let reason;
         try {
-          const wire = await attempt(call.method, target, headers, payload, signal);
+          const wire = await attempt(call.method, target, headers, payload, signal, useFresh);
           const settled = () => ({
             status: wire.status,
             json: answerJson(wire),
@@ -827,6 +838,12 @@ function createInternalClient(options) {
           }
           const failure = caught instanceof Failure ? caught : new Failure("connection");
           const retryable = failure.kind === "connection" || failure.kind === "stale_connection" || failure.kind === "timeout";
+          if (failure.kind === "stale_connection" && safeToRepeat && !staleResent) {
+            staleResent = true;
+            fresh = true;
+          } else if (failure.kind === "stale_connection") {
+            throw fail(failure.kind);
+          }
           if (!retryable) {
             throw fail(failure.kind, failure.status);
           }
@@ -844,7 +861,7 @@ function createInternalClient(options) {
           attempt: attempts,
           delayMs: delay
         });
-        await pauseOrAbort(sleep, delay, call.signal);
+        await pauseOrAbort(sleep, delay, call.signal, lifetime.signal);
       }
     }
   };
@@ -882,24 +899,25 @@ function timerSleep(ms, signal) {
     signal?.addEventListener("abort", done, { once: true });
   });
 }
-async function pauseOrAbort(sleep, ms, signal) {
-  if (signal === undefined) {
-    await sleep(ms);
-    return;
-  }
+async function pauseOrAbort(sleep, ms, signal, lifetime) {
   const stop = new AbortController;
+  const watched = signal === undefined ? [lifetime] : [signal, lifetime];
   let onAbort;
   try {
     await Promise.race([
       sleep(ms, stop.signal),
       new Promise((resolve) => {
         onAbort = () => resolve();
-        signal.addEventListener("abort", onAbort, { once: true });
+        for (const watch of watched) {
+          watch.addEventListener("abort", onAbort, { once: true });
+        }
       })
     ]);
   } finally {
     if (onAbort !== undefined) {
-      signal.removeEventListener("abort", onAbort);
+      for (const watch of watched) {
+        watch.removeEventListener("abort", onAbort);
+      }
     }
     stop.abort();
   }
