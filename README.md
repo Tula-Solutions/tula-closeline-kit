@@ -343,8 +343,10 @@ is spent, strings become `[truncated]` and further keys are dropped with a `[+N 
 Redaction runs first (a redacted value costs only its marker). Error text is cut to the room
 left and scrubbed before it is written, so a cut leaves no part of a secret in error text or under
 a sensitive key. Plain string fields are not scrubbed (as before): a plain string is written as it
-is, or cut. Only the first 200 Errors of an entry are copied; the rest are `[truncated]` and their
-text is never read.
+is, or cut. Only 200 Errors of an entry are copied, shared by its fields, plus 2 for each top-level field, so
+a single `err` survives whatever its key position; the rest are `[truncated]` and their text is
+never read. Only real `Error` instances are scrubbed; an error-like plain object (`{ message,
+stack }`) is treated as plain data.
 
 A plain string over 16 KiB is now cut and ends in `[truncated]`, and a single unbroken word over
 16 KiB (a base64 blob) becomes only `[truncated]`, because a cut drops a trailing partial word. A
@@ -359,7 +361,7 @@ survives. The allowance only covers a field that fits in it: a larger field afte
 is spent is cut.
 
 Bounds, both counts and bytes: at most 5,000 + 200 x 50 objects, 20,000 + 200 x 200 nested
-values and 200 Errors, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
+values and 200 + 200 x 2 Errors, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
 12 MB in the worst case (control characters, which escape to six bytes) and about 2 MB for ordinary
 text. `bench/redact.bench.ts` budgets a typical entry, an oversized one and the worst case.
 

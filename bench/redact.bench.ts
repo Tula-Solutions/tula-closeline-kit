@@ -22,7 +22,7 @@ import { prepareFields } from '../src/redact'
  *   field; a serialised entry is about 2 MB.
  *
  * - `many errors entry` is 200 top-level fields of 100 Errors each, with 30,000 character messages
- *   and stacks: the shape where scrubbing every Error cost about 1 s. Only the first 200 Errors are
+ *   and stacks: the shape where scrubbing every Error cost about 1 s. Only 200 Errors (plus 2 per field) are
  *   copied (each scrubbed up to 16 KiB); the rest are `[truncated]` and their text is never read.
  *   Expected complexity O(1) in the input.
  *
@@ -41,7 +41,8 @@ interface Budget {
 }
 const TYPICAL_BUDGET: Budget = { meanMs: 0.06, medianMs: 0.05, tailMs: 0.08 }
 const OVERSIZED_BUDGET: Budget = { meanMs: 20, medianMs: 20, tailMs: 25 }
-const WORST_BUDGET: Budget = { meanMs: 300, medianMs: 280, tailMs: 300 }
+// The mean allows for a garbage-collection outlier (one run in five is about twice the median).
+const WORST_BUDGET: Budget = { meanMs: 400, medianMs: 280, tailMs: 300 }
 const ERRORS_BUDGET: Budget = { meanMs: 40, medianMs: 40, tailMs: 40 }
 
 function typical(i: number): Record<string, unknown> {

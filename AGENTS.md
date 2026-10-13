@@ -64,7 +64,7 @@ Other scripts are in `package.json`.
 
 - `prepareFields` / `redactFields` (`src/redact.ts`) copy the fields of every log line. O(fields +
   objects walked + text emitted), bounded in counts by 5,000 shared objects and 20,000 shared nested
-  values plus 50 objects and 200 values per top-level field, and 200 Errors scrubbed per entry (the rest are `[truncated]` unread), and in text by 1 MiB of UTF-16 code
+  values plus 50 objects and 200 values per top-level field, and 200 Errors scrubbed per entry plus 2 per top-level field (the rest are `[truncated]` unread), and in text by 1 MiB of UTF-16 code
   units plus 1 KiB per top-level field (a string is cut at 16 KiB, a key at 256): the serialised
   entry is under 12 MB worst case (control characters) and about 2 MB for ordinary text. Budgets in
   `bench/redact.bench.ts`: a typical entry, an oversized one (a field that spends the shared budget,

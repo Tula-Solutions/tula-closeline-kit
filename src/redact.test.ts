@@ -367,7 +367,7 @@ describe('cuts and error cap', () => {
     }
   })
 
-  test('only the first 200 Errors are scrubbed, the rest are the truncation marker', () => {
+  test('past 200 Errors only 2 per field are scrubbed, the rest are the truncation marker', () => {
     const many = redactFields(
       Object.fromEntries(
         Array.from({ length: 6 }, (_, field) => [
@@ -378,9 +378,39 @@ describe('cuts and error cap', () => {
     )
     const kinds = Object.values(many).flat() as unknown[]
 
-    expect(kinds.filter((item) => typeof item === 'object')).toHaveLength(200)
-    expect(kinds.filter((item) => item === '[truncated]')).toHaveLength(400)
+    expect(kinds.filter((item) => typeof item === 'object')).toHaveLength(208)
+    expect(kinds.filter((item) => item === '[truncated]')).toHaveLength(392)
     expect(JSON.stringify(many)).not.toContain('hunter')
+  })
+
+  test('a single Error survives after 200 others, in any key position', () => {
+    const many = () =>
+      Array.from({ length: 100 }, (_, index) => new Error(`failed password=hunter${index}`))
+    const err = () => new Error('boom password=hunter9', { cause: new Error('root') })
+    const shapes: Array<Record<string, unknown>> = [
+      { err: err(), a: many(), b: many() },
+      { a: many(), err: err(), b: many() },
+      { a: many(), b: many(), err: err() },
+    ]
+    for (const shape of shapes) {
+      const out = redactFields(shape)
+      const line = JSON.stringify(out)
+
+      expect((out.err as { message: string }).message).toBe('boom password=[redacted]')
+      expect(line).not.toContain('hunter')
+    }
+  })
+
+  test('the Errors copied are bounded by 200 shared plus 2 per top-level field', () => {
+    const input = Object.fromEntries(
+      Array.from({ length: 200 }, (_, field) => [
+        `f${field}`,
+        Array.from({ length: 100 }, () => new Error('x')),
+      ])
+    )
+    const kinds = Object.values(redactFields(input)).flat() as unknown[]
+
+    expect(kinds.filter((item) => typeof item === 'object')).toHaveLength(200 + 198 * 2)
   })
 
   test('200 fields of 100 Errors with 30,000 character texts take well under 100 ms', () => {

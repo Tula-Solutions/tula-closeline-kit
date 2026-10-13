@@ -736,6 +736,7 @@ var MAX_VALUES = 20000;
 var MAX_ERRORS = 200;
 var FIELD_NODE_ALLOWANCE = 50;
 var FIELD_VALUE_ALLOWANCE = 200;
+var FIELD_ERROR_ALLOWANCE = 2;
 var MAX_ENTRY_CHARS = 1048576;
 var MAX_STRING_CHARS = 16384;
 var MAX_KEY_CHARS = 256;
@@ -745,6 +746,7 @@ function startField(state) {
   state.nodeReserve = FIELD_NODE_ALLOWANCE;
   state.valueReserve = FIELD_VALUE_ALLOWANCE;
   state.charReserve = FIELD_CHAR_ALLOWANCE;
+  state.errorReserve = FIELD_ERROR_ALLOWANCE;
 }
 function grant(state, wanted) {
   const shared = Math.min(wanted, Math.max(0, MAX_ENTRY_CHARS - state.chars));
@@ -954,7 +956,10 @@ function redactObject(value, state, ancestors, depth) {
   }
   if (value instanceof Error) {
     if (state.errors >= MAX_ERRORS) {
-      return TRUNCATED2;
+      if (state.errorReserve <= 0) {
+        return TRUNCATED2;
+      }
+      state.errorReserve--;
     }
     state.errors++;
     return redactError(value, state, ancestors, depth);
@@ -998,7 +1003,16 @@ function redactValue(value, state, ancestors, depth) {
 }
 function redactFields(fields) {
   try {
-    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0, errors: 0 }, new Set([fields]), 0);
+    return redactRecord(fields, {
+      nodes: 0,
+      values: 0,
+      nodeReserve: 0,
+      valueReserve: 0,
+      chars: 0,
+      charReserve: 0,
+      errors: 0,
+      errorReserve: 0
+    }, new Set([fields]), 0);
   } catch {
     return { fields: UNSERIALIZABLE };
   }
