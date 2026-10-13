@@ -1,6 +1,6 @@
 import { createFixedClock, type FixedClock } from './clock'
 import type { Logger } from './logger'
-import { redactFields } from './redact'
+import { prepareFields } from './redact'
 
 /** One recorded log call, with fields already redacted. */
 export interface LogEntry {
@@ -24,7 +24,7 @@ export interface TestDeps {
 function build(entries: LogEntry[], bound: Record<string, unknown>): MemoryLogger {
   const record =
     (level: LogEntry['level']) => (message: string, fields?: Record<string, unknown>) => {
-      entries.push({ level, message, fields: { ...bound, ...redactFields(fields ?? {}) } })
+      entries.push({ level, message, fields: { ...bound, ...prepareFields(fields) } })
     }
   return {
     entries,
@@ -32,7 +32,7 @@ function build(entries: LogEntry[], bound: Record<string, unknown>): MemoryLogge
     info: record('info'),
     warn: record('warn'),
     error: record('error'),
-    child: (fields) => build(entries, { ...bound, ...redactFields(fields) }),
+    child: (fields) => build(entries, { ...bound, ...prepareFields(fields) }),
   }
 }
 

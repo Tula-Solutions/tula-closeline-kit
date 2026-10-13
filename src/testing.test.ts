@@ -39,6 +39,45 @@ describe('createMemoryLogger', () => {
     ])
   })
 
+  test('renames reserved keys the way the real logger does', () => {
+    const logger = createMemoryLogger()
+    logger.info('x', { level: 'a', msg: 'b', service: 'c', time: 'd', ok: 1 })
+    expect(logger.entries[0]?.fields).toEqual({
+      field_level: 'a',
+      field_msg: 'b',
+      field_service: 'c',
+      field_time: 'd',
+      ok: 1,
+    })
+  })
+
+  test('renames reserved keys given to child()', () => {
+    const logger = createMemoryLogger()
+    logger.child({ level: 'a' }).info('x')
+    expect(logger.entries[0]?.fields).toEqual({ field_level: 'a' })
+  })
+
+  test('call fields beat child fields, and a deeper child beats its parent', () => {
+    const logger = createMemoryLogger()
+    logger.child({ who: 'parent', keep: 1 }).child({ who: 'child' }).info('x', { other: 2 })
+    logger.child({ who: 'child' }).info('y', { who: 'call' })
+    expect(logger.entries[0]?.fields).toEqual({ who: 'child', keep: 1, other: 2 })
+    expect(logger.entries[1]?.fields).toEqual({ who: 'call' })
+  })
+
+  test('never throws on fields that throw', () => {
+    const logger = createMemoryLogger()
+    const fields = {}
+    Object.defineProperty(fields, 'bad', {
+      enumerable: true,
+      get() {
+        throw new Error('boom')
+      },
+    })
+    expect(() => logger.info('x', fields)).not.toThrow()
+    expect(logger.entries[0]?.fields).toEqual({ bad: '[unserializable]' })
+  })
+
   test('serialises errors the way the real logger does', () => {
     const logger = createMemoryLogger()
     logger.error('x', { error: new AppError({ code: 'a.b', status: 500, message: 'm' }) })

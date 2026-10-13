@@ -1,8 +1,8 @@
 import {
   systemClock2,
   createFixedClock2,
-  redactFields
-} from "./shared/chunk-279hrqks.js";
+  prepareFields
+} from "./shared/chunk-67sxzn8d.js";
 // src/errors.ts
 var CODE_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
 
@@ -38,26 +38,18 @@ function toErrorBody(error) {
 }
 // src/logger.ts
 import pino from "pino";
-var RESERVED_KEYS = ["level", "time", "msg", "service"];
-function protectReserved(fields) {
-  for (const key of RESERVED_KEYS) {
-    if (key in fields) {
-      fields[`field_${key}`] = fields[key];
-      delete fields[key];
-    }
-  }
-  return fields;
-}
-function prepare(fields) {
-  return protectReserved(redactFields(fields ?? {}));
-}
 function wrap(base) {
+  const emit = (level) => (message, fields) => {
+    if (base.isLevelEnabled(level)) {
+      base[level](prepareFields(fields), message);
+    }
+  };
   return {
-    debug: (message, fields) => base.debug(prepare(fields), message),
-    info: (message, fields) => base.info(prepare(fields), message),
-    warn: (message, fields) => base.warn(prepare(fields), message),
-    error: (message, fields) => base.error(prepare(fields), message),
-    child: (fields) => wrap(base.child(prepare(fields)))
+    debug: emit("debug"),
+    info: emit("info"),
+    warn: emit("warn"),
+    error: emit("error"),
+    child: (fields) => wrap(base.child(prepareFields(fields)))
   };
 }
 function createLogger(options) {

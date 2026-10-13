@@ -1,12 +1,12 @@
 import {
   createFixedClock2,
-  redactFields
-} from "./shared/chunk-279hrqks.js";
+  prepareFields
+} from "./shared/chunk-67sxzn8d.js";
 
 // src/testing.ts
 function build(entries, bound) {
   const record = (level) => (message, fields) => {
-    entries.push({ level, message, fields: { ...bound, ...redactFields(fields ?? {}) } });
+    entries.push({ level, message, fields: { ...bound, ...prepareFields(fields) } });
   };
   return {
     entries,
@@ -14,7 +14,7 @@ function build(entries, bound) {
     info: record("info"),
     warn: record("warn"),
     error: record("error"),
-    child: (fields) => build(entries, { ...bound, ...redactFields(fields) })
+    child: (fields) => build(entries, { ...bound, ...prepareFields(fields) })
   };
 }
 function createMemoryLogger() {

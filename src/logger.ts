@@ -1,5 +1,5 @@
 import pino from 'pino'
-import { redactFields } from './redact'
+import { prepareFields } from './redact'
 
 /** Where log lines go: anything with a `write` that takes one newline-terminated JSON line. */
 export interface LogDestination {
@@ -33,31 +33,21 @@ export interface LoggerOptions {
   destination?: LogDestination
 }
 
-// Keys pino writes itself; a caller field with one of these names is renamed, not allowed to
-// overwrite it.
-const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
-
-function protectReserved(fields: Record<string, unknown>): Record<string, unknown> {
-  for (const key of RESERVED_KEYS) {
-    if (key in fields) {
-      fields[`field_${key}`] = fields[key]
-      delete fields[key]
-    }
-  }
-  return fields
-}
-
-function prepare(fields: Record<string, unknown> | undefined): Record<string, unknown> {
-  return protectReserved(redactFields(fields ?? {}))
-}
+type EmitLevel = 'debug' | 'info' | 'warn' | 'error'
 
 function wrap(base: pino.Logger): Logger {
+  // Check the level first: a disabled call must not pay for walking its fields.
+  const emit = (level: EmitLevel) => (message: string, fields?: Record<string, unknown>) => {
+    if (base.isLevelEnabled(level)) {
+      base[level](prepareFields(fields), message)
+    }
+  }
   return {
-    debug: (message, fields) => base.debug(prepare(fields), message),
-    info: (message, fields) => base.info(prepare(fields), message),
-    warn: (message, fields) => base.warn(prepare(fields), message),
-    error: (message, fields) => base.error(prepare(fields), message),
-    child: (fields) => wrap(base.child(prepare(fields))),
+    debug: emit('debug'),
+    info: emit('info'),
+    warn: emit('warn'),
+    error: emit('error'),
+    child: (fields) => wrap(base.child(prepareFields(fields))),
   }
 }
 
