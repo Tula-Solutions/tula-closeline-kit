@@ -33,7 +33,7 @@ const proxy = net.createServer((socket) => {
 beforeAll(async () => {
   await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve))
   proxyPort = (proxy.address() as net.AddressInfo).port
-  target = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('ok') })
+  target = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ ok: true }) })
   // A port nothing listens on: an https request there can only reach the proxy, never a server.
   const probe = net.createServer().listen(0, '127.0.0.1')
   await new Promise<void>((resolve) => probe.once('listening', resolve))

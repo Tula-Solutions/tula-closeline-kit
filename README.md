@@ -71,10 +71,13 @@ const { status, json } = await core.request({
 
 - `request` resolves with `{ status, json, attempts }` for every answer that is not a redirect,
   4xx and 5xx included: the adapter maps statuses and validates `json` with the contract's schema.
-  `json` is parsed whatever the content type says and is `undefined` when the body is empty or not
-  JSON; that is an answer, not a failure, and the adapter's schema check decides. It rejects with `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`,
-  `redirect`, `response_too_large`), which carries `method`, `path` (no query), `status` and
-  `attempts`, and never the secret, a body or the underlying error.
+  `json` is parsed whatever the content type says. It is `undefined` for an empty body (204,
+  `HEAD`) and for a non-2xx answer that is not JSON. A 2xx answer with a non-empty body that is not
+  JSON (an HTML error or login page) is a failure, not an answer. `request` rejects with
+  `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`, `redirect`,
+  `response_too_large`, `response_invalid`), which carries `method`, `path` (no query), `status`
+  and `attempts`, and never the secret, a body or the underlying error. `response_invalid`,
+  `response_too_large` and `redirect` are not retried.
 - Retries: only a connection failure, a timeout, 429, 502, 503 and 504, and only when the method is
   `GET`, `HEAD`, `PUT`, `DELETE` or `OPTIONS`, or an `idempotencyKey` is given. Never on another
   status. Defaults: 3 attempts, full jitter (`random * min(2000, 100 * 2^(n-1))` ms), and a

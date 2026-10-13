@@ -41,8 +41,8 @@ const FORBIDDEN_HEADERS = new Set([
 ])
 
 /**
- * Every way {@link InternalClient.request} can reject. A body that is empty or not JSON is not
- * one of them: `json` is `undefined` and the caller's schema check decides.
+ * Every way {@link InternalClient.request} can reject. `response_invalid` is a 2xx answer whose
+ * non-empty body is not JSON (an HTML error or login page); it is never retried.
  */
 export const INTERNAL_CALL_FAILURES = [
   'connection',
@@ -50,6 +50,7 @@ export const INTERNAL_CALL_FAILURES = [
   'aborted',
   'redirect',
   'response_too_large',
+  'response_invalid',
 ] as const
 
 /** The most attempts a call may be given, the first included. */
@@ -152,7 +153,7 @@ export type InternalRequest = {
 /** What came back: the status, and the body parsed as JSON when it was JSON. */
 export type InternalResponse = {
   status: number
-  /** The parsed body, or `undefined` when it was empty or not JSON, whatever its content type. */
+  /** The parsed body, or `undefined` when it was empty, or not JSON on a non-2xx answer. */
   json: unknown
   /** Attempts made, the first included. */
   attempts: number
@@ -408,11 +409,12 @@ export function createInternalClient(options: InternalClientOptions): InternalCl
         let reason: string
         try {
           const wire = await attempt(call.method, target, headers, payload, signal)
+          const settled = () => ({ status: wire.status, json: answerJson(wire), attempts })
           if (!INTERNAL_RETRY_STATUSES.includes(wire.status)) {
-            return { status: wire.status, json: parseJson(wire.text), attempts }
+            return settled()
           }
           if (!safeToRepeat || attempts >= maxAttempts) {
-            return { status: wire.status, json: parseJson(wire.text), attempts }
+            return settled()
           }
           retryAfter = wire.retryAfter
           reason = `HTTP ${wire.status}`
@@ -454,6 +456,15 @@ class Failure {
     readonly kind: InternalCallFailure,
     readonly status?: number
   ) {}
+}
+
+/** The JSON of an answer; a non-empty 2xx body that is not JSON fails without being quoted. */
+function answerJson(wire: { status: number; text: string }): unknown {
+  const json = parseJson(wire.text)
+  if (json === undefined && wire.status >= 200 && wire.status < 300 && wire.text.trim() !== '') {
+    throw new Failure('response_invalid', wire.status)
+  }
+  return json
 }
 
 /** Whether `value` is a finite number above zero. */

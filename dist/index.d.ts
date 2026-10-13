@@ -305,10 +305,10 @@ declare const INTERNAL_DEFAULT_RETRY: {
 /** The statuses an idempotent call is retried on. Other statuses are answers, not faults. */
 declare const INTERNAL_RETRY_STATUSES: readonly number[];
 /**
-* Every way {@link InternalClient.request} can reject. A body that is empty or not JSON is not
-* one of them: `json` is `undefined` and the caller's schema check decides.
+* Every way {@link InternalClient.request} can reject. `response_invalid` is a 2xx answer whose
+* non-empty body is not JSON (an HTML error or login page); it is never retried.
 */
-declare const INTERNAL_CALL_FAILURES: readonly ["connection", "timeout", "aborted", "redirect", "response_too_large"];
+declare const INTERNAL_CALL_FAILURES: readonly ["connection", "timeout", "aborted", "redirect", "response_too_large", "response_invalid"];
 /** The most attempts a call may be given, the first included. */
 declare const INTERNAL_MAX_ATTEMPTS = 10;
 /** The HTTP methods the client sends. */
@@ -389,7 +389,7 @@ type InternalRequest = {
 /** What came back: the status, and the body parsed as JSON when it was JSON. */
 type InternalResponse = {
 	status: number;
-	/** The parsed body, or `undefined` when it was empty or not JSON, whatever its content type. */
+	/** The parsed body, or `undefined` when it was empty, or not JSON on a non-2xx answer. */
 	json: unknown;
 	/** Attempts made, the first included. */
 	attempts: number;

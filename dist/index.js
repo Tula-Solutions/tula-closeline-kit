@@ -503,7 +503,8 @@ var INTERNAL_CALL_FAILURES = [
   "timeout",
   "aborted",
   "redirect",
-  "response_too_large"
+  "response_too_large",
+  "response_invalid"
 ];
 var INTERNAL_MAX_ATTEMPTS = 10;
 
@@ -707,11 +708,12 @@ function createInternalClient(options) {
         let reason;
         try {
           const wire = await attempt(call.method, target, headers, payload, signal);
+          const settled = () => ({ status: wire.status, json: answerJson(wire), attempts });
           if (!INTERNAL_RETRY_STATUSES.includes(wire.status)) {
-            return { status: wire.status, json: parseJson(wire.text), attempts };
+            return settled();
           }
           if (!safeToRepeat || attempts >= maxAttempts) {
-            return { status: wire.status, json: parseJson(wire.text), attempts };
+            return settled();
           }
           retryAfter = wire.retryAfter;
           reason = `HTTP ${wire.status}`;
@@ -751,6 +753,13 @@ class Failure {
     this.kind = kind;
     this.status = status;
   }
+}
+function answerJson(wire) {
+  const json = parseJson(wire.text);
+  if (json === undefined && wire.status >= 200 && wire.status < 300 && wire.text.trim() !== "") {
+    throw new Failure("response_invalid", wire.status);
+  }
+  return json;
 }
 function isPositive(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0;

@@ -452,15 +452,65 @@ describe('the answer', () => {
     expect((await client.request({ method: 'GET', path: '/x' })).json).toEqual({ a: 1 })
   })
 
-  test('is undefined when it is not JSON or is empty, even if the type says JSON', async () => {
-    for (const text of ['<html>', '', '{"a":']) {
+  test('an empty body is undefined json, even if the type says JSON', async () => {
+    const receiver = stand(
+      () => new Response('', { headers: { 'content-type': 'application/json' } })
+    )
+    const { client } = clientFor(receiver)
+    expect(await client.request({ method: 'GET', path: '/x' })).toEqual({
+      status: 200,
+      json: undefined,
+      attempts: 1,
+    })
+  })
+
+  test('204 resolves with undefined json', async () => {
+    const { client } = clientFor(stand(() => new Response(null, { status: 204 })))
+    expect(await client.request({ method: 'DELETE', path: '/x' })).toEqual({
+      status: 204,
+      json: undefined,
+      attempts: 1,
+    })
+  })
+
+  test('HEAD resolves with undefined json', async () => {
+    const { client } = clientFor(stand(() => new Response(null)))
+    expect((await client.request({ method: 'HEAD', path: '/x' })).json).toBeUndefined()
+  })
+
+  test.each(['<html>login</html>', '{"a":', 'null-ish'])(
+    'a 2xx body that is not JSON (%j) fails as response_invalid, once, without the body',
+    async (text) => {
       const receiver = stand(
-        () => new Response(text, { headers: { 'content-type': 'application/json' } })
+        () =>
+          new Response(`${text} ${ANSWER_MARKER}`, {
+            headers: { 'content-type': 'application/json' },
+          })
       )
-      const { client } = clientFor(receiver)
-      const answer = await client.request({ method: 'GET', path: '/x' })
-      expect(answer.status).toBe(200)
-      expect(answer.json).toBeUndefined()
+      const { client, h } = clientFor(receiver)
+      const error = await failure(client.request({ method: 'GET', path: '/x' }))
+      expect(error.failure).toBe('response_invalid')
+      expect(error.status).toBe(200)
+      expect(error.attempts).toBe(1)
+      expect(receiver.seen).toHaveLength(1)
+      expect(h.pauses).toEqual([])
+      expect(everything(error)).not.toContain(ANSWER_MARKER)
+    }
+  )
+
+  test('a non-2xx answer with an HTML body resolves with undefined json', async () => {
+    for (const status of [400, 500, 503]) {
+      const { client } = clientFor(
+        stand(() => new Response('<html>oops</html>', { status })),
+        {
+          retry: { maxAttempts: 1 },
+        }
+      )
+      expect(await client.request({ method: 'GET', path: '/x' })).toEqual({
+        status,
+        json: undefined,
+        attempts: 1,
+      })
     }
   })
 
@@ -811,6 +861,7 @@ describe('failure kinds', () => {
       case 'aborted':
       case 'redirect':
       case 'response_too_large':
+      case 'response_invalid':
         return kind
       default: {
         const unreachable: never = kind
@@ -825,15 +876,5 @@ describe('failure kinds', () => {
     for (const kind of INTERNAL_CALL_FAILURES) {
       expect(readme).toContain(`\`${kind}\``)
     }
-    expect(readme).not.toContain('response_invalid')
-  })
-
-  test('a 2xx body that is not JSON is an answer with undefined json, not a failure', async () => {
-    const { client } = clientFor(stand(() => new Response('<html>')))
-    expect(await client.request({ method: 'GET', path: '/x' })).toEqual({
-      status: 200,
-      json: undefined,
-      attempts: 1,
-    })
   })
 })
