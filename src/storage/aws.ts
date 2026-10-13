@@ -7,12 +7,12 @@ import {
   ListObjectsV2Command,
   type ListObjectsV2CommandOutput,
   PutObjectCommand,
-  S3Client,
 } from '@aws-sdk/client-s3'
 import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
 import type { Logger } from '../logger'
 import type { OrganizationIdCheck } from '../organization'
 import type { Environment } from '../reporting/env'
+import { createS3Client } from './client'
 import { STORAGE_ERROR_CODES, StorageError } from './errors'
 import {
   DEFAULT_CONTENT_TYPE,
@@ -176,24 +176,12 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
   const { bucket, logger } = options
   const client: S3Sender =
     options.client ??
-    new S3Client({
+    createS3Client({
       region: options.region,
+      environment: options.environment,
+      endpoint: options.endpoint,
+      timeoutMs,
       maxAttempts,
-      retryMode: 'standard',
-      requestHandler: {
-        connectionTimeout: timeoutMs,
-        requestTimeout: timeoutMs,
-        throwOnRequestTimeout: true,
-      },
-      ...(options.endpoint === undefined
-        ? {}
-        : {
-            endpoint: options.endpoint,
-            forcePathStyle: true,
-            // Stand-ins do not all take the SDK's default checksum trailers.
-            requestChecksumCalculation: 'WHEN_REQUIRED',
-            responseChecksumValidation: 'WHEN_REQUIRED',
-          }),
     })
 
   const prefixOf = (organization: string) => `${S3_KEY_PREFIX}${organization}/`

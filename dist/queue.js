@@ -22,9 +22,27 @@ import {
   DeleteMessageCommand,
   ReceiveMessageCommand,
   SendMessageBatchCommand,
-  SendMessageCommand,
-  SQSClient
+  SendMessageCommand
 } from "@aws-sdk/client-sqs";
+
+// src/queue/client.ts
+import { SQSClient } from "@aws-sdk/client-sqs";
+function createSqsClient(settings) {
+  return new SQSClient({
+    region: settings.region,
+    ...settings.endpoint === undefined ? {} : { endpoint: settings.endpoint },
+    ...settings.environment === "local" ? {} : { ignoreConfiguredEndpointUrls: true },
+    maxAttempts: settings.maxAttempts,
+    retryMode: "standard",
+    requestHandler: {
+      connectionTimeout: settings.timeoutMs,
+      requestTimeout: settings.timeoutMs,
+      throwOnRequestTimeout: true
+    }
+  });
+}
+
+// src/queue/aws.ts
 var SQS_DEFAULT_TIMEOUT_MS = 5000;
 var SQS_DEFAULT_MAX_ATTEMPTS = 3;
 function bytesOf(body) {
@@ -69,16 +87,12 @@ function createSqsQueue(options) {
     throw new TypeError("maxAttempts must be a whole number from 1 to 10");
   }
   const { registry, queueUrl } = options;
-  const client = options.client ?? new SQSClient({
+  const client = options.client ?? createSqsClient({
     region: options.region,
-    ...options.endpoint === undefined ? {} : { endpoint: options.endpoint },
-    maxAttempts,
-    retryMode: "standard",
-    requestHandler: {
-      connectionTimeout: timeoutMs,
-      requestTimeout: timeoutMs,
-      throwOnRequestTimeout: true
-    }
+    environment: options.environment,
+    endpoint: options.endpoint,
+    timeoutMs,
+    maxAttempts
   });
   function encodeChecked(envelope) {
     const body = registry.encode(envelope);

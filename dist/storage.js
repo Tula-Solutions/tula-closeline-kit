@@ -19,9 +19,32 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
-  PutObjectCommand,
-  S3Client
+  PutObjectCommand
 } from "@aws-sdk/client-s3";
+
+// src/storage/client.ts
+import { S3Client } from "@aws-sdk/client-s3";
+function createS3Client(settings) {
+  return new S3Client({
+    region: settings.region,
+    maxAttempts: settings.maxAttempts,
+    retryMode: "standard",
+    requestHandler: {
+      connectionTimeout: settings.timeoutMs,
+      requestTimeout: settings.timeoutMs,
+      throwOnRequestTimeout: true
+    },
+    ...settings.environment === "local" ? {} : { ignoreConfiguredEndpointUrls: true },
+    ...settings.endpoint === undefined ? {} : {
+      endpoint: settings.endpoint,
+      forcePathStyle: true,
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED"
+    }
+  });
+}
+
+// src/storage/aws.ts
 var S3_DEFAULT_TIMEOUT_MS = 5000;
 var S3_DEFAULT_DEADLINE_MS = 60000;
 var S3_DEFAULT_MAX_ATTEMPTS = 3;
@@ -81,21 +104,12 @@ function createS3ObjectStore(options) {
     isOrganizationId: options.isOrganizationId
   });
   const { bucket, logger } = options;
-  const client = options.client ?? new S3Client({
+  const client = options.client ?? createS3Client({
     region: options.region,
-    maxAttempts,
-    retryMode: "standard",
-    requestHandler: {
-      connectionTimeout: timeoutMs,
-      requestTimeout: timeoutMs,
-      throwOnRequestTimeout: true
-    },
-    ...options.endpoint === undefined ? {} : {
-      endpoint: options.endpoint,
-      forcePathStyle: true,
-      requestChecksumCalculation: "WHEN_REQUIRED",
-      responseChecksumValidation: "WHEN_REQUIRED"
-    }
+    environment: options.environment,
+    endpoint: options.endpoint,
+    timeoutMs,
+    maxAttempts
   });
   const prefixOf = (organization) => `${S3_KEY_PREFIX}${organization}/`;
   const send = (command) => client.send(command, {

@@ -6,10 +6,10 @@ import {
   SendMessageBatchCommand,
   type SendMessageBatchCommandOutput,
   SendMessageCommand,
-  SQSClient,
 } from '@aws-sdk/client-sqs'
 import { reduceAwsCause } from '../aws-failure'
 import type { Environment } from '../reporting/env'
+import { createSqsClient } from './client'
 import {
   type AnyDefinition,
   type EnvelopeOf,
@@ -161,18 +161,12 @@ export function createSqsQueue<const D extends AnyDefinition>(
   const { registry, queueUrl } = options
   const client: SqsSender =
     options.client ??
-    new SQSClient({
+    createSqsClient({
       region: options.region,
-      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+      environment: options.environment,
+      endpoint: options.endpoint,
+      timeoutMs,
       maxAttempts,
-      retryMode: 'standard',
-      // Without throwOnRequestTimeout the handler only logs a warning when a request is slow and
-      // keeps waiting, so a hung connection would never end.
-      requestHandler: {
-        connectionTimeout: timeoutMs,
-        requestTimeout: timeoutMs,
-        throwOnRequestTimeout: true,
-      },
     })
 
   function encodeChecked(envelope: EnvelopeOf<D>): string {
