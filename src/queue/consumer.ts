@@ -67,13 +67,21 @@ export interface ConsumerOptions<E extends AnyEnvelope> {
   retryBaseSeconds?: number
   /** Longest retry delay in seconds; default 300. */
   retryMaxSeconds?: number
-  /** How long an invalid or unhandled message stays hidden before the next look, in seconds; default 60. */
+  /**
+   * How long an invalid or unhandled message stays hidden before the next look, in seconds;
+   * default 60. A message of a version this consumer does not know starts here and doubles with
+   * each delivery, up to `unsupportedVersionMaxSeconds`.
+   */
   invalidDelaySeconds?: number
+  /** Longest delay for a message of an unknown version, in seconds; default 3600. */
+  unsupportedVersionMaxSeconds?: number
+  /** How long one call to the processed store may take, in ms; default 10000. A timeout counts as a failure. */
+  storeTimeoutMs?: number
 }
 
 /** What {@link Consumer.stop} did with the messages in flight. */
 export interface StopResult {
-  /** Messages whose handling ended before the deadline, over the consumer's life. */
+  /** Handlings that ran to an end without being abandoned, whatever their outcome (success, failure or timeout), over the consumer's life. */
   finished: number
   /** Messages given back to the queue because the deadline passed. */
   abandoned: number
@@ -167,16 +175,41 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
     throw new TypeError('a consumer needs a name')
   }
   const log = logger.child({ consumer: options.name })
-  // The lease outlives the longest handler plus one visibility window, so a claim only lapses when
-  // its holder is gone.
-  const leaseSeconds = Math.ceil(handlerTimeoutMs / 1000) + visibility
+  // The lease is two visibility windows and is renewed with every visibility extension, so a claim
+  // lapses within about a minute of its holder dying, however long handlers are allowed to run.
+  const leaseSeconds = visibility * 2
   const extendEveryMs = Math.max(500, Math.floor((visibility * 1000) / 3))
+  const unsupportedMax = integerIn(
+    'unsupportedVersionMaxSeconds',
+    options.unsupportedVersionMaxSeconds ?? 3600,
+    invalidDelay,
+    MAX_VISIBILITY_SECONDS
+  )
+  const storeTimeoutMs = integerIn('storeTimeoutMs', options.storeTimeoutMs ?? 10_000, 1, 600_000)
 
   const flights = new Set<Flight>()
   const stopControl = new AbortController()
   let loop: Promise<void> | undefined
   let abandonedCount = 0
   let finishedCount = 0
+  let stopped: Promise<StopResult> | undefined
+
+  /** Gives one store call `storeTimeoutMs`; a call that takes longer fails instead of wedging a slot. */
+  async function bounded<T>(call: Promise<T>, what: string): Promise<T> {
+    const stop = new AbortController()
+    const timer = new Promise<never>((_, reject) => {
+      void sleep(storeTimeoutMs, stop.signal).then(() => {
+        if (!stop.signal.aborted) {
+          reject(new Error(`the processed store timed out on ${what}`))
+        }
+      })
+    })
+    try {
+      return await Promise.race([call, timer])
+    } finally {
+      stop.abort()
+    }
+  }
 
   function report(error: unknown): void {
     try {
@@ -209,7 +242,15 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         receiveCount: delivery.receiveCount,
       })
       report(new Error(`invalid queue message: ${delivery.reason}`))
-      await delay(delivery.receipt, invalidDelay, 'invalid')
+      let seconds = invalidDelay
+      if (delivery.reason === 'unsupported_version') {
+        const ceiling = Math.min(
+          unsupportedMax,
+          invalidDelay * 2 ** Math.min(delivery.receiveCount - 1, 20)
+        )
+        seconds = Math.max(1, Math.floor(ceiling / 2 + random() * (ceiling / 2)))
+      }
+      await delay(delivery.receipt, seconds, 'invalid')
       return
     }
     const { envelope, receipt, receiveCount } = delivery
@@ -236,7 +277,7 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
     }
     let claim: Awaited<ReturnType<ProcessedStore['claim']>>
     try {
-      claim = await store.claim(key, leaseSeconds)
+      claim = await bounded(store.claim(key, leaseSeconds), 'claim')
     } catch (error) {
       log.error('the processed store failed on claim', { ...fields, errorName: nameOf(error) })
       report(error)
@@ -252,12 +293,18 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
     }
     if (claim.status === 'busy') {
       log.debug('message is being processed elsewhere; backing off', fields)
-      await delay(receipt, visibility, 'busy')
+      await delay(receipt, Math.min(claim.retryAfterSeconds, MAX_VISIBILITY_SECONDS), 'busy')
       return
     }
     const token = claim.token
     flight.key = key
     flight.token = token
+    if (flight.abandoned || flight.control.signal.aborted) {
+      // Shutdown gave up on this flight while it was waiting for the store: do not start the
+      // handler, and free the claim for whoever gets the message next.
+      await bounded(store.release(key, token), 'release').catch(() => undefined)
+      return
+    }
     const context: HandlerContext = Object.freeze({
       organizationId: envelope.organizationId,
       traceId: envelope.traceId,
@@ -273,20 +320,20 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         () => ({ ok: true as const }),
         (error: unknown) => ({ ok: false as const, error })
       )
-    // Keeps the visibility timeout alive while the handler runs, and times it out.
+    // While the handler runs: extend the message's visibility and renew the claim's lease on every
+    // tick, and abort the handler when its time is up. The two use separate timers.
     const stopKeepAlive = new AbortController()
     let timedOut = false
+    const deadline = sleep(handlerTimeoutMs, stopKeepAlive.signal).then(() => {
+      if (!stopKeepAlive.signal.aborted) {
+        timedOut = true
+        flight.control.abort()
+      }
+    })
     const keepAlive = (async () => {
-      let elapsed = 0
       while (!stopKeepAlive.signal.aborted) {
         await sleep(extendEveryMs, stopKeepAlive.signal)
         if (stopKeepAlive.signal.aborted) {
-          return
-        }
-        elapsed += extendEveryMs
-        if (elapsed >= handlerTimeoutMs) {
-          timedOut = true
-          flight.control.abort()
           return
         }
         try {
@@ -299,11 +346,20 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
           }
           log.warn('could not extend visibility', { ...fields, errorName: nameOf(error) })
         }
+        try {
+          if (!(await bounded(store.renew(key, token, leaseSeconds), 'renew'))) {
+            log.warn('lost the claim while its handler was running', fields)
+            flight.control.abort()
+            return
+          }
+        } catch (error) {
+          log.warn('could not renew the claim', { ...fields, errorName: nameOf(error) })
+        }
       }
     })()
     const outcome = await Promise.race([running, aborted])
     stopKeepAlive.abort()
-    await keepAlive
+    await Promise.all([keepAlive, deadline])
     if (flight.abandoned) {
       return
     }
@@ -320,18 +376,18 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         errorName: nameOf(outcome.error),
       })
       report(outcome.error)
-      await store.release(key, token).catch(() => undefined)
+      await bounded(store.release(key, token), 'release').catch(() => undefined)
       await delay(receipt, retryDelay(receiveCount), 'handler_failed')
       return
     }
     try {
-      if (!(await store.complete(key, token))) {
+      if (!(await bounded(store.complete(key, token), 'complete'))) {
         log.warn('the claim was lost before completion; acknowledging anyway', fields)
       }
     } catch (error) {
       log.error('the processed store failed on complete', { ...fields, errorName: nameOf(error) })
       report(error)
-      await store.release(key, token).catch(() => undefined)
+      await bounded(store.release(key, token), 'release').catch(() => undefined)
       await delay(receipt, retryDelay(receiveCount), 'complete_failed')
       return
     }
@@ -417,35 +473,9 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         report(error)
       })
     },
-    async stop(deadlineMs) {
-      stopControl.abort()
-      const cancel = new AbortController()
-      const drained = (async () => {
-        await loop
-        while (flights.size > 0) {
-          await Promise.all([...flights].map((flight) => flight.done))
-        }
-      })()
-      await Promise.race([drained, sleep(deadlineMs, cancel.signal)])
-      cancel.abort()
-      if (flights.size > 0) {
-        const left = [...flights]
-        abandonedCount += left.length
-        for (const flight of left) {
-          flight.abandoned = true
-          flight.control.abort()
-        }
-        await Promise.all(
-          left.map(async (flight) => {
-            if (flight.key !== null && flight.token !== null) {
-              await store.release(flight.key, flight.token).catch(() => undefined)
-            }
-            await queue.release(flight.receipt).catch(() => undefined)
-          })
-        )
-        log.warn('shutdown gave up waiting; returned messages to the queue', { count: left.length })
-      }
-      return { finished: finishedCount, abandoned: abandonedCount }
+    stop(deadlineMs) {
+      stopped ??= stopNow(deadlineMs)
+      return stopped
     },
     async pollOnce() {
       const batch = await queue.receive({
@@ -456,5 +486,36 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
       await Promise.all(batch.map((delivery) => dispatch(delivery).done))
       return batch.length
     },
+  }
+
+  async function stopNow(deadlineMs: number): Promise<StopResult> {
+    stopControl.abort()
+    const cancel = new AbortController()
+    const drained = (async () => {
+      await loop
+      while (flights.size > 0) {
+        await Promise.all([...flights].map((flight) => flight.done))
+      }
+    })()
+    await Promise.race([drained, sleep(deadlineMs, cancel.signal)])
+    cancel.abort()
+    if (flights.size > 0) {
+      const left = [...flights]
+      abandonedCount += left.length
+      for (const flight of left) {
+        flight.abandoned = true
+        flight.control.abort()
+      }
+      await Promise.all(
+        left.map(async (flight) => {
+          if (flight.key !== null && flight.token !== null) {
+            await bounded(store.release(flight.key, flight.token), 'release').catch(() => undefined)
+          }
+          await queue.release(flight.receipt).catch(() => undefined)
+        })
+      )
+      log.warn('shutdown gave up waiting; returned messages to the queue', { count: left.length })
+    }
+    return { finished: finishedCount, abandoned: abandonedCount }
   }
 }

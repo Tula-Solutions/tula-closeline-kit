@@ -1045,13 +1045,31 @@ function createConsumer(options) {
     throw new TypeError("a consumer needs a name");
   }
   const log = logger.child({ consumer: options.name });
-  const leaseSeconds = Math.ceil(handlerTimeoutMs / 1000) + visibility;
+  const leaseSeconds = visibility * 2;
   const extendEveryMs = Math.max(500, Math.floor(visibility * 1000 / 3));
+  const unsupportedMax = integerIn("unsupportedVersionMaxSeconds", options.unsupportedVersionMaxSeconds ?? 3600, invalidDelay, MAX_VISIBILITY_SECONDS2);
+  const storeTimeoutMs = integerIn("storeTimeoutMs", options.storeTimeoutMs ?? 1e4, 1, 600000);
   const flights = new Set;
   const stopControl = new AbortController;
   let loop;
   let abandonedCount = 0;
   let finishedCount = 0;
+  let stopped;
+  async function bounded(call, what) {
+    const stop = new AbortController;
+    const timer = new Promise((_, reject) => {
+      sleep(storeTimeoutMs, stop.signal).then(() => {
+        if (!stop.signal.aborted) {
+          reject(new Error(`the processed store timed out on ${what}`));
+        }
+      });
+    });
+    try {
+      return await Promise.race([call, timer]);
+    } finally {
+      stop.abort();
+    }
+  }
   function report(error) {
     try {
       options.errorReporter?.capture(error, { tags: { consumer: options.name } });
@@ -1077,7 +1095,12 @@ function createConsumer(options) {
         receiveCount: delivery.receiveCount
       });
       report(new Error(`invalid queue message: ${delivery.reason}`));
-      await delay(delivery.receipt, invalidDelay, "invalid");
+      let seconds = invalidDelay;
+      if (delivery.reason === "unsupported_version") {
+        const ceiling = Math.min(unsupportedMax, invalidDelay * 2 ** Math.min(delivery.receiveCount - 1, 20));
+        seconds = Math.max(1, Math.floor(ceiling / 2 + random() * (ceiling / 2)));
+      }
+      await delay(delivery.receipt, seconds, "invalid");
       return;
     }
     const { envelope, receipt, receiveCount } = delivery;
@@ -1102,7 +1125,7 @@ function createConsumer(options) {
     };
     let claim;
     try {
-      claim = await store.claim(key, leaseSeconds);
+      claim = await bounded(store.claim(key, leaseSeconds), "claim");
     } catch (error) {
       log.error("the processed store failed on claim", { ...fields, errorName: nameOf(error) });
       report(error);
@@ -1118,12 +1141,18 @@ function createConsumer(options) {
     }
     if (claim.status === "busy") {
       log.debug("message is being processed elsewhere; backing off", fields);
-      await delay(receipt, visibility, "busy");
+      await delay(receipt, Math.min(claim.retryAfterSeconds, MAX_VISIBILITY_SECONDS2), "busy");
       return;
     }
     const token = claim.token;
     flight.key = key;
     flight.token = token;
+    if (flight.abandoned || flight.control.signal.aborted) {
+      await bounded(store.release(key, token), "release").catch(() => {
+        return;
+      });
+      return;
+    }
     const context = Object.freeze({
       organizationId: envelope.organizationId,
       traceId: envelope.traceId,
@@ -1136,17 +1165,16 @@ function createConsumer(options) {
     const running = Promise.resolve().then(() => handler(Object.freeze({ ...envelope }), context)).then(() => ({ ok: true }), (error) => ({ ok: false, error }));
     const stopKeepAlive = new AbortController;
     let timedOut = false;
+    const deadline = sleep(handlerTimeoutMs, stopKeepAlive.signal).then(() => {
+      if (!stopKeepAlive.signal.aborted) {
+        timedOut = true;
+        flight.control.abort();
+      }
+    });
     const keepAlive = (async () => {
-      let elapsed = 0;
       while (!stopKeepAlive.signal.aborted) {
         await sleep(extendEveryMs, stopKeepAlive.signal);
         if (stopKeepAlive.signal.aborted) {
-          return;
-        }
-        elapsed += extendEveryMs;
-        if (elapsed >= handlerTimeoutMs) {
-          timedOut = true;
-          flight.control.abort();
           return;
         }
         try {
@@ -1159,11 +1187,20 @@ function createConsumer(options) {
           }
           log.warn("could not extend visibility", { ...fields, errorName: nameOf(error) });
         }
+        try {
+          if (!await bounded(store.renew(key, token, leaseSeconds), "renew")) {
+            log.warn("lost the claim while its handler was running", fields);
+            flight.control.abort();
+            return;
+          }
+        } catch (error) {
+          log.warn("could not renew the claim", { ...fields, errorName: nameOf(error) });
+        }
       }
     })();
     const outcome = await Promise.race([running, aborted]);
     stopKeepAlive.abort();
-    await keepAlive;
+    await Promise.all([keepAlive, deadline]);
     if (flight.abandoned) {
       return;
     }
@@ -1178,20 +1215,20 @@ function createConsumer(options) {
         errorName: nameOf(outcome.error)
       });
       report(outcome.error);
-      await store.release(key, token).catch(() => {
+      await bounded(store.release(key, token), "release").catch(() => {
         return;
       });
       await delay(receipt, retryDelay(receiveCount), "handler_failed");
       return;
     }
     try {
-      if (!await store.complete(key, token)) {
+      if (!await bounded(store.complete(key, token), "complete")) {
         log.warn("the claim was lost before completion; acknowledging anyway", fields);
       }
     } catch (error) {
       log.error("the processed store failed on complete", { ...fields, errorName: nameOf(error) });
       report(error);
-      await store.release(key, token).catch(() => {
+      await bounded(store.release(key, token), "release").catch(() => {
         return;
       });
       await delay(receipt, retryDelay(receiveCount), "complete_failed");
@@ -1273,37 +1310,9 @@ function createConsumer(options) {
         report(error);
       });
     },
-    async stop(deadlineMs) {
-      stopControl.abort();
-      const cancel = new AbortController;
-      const drained = (async () => {
-        await loop;
-        while (flights.size > 0) {
-          await Promise.all([...flights].map((flight) => flight.done));
-        }
-      })();
-      await Promise.race([drained, sleep(deadlineMs, cancel.signal)]);
-      cancel.abort();
-      if (flights.size > 0) {
-        const left = [...flights];
-        abandonedCount += left.length;
-        for (const flight of left) {
-          flight.abandoned = true;
-          flight.control.abort();
-        }
-        await Promise.all(left.map(async (flight) => {
-          if (flight.key !== null && flight.token !== null) {
-            await store.release(flight.key, flight.token).catch(() => {
-              return;
-            });
-          }
-          await queue.release(flight.receipt).catch(() => {
-            return;
-          });
-        }));
-        log.warn("shutdown gave up waiting; returned messages to the queue", { count: left.length });
-      }
-      return { finished: finishedCount, abandoned: abandonedCount };
+    stop(deadlineMs) {
+      stopped ??= stopNow(deadlineMs);
+      return stopped;
     },
     async pollOnce() {
       const batch = await queue.receive({
@@ -1315,6 +1324,38 @@ function createConsumer(options) {
       return batch.length;
     }
   };
+  async function stopNow(deadlineMs) {
+    stopControl.abort();
+    const cancel = new AbortController;
+    const drained = (async () => {
+      await loop;
+      while (flights.size > 0) {
+        await Promise.all([...flights].map((flight) => flight.done));
+      }
+    })();
+    await Promise.race([drained, sleep(deadlineMs, cancel.signal)]);
+    cancel.abort();
+    if (flights.size > 0) {
+      const left = [...flights];
+      abandonedCount += left.length;
+      for (const flight of left) {
+        flight.abandoned = true;
+        flight.control.abort();
+      }
+      await Promise.all(left.map(async (flight) => {
+        if (flight.key !== null && flight.token !== null) {
+          await bounded(store.release(flight.key, flight.token), "release").catch(() => {
+            return;
+          });
+        }
+        await queue.release(flight.receipt).catch(() => {
+          return;
+        });
+      }));
+      log.warn("shutdown gave up waiting; returned messages to the queue", { count: left.length });
+    }
+    return { finished: finishedCount, abandoned: abandonedCount };
+  }
 }
 // src/queue/store.ts
 function keyOf(key) {
@@ -1332,11 +1373,23 @@ function createMemoryProcessedStore(options) {
         return { status: "done" };
       }
       if (existing !== undefined && existing.at > now()) {
-        return { status: "busy" };
+        return {
+          status: "busy",
+          retryAfterSeconds: Math.max(1, Math.ceil((existing.at - now()) / 1000))
+        };
       }
       const token = newToken();
       records.set(id, { state: "claimed", token, at: now() + leaseSeconds * 1000 });
       return { status: "claimed", token };
+    },
+    async renew(key, token, leaseSeconds) {
+      const id = keyOf(key);
+      const existing = records.get(id);
+      if (existing?.state !== "claimed" || existing.token !== token || existing.at <= now()) {
+        return false;
+      }
+      existing.at = now() + leaseSeconds * 1000;
+      return true;
     },
     async complete(key, token) {
       const id = keyOf(key);

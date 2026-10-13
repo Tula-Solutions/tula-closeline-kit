@@ -225,7 +225,8 @@ describe('idempotence', () => {
     expect(effects).toEqual(['first'])
     hold.open()
     await running
-    await t.time.advance(31_000)
+    // The duplicate was hidden until the holder's lease would have lapsed (a minute at most).
+    await t.time.advance(61_000)
     expect(await second.pollOnce()).toBe(1)
     expect(effects).toEqual(['first'])
     expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
@@ -585,5 +586,364 @@ describe('tenant scoping', () => {
     t.memory.publishRaw(JSON.stringify({ ...good, organizationId: undefined }))
     await consumer.pollOnce()
     expect(calls).toEqual([])
+  })
+})
+
+describe('the claim lease is a heartbeat', () => {
+  const key = { consumer: 'test.consumer', organizationId: 'org_a' }
+
+  test('a crashed holder does not burn the message towards the dead-letter queue', async () => {
+    const t = setup({ maxReceiveCount: 5 })
+    const runs: number[] = []
+    const consumer = t.make({ 'test.ping': async (m) => void runs.push(m.payload.n) })
+    await t.queue.publish(t.ping(1, 'org_a', 'crash'))
+    // A holder claimed the message (lease: two visibility windows) and received it, then died.
+    await t.store.claim({ ...key, messageId: 'crash' }, 60)
+    await t.queue.receive({ maxMessages: 1, visibilityTimeoutSeconds: 30, waitSeconds: 0 })
+    for (let i = 0; i < 8; i++) {
+      await t.time.advance(31_000)
+      await consumer.pollOnce()
+    }
+    expect(runs).toEqual([1])
+    expect(t.memory.deadLetters()).toEqual([])
+    expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
+  })
+
+  test('a store that fails to release a claim after a failed handler does not burn it either', async () => {
+    const t = setup({
+      maxReceiveCount: 5,
+      store: (inner) => ({
+        ...inner,
+        release: async () => {
+          throw new Error('db down')
+        },
+      }),
+    })
+    let attempts = 0
+    let lastCount = 0
+    const consumer = t.make({
+      'test.ping': async (_m, ctx) => {
+        attempts += 1
+        lastCount = ctx.receiveCount
+        if (attempts === 1) {
+          throw new Error('boom')
+        }
+      },
+    })
+    await t.queue.publish(t.ping(1))
+    for (let i = 0; i < 10; i++) {
+      await consumer.pollOnce()
+      await t.time.advance(31_000)
+    }
+    expect(attempts).toBe(2)
+    expect(lastCount).toBeLessThanOrEqual(3)
+    expect(t.memory.deadLetters()).toEqual([])
+  })
+
+  test('while a handler runs, each visibility extension renews the lease with the same token', async () => {
+    const renewals: Array<{ token: string; seconds: number }> = []
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        renew: async (k, token, seconds) => {
+          renewals.push({ token, seconds })
+          return inner.renew(k, token, seconds)
+        },
+      }),
+    })
+    const hold = gate()
+    const consumer = t.make({ 'test.ping': async () => hold.opened })
+    await t.queue.publish(t.ping(1, 'org_a', 'long'))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(100_000)
+    // A second consumer meeting the same message finds a live claim, a minute at most from lapsing.
+    expect(await t.store.claim({ ...key, messageId: 'long' }, 60)).toMatchObject({ status: 'busy' })
+    hold.open()
+    await running
+    expect(renewals.length).toBeGreaterThanOrEqual(8)
+    expect(new Set(renewals.map((r) => r.token)).size).toBe(1)
+    expect(renewals.every((r) => r.seconds === 60)).toBe(true)
+  })
+
+  test('a lease that cannot be renewed means the claim was lost: the handler is aborted and nothing is acknowledged', async () => {
+    const t = setup({ store: (inner) => ({ ...inner, renew: async () => false }) })
+    const hold = gate()
+    let signal: AbortSignal | undefined
+    const consumer = t.make({
+      'test.ping': async (_m, ctx) => {
+        signal = ctx.signal
+        await hold.opened
+      },
+    })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(11_000)
+    await running
+    expect(signal?.aborted).toBe(true)
+    expect(t.memory.depth().inFlight).toBe(1)
+    hold.open()
+  })
+
+  test('a renew that throws is tolerated: the next tick tries again', async () => {
+    let calls = 0
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        renew: async (k, token, seconds) => {
+          calls += 1
+          if (calls === 1) {
+            throw new Error('blip')
+          }
+          return inner.renew(k, token, seconds)
+        },
+      }),
+    })
+    const hold = gate()
+    let signal: AbortSignal | undefined
+    const consumer = t.make({
+      'test.ping': async (_m, ctx) => {
+        signal = ctx.signal
+        await hold.opened
+      },
+    })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(35_000)
+    expect(signal?.aborted).toBe(false)
+    hold.open()
+    await running
+    expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
+  })
+})
+
+describe('time limits', () => {
+  test('a handler timeout shorter than one extension tick is honoured', async () => {
+    const t = setup()
+    const hold = gate()
+    let signal: AbortSignal | undefined
+    const consumer = t.make(
+      {
+        'test.ping': async (_m, ctx) => {
+          signal = ctx.signal
+          await hold.opened
+        },
+      },
+      { handlerTimeoutMs: 400 }
+    )
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(400)
+    await running
+    expect(signal?.aborted).toBe(true)
+    hold.open()
+  })
+
+  test('a store that never answers cannot wedge a slot: the call times out and the message is left for a retry', async () => {
+    const t = setup({ store: (inner) => ({ ...inner, claim: () => new Promise(() => undefined) }) })
+    const consumer = t.make({ 'test.ping': async () => undefined })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(10_000)
+    await expect(running).resolves.toBe(1)
+    expect(t.memory.depth().inFlight).toBe(1)
+    expect(t.errorReporter.captured).toHaveLength(1)
+  })
+
+  test('a store that never answers on complete is also cut off, and the claim is released', async () => {
+    let hang = true
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        complete: (k, token) => (hang ? new Promise(() => undefined) : inner.complete(k, token)),
+      }),
+    })
+    const calls: number[] = []
+    const consumer = t.make({ 'test.ping': async (m) => void calls.push(m.payload.n) })
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(10_000)
+    await running
+    hang = false
+    await t.time.advance(10_000)
+    await consumer.pollOnce()
+    expect(calls).toEqual([1, 1])
+  })
+})
+
+describe('shutdown interleavings', () => {
+  test('stop passing its deadline while a flight is still claiming: no handler runs and the claim is released', async () => {
+    const claimGate = gate()
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        claim: async (k, lease) => {
+          await claimGate.opened
+          return inner.claim(k, lease)
+        },
+      }),
+    })
+    let ran = false
+    const consumer = t.make({
+      'test.ping': async () => {
+        ran = true
+      },
+    })
+    consumer.start()
+    await t.queue.publish(t.ping(1, 'org_a', 'late'))
+    await t.time.settle()
+    const stopping = consumer.stop(5_000)
+    await t.time.advance(5_000)
+    expect(await stopping).toEqual({ finished: 0, abandoned: 1 })
+    claimGate.open()
+    await t.time.settle()
+    expect(ran).toBe(false)
+    expect(
+      await t.store.claim(
+        { consumer: 'test.consumer', organizationId: 'org_a', messageId: 'late' },
+        60
+      )
+    ).toMatchObject({ status: 'claimed' })
+  })
+
+  test('stop twice reports the same result and counts nothing twice', async () => {
+    const t = setup()
+    const hold = gate()
+    const consumer = t.make({ 'test.ping': async () => hold.opened })
+    consumer.start()
+    await t.queue.publish(t.ping(1))
+    await t.time.settle()
+    const first = consumer.stop(1_000)
+    const second = consumer.stop(1_000)
+    await t.time.advance(1_000)
+    expect(await first).toEqual({ finished: 0, abandoned: 1 })
+    expect(await second).toEqual({ finished: 0, abandoned: 1 })
+    expect(await consumer.stop(1_000)).toEqual({ finished: 0, abandoned: 1 })
+    hold.open()
+  })
+})
+
+describe('other interleavings', () => {
+  test('a claim lost before complete is logged and the message is still acknowledged', async () => {
+    const t = setup({ store: (inner) => ({ ...inner, complete: async () => false }) })
+    const consumer = t.make({ 'test.ping': async () => undefined })
+    await t.queue.publish(t.ping(1))
+    await consumer.pollOnce()
+    expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
+    expect(t.logger.entries.some((e) => e.message.includes('claim was lost'))).toBe(true)
+  })
+
+  test('an acknowledge that fails after complete is logged, and the redelivery is acknowledged without running again', async () => {
+    let failAck = true
+    const t = setup({
+      wrapQueue: (queue) => ({
+        ...queue,
+        acknowledge: async (receipt) => {
+          if (failAck) {
+            throw new QueueError(QUEUE_ERROR_CODES.unavailable, 'down')
+          }
+          return queue.acknowledge(receipt)
+        },
+      }),
+    })
+    const calls: number[] = []
+    const consumer = t.make({ 'test.ping': async (m) => void calls.push(m.payload.n) })
+    await t.queue.publish(t.ping(1))
+    await consumer.pollOnce()
+    expect(t.logger.entries.some((e) => e.message.includes('acknowledge failed'))).toBe(true)
+    failAck = false
+    await t.time.advance(31_000)
+    await consumer.pollOnce()
+    expect(calls).toEqual([1])
+    expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
+  })
+
+  test('an unexpected failure inside the helper is logged and reported and does not stop the batch', async () => {
+    let first = true
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        claim: async (k, lease) => {
+          if (first) {
+            first = false
+            return undefined as never
+          }
+          return inner.claim(k, lease)
+        },
+      }),
+    })
+    const calls: number[] = []
+    const consumer = t.make({ 'test.ping': async (m) => void calls.push(m.payload.n) })
+    await t.queue.publish(t.ping(1))
+    await t.queue.publish(t.ping(2))
+    await expect(consumer.pollOnce()).resolves.toBe(2)
+    expect(calls).toHaveLength(1)
+    expect(t.logger.entries.some((e) => e.message.includes('unexpected consumer failure'))).toBe(
+      true
+    )
+    expect(t.errorReporter.captured).toHaveLength(1)
+  })
+})
+
+describe('messages for a version this consumer does not know', () => {
+  test('are delayed for longer each time', async () => {
+    const delays: number[] = []
+    const t = setup({
+      maxReceiveCount: 10,
+      wrapQueue: (queue) => ({
+        ...queue,
+        extendVisibility: async (receipt, seconds) => {
+          delays.push(seconds)
+          await queue.extendVisibility(receipt, seconds)
+        },
+      }),
+    })
+    const consumer = t.make({ 'test.ping': async () => undefined }, { invalidDelaySeconds: 60 })
+    t.memory.publishRaw(JSON.stringify({ ...t.ping(1), version: 9 }))
+    for (let i = 0; i < 4; i++) {
+      await consumer.pollOnce()
+      await t.time.advance(4_000_000)
+    }
+    expect(delays).toEqual([45, 90, 180, 360])
+  })
+
+  test('a plain invalid message keeps the flat delay', async () => {
+    const delays: number[] = []
+    const t = setup({
+      maxReceiveCount: 10,
+      wrapQueue: (queue) => ({
+        ...queue,
+        extendVisibility: async (receipt, seconds) => {
+          delays.push(seconds)
+          await queue.extendVisibility(receipt, seconds)
+        },
+      }),
+    })
+    const consumer = t.make({ 'test.ping': async () => undefined }, { invalidDelaySeconds: 60 })
+    t.memory.publishRaw('not json')
+    for (let i = 0; i < 3; i++) {
+      await consumer.pollOnce()
+      await t.time.advance(100_000)
+    }
+    expect(delays).toEqual([60, 60, 60])
+  })
+})
+
+describe('what an invalid message leaves in logs and reports', () => {
+  test('an unknown type and an email-keyed payload appear in no entry', async () => {
+    const t = setup()
+    const consumer = t.make({ 'test.ping': async () => undefined })
+    t.memory.publishRaw(JSON.stringify({ ...t.ping(1), type: 'SECRET-xyz' }))
+    t.memory.publishRaw(JSON.stringify({ ...t.ping(2), payload: { 'jane@acme.com': 1 } }))
+    await consumer.pollOnce()
+    const everything = JSON.stringify([t.logger.entries, t.errorReporter.captured.map(String)])
+    expect(everything).not.toContain('SECRET')
+    expect(everything).not.toContain('jane')
+    expect(t.logger.entries.length).toBeGreaterThan(0)
   })
 })

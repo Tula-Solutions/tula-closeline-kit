@@ -804,7 +804,11 @@ interface ConsumedKey {
 	/** The envelope id. */
 	messageId: string;
 }
-/** What {@link ProcessedStore.claim} answers. */
+/**
+* What {@link ProcessedStore.claim} answers. `busy` says how many whole seconds remain on the live
+* claim's lease (at least 1), so the consumer can hide the message until then instead of
+* redelivering it again and again.
+*/
 type ClaimResult = {
 	status: "claimed";
 	token: string;
@@ -812,6 +816,7 @@ type ClaimResult = {
 	status: "done";
 } | {
 	status: "busy";
+	retryAfterSeconds: number;
 };
 /**
 * Where an idempotent consumer records which messages are done. In production it is a Postgres
@@ -824,8 +829,18 @@ interface ProcessedStore {
 	* must pass to `complete` or `release`; `done` means it was completed before; `busy` means
 	* another claim is live. A claim whose lease ran out can be taken again, so a consumer that
 	* died mid-handler does not block the message forever. Must be atomic (one statement).
+	* Like every method here it must answer within a few seconds or fail; the consumer gives each
+	* call `storeTimeoutMs` (10 s by default) and treats a timeout as a failure, so a hung database
+	* cannot hold a slot for ever. A call that completes after its timeout may leave a claim behind;
+	* its lease lapses by itself.
 	*/
 	claim(key: ConsumedKey, leaseSeconds: number): Promise<ClaimResult>;
+	/**
+	* Pushes the end of the claim's lease to `leaseSeconds` from now. Returns false if the claim was
+	* lost (it lapsed and another took it, or it was released). The consumer calls it with every
+	* visibility extension while a handler runs, so a live holder never loses its lease.
+	*/
+	renew(key: ConsumedKey, token: string, leaseSeconds: number): Promise<boolean>;
 	/** Marks the message done. Returns false if the claim was lost (its lease ran out and another took it). */
 	complete(key: ConsumedKey, token: string): Promise<boolean>;
 	/** Gives up a claim without completing, so the next delivery can take it. A lost claim is ignored. */
@@ -895,12 +910,20 @@ interface ConsumerOptions<E extends AnyEnvelope> {
 	retryBaseSeconds?: number;
 	/** Longest retry delay in seconds; default 300. */
 	retryMaxSeconds?: number;
-	/** How long an invalid or unhandled message stays hidden before the next look, in seconds; default 60. */
+	/**
+	* How long an invalid or unhandled message stays hidden before the next look, in seconds;
+	* default 60. A message of a version this consumer does not know starts here and doubles with
+	* each delivery, up to `unsupportedVersionMaxSeconds`.
+	*/
 	invalidDelaySeconds?: number;
+	/** Longest delay for a message of an unknown version, in seconds; default 3600. */
+	unsupportedVersionMaxSeconds?: number;
+	/** How long one call to the processed store may take, in ms; default 10000. A timeout counts as a failure. */
+	storeTimeoutMs?: number;
 }
 /** What {@link Consumer.stop} did with the messages in flight. */
 interface StopResult {
-	/** Messages whose handling ended before the deadline, over the consumer's life. */
+	/** Handlings that ran to an end without being abandoned, whatever their outcome (success, failure or timeout), over the consumer's life. */
 	finished: number;
 	/** Messages given back to the queue because the deadline passed. */
 	abandoned: number;

@@ -10,11 +10,15 @@ export interface ConsumedKey {
   messageId: string
 }
 
-/** What {@link ProcessedStore.claim} answers. */
+/**
+ * What {@link ProcessedStore.claim} answers. `busy` says how many whole seconds remain on the live
+ * claim's lease (at least 1), so the consumer can hide the message until then instead of
+ * redelivering it again and again.
+ */
 export type ClaimResult =
   | { status: 'claimed'; token: string }
   | { status: 'done' }
-  | { status: 'busy' }
+  | { status: 'busy'; retryAfterSeconds: number }
 
 /**
  * Where an idempotent consumer records which messages are done. In production it is a Postgres
@@ -27,8 +31,18 @@ export interface ProcessedStore {
    * must pass to `complete` or `release`; `done` means it was completed before; `busy` means
    * another claim is live. A claim whose lease ran out can be taken again, so a consumer that
    * died mid-handler does not block the message forever. Must be atomic (one statement).
+   * Like every method here it must answer within a few seconds or fail; the consumer gives each
+   * call `storeTimeoutMs` (10 s by default) and treats a timeout as a failure, so a hung database
+   * cannot hold a slot for ever. A call that completes after its timeout may leave a claim behind;
+   * its lease lapses by itself.
    */
   claim(key: ConsumedKey, leaseSeconds: number): Promise<ClaimResult>
+  /**
+   * Pushes the end of the claim's lease to `leaseSeconds` from now. Returns false if the claim was
+   * lost (it lapsed and another took it, or it was released). The consumer calls it with every
+   * visibility extension while a handler runs, so a live holder never loses its lease.
+   */
+  renew(key: ConsumedKey, token: string, leaseSeconds: number): Promise<boolean>
   /** Marks the message done. Returns false if the claim was lost (its lease ran out and another took it). */
   complete(key: ConsumedKey, token: string): Promise<boolean>
   /** Gives up a claim without completing, so the next delivery can take it. A lost claim is ignored. */
@@ -68,11 +82,23 @@ export function createMemoryProcessedStore(options: {
         return { status: 'done' }
       }
       if (existing !== undefined && existing.at > now()) {
-        return { status: 'busy' }
+        return {
+          status: 'busy',
+          retryAfterSeconds: Math.max(1, Math.ceil((existing.at - now()) / 1000)),
+        }
       }
       const token = newToken()
       records.set(id, { state: 'claimed', token, at: now() + leaseSeconds * 1000 })
       return { status: 'claimed', token }
+    },
+    async renew(key, token, leaseSeconds) {
+      const id = keyOf(key)
+      const existing = records.get(id)
+      if (existing?.state !== 'claimed' || existing.token !== token || existing.at <= now()) {
+        return false
+      }
+      existing.at = now() + leaseSeconds * 1000
+      return true
     },
     async complete(key, token) {
       const id = keyOf(key)
