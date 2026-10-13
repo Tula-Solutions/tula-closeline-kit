@@ -124,7 +124,6 @@ var INVALID_REASONS2 = [
   "invalid_payload"
 ];
 var ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
-var SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
 var envelopeSchema = z.object({
   id: z.string().regex(ID_PATTERN),
   type: z.string().min(1).max(128),
@@ -134,9 +133,59 @@ var envelopeSchema = z.object({
   traceId: z.string().regex(ID_PATTERN),
   payload: z.unknown()
 });
-function issuesOf(error) {
+var WRAPPERS = new Set([
+  "optional",
+  "nullable",
+  "default",
+  "prefault",
+  "nonoptional",
+  "readonly",
+  "catch"
+]);
+function defOf(schema) {
+  return schema._zod.def;
+}
+function unwrap(schema, depth = 0) {
+  if (depth > 20) {
+    return;
+  }
+  const def = defOf(schema);
+  if (def.type !== undefined && WRAPPERS.has(def.type) && def.innerType !== undefined) {
+    return unwrap(def.innerType, depth + 1);
+  }
+  if (def.type === "pipe" && def.in !== undefined) {
+    return unwrap(def.in, depth + 1);
+  }
+  if (def.type === "lazy" && def.getter !== undefined) {
+    return unwrap(def.getter(), depth + 1);
+  }
+  return schema;
+}
+function step(schema, segment) {
+  const node = schema === undefined ? undefined : unwrap(schema);
+  const def = node === undefined ? undefined : defOf(node);
+  if (def?.type === "object" && def.shape !== undefined) {
+    if (typeof segment === "string" && Object.hasOwn(def.shape, segment)) {
+      return [segment, def.shape[segment]];
+    }
+    return ["*", undefined];
+  }
+  if (def?.type === "array" && typeof segment === "number") {
+    return ["*", def.element];
+  }
+  if (def?.type === "tuple" && typeof segment === "number") {
+    return ["*", def.items?.[segment] ?? def.rest ?? undefined];
+  }
+  return ["*", undefined];
+}
+function issuesOf(error, schema) {
   return error.issues.slice(0, 20).map((issue) => {
-    const path = issue.path.map((segment) => typeof segment === "string" && SEGMENT_PATTERN.test(segment) ? segment : "*").join(".");
+    let at = schema;
+    const path = issue.path.map((segment) => {
+      const [shown, next] = step(at, segment);
+      at = next;
+      return shown;
+    }).join(".");
     return `${path || "(root)"}: ${issue.code}`;
   });
 }
@@ -163,7 +212,7 @@ function createMessageRegistry2(definitions, options = {}) {
       return {
         ok: false,
         reason: "malformed",
-        issues: issuesOf(shape.error),
+        issues: issuesOf(shape.error, envelopeSchema),
         ...typeof id === "string" && ID_PATTERN.test(id) ? { messageId: id } : {}
       };
     }
@@ -202,9 +251,15 @@ function createMessageRegistry2(definitions, options = {}) {
         ...base
       };
     }
-    const payload = (older?.payload ?? definition.payload).safeParse(value.payload);
+    const payloadSchema = older?.payload ?? definition.payload;
+    const payload = payloadSchema.safeParse(value.payload);
     if (!payload.success) {
-      return { ok: false, reason: "invalid_payload", issues: issuesOf(payload.error), ...base };
+      return {
+        ok: false,
+        reason: "invalid_payload",
+        issues: issuesOf(payload.error, payloadSchema),
+        ...base
+      };
     }
     let current = payload;
     if (older !== undefined) {
@@ -214,7 +269,12 @@ function createMessageRegistry2(definitions, options = {}) {
         return { ok: false, reason: "invalid_payload", issues: ["upcast: failed"], ...base };
       }
       if (!current.success) {
-        return { ok: false, reason: "invalid_payload", issues: issuesOf(current.error), ...base };
+        return {
+          ok: false,
+          reason: "invalid_payload",
+          issues: issuesOf(current.error, definition.payload),
+          ...base
+        };
       }
     }
     const envelope = {

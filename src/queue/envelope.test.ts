@@ -303,3 +303,82 @@ describe('versions during a rolling deploy', () => {
     ).toThrow(TypeError)
   })
 })
+
+describe('a path keeps only field names the schema declares (a record key is body content)', () => {
+  const tagged = defineMessage({
+    type: 'test.tagged',
+    version: 2,
+    scope: 'global',
+    payload: z.object({
+      tags: z.record(z.string(), z.number()),
+      groups: z.array(
+        z.object({ title: z.string(), members: z.array(z.object({ age: z.number() })) })
+      ),
+      either: z.union([z.object({ a: z.string() }), z.object({ b: z.string() })]),
+      maybe: z.object({ inner: z.number() }).optional(),
+    }),
+    previous: [
+      {
+        version: 1,
+        payload: z.object({ labels: z.array(z.string()) }),
+        // A bad upcast: record keys from the old body end up under `tags`.
+        upcast: (old) => ({
+          tags: Object.fromEntries((old as { labels: string[] }).labels.map((l) => [l, 'x'])),
+          groups: [],
+          either: { a: 'a' },
+        }),
+      },
+    ],
+  })
+  const registry = createMessageRegistry([tagged])
+  const wire = (version: number, payload: unknown) =>
+    JSON.stringify({
+      id: 'm1',
+      type: 'test.tagged',
+      version,
+      occurredAt: '2026-01-01T00:00:00.000Z',
+      traceId: 't',
+      payload,
+    })
+  const good = { tags: {}, groups: [], either: { a: 'a' } }
+
+  test('a record key that looks like a field name is masked', () => {
+    const result = registry.decode(wire(2, { ...good, tags: { alice_smith: 'x' } }))
+    expect(result).toMatchObject({ ok: false, issues: ['tags.*: invalid_type'] })
+    expect(JSON.stringify(result)).not.toContain('alice_smith')
+  })
+
+  test('ordinary paths through objects and arrays keep their field names', () => {
+    const result = registry.decode(
+      wire(2, { ...good, groups: [{ title: 't', members: [{ age: 1 }, { age: 'x' }] }] })
+    )
+    expect(result).toMatchObject({ ok: false, issues: ['groups.*.members.*.age: invalid_type'] })
+  })
+
+  test('an optional object keeps its declared field', () => {
+    const result = registry.decode(wire(2, { ...good, maybe: { inner: 'x' } }))
+    expect(result).toMatchObject({ ok: false, issues: ['maybe.inner: invalid_type'] })
+  })
+
+  test('under a union, which cannot be resolved to one branch, every segment is masked', () => {
+    const result = registry.decode(wire(2, { ...good, either: { c: 'secret_key' } }))
+    expect(result.ok).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('secret_key')
+    expect(JSON.stringify(result)).not.toContain('either.a')
+  })
+
+  test('the result of an upcast is reported against the current schema, so its record keys are masked too', () => {
+    const result = registry.decode(wire(1, { labels: ['bob_jones'] }))
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'invalid_payload',
+      issues: ['tags.*: invalid_type'],
+    })
+    expect(JSON.stringify(result)).not.toContain('bob_jones')
+  })
+
+  test('an old version that fails its own schema is reported against that schema', () => {
+    const result = registry.decode(wire(1, { labels: [1] }))
+    expect(result).toMatchObject({ ok: false, issues: ['labels.*: invalid_type'] })
+  })
+})

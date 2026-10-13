@@ -947,3 +947,60 @@ describe('what an invalid message leaves in logs and reports', () => {
     expect(t.logger.entries.length).toBeGreaterThan(0)
   })
 })
+
+describe('the lease covers a slow store', () => {
+  test('with a 2 s visibility timeout a renew that takes 3 s does not abort a healthy handler', async () => {
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        renew: async (k, token, seconds) => {
+          await t.time.sleep(3_000)
+          return inner.renew(k, token, seconds)
+        },
+      }),
+    })
+    const hold = gate()
+    const calls: number[] = []
+    let signal: AbortSignal | undefined
+    const consumer = t.make(
+      {
+        'test.ping': async (m, ctx) => {
+          signal = ctx.signal
+          await hold.opened
+          calls.push(m.payload.n)
+        },
+      },
+      { visibilityTimeoutSeconds: 2 }
+    )
+    await t.queue.publish(t.ping(1))
+    const running = consumer.pollOnce()
+    await t.time.settle()
+    await t.time.advance(14_000)
+    expect(signal?.aborted).toBe(false)
+    hold.open()
+    await running
+    expect(calls).toEqual([1])
+    expect(t.memory.depth()).toEqual({ visible: 0, inFlight: 0 })
+  })
+
+  test('the lease is at least the store timeout plus two ticks plus a margin, and a busy claim reports no more than the lease', async () => {
+    const leases: number[] = []
+    const t = setup({
+      store: (inner) => ({
+        ...inner,
+        claim: async (k, lease) => {
+          leases.push(lease)
+          return inner.claim(k, lease)
+        },
+      }),
+    })
+    await t.queue.publish(t.ping(1))
+    await t.make({ 'test.ping': async () => undefined }, { visibilityTimeoutSeconds: 2 }).pollOnce()
+    // storeTimeoutMs 10 s -> 10 + 2 ticks of 1 s + 5 s margin
+    expect(leases).toEqual([17])
+    leases.length = 0
+    await t.queue.publish(t.ping(2))
+    await t.make({ 'test.ping': async () => undefined }).pollOnce()
+    expect(leases).toEqual([60])
+  })
+})

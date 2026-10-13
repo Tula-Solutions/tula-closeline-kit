@@ -1,6 +1,6 @@
 import {
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-vk3tcs4x.js";
+} from "./shared/chunk-pzmynk9n.js";
 
 // src/queue/behaviour.ts
 import { afterEach, describe, expect, test } from "bun:test";

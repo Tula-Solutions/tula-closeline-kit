@@ -2,7 +2,7 @@ import {
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-vk3tcs4x.js";
+} from "./shared/chunk-pzmynk9n.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -11,7 +11,7 @@ import {
   assertVisibility2,
   assertBatchCount2,
   systemSleep2
-} from "./shared/chunk-9f0bsnc4.js";
+} from "./shared/chunk-pkdp60t0.js";
 
 // src/queue/aws.ts
 import {
@@ -213,6 +213,7 @@ function createSqsQueue(options) {
   };
 }
 // src/queue/consumer.ts
+var LEASE_MARGIN_SECONDS = 5;
 function integerIn(name, value, min, max) {
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new TypeError(`${name} must be a whole number from ${min} to ${max}, got ${value}`);
@@ -237,10 +238,10 @@ function createConsumer(options) {
     throw new TypeError("a consumer needs a name");
   }
   const log = logger.child({ consumer: options.name });
-  const leaseSeconds = visibility * 2;
   const extendEveryMs = Math.max(500, Math.floor(visibility * 1000 / 3));
   const unsupportedMax = integerIn("unsupportedVersionMaxSeconds", options.unsupportedVersionMaxSeconds ?? 3600, invalidDelay, MAX_VISIBILITY_SECONDS2);
   const storeTimeoutMs = integerIn("storeTimeoutMs", options.storeTimeoutMs ?? 1e4, 1, 600000);
+  const leaseSeconds = Math.max(visibility * 2, Math.ceil(storeTimeoutMs / 1000) + 2 * Math.ceil(extendEveryMs / 1000) + LEASE_MARGIN_SECONDS);
   const flights = new Set;
   const stopControl = new AbortController;
   let loop;
@@ -363,6 +364,7 @@ function createConsumer(options) {
         flight.control.abort();
       }
     });
+    let renewalPending = false;
     const keepAlive = (async () => {
       while (!stopKeepAlive.signal.aborted) {
         await sleep(extendEveryMs, stopKeepAlive.signal);
@@ -379,15 +381,22 @@ function createConsumer(options) {
           }
           log.warn("could not extend visibility", { ...fields, errorName: nameOf(error) });
         }
-        try {
-          if (!await bounded(store.renew(key, token, leaseSeconds), "renew")) {
-            log.warn("lost the claim while its handler was running", fields);
-            flight.control.abort();
-            return;
-          }
-        } catch (error) {
-          log.warn("could not renew the claim", { ...fields, errorName: nameOf(error) });
+        if (renewalPending) {
+          continue;
         }
+        renewalPending = true;
+        (async () => {
+          try {
+            if (!await bounded(store.renew(key, token, leaseSeconds), "renew")) {
+              log.warn("lost the claim while its handler was running", fields);
+              flight.control.abort();
+            }
+          } catch (error) {
+            log.warn("could not renew the claim", { ...fields, errorName: nameOf(error) });
+          } finally {
+            renewalPending = false;
+          }
+        })();
       }
     })();
     const outcome = await Promise.race([running, aborted]);

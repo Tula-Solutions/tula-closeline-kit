@@ -180,7 +180,6 @@ export interface MessageRegistryOptions {
 
 /** The pattern ids and trace ids on the wire must match: they are written to logs, so no free text. */
 const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
-const SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/
 
 const envelopeSchema = z.object({
   id: z.string().regex(ID_PATTERN),
@@ -192,16 +191,89 @@ const envelopeSchema = z.object({
   payload: z.unknown(),
 })
 
+interface SchemaDef {
+  type?: string
+  shape?: Record<string, z.ZodType>
+  element?: z.ZodType
+  innerType?: z.ZodType
+  in?: z.ZodType
+  getter?: () => z.ZodType
+  items?: z.ZodType[]
+  rest?: z.ZodType | null
+}
+
+const WRAPPERS = new Set([
+  'optional',
+  'nullable',
+  'default',
+  'prefault',
+  'nonoptional',
+  'readonly',
+  'catch',
+])
+
+function defOf(schema: z.ZodType): SchemaDef {
+  return (schema as unknown as { _zod: { def: SchemaDef } })._zod.def
+}
+
+/** Looks through wrappers (optional, default, pipe, lazy) to the schema that has the shape. */
+function unwrap(schema: z.ZodType, depth = 0): z.ZodType | undefined {
+  if (depth > 20) {
+    return undefined
+  }
+  const def = defOf(schema)
+  if (def.type !== undefined && WRAPPERS.has(def.type) && def.innerType !== undefined) {
+    return unwrap(def.innerType, depth + 1)
+  }
+  if (def.type === 'pipe' && def.in !== undefined) {
+    return unwrap(def.in, depth + 1)
+  }
+  if (def.type === 'lazy' && def.getter !== undefined) {
+    return unwrap(def.getter(), depth + 1)
+  }
+  return schema
+}
+
 /**
- * Field paths and codes of a ZodError, with no values. A path segment is kept only if it looks like
- * a field name; a record key, an array index or anything else (an email, a name) becomes `*`.
+ * One step down a schema. A segment is kept only when the schema declares it as an object field;
+ * an array or tuple position is shown as `*`; anything else (a record, a union, a map, a node this
+ * does not know) is `*` and ends the walk, so the rest of the path is masked too: fail closed.
  */
-function issuesOf(error: z.ZodError): string[] {
+function step(
+  schema: z.ZodType | undefined,
+  segment: PropertyKey
+): [string, z.ZodType | undefined] {
+  const node = schema === undefined ? undefined : unwrap(schema)
+  const def = node === undefined ? undefined : defOf(node)
+  if (def?.type === 'object' && def.shape !== undefined) {
+    if (typeof segment === 'string' && Object.hasOwn(def.shape, segment)) {
+      return [segment, def.shape[segment]]
+    }
+    return ['*', undefined]
+  }
+  if (def?.type === 'array' && typeof segment === 'number') {
+    return ['*', def.element]
+  }
+  if (def?.type === 'tuple' && typeof segment === 'number') {
+    return ['*', def.items?.[segment] ?? def.rest ?? undefined]
+  }
+  return ['*', undefined]
+}
+
+/**
+ * Field paths and codes of a ZodError, with no values. A record key is body content (it can be a
+ * name or an email), so a path segment is shown only when `schema` declares it as an object field
+ * at that position; see {@link step}. `schema` is the one the failing data was parsed with.
+ */
+function issuesOf(error: z.ZodError, schema: z.ZodType): string[] {
   return error.issues.slice(0, 20).map((issue) => {
+    let at: z.ZodType | undefined = schema
     const path = issue.path
-      .map((segment) =>
-        typeof segment === 'string' && SEGMENT_PATTERN.test(segment) ? segment : '*'
-      )
+      .map((segment) => {
+        const [shown, next] = step(at, segment)
+        at = next
+        return shown
+      })
       .join('.')
     return `${path || '(root)'}: ${issue.code}`
   })
@@ -242,7 +314,7 @@ export function createMessageRegistry<const D extends AnyDefinition>(
       return {
         ok: false,
         reason: 'malformed',
-        issues: issuesOf(shape.error),
+        issues: issuesOf(shape.error, envelopeSchema),
         ...(typeof id === 'string' && ID_PATTERN.test(id) ? { messageId: id } : {}),
       }
     }
@@ -284,9 +356,15 @@ export function createMessageRegistry<const D extends AnyDefinition>(
         ...base,
       }
     }
-    const payload = (older?.payload ?? definition.payload).safeParse(value.payload)
+    const payloadSchema = older?.payload ?? definition.payload
+    const payload = payloadSchema.safeParse(value.payload)
     if (!payload.success) {
-      return { ok: false, reason: 'invalid_payload', issues: issuesOf(payload.error), ...base }
+      return {
+        ok: false,
+        reason: 'invalid_payload',
+        issues: issuesOf(payload.error, payloadSchema),
+        ...base,
+      }
     }
     let current: z.ZodSafeParseResult<unknown> = payload
     if (older !== undefined) {
@@ -296,7 +374,12 @@ export function createMessageRegistry<const D extends AnyDefinition>(
         return { ok: false, reason: 'invalid_payload', issues: ['upcast: failed'], ...base }
       }
       if (!current.success) {
-        return { ok: false, reason: 'invalid_payload', issues: issuesOf(current.error), ...base }
+        return {
+          ok: false,
+          reason: 'invalid_payload',
+          issues: issuesOf(current.error, definition.payload),
+          ...base,
+        }
       }
     }
     const envelope: AnyEnvelope = {

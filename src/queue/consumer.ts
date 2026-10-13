@@ -109,6 +109,9 @@ interface Flight {
   done: Promise<void>
 }
 
+/** Seconds added to the lease on top of the slowest renewal and two missed ticks. */
+const LEASE_MARGIN_SECONDS = 5
+
 function integerIn(name: string, value: number, min: number, max: number): number {
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new TypeError(`${name} must be a whole number from ${min} to ${max}, got ${value}`)
@@ -175,9 +178,8 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
     throw new TypeError('a consumer needs a name')
   }
   const log = logger.child({ consumer: options.name })
-  // The lease is two visibility windows and is renewed with every visibility extension, so a claim
-  // lapses within about a minute of its holder dying, however long handlers are allowed to run.
-  const leaseSeconds = visibility * 2
+  // The lease is renewed on the heartbeat, so a claim lapses within a lease length of its holder
+  // dying, however long handlers are allowed to run. See `leaseSeconds` below for its length.
   const extendEveryMs = Math.max(500, Math.floor((visibility * 1000) / 3))
   const unsupportedMax = integerIn(
     'unsupportedVersionMaxSeconds',
@@ -186,6 +188,13 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
     MAX_VISIBILITY_SECONDS
   )
   const storeTimeoutMs = integerIn('storeTimeoutMs', options.storeTimeoutMs ?? 10_000, 1, 600_000)
+  // Long enough for a renewal that takes the whole store timeout, started at the worst moment,
+  // with two missed ticks and a margin, so one slow store call cannot lapse a healthy claim. A
+  // busy claim reports at most this many seconds, far below what the queue accepts (12 hours).
+  const leaseSeconds = Math.max(
+    visibility * 2,
+    Math.ceil(storeTimeoutMs / 1000) + 2 * Math.ceil(extendEveryMs / 1000) + LEASE_MARGIN_SECONDS
+  )
 
   const flights = new Set<Flight>()
   const stopControl = new AbortController()
@@ -330,6 +339,7 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
         flight.control.abort()
       }
     })
+    let renewalPending = false
     const keepAlive = (async () => {
       while (!stopKeepAlive.signal.aborted) {
         await sleep(extendEveryMs, stopKeepAlive.signal)
@@ -346,19 +356,29 @@ export function createConsumer<E extends AnyEnvelope>(options: ConsumerOptions<E
           }
           log.warn('could not extend visibility', { ...fields, errorName: nameOf(error) })
         }
-        try {
-          if (!(await bounded(store.renew(key, token, leaseSeconds), 'renew'))) {
-            log.warn('lost the claim while its handler was running', fields)
-            flight.control.abort()
-            return
-          }
-        } catch (error) {
-          log.warn('could not renew the claim', { ...fields, errorName: nameOf(error) })
+        // The renewal runs beside the ticks, not in them: a slow store must not delay the next
+        // visibility extension, or the message would lapse while the claim is being renewed.
+        if (renewalPending) {
+          continue
         }
+        renewalPending = true
+        void (async () => {
+          try {
+            if (!(await bounded(store.renew(key, token, leaseSeconds), 'renew'))) {
+              log.warn('lost the claim while its handler was running', fields)
+              flight.control.abort()
+            }
+          } catch (error) {
+            log.warn('could not renew the claim', { ...fields, errorName: nameOf(error) })
+          } finally {
+            renewalPending = false
+          }
+        })()
       }
     })()
     const outcome = await Promise.race([running, aborted])
     stopKeepAlive.abort()
+    // A renewal still in flight is not waited for: its answer no longer matters.
     await Promise.all([keepAlive, deadline])
     if (flight.abandoned) {
       return

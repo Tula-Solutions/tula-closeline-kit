@@ -400,7 +400,7 @@ UUID unless you pass one: when you retry a publish, pass the same envelope, so t
 recognise the copy. `encode` and `decode` validate with Zod on the way in and out. A body that is
 not JSON, has an unknown type or another version, lacks (or wrongly has) an Organization id, or
 fails its payload schema is never dropped and never throws in the consumer: `receive` returns it as
-`{ kind: 'invalid', reason, issues }` (field paths and codes, never values), the consumer logs and
+`{ kind: 'invalid', reason, issues }` (field names the schema declares and codes, never values; a record key or any path under a union is shown as `*`), the consumer logs and
 reports it and hides it for `invalidDelaySeconds`, and the queue's redrive policy sends it to the
 dead-letter queue after `maxReceiveCount` deliveries.
 
@@ -489,15 +489,18 @@ What `createConsumer` guarantees:
 
 - A message completed before is acknowledged without running again (`store.claim` says `done`).
 - Two consumers that get the same message do not both run it: the second sees a live claim, hides
-  the message until the holder's lease would lapse (at most two visibility windows) and
+  the message until the holder's lease would lapse (its lease length: 60 s by default) and
   acknowledges it on the next delivery if the holder finished.
 - A handler that throws releases its claim and the message returns after a jittered exponential
   delay (`retryBaseSeconds` doubling to `retryMaxSeconds`); after the queue's `maxReceiveCount`
   deliveries it is in the dead-letter queue. Failures go to the logger (type, ids, error name; never
   the payload) and to `errorReporter`.
 - A handler that runs longer than the visibility timeout has it extended every third of the
-  timeout. The claim's lease is two visibility windows and is renewed (`store.renew`) with every
-  extension, so a live holder keeps it however long its handler runs, and a holder that dies loses
+  timeout. The claim's lease is the longer of two visibility windows and the store timeout plus
+  two heartbeat ticks plus a 5 s margin (so a renewal that takes the whole store timeout, or one
+  missed tick, cannot lapse a healthy claim even with a 2 s visibility timeout), and is renewed
+  (`store.renew`, beside the ticks so a slow store never delays a visibility extension) on the
+  heartbeat, so a live holder keeps it however long its handler runs, and a holder that dies loses
   it within about a minute. A consumer that meets a busy claim hides the message for the seconds
   left on the lease, so a dead holder does not burn the message's receive count towards the
   dead-letter queue. If a renewal says the claim was lost, the handler's `signal` aborts and the
