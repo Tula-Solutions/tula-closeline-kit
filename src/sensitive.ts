@@ -32,6 +32,11 @@ const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'sessionid',
   'sessid',
   'signature',
+  'dsn',
+  'otp',
+  'cvv',
+  'credential',
+  'credentials',
 ])
 const SENSITIVE_SUFFIXES = [
   'token',
@@ -44,6 +49,11 @@ const SENSITIVE_SUFFIXES = [
   'privatekey',
   'secretaccesskey',
   'signature',
+  'signature256',
+  'passwordhash',
+  'sessionkey',
+  'accesskey',
+  'connectionstring',
   'passwd',
   'sessionid',
   'sessid',

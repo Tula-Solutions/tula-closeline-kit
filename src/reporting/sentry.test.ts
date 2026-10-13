@@ -895,6 +895,33 @@ describe('ids in tags are sent as they are (N1)', () => {
     expect(h.wire()).not.toContain('jane@acme.com')
   })
 
+  test.each([
+    ['a Stripe live key', 'sk_live_abcdefghijklmnop1234'],
+    ['a GitHub token', 'ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'],
+    ['an AWS access key id', 'AKIAIOSFODNN7EXAMPLE'],
+    ['a JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz'],
+    ['a card number', '4111111111111111'],
+  ])(
+    '%s that fits the id charset is replaced by the fixed marker, not sent',
+    async (_n, secret) => {
+      const h = harness()
+      h.reporter.capture(new Error('boom'), { organizationId: secret, requestId: secret })
+      const tags = (await h.events())[0]?.tags
+      // `[invalid]`, not `[redacted]`: an id is either sent as it was given or not at all.
+      expect(tags?.organization_id).toBe('[invalid]')
+      expect(tags?.request_id).toBe('[invalid]')
+      expect(h.wire()).not.toContain(secret)
+      expect(h.wire()).not.toContain('[redacted]')
+    }
+  )
+
+  test('a 64 character hex digest is an id like any other and is sent as it was given', async () => {
+    const digest = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c148f4c1ab0'
+    const h = harness()
+    h.reporter.capture(new Error('boom'), { requestId: digest })
+    expect((await h.events())[0]?.tags.request_id).toBe(digest)
+  })
+
   test('a free-form tag under a sensitive key is still redacted', async () => {
     const h = harness()
     h.reporter.capture(new Error('boom'), { tags: { sessionToken: 'KEYED-VALUE-1', note: 'ok' } })
@@ -935,6 +962,53 @@ describe('the exception is rebuilt from known fields (N5)', () => {
       ).toBe(true)
     }
     expect(events[0]).not.toHaveProperty('debug_meta')
+  })
+
+  test('the other kept fields are rebuilt too: sdk, runtime, release, environment, platform, id, time', async () => {
+    const h = harness()
+    h.reporter.client.addEventProcessor((event) => {
+      Object.assign(event, {
+        sdk: {
+          name: 'sentry.javascript.bun',
+          version: '1.2.3',
+          leak: 'LEAK-SDK',
+          packages: [{ name: 'LEAK-PKG' }],
+        },
+        release: 'LEAK Hello Jane I am sick',
+        environment: 'LEAK-ENVIRONMENT',
+        platform: 'LEAK-PLATFORM',
+        event_id: 'LEAK-EVENT-ID',
+        timestamp: 'LEAK-TIMESTAMP',
+      })
+      Object.assign(event.contexts?.runtime ?? {}, { leak: 'LEAK-RUNTIME' })
+      return event
+    })
+    h.reporter.capture(new Error('boom'))
+    const events = await h.events()
+    expect(events).toHaveLength(1)
+    // `wire()` includes the envelope header, where the event id is also written.
+    expect(h.wire()).not.toContain('LEAK')
+    const event = events[0] as unknown as Record<string, unknown>
+    expect(event.release).toBe('abc1234def')
+    expect(event.environment).toBe('staging')
+    expect(event.platform).toBe('node')
+    // The SDK adds its own `packages`, `integrations` and `settings` after `beforeSend`; the
+    // `leak` key and the processor's package entry are ours to drop, and are (see `LEAK` above).
+    expect(Object.keys(event.sdk as object)).not.toContain('leak')
+    expect(JSON.stringify((event.sdk as { packages?: unknown }).packages)).toContain('@sentry/')
+    const runtime = (event.contexts as { runtime: Record<string, unknown> }).runtime
+    expect(Object.keys(runtime).sort()).toEqual(['name', 'version'])
+    expect(typeof event.timestamp === 'number' || event.timestamp === undefined).toBe(true)
+  })
+
+  test('a genuine event id, timestamp and platform pass through unchanged', async () => {
+    const h = harness()
+    h.reporter.capture(new Error('boom'))
+    const event = (await h.events())[0] as unknown as Record<string, unknown>
+    expect(event.event_id).toMatch(/^[0-9a-f]{32}$/)
+    expect(Number.isFinite(event.timestamp)).toBe(true)
+    expect(event.platform).toBe('node')
+    expect((event.sdk as { name: string }).name).toContain('sentry')
   })
 
   test('the type, the value, the frames and the mechanism are kept', async () => {

@@ -10,7 +10,7 @@ import {
   redactFields,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-7vbr3qrx.js";
+} from "./shared/chunk-hqqw2v8v.js";
 
 // src/auth/claims.ts
 import {
@@ -655,19 +655,14 @@ var MAX_STACK_HEADER = 1024;
 var MAX_EXCEPTIONS = 12;
 var MAX_FRAMES = 200;
 var MAX_STRING_VALUE = 512;
-var KEPT_EVENT_KEYS = new Set([
-  "event_id",
-  "timestamp",
-  "platform",
-  "release",
-  "environment",
-  "sdk"
-]);
+var EVENT_ID = /^[0-9a-f]{32}$/;
+var PLATFORM = "node";
+var MAX_VERSION_FIELD = 64;
 function text(value, max) {
   return scrubText2(String(value)).slice(0, max);
 }
 function identifier(value) {
-  return typeof value === "string" && IDENTIFIER.test(value) ? value : INVALID_IDENTIFIER;
+  return typeof value === "string" && IDENTIFIER.test(value) && scrubText2(value) === value ? value : INVALID_IDENTIFIER;
 }
 function pathWithoutQuery(path) {
   const end = path.search(/[?#]/);
@@ -882,13 +877,42 @@ function ownException(exception) {
   }
   return { values };
 }
-function confine(event, hint) {
+function label(value) {
+  return typeof value === "string" && /^[\x20-\x7e]*$/.test(value) ? value.slice(0, MAX_VERSION_FIELD) : undefined;
+}
+function nameAndVersion(source) {
+  if (!isPlain2(source)) {
+    return;
+  }
+  const out = {};
+  const name = label(source.name);
+  const version = label(source.version);
+  if (name !== undefined) {
+    out.name = name;
+  }
+  if (version !== undefined) {
+    out.version = version;
+  }
+  return out;
+}
+function confine(event, hint, expected) {
   const own = hint.data;
   const kept = {};
-  for (const [key, value] of Object.entries(event)) {
-    if (KEPT_EVENT_KEYS.has(key)) {
-      kept[key] = value;
-    }
+  const eventId = [event.event_id, hint.event_id].find((id) => typeof id === "string" && EVENT_ID.test(id));
+  if (eventId !== undefined) {
+    kept.event_id = eventId;
+  }
+  if (typeof event.timestamp === "number" && Number.isFinite(event.timestamp)) {
+    kept.timestamp = event.timestamp;
+  }
+  kept.platform = PLATFORM;
+  if (expected.release !== undefined) {
+    kept.release = expected.release;
+  }
+  kept.environment = expected.environment;
+  const sdk = nameAndVersion(event.sdk);
+  if (sdk !== undefined) {
+    kept.sdk = sdk;
   }
   kept.level = "error";
   kept.tags = own?.tags ?? {};
@@ -896,7 +920,7 @@ function confine(event, hint) {
   if (exception !== undefined) {
     kept.exception = exception;
   }
-  const runtime = event.contexts?.runtime;
+  const runtime = nameAndVersion(event.contexts?.runtime);
   kept.contexts = {
     ...runtime === undefined ? {} : { runtime },
     ...own === undefined ? {} : { closeline: own.closeline }
@@ -936,7 +960,7 @@ function createSentryReporter(options) {
     enableRuntimeChannelInjection: false,
     beforeSend: (event, hint) => {
       try {
-        const { tags, ...rest } = confine(event, hint);
+        const { tags, ...rest } = confine(event, hint, options);
         const clean = scrubEvent(rest);
         return clean === null ? null : { ...clean, tags };
       } catch {

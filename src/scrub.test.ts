@@ -163,7 +163,15 @@ describe('scrubText is bounded and never throws', () => {
   })
 
   test('work grows in proportion to the input, not its square', () => {
-    const shapes = ['password="', 'Bearer ', 'a=', 'eyJ.a', 'http://u:']
+    const shapes = [
+      'password="',
+      'Bearer ',
+      'a=',
+      'eyJ.a',
+      'http://u:',
+      'tokens=1 ',
+      'max_tokens=1,',
+    ]
     for (const shape of shapes) {
       const small = shape.repeat(Math.ceil(8_000 / shape.length))
       const large = shape.repeat(Math.ceil(32_000 / shape.length))

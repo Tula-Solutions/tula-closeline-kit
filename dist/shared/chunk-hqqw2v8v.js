@@ -286,7 +286,7 @@ function hasPhoneLead(text, run) {
     return run.seps[0]?.startsWith(")") === true;
   }
   const first = run.groups[0];
-  return text.charCodeAt(run.start) === 48 && first >= 2 && first <= 5 && run.seps.every((sep) => sep === run.seps[0]);
+  return text.charCodeAt(run.start) === 48 && text.charCodeAt(run.start + 1) !== 48 && first >= 2 && first <= 5 && run.seps.every((sep) => sep === run.seps[0]);
 }
 function isPhone(text, run) {
   if (!hasPhoneLead(text, run)) {
@@ -390,7 +390,12 @@ var SENSITIVE_WORDS = new Set([
   "session",
   "sessionid",
   "sessid",
-  "signature"
+  "signature",
+  "dsn",
+  "otp",
+  "cvv",
+  "credential",
+  "credentials"
 ]);
 var SENSITIVE_SUFFIXES = [
   "token",
@@ -403,6 +408,11 @@ var SENSITIVE_SUFFIXES = [
   "privatekey",
   "secretaccesskey",
   "signature",
+  "signature256",
+  "passwordhash",
+  "sessionkey",
+  "accesskey",
+  "connectionstring",
   "passwd",
   "sessionid",
   "sessid",
@@ -631,11 +641,11 @@ function maskPairs(text) {
       }
       const before = text[match.index - 1];
       const jsonKey = match[0].charAt(key.length) === '"' || match[0].charAt(key.length) === "'";
-      const end = valueEnd(text, start, before === "?" || before === "&", jsonKey);
-      if (end === start) {
+      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
         continue;
       }
-      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
+      const end = valueEnd(text, start, before === "?" || before === "&", jsonKey);
+      if (end === start) {
         continue;
       }
       out += text.slice(copied, start) + MASK;

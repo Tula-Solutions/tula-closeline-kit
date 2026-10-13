@@ -252,12 +252,14 @@ function maskPairs(text: string): string {
       }
       const before = text[match.index - 1]
       const jsonKey = match[0].charAt(key.length) === '"' || match[0].charAt(key.length) === "'"
-      const end = valueEnd(text, start, before === '?' || before === '&', jsonKey)
-      if (end === start) {
+      // A figure under a token-count key is usage, not a credential, and what follows it is prose.
+      // Checked on a short slice before `valueEnd` scans to the end of the line, so a run of such
+      // pairs costs a constant each.
+      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
         continue
       }
-      // A figure under a token-count key is usage, not a credential, and what follows it is prose.
-      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
+      const end = valueEnd(text, start, before === '?' || before === '&', jsonKey)
+      if (end === start) {
         continue
       }
       out += text.slice(copied, start) + MASK

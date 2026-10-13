@@ -90,9 +90,12 @@ printed to the console. An `http:` DSN is accepted only when `ENVIRONMENT` is `l
 The event's `exception` entries are rebuilt by the adapter from known fields (type, value, frames
 with file, function, line and column, and the mechanism's type, handled flag and cause links), not
 kept from the SDK, so nothing another event processor adds to them is sent; there is no
-`debug_meta`. The `organization_id` and `request_id` tags are checked against `[A-Za-z0-9_.:-]` and
-64 characters and sent as they are, not through `scrubText`; a value that fails is sent as
-`[invalid]`.
+`debug_meta`. The other kept fields are rebuilt or checked too: `sdk` and `contexts.runtime` keep
+a name and a version string only, `release`, `environment` and `platform` are the adapter's own
+values, `event_id` must be 32 hex digits and `timestamp` a number. The `organization_id` and
+`request_id` tags are sent only if they fit `[A-Za-z0-9_.:-]` and 64 characters and `scrubText`
+would leave them as they are; they are never masked, so a value that fails either test (a key, a
+token or a card number passed by mistake) is sent as `[invalid]`.
 
 Every event then passes the kit's key-based redaction and `scrubText` on every string, in
 `beforeSend`. Only the fields this adapter set are kept: the SDK merges its process-wide global
@@ -152,9 +155,17 @@ data in fields, not in messages. These are not masked in free text:
 - IBANs and other bank account identifiers, and national ids;
 - postal addresses and names.
 
-The one place an id can still be altered: a bare run of 13 to 19 digits that starts in a card
-issuer's range and passes the Luhn check by chance (about one in ten such runs), and four numeric
-ids of four digits written one after the other like a card.
+The places an id can still be altered, and the only ones:
+- a bare run of 13 to 19 digits that starts in a card issuer's range (4, 5, 6, 3 not followed by
+  1, 2 or 3, 2221 to 2720, 81, 86) and passes the Luhn check by chance (about one in ten such
+  runs); an id starting with 1 is never read as a bare card, and neither is one outside those
+  ranges;
+- four ids of four digits written one after the other like a card, when they pass the Luhn check
+  (and start in an issuer's range, unless they start with 1);
+- digit groups of 9 to 15 digits written with one kind of separator whose first group has 2 to 5
+  digits and starts with a single `0` followed by a non-zero digit, because that is how a national
+  telephone number opens (`invoice 0123-4567-8901`). A first group starting `00` is left alone, so
+  zero-padded counters (`0042-0017-0231`) stay readable.
 
 **It over-masks on purpose.** Prose after a sensitive key goes with the value, because a free-text
 value cannot be told from a secret: `Invalid token: expired` becomes `Invalid token: [redacted]`,
@@ -184,7 +195,14 @@ For callers of the logger and `scrubText` before this version:
   trailing newline now boots.
 - **The memory reporter** drops captures, and its `flush` resolves `false`, after `close`.
 - **Tags set from typed context** (`organization_id`, `request_id`) are sent as they are when they
-  match `[A-Za-z0-9_.:-]{1,64}`, and as `[invalid]` otherwise.
+  match `[A-Za-z0-9_.:-]{1,64}` and hold nothing `scrubText` would mask, and as `[invalid]`
+  otherwise.
+- **More field names are redacted**: `passwordHash`, `sessionKey`, `accessKey`, `connectionString`,
+  `dsn`, `credential(s)`, `otp`, `cvv` and `X-Hub-Signature-256`. `accessKeyId` stays readable.
+- **A number group written with a trunk zero** is a telephone number only if the zero is followed
+  by a non-zero digit (`00` opens counters, not telephone numbers).
+- **The Sentry event's `sdk` keeps a name and version** (the SDK adds its own package list after),
+  and its `release`, `environment` and `platform` are always the adapter's own values.
 
 ### Wiring it into a service
 

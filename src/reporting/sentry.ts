@@ -61,17 +61,10 @@ const MAX_EXCEPTIONS = 12
 const MAX_FRAMES = 200
 const MAX_STRING_VALUE = 512
 
-// The event fields the adapter lets through as they are; anything else on an event came from a scope
-// that belongs to someone else (see `confine`). `exception` is not here: it is rebuilt field by
-// field (`ownException`). `debug_meta` is not, because the adapter sets none.
-const KEPT_EVENT_KEYS: ReadonlySet<string> = new Set([
-  'event_id',
-  'timestamp',
-  'platform',
-  'release',
-  'environment',
-  'sdk',
-])
+const EVENT_ID = /^[0-9a-f]{32}$/
+// The platform the SDK reports for this runtime.
+const PLATFORM = 'node'
+const MAX_VERSION_FIELD = 64
 
 /** Options for createSentryReporter: the common ones plus the DSN, which is required. */
 export interface SentryReporterOptions extends ErrorReporterOptions {
@@ -94,9 +87,13 @@ function text(value: unknown, max: number): string {
   return scrubText(String(value)).slice(0, max)
 }
 
-/** An id as it was given when it has the shape of one, otherwise a fixed marker. */
+/** An id as it was given when it has the shape of one and holds nothing secret-shaped, otherwise a fixed marker. */
 function identifier(value: unknown): string {
-  return typeof value === 'string' && IDENTIFIER.test(value) ? value : INVALID_IDENTIFIER
+  // An id that `scrubText` would change looks like a secret or a card number: it is dropped, not
+  // masked, so what is sent is always exactly what was given.
+  return typeof value === 'string' && IDENTIFIER.test(value) && scrubText(value) === value
+    ? value
+    : INVALID_IDENTIFIER
 }
 
 function pathWithoutQuery(path: string): string {
@@ -379,18 +376,61 @@ function ownException(exception: unknown): { values: Plain[] } | undefined {
   return { values }
 }
 
+/** A name or version string from the SDK or runtime, cut short; anything else is left out. */
+function label(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[\x20-\x7e]*$/.test(value)
+    ? value.slice(0, MAX_VERSION_FIELD)
+    : undefined
+}
+
+/** An object holding the `name` and `version` of `source` that are strings, and nothing else. */
+function nameAndVersion(source: unknown): Plain | undefined {
+  if (!isPlain(source)) {
+    return undefined
+  }
+  const out: Plain = {}
+  const name = label(source.name)
+  const version = label(source.version)
+  if (name !== undefined) {
+    out.name = name
+  }
+  if (version !== undefined) {
+    out.version = version
+  }
+  return out
+}
+
 /**
- * Keeps only what this adapter put on the event. The SDK merges the process-wide global and
- * isolation scopes into every event, and an application or another library can set tags, extra
- * data, a user, contexts or attachments there; none of it may travel with a Closeline error.
+ * Keeps only what this adapter put on the event, every field rebuilt or checked: the SDK merges the
+ * process-wide global and isolation scopes into every event, and an application or another library
+ * can set tags, extra data, a user, contexts or attachments there, or add event processors that
+ * write to any field; none of it may travel with a Closeline error.
  */
-function confine(event: Event, hint: EventHint): Event {
+function confine(
+  event: Event,
+  hint: EventHint,
+  expected: { release?: string | undefined; environment: string }
+): Event {
   const own = hint.data as OwnData | undefined
   const kept: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(event)) {
-    if (KEPT_EVENT_KEYS.has(key)) {
-      kept[key] = value
-    }
+  const eventId = [event.event_id, hint.event_id].find(
+    (id) => typeof id === 'string' && EVENT_ID.test(id)
+  )
+  if (eventId !== undefined) {
+    kept.event_id = eventId
+  }
+  if (typeof event.timestamp === 'number' && Number.isFinite(event.timestamp)) {
+    kept.timestamp = event.timestamp
+  }
+  // These three are fixed by the adapter's own setup, whatever a processor wrote over them.
+  kept.platform = PLATFORM
+  if (expected.release !== undefined) {
+    kept.release = expected.release
+  }
+  kept.environment = expected.environment
+  const sdk = nameAndVersion(event.sdk)
+  if (sdk !== undefined) {
+    kept.sdk = sdk
   }
   kept.level = 'error'
   kept.tags = own?.tags ?? {}
@@ -398,7 +438,7 @@ function confine(event: Event, hint: EventHint): Event {
   if (exception !== undefined) {
     kept.exception = exception
   }
-  const runtime = (event.contexts as Record<string, unknown> | undefined)?.runtime
+  const runtime = nameAndVersion((event.contexts as Plain | undefined)?.runtime)
   kept.contexts = {
     ...(runtime === undefined ? {} : { runtime }),
     ...(own === undefined ? {} : { closeline: own.closeline }),
@@ -463,7 +503,7 @@ export function createSentryReporter(options: SentryReporterOptions): SentryRepo
       try {
         // The tags are the adapter's own and were checked or scrubbed one by one when they were
         // built; they skip `scrubEvent`, which would run its patterns over an id again.
-        const { tags, ...rest } = confine(event, hint)
+        const { tags, ...rest } = confine(event, hint, options)
         const clean = scrubEvent(rest)
         return clean === null ? null : ({ ...clean, tags } as typeof event)
       } catch {

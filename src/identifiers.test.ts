@@ -138,7 +138,50 @@ const idList = (): string => {
     return `${pick(['ids', 'orders', 'rows'])} ${lengths.map((length) => digits(length)).join(' ')}`
   }
 }
+// Counters and padded ids start with `00` (`0042-0017-0231`); a lone leading zero is a trunk zero.
+const zeroPadded = (): string => {
+  const separator = pick([' ', '-', '.'])
+  const groups = Array.from({ length: int(3, 5) }, () => chars('0123456789', int(2, 5)))
+  groups[0] = `00${chars('0123456789', int(0, 3))}`
+  return `${pick(['invoice', 'order', 'seq', 'id='])}${rand() < 0.5 ? ' ' : ''}${groups.join(separator)}`
+}
+// 13 to 19 digits that no card issuer uses: outside 4, 5, 6, 3[4-9], 2221 to 2720, 81 and 86.
+const longIdOutsideIssuers = (): string => {
+  for (;;) {
+    const value = digits(int(13, 19), false)
+    if (!startsInIssuerRange(value) && value[0] !== '1') {
+      return value
+    }
+  }
+}
 const idRange = (): string => `${digits(int(5, 7))}-${digits(int(5, 7))}`
+
+/** Luhn check, as the card rule applies it. */
+function luhn(value: string): boolean {
+  let sum = 0
+  for (let i = 0; i < value.length; i++) {
+    let n = Number(value[value.length - 1 - i])
+    if (i % 2 === 1) {
+      n = n * 2 > 9 ? n * 2 - 9 : n * 2
+    }
+    sum += n
+  }
+  return sum % 10 === 0
+}
+function startsInIssuerRange(value: string): boolean {
+  const first = value[0]
+  if (first === '4' || first === '5' || first === '6') {
+    return true
+  }
+  if (first === '3') {
+    return !['1', '2', '3'].includes(value[1] as string)
+  }
+  if (first === '2') {
+    const prefix = Number(value.slice(0, 4))
+    return prefix >= 2221 && prefix <= 2720
+  }
+  return value.startsWith('81') || value.startsWith('86')
+}
 
 const WRAPPERS: ReadonlyArray<(value: string) => string> = [
   (value) => value,
@@ -177,6 +220,8 @@ const CATEGORIES: Category[] = [
   { name: 'IPv6 addresses', count: 5_000, make: ipv6 },
   { name: 'lists of numeric ids', count: 5_000, make: idList },
   { name: 'id ranges', count: 5_000, make: idRange },
+  { name: 'zero-padded ids', count: 5_000, make: zeroPadded },
+  { name: '13 to 19 digit ids no issuer uses', count: 5_000, make: longIdOutsideIssuers },
 ]
 
 describe('scrubText never alters an identifier (property tests, fixed seed)', () => {
@@ -201,6 +246,72 @@ describe('scrubText never alters an identifier (property tests, fixed seed)', ()
     const again = random(20260612)
     const first = random(20260612)
     expect([again(), again(), again()]).toEqual([first(), first(), first()])
+  })
+})
+
+describe('scrubText: the ids that can still be altered are the ones the README lists', () => {
+  const wrapped = (value: string): string => `request ${value} failed.`
+
+  test('a bare 13 to 19 digit id starting 2 to 9 in an issuer range is altered only if it passes Luhn', () => {
+    let seen = 0
+    let altered = 0
+    for (let i = 0; i < 5_000; i++) {
+      const value = digits(int(13, 19))
+      if (value[0] === '1' || !startsInIssuerRange(value)) {
+        continue
+      }
+      seen++
+      const changed = scrubText(wrapped(value)) !== wrapped(value)
+      expect(changed).toBe(luhn(value))
+      altered += changed ? 1 : 0
+    }
+    // About one in ten, as the README says; a wide band so the check is not about the seed.
+    expect(altered / seen).toBeGreaterThan(0.03)
+    expect(altered / seen).toBeLessThan(0.2)
+  })
+
+  test('four ids of four digits written like a card are altered only if they pass Luhn', () => {
+    for (let i = 0; i < 3_000; i++) {
+      const groups = Array.from({ length: 4 }, () => digits(4))
+      const value = groups.join(pick([' ', '-']))
+      const changed = scrubText(wrapped(value)) !== wrapped(value)
+      if (changed) {
+        expect(luhn(groups.join(''))).toBe(true)
+      }
+    }
+  })
+
+  test.each([
+    ['groups led by 00', 'invoice 0012-3456-7890'],
+    ['a zero-padded counter', 'order 0042 0017 0231'],
+    ['four zero-padded groups', 'seq 0001 0002 0003 0004'],
+    ['an assignment', 'id=0042-0017-0231'],
+    ['two-digit groups led by 00', 'rows 00 11 22 33 44'],
+  ])('%s is not read as a trunk-zero telephone number', (_name, text) => {
+    expect(scrubText(text)).toBe(text)
+  })
+
+  test('a lone leading zero still reads as a trunk zero, which the README lists', () => {
+    expect(scrubText('invoice 0123-4567-8901')).toBe('invoice [redacted]')
+  })
+})
+
+describe('scrubText: each guard in the number rules decides something (round 3 F5)', () => {
+  test.each([
+    ['digits after a time and a colon', 'at 12:020 7946 0958'],
+    ['digits after a ratio and a colon', 'ratio 1:0171-123-4567'],
+    ['a card-length id written as a fraction', 'x .4111111111111111'],
+    [
+      'a digits-only UUID that starts with a plus sign',
+      'ref +12345678-1234-4234-8234-123456789012',
+    ],
+  ])('%s is left alone', (_name, text) => {
+    expect(scrubText(text)).toBe(text)
+  })
+
+  test('a single digit after a card is not part of it, so the card is still masked', () => {
+    expect(scrubText('card 4111 1111 1111 1111 1')).toBe('card [redacted] 1')
+    expect(scrubText('card 4111 1111 1111 1111 7 ok')).toBe('card [redacted] 7 ok')
   })
 })
 

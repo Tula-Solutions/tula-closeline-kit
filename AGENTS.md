@@ -38,6 +38,8 @@ Other scripts are in `package.json`.
   `bench/reporting.bench.ts`: no-op `capture` mean 0.001 ms, Sentry `capture` mean 0.4 ms, an
   ordinary message mean 0.008 ms, a message with secrets mean 0.015 ms and a 32 KiB input mean
   3 ms and a 32 KiB input made only of `@` (the shape that made email masking quadratic) mean 3 ms,
+  and a 32 KiB input of `tokens=1 ` repeated (a token count scanned to the end of the line at every
+  pair, 82 ms) mean 6 ms,
   each with a median and best-batch p95 budget as above.
 
 ## Issues

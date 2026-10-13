@@ -7,7 +7,7 @@ import { scrubText } from '../src/scrub'
 
 /**
  * Benchmark: reporting an error with no DSN configured, reporting one through the Sentry adapter,
- * and scrubbing free text, in six legs.
+ * and scrubbing free text, in seven legs.
  *
  * Input: 2,000 distinct inputs per leg (300 for the 32 KiB leg), built from a fixed sequence (no
  * randomness), run one after another, each timed on its own.
@@ -32,6 +32,10 @@ import { scrubText } from '../src/scrub'
  * - `scrubText, 32 KiB of @` is an input made only of `@`, the shape that made email masking
  *   quadratic (a backward search from each `@` over the whole text). Expected complexity
  *   O(input length). The mixed-prose leg above cannot catch that, so this one has its own budget.
+ *
+ * - `scrubText, 32 KiB of tokens=1` is `tokens=1 ` repeated, the shape that made every pair scan to
+ *   the end of the line (quadratic, 82 ms at 32 KiB). Expected complexity O(input length): about 2.4
+ *   ms measured (3,600 pairs, each a key match), so the budgets are 2.5x, 2x and 3x.
  *
  * Budgets, per call, and why each number (measured over many runs on one developer machine):
  * - mean: the regression gate across all 2,000 calls. Measured 0.0001 ms for the no-op capture,
@@ -67,6 +71,7 @@ const SCRUB_SECRETS_BUDGET: Budget = { meanMs: 0.015, medianMs: 0.012, tailMs: 0
 const SENTRY_CAPTURE_BUDGET: Budget = { meanMs: 0.4, medianMs: 0.35, tailMs: 0.6 }
 const SCRUB_32K_BUDGET: Budget = { meanMs: 3, medianMs: 2.5, tailMs: 4 }
 const SCRUB_AT_BUDGET: Budget = { meanMs: 3, medianMs: 2.5, tailMs: 4 }
+const SCRUB_TOKENS_BUDGET: Budget = { meanMs: 6, medianMs: 5, tailMs: 8 }
 
 const reporter = createErrorReporter({
   service: 'bench',
@@ -169,6 +174,16 @@ for (let i = 0; i < CALLS_32K + WARMUP_32K; i++) {
   atMessages.push(prefix + '@'.repeat(32_768 - prefix.length))
 }
 
+// A token count under a token-count key, repeated: the shape that scanned to the end of the line
+// at every pair (82 ms at 32 KiB) before the count was tested first.
+const tokenMessages: string[] = []
+for (let i = 0; i < CALLS_32K + WARMUP_32K; i++) {
+  const prefix = `run ${i}: `
+  tokenMessages.push(
+    prefix + 'tokens=1 '.repeat(Math.ceil(32_768 / 9)).slice(0, 32_768 - prefix.length)
+  )
+}
+
 interface Leg<T> {
   name: string
   budget: Budget
@@ -224,6 +239,15 @@ const legs: Array<Leg<CaptureInput> | Leg<string>> = [
     name: 'scrubText, 32 KiB of @',
     budget: SCRUB_AT_BUDGET,
     inputs: atMessages,
+    warmup: WARMUP_32K,
+    run: (message: string) => {
+      scrubText(message)
+    },
+  } satisfies Leg<string>,
+  {
+    name: 'scrubText, 32 KiB of tokens=1',
+    budget: SCRUB_TOKENS_BUDGET,
+    inputs: tokenMessages,
     warmup: WARMUP_32K,
     run: (message: string) => {
       scrubText(message)

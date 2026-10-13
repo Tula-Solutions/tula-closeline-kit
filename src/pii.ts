@@ -315,7 +315,8 @@ function isCard(text: string, run: Run): boolean {
 
 /**
  * True when a number written with separators opens the way telephone numbers do: a `+`, a
- * parenthesised area code `(415)`, or the national trunk zero (`020 7946 0958`, `06 12 34 56 78`).
+ * parenthesised area code `(415)`, or the national trunk zero (`020 7946 0958`, `06 12 34 56 78`;
+ * a leading `00` is not one).
  * Without one of those it cannot be told from an id, a range or a count, and is left alone.
  */
 function hasPhoneLead(text: string, run: Run): boolean {
@@ -327,8 +328,10 @@ function hasPhoneLead(text: string, run: Run): boolean {
   }
   const first = run.groups[0] as number
   // Written with one kind of separator throughout, so `05.109-0800` (seconds, then an offset) is not one.
+  // `00` is not a trunk zero: padded counters and ids (`0042-0017-0231`) open that way.
   return (
     text.charCodeAt(run.start) === 48 &&
+    text.charCodeAt(run.start + 1) !== 48 &&
     first >= 2 &&
     first <= 5 &&
     run.seps.every((sep) => sep === run.seps[0])
