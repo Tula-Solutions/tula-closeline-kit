@@ -1,0 +1,17 @@
+# ElasticMQ, an SQS-compatible stand-in, for `bun run test:integration` (the SQS adapter's run of the
+# shared behaviour suite). Same image and digest as the hub's compose.dev.yaml. CI starts this file
+# before the integration step; locally: `docker compose up -d --wait`, then `bun run test:integration`.
+services:
+  queue:
+    image: softwaremill/elasticmq-native:1.7.1@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c
+    ports: ['127.0.0.1:9324:9324']
+    volumes:
+      - ./scripts/elasticmq.conf:/opt/elasticmq.conf:ro
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null "http://127.0.0.1:9324/?Action=ListQueues" || exit 1']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s

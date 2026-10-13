@@ -1,64 +1,6 @@
-// src/clock.ts
-var UNIT_MS = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 };
-var DURATION_PATTERN = /^(\d+)(ms|s|m|h|d)$/;
-function isUnit(unit) {
-  return unit !== undefined && unit in UNIT_MS;
-}
-var systemClock2 = {
-  now: () => new Date
-};
-function createFixedClock2(start) {
-  let current = new Date(start).getTime();
-  if (Number.isNaN(current)) {
-    throw new TypeError(`createFixedClock needs a valid start time, got ${String(start)}`);
-  }
-  return {
-    now: () => new Date(current),
-    advance(duration) {
-      const match = DURATION_PATTERN.exec(duration);
-      const amount = match?.[1];
-      const unit = match?.[2];
-      if (amount === undefined || !isUnit(unit)) {
-        throw new TypeError(`Invalid duration ${JSON.stringify(duration)}: use a whole number and ms, s, m, h or d`);
-      }
-      current += Number(amount) * UNIT_MS[unit];
-    }
-  };
-}
-
-// src/errors.ts
-var CODE_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
-
-class AppError2 extends Error {
-  code;
-  status;
-  details;
-  constructor(init) {
-    super(init.message, init.cause === undefined ? undefined : { cause: init.cause });
-    if (!CODE_PATTERN.test(init.code)) {
-      throw new TypeError(`AppError code must look like "area.reason", got ${JSON.stringify(init.code)}`);
-    }
-    if (!Number.isInteger(init.status) || init.status < 100 || init.status > 599) {
-      throw new TypeError(`AppError status must be an HTTP status, got ${init.status}`);
-    }
-    this.name = "AppError";
-    this.code = init.code;
-    this.status = init.status;
-    if (init.details !== undefined) {
-      this.details = init.details;
-    }
-  }
-}
-function isAppError2(value) {
-  return value instanceof AppError2;
-}
-function toErrorBody2(error) {
-  const body = { error: { code: error.code, message: error.message } };
-  if (error.details !== undefined) {
-    body.error.details = error.details;
-  }
-  return body;
-}
+import {
+  isAppError2
+} from "./chunk-pzmynk9n.js";
 
 // src/pii.ts
 var MAX_LOCAL_PART = 64;
@@ -989,4 +931,4 @@ function shouldReportError2(error) {
   }
 }
 
-export { systemClock2, createFixedClock2, AppError2, isAppError2, toErrorBody2, isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2 };
+export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2 };

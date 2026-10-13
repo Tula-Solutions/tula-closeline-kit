@@ -69,11 +69,14 @@ const { status, json } = await core.request({
 })
 ```
 
-- `request` resolves with `{ status, json, attempts }` for every answer that is not a redirect,
+- `request` resolves with `{ status, json, attempts, retryAfterMs? }` for every answer that is not a redirect,
   4xx and 5xx included: the adapter maps statuses and validates `json` with the contract's schema.
   `json` is parsed whatever the content type says. It is `undefined` for an empty body (204,
   `HEAD`) and for a non-2xx answer that is not JSON. A 2xx answer with a non-empty body that is not
-  JSON (an HTML error or login page) is a failure, not an answer. `request` rejects with
+  JSON (an HTML error or login page) is a failure, not an answer. `retryAfterMs` is present when
+  the answer had a `Retry-After` of whole seconds (1 to 9 digits; the date form is ignored), in
+  milliseconds and uncapped, so a caller that cannot retry itself (a sign-up that must tell the
+  user to wait) applies its own cap; no other header is exposed. `request` rejects with
   `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`, `redirect`,
   `response_too_large`, `response_invalid`), which carries `method`, `path` (no query), `status`
   and `attempts`, and never the secret, a body or the underlying error. `response_invalid`,
@@ -348,3 +351,242 @@ app.onError((error, c) => {
 ```
 
 On `SIGTERM`, `await container.shutdown()` before exiting.
+
+## Queues and events (`Queue`, `createConsumer`)
+
+Services publish events and queue work through the kit's `Queue` port. There are two adapters, the
+SQS one (`createSqsQueue`) and a memory one for tests (`createMemoryQueue`, from
+`tula-closeline-kit/testing`). One behaviour suite (`src/queue/behaviour.ts`) runs against both.
+
+Where things are imported from: the envelope, the port types, errors and `ProcessedStore` come from
+`tula-closeline-kit`. The SQS adapter and `createConsumer` come from `tula-closeline-kit/queue`, so
+a service that only needs the types does not load the AWS SDK. The memory adapters and test helpers
+come from `tula-closeline-kit/testing`. The behaviour suites (`queueBehaviour`,
+`processedStoreBehaviour`) come from `tula-closeline-kit/testing/behaviour`, which imports
+`bun:test`; keep it out of production code. FIFO queues and message ordering are out of scope:
+everything here assumes a standard queue.
+
+**What at-least-once means for a handler.** The queue hands a message out at least once, in no
+guaranteed order. It can hand the same message out twice (a slow consumer, a crash, a duplicate in
+SQS itself), and a publisher that retries after a timeout can put two copies in. Every handler is
+therefore written so that a second run changes nothing, and `createConsumer` helps by recording
+which message ids are done. Do not rely on order: carry what the handler needs in the payload, or
+read current state.
+
+### Defining messages
+
+```ts
+import { z } from 'zod'
+import { createMessageRegistry, defineMessage } from 'tula-closeline-kit'
+
+const organizationCreated = defineMessage({
+  type: 'core.organization_created', // area.event_name
+  version: 1, // raise it on an incompatible payload change
+  scope: 'organization', // carries organizationId; 'global' messages must not
+  payload: z.object({ name: z.string() }),
+})
+export const registry = createMessageRegistry([organizationCreated])
+
+const envelope = registry.create({
+  type: 'core.organization_created',
+  organizationId,
+  traceId: requestId,
+  payload: { name },
+})
+```
+
+The envelope is `{ id, type, version, occurredAt, organizationId?, traceId, payload }`. `id` is a
+UUID unless you pass one: when you retry a publish, pass the same envelope, so the consumer can
+recognise the copy. `encode` and `decode` validate with Zod on the way in and out. A body that is
+not JSON, has an unknown type or another version, lacks (or wrongly has) an Organization id, or
+fails its payload schema is never dropped and never throws in the consumer: `receive` returns it as
+`{ kind: 'invalid', reason, issues }` (field names the schema declares and codes, never values; a record key or any path under a union is shown as `*`). Paths under a union or intersection are masked entirely, so a payload shaped as a discriminated union reports no field names; prefer an object with optional fields where diagnostics matter, the consumer logs and
+reports it and hides it for `invalidDelaySeconds`, and the queue's redrive policy sends it to the
+dead-letter queue after `maxReceiveCount` deliveries.
+
+**Versions and deploy order.** A definition accepts its own `version` and the `previous` versions it
+lists, each with its old payload schema and an `upcast` to the current shape (the handler only
+ever sees the current shape and version). Raise a version in three steps: deploy consumers that
+list the new version as current and the old one as `previous`; then deploy publishers that send the
+new one; later drop `previous`. A message of a version nobody lists is not acknowledged: the
+consumer hides it for `invalidDelaySeconds`, doubling with each delivery up to
+`unsupportedVersionMaxSeconds`, and the queue sends it to the dead-letter queue after
+`maxReceiveCount`. If publishers got ahead of consumers, redrive the dead-letter queue to the
+source queue once the consumers are deployed; the consumer dedupes on the envelope id, so a
+redrive is safe.
+
+**Trust.** The envelope is trusted exactly as far as permission to send to the queue is. It
+carries no signature, so anything that can send to the queue can claim any Organization id. The
+registry checks the shape of the id (the contract's `org_` plus 32 lower-case hex digits; pass
+`organizationIdSchema` to change it) but not that the sender may speak for that Organization.
+Give each queue the narrowest send permission, and keep tokens out of payloads.
+
+### The port
+
+```ts
+publish(envelope): Promise<void> // throws queue.invalid_message | message_too_large | unavailable
+publishBatch(envelopes): Promise<{ sent: string[]; failed: BatchFailure[] }> // 1 to 10, 256 KiB total
+receive({ maxMessages /*1-10*/, visibilityTimeoutSeconds, waitSeconds /*0-20*/, signal? }): Promise<Delivery[]>
+acknowledge(receipt): Promise<void> // safe to repeat
+extendVisibility(receipt, seconds): Promise<void> // queue.receipt_invalid if no longer in flight
+release(receipt): Promise<void> // visible again at once
+```
+
+Publish is O(message size) and receive is O(batch size) (the memory adapter's receive scans what it
+holds). Limits are checked before anything is sent; a partial batch failure comes back per
+envelope in `failed`, so retry only those.
+
+### Wiring it in a service
+
+In `src/env.ts` add `QUEUE_URL`, `AWS_REGION` and, for `local` only, `QUEUE_ENDPOINT`. In
+`src/container.ts`:
+
+```ts
+import { createConsumer, createSqsQueue } from 'tula-closeline-kit/queue'
+
+const queue = createSqsQueue({
+  queueUrl: env.QUEUE_URL,
+  region: env.AWS_REGION,
+  environment: env.ENVIRONMENT,
+  endpoint: env.QUEUE_ENDPOINT, // ElasticMQ, http://127.0.0.1:9324; throws unless ENVIRONMENT=local
+  registry,
+})
+```
+
+Credentials come only from the AWS SDK's default chain (the task role in AWS). Locally ElasticMQ
+ignores them, but the chain needs some, so export any `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. Every call has a connect and request timeout (`timeoutMs`, default 5 s; a
+long poll adds its wait) and the SDK's own retry (`maxAttempts`, default 3, `standard` mode with
+jittered exponential back-off); there is no second retry layer, so worst case for one call is
+`maxAttempts` times (timeout plus back-off). Message bodies are never logged. **Proxies:** the
+adapter ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms; queue traffic
+never goes through a proxy named in the environment (ADR 0013), and `aws-proxy.test.ts` proves it.
+There is no option for a deliberate proxy yet. The dead-letter queue and its `maxReceiveCount`
+(5 in the dev stack) are infrastructure; the adapter neither creates nor reads them.
+
+Consume with the idempotent helper:
+
+```ts
+const consumer = createConsumer({
+  name: 'playbook.ingestion', // part of the idempotency key
+  queue,
+  store: createPostgresProcessedStore(db), // see below; createMemoryProcessedStore in tests
+  logger,
+  errorReporter,
+  handlers: {
+    'core.organization_created': async (message, { organizationId, signal }) => {
+      // Scope every read and write to organizationId. Stop between steps if signal.aborted.
+    },
+  },
+  concurrency: 4,
+})
+consumer.start()
+// on SIGTERM:
+await consumer.stop(20_000)
+```
+
+What `createConsumer` guarantees:
+
+- A message completed before is acknowledged without running again (`store.claim` says `done`).
+- Two consumers that get the same message do not both run it: the second sees a live claim, hides
+  the message until the holder's lease would lapse (its lease length: 60 s by default) and
+  acknowledges it on the next delivery if the holder finished.
+- A handler that throws releases its claim and the message returns after a jittered exponential
+  delay (`retryBaseSeconds` doubling to `retryMaxSeconds`); after the queue's `maxReceiveCount`
+  deliveries it is in the dead-letter queue. Failures go to the logger (type, ids, error name; never
+  the payload) and to `errorReporter`.
+- A handler that runs longer than the visibility timeout has it extended every third of the
+  timeout. The claim's lease is the longer of two visibility windows and the store timeout plus
+  two heartbeat ticks plus a 5 s margin (so a renewal that takes the whole store timeout, or one
+  missed tick, cannot lapse a healthy claim even with a 2 s visibility timeout), and is renewed
+  (`store.renew`, beside the ticks so a slow store never delays a visibility extension) on the
+  heartbeat, so a live holder keeps it however long its handler runs, and a holder that dies loses
+  it within about a minute. A consumer that meets a busy claim hides the message for the seconds
+  left on the lease, so a dead holder does not burn the message's receive count towards the
+  dead-letter queue. If a renewal says the claim was lost, the handler's `signal` aborts and the
+  message is not acknowledged.
+- Past `handlerTimeoutMs` (default 5 minutes, measured by its own timer) the `signal` aborts, the
+  message is not acknowledged and the claim lapses, so a retry can run. A handler that ignores
+  its signal can overlap that retry. Every call to the store has `storeTimeoutMs` (10 s by
+  default); a store call that hangs fails, and the message returns to the queue.
+- At most `concurrency` handlers run at once; receive asks only for free slots.
+- `stop(deadlineMs)` stops receiving, lets work in flight finish for up to the deadline, then aborts
+  signals and gives the rest back to the queue (claims released, visibility 0). It reports
+  `{ finished, abandoned }`; calling it again returns the same result.
+- Tenant scoping: the handler is given the envelope's own Organization id, frozen, and the
+  Organization id is part of the idempotency key, so another Organization's message with the same
+  id is a different message and is never skipped or completed on the first one's account. An
+  `organization` message without an id never reaches a handler.
+
+What it cannot guarantee: a crash between the handler's effect and `store.complete` runs the effect
+again after the lease. The consumer calls `complete` after the handler returns, in a separate
+call, so the handler's own transaction and the store's record are never one commit. At-least-once
+therefore applies to the effect: make the write idempotent itself (a unique key on the message id
+or an upsert), or have the handler write `consumed_message` in its own transaction as well.
+
+### The store table a service adds
+
+`ProcessedStore` (`claim`, `renew`, `complete`, `release`, `purge`) must not live in process memory in
+production. Each service that consumes adds this table to its own schema through a migration in
+`tula-closeline-db` (the kit does not write migrations), with the usual `organization_id` and
+fail-closed row-level security, and implements the port over it:
+
+```sql
+create table consumed_message (
+  consumer text not null,
+  organization_id uuid not null,   -- the wire id converted to a uuid; all zeros for a global message
+  message_id text not null,
+  state text not null check (state in ('claimed', 'done')),
+  claim_token uuid not null,
+  lease_expires_at timestamptz,    -- while claimed
+  completed_at timestamptz,        -- when done
+  primary key (consumer, organization_id, message_id)
+);
+create index on consumed_message (completed_at) where state = 'done';
+```
+
+- `claim`: one statement, `insert ... on conflict (consumer, organization_id, message_id) do update
+  set state = 'claimed', claim_token = $new, lease_expires_at = now() + $lease where state =
+  'claimed' and lease_expires_at <= now() returning ...`. A returned row is `claimed`; no row means
+  look the row up: `done` or `busy`.
+- Wire ids are `org_` plus 32 hex digits; the store converts them to the uuid form (insert dashes
+  after 8, 12, 16 and 20 digits) before writing and never stores the prefix. A global message has no
+  Organization, so its rows hold the all-zero uuid; the consumer of global messages therefore runs
+  under the all-zero scope, and that scope is not any real Organization's.
+- When `claim` finds a live claim it also returns `retryAfterSeconds`, `ceil(lease_expires_at -
+  now())` and at least 1.
+- `renew`: `update ... set lease_expires_at = now() + $lease where ... and claim_token = $token and
+  state = 'claimed' and lease_expires_at > now()`; true if a row changed.
+- `complete`: `update ... set state = 'done', completed_at = now() where ... and claim_token = $token
+  and state = 'claimed'`; true if a row changed.
+- `release`: `delete ... where ... and claim_token = $token and state = 'claimed'`.
+- `purge(before, limit)`: delete up to `limit` rows that are `done` with `completed_at < before` or
+  `claimed` with a lapsed lease. Run it from a periodic job with `before` older than the queue's
+  retention (14 days at most; 15 is safe), or a very late redelivery would run twice. With
+  fail-closed row-level security a plain `purge` sees no rows. Run it either as a maintenance role
+  that is exempt from the policy (the simplest; it deletes only by age, never reads a row's
+  content), or loop over Organizations and purge under each one's tenant-scoped helper (and once
+  under the all-zero scope), splitting `limit` between them.
+
+Run both behaviour suites against your own store and adapter: `processedStoreBehaviour(name, make)`
+and `queueBehaviour(name, make)` from `tula-closeline-kit/testing/behaviour`. `make` returns the
+store (or queue) plus a `pass(seconds)` that advances time (a fake database clock, or a real wait)
+and a `close()`.
+
+### Running the SQS suite against ElasticMQ
+
+`src/queue/aws.integration.ts` runs the shared suite against the SQS adapter on ElasticMQ, the
+same image as the hub's dev stack. It is an integration test, so `bun test src` does not run it.
+`compose.yaml` starts ElasticMQ; CI (the hub's `verify.yml`) runs `docker compose up -d --wait` and
+then `bun run test:integration`:
+
+```sh
+docker compose up -d --wait
+bun run test:integration
+```
+
+Without `QUEUE_TEST_ENDPOINT` the suite is skipped with a notice on a developer machine and fails
+when `CI` is set. The test refuses any endpoint that is not local, so it can never reach AWS. Its
+queues, each with a dead-letter queue, are created and deleted per test. As of 0.6.0 this suite has
+not been run against a live ElasticMQ by its author (no Docker on the machine it was written on):
+CI is its first execution, so expect a small fix or two on the first run.

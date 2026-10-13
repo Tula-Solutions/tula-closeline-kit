@@ -424,6 +424,56 @@ describe('retry', () => {
     expect(await run('-5')).toEqual([50])
   })
 
+  describe('the answer carries Retry-After for the caller to apply its own cap', () => {
+    const call = async (headers: Record<string, string>, status = 503) => {
+      const { client } = clientFor(
+        stand(() => new Response('x', { status, headers })),
+        {
+          retry: { maxAttempts: 1 },
+        }
+      )
+      return client.request({ method: 'GET', path: '/x' })
+    }
+
+    test('a 503 with seconds resolves with retryAfterMs, uncapped by the retry cap', async () => {
+      expect(await call({ 'retry-after': '2' })).toMatchObject({ status: 503, retryAfterMs: 2_000 })
+      expect(await call({ 'retry-after': '3600' })).toMatchObject({ retryAfterMs: 3_600_000 })
+      expect(await call({ 'retry-after': '0' })).toMatchObject({ retryAfterMs: 0 })
+    })
+
+    test('a 200 without the header has no field at all', async () => {
+      const { client } = clientFor(stand())
+      const answer = await client.request({ method: 'GET', path: '/x' })
+      expect('retryAfterMs' in answer).toBe(false)
+    })
+
+    test.each(['Wed, 21 Oct 2099 07:28:00 GMT', 'soon', '-5', '1.5', '1234567890', ''])(
+      'the value %j gives no field',
+      async (value) => {
+        const answer = await call({ 'retry-after': value })
+        expect('retryAfterMs' in answer).toBe(false)
+      }
+    )
+
+    test('no other header is exposed', async () => {
+      const answer = await call({ 'retry-after': '1', 'x-secret-header': 'v', 'set-cookie': 'a=b' })
+      expect(Object.keys(answer).sort()).toEqual(['attempts', 'json', 'retryAfterMs', 'status'])
+    })
+
+    test('after the retries are used up, the last answer still carries it', async () => {
+      const { client } = clientFor(
+        stand(() => new Response('x', { status: 503, headers: { 'retry-after': '7' } })),
+        {
+          retry: { maxAttempts: 2 },
+        }
+      )
+      expect(await client.request({ method: 'GET', path: '/x' })).toMatchObject({
+        attempts: 2,
+        retryAfterMs: 7_000,
+      })
+    })
+  })
+
   test('a retry is noted without the secret, a body or an answer', async () => {
     const receiver = stand((_r, count) =>
       count === 1 ? new Response(ANSWER_MARKER, { status: 503 }) : Response.json({})

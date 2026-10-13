@@ -42,6 +42,17 @@ Other scripts are in `package.json`.
   pair, 82 ms) mean 6 ms,
   each with a median and best-batch p95 budget as above.
 
+- The queue: `registry.encode` and `registry.decode` (`src/queue/envelope.ts`) run on every
+  publish and every delivery (queue consumers are a hot path, ADR 0009). They are O(message size),
+  at most 256 KiB because a longer body is refused before parsing. The memory adapter's publish and
+  acknowledge are O(1) and its receive is O(messages stored), a scan that is fine for tests only;
+  the SQS adapter is one HTTP call per operation. The consumer adds one claim, one renew per third
+  of the visibility timeout while a handler runs, one complete, all O(1) against the store.
+  Budgets in `bench/queue.bench.ts`, about five times the measured means: encode plus decode of an
+  ordinary message mean 0.015 ms, decode of a 200 KiB message mean 0.15 ms, a memory publish,
+  receive and acknowledge mean 0.02 ms and a whole consumer cycle on the memory adapters mean
+  0.07 ms, each with a median and best-batch p95 budget as above.
+
 ## Issues
 
 All tickets live in the hub: `gh issue list -R Tula-Solutions/tula-closeline --label repo:kit`.

@@ -1,16 +1,33 @@
 import {
-  systemClock2,
-  createFixedClock2,
-  AppError2,
-  isAppError2,
-  toErrorBody2,
   isSensitiveKey,
   cutText2,
   scrubText2,
   redactFields,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-r1sa3cwf.js";
+} from "./shared/chunk-x863z57h.js";
+import {
+  systemClock2,
+  createFixedClock2,
+  AppError2,
+  isAppError2,
+  toErrorBody2,
+  QUEUE_ERROR_CODES2,
+  QueueError2,
+  MAX_MESSAGE_BYTES2,
+  defineMessage2,
+  INVALID_REASONS2,
+  createMessageRegistry2
+} from "./shared/chunk-pzmynk9n.js";
+import {
+  MAX_BATCH_SIZE2,
+  MAX_WAIT_SECONDS2,
+  MAX_VISIBILITY_SECONDS2,
+  assertReceiveOptions2,
+  assertVisibility2,
+  assertBatchCount2,
+  systemSleep2
+} from "./shared/chunk-pkdp60t0.js";
 
 // src/auth/claims.ts
 import {
@@ -708,7 +725,12 @@ function createInternalClient(options) {
         let reason;
         try {
           const wire = await attempt(call.method, target, headers, payload, signal);
-          const settled = () => ({ status: wire.status, json: answerJson(wire), attempts });
+          const settled = () => ({
+            status: wire.status,
+            json: answerJson(wire),
+            attempts,
+            ...wire.retryAfter === undefined ? {} : { retryAfterMs: wire.retryAfter }
+          });
           if (!INTERNAL_RETRY_STATUSES.includes(wire.status)) {
             return settled();
           }
@@ -824,6 +846,72 @@ function createLogger(options) {
     serializers: { err: (value) => value }
   };
   return wrap(options.destination ? pino(config, options.destination) : pino(config));
+}
+// src/queue/store.ts
+function keyOf(key) {
+  return JSON.stringify([key.consumer, key.organizationId, key.messageId]);
+}
+function createMemoryProcessedStore(options) {
+  const records = new Map;
+  const newToken = options.newToken ?? (() => crypto.randomUUID());
+  const now = () => options.clock.now().getTime();
+  return {
+    async claim(key, leaseSeconds) {
+      const id = keyOf(key);
+      const existing = records.get(id);
+      if (existing?.state === "done") {
+        return { status: "done" };
+      }
+      if (existing !== undefined && existing.at > now()) {
+        return {
+          status: "busy",
+          retryAfterSeconds: Math.max(1, Math.ceil((existing.at - now()) / 1000))
+        };
+      }
+      const token = newToken();
+      records.set(id, { state: "claimed", token, at: now() + leaseSeconds * 1000 });
+      return { status: "claimed", token };
+    },
+    async renew(key, token, leaseSeconds) {
+      const id = keyOf(key);
+      const existing = records.get(id);
+      if (existing?.state !== "claimed" || existing.token !== token || existing.at <= now()) {
+        return false;
+      }
+      existing.at = now() + leaseSeconds * 1000;
+      return true;
+    },
+    async complete(key, token) {
+      const id = keyOf(key);
+      const existing = records.get(id);
+      if (existing?.state !== "claimed" || existing.token !== token) {
+        return false;
+      }
+      records.set(id, { state: "done", token, at: now() });
+      return true;
+    },
+    async release(key, token) {
+      const id = keyOf(key);
+      const existing = records.get(id);
+      if (existing?.state === "claimed" && existing.token === token) {
+        records.delete(id);
+      }
+    },
+    async purge(before, limit) {
+      let removed = 0;
+      for (const [id, record] of records) {
+        if (removed >= limit) {
+          break;
+        }
+        const stale = record.state === "done" ? record.at < before.getTime() : record.at <= now();
+        if (stale) {
+          records.delete(id);
+          removed += 1;
+        }
+      }
+      return removed;
+    }
+  };
 }
 // src/reporting/env.ts
 import { z as z3 } from "zod";
@@ -1391,23 +1479,36 @@ export {
   INTERNAL_MAX_ATTEMPTS,
   INTERNAL_MAX_REQUEST_BYTES,
   INTERNAL_RETRY_STATUSES,
+  INVALID_REASONS2 as INVALID_REASONS,
   InternalCallError,
+  MAX_BATCH_SIZE2 as MAX_BATCH_SIZE,
   MAX_JWKS_BYTES,
   MAX_JWKS_KEYS,
+  MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
   MAX_TOKEN_LENGTH,
+  MAX_VISIBILITY_SECONDS2 as MAX_VISIBILITY_SECONDS,
+  MAX_WAIT_SECONDS2 as MAX_WAIT_SECONDS,
   PACKAGE,
+  QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
+  QueueError2 as QueueError,
   TokenVerificationError,
   accessTokenClaimsSchema,
+  assertBatchCount2 as assertBatchCount,
+  assertReceiveOptions2 as assertReceiveOptions,
+  assertVisibility2 as assertVisibility,
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
   createInternalClient,
   createLogger,
+  createMemoryProcessedStore,
+  createMessageRegistry2 as createMessageRegistry,
   createNoopErrorReporter,
   createRemoteKeySet,
   createStaticKeySet,
   createTokenVerifier,
   cutText2 as cutText,
+  defineMessage2 as defineMessage,
   environmentSchema,
   isAppError2 as isAppError,
   isSentryDsn,
@@ -1416,5 +1517,6 @@ export {
   sentryDsnSchema,
   shouldReportError2 as shouldReportError,
   systemClock2 as systemClock,
+  systemSleep2 as systemSleep,
   toErrorBody2 as toErrorBody
 };
