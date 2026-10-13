@@ -35,6 +35,7 @@ var MAX_DEPTH = 32;
 var MAX_ARRAY_ITEMS = 100;
 var MAX_OBJECT_KEYS = 200;
 var MAX_NODES = 5000;
+var MAX_VALUES = 20000;
 var SENSITIVE_WORDS = new Set([
   "password",
   "token",
@@ -60,10 +61,23 @@ var SENSITIVE_SUFFIXES = [
   "authorizationheader"
 ];
 var RESERVED_KEYS = ["level", "time", "msg", "service"];
+function normalizeKey(key) {
+  return key.toLowerCase().replace(/[_-]/g, "");
+}
 function isSensitiveKey(key) {
-  const normalized = key.toLowerCase().replace(/[_-]/g, "");
+  const normalized = normalizeKey(key);
   const singular = normalized.endsWith("s") ? normalized.slice(0, -1) : normalized;
   return [normalized, singular].some((name) => SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix)));
+}
+function mayBeTokenCount(key) {
+  return normalizeKey(key).endsWith("tokens");
+}
+function spend(state, depth) {
+  if (depth === 0) {
+    return true;
+  }
+  state.values++;
+  return state.values <= MAX_VALUES;
 }
 function attempt(read) {
   try {
@@ -108,6 +122,10 @@ function redactList(items, size, state, ancestors, depth) {
     if (out.length >= MAX_ARRAY_ITEMS) {
       break;
     }
+    if (!spend(state, depth + 1)) {
+      out.push(TRUNCATED);
+      return out;
+    }
     out.push(redactValue(item, state, ancestors, depth + 1));
   }
   if (size > MAX_ARRAY_ITEMS) {
@@ -123,7 +141,12 @@ function redactMap(map, state, ancestors, depth) {
       break;
     }
     const name = typeof key === "string" ? key : `[key ${index}]`;
-    put(out, name, isSensitiveKey(name) ? REDACTED : redactValue(value, state, ancestors, depth + 1));
+    if (!spend(state, depth + 1)) {
+      put(out, "[more]", TRUNCATED);
+      return out;
+    }
+    const hidden = isSensitiveKey(name) && !(mayBeTokenCount(name) && typeof value === "number");
+    put(out, name, hidden ? REDACTED : redactValue(value, state, ancestors, depth + 1));
     index++;
   }
   if (map.size > MAX_OBJECT_KEYS) {
@@ -136,12 +159,22 @@ function redactRecord(record, state, ancestors, depth) {
   const kept = keys.slice(0, MAX_OBJECT_KEYS);
   const out = {};
   const nested = [];
+  let spent = false;
   for (const key of kept) {
-    if (isSensitiveKey(key)) {
+    if (!spend(state, depth)) {
+      spent = true;
+      break;
+    }
+    const sensitive = isSensitiveKey(key);
+    if (sensitive && !mayBeTokenCount(key)) {
       put(out, key, REDACTED);
       continue;
     }
     const value = attempt(() => record[key]);
+    if (sensitive && typeof value !== "number") {
+      put(out, key, REDACTED);
+      continue;
+    }
     if (typeof value === "object" && value !== null) {
       put(out, key, undefined);
       nested.push([key, value]);
@@ -152,7 +185,9 @@ function redactRecord(record, state, ancestors, depth) {
   for (const [key, value] of nested) {
     put(out, key, redactValue(value, state, ancestors, depth + 1));
   }
-  if (keys.length > MAX_OBJECT_KEYS) {
+  if (spent) {
+    put(out, "[more]", TRUNCATED);
+  } else if (keys.length > MAX_OBJECT_KEYS) {
     put(out, "[more]", `[+${keys.length - MAX_OBJECT_KEYS} more]`);
   }
   return out;
@@ -204,7 +239,7 @@ function redactValue(value, state, ancestors, depth) {
 }
 function redactFields(fields) {
   try {
-    return redactRecord(fields, { nodes: 0 }, new Set([fields]), 0);
+    return redactRecord(fields, { nodes: 0, values: 0 }, new Set([fields]), 0);
   } catch {
     return { fields: UNSERIALIZABLE };
   }

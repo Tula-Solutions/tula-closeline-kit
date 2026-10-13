@@ -1,7 +1,7 @@
 import {
   createFixedClock2,
   prepareFields
-} from "./shared/chunk-ewee5rnh.js";
+} from "./shared/chunk-708x5jg5.js";
 
 // src/testing.ts
 function build(entries, bound) {

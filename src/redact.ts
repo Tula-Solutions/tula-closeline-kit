@@ -9,6 +9,9 @@ const MAX_OBJECT_KEYS = 200
 // Objects (including arrays, Maps, Sets and Errors) visited by one call, so shared references
 // cannot multiply the work. Primitives are free: the caps above already bound them per object.
 const MAX_NODES = 5_000
+// Values written below the top level by one call, so many small objects cannot add up to a huge
+// entry. Top-level fields are exempt: they are what identifies the entry.
+const MAX_VALUES = 20_000
 
 // Compared after lowercasing and dropping `_` and `-`, so `apiKey`, `API_KEY` and `api-key` match.
 // A key is sensitive when it, or it without one trailing `s`, is a listed word or ends with a
@@ -45,15 +48,38 @@ const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
 
 interface State {
   nodes: number
+  values: number
+}
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[_-]/g, '')
 }
 
 function isSensitiveKey(key: string): boolean {
-  const normalized = key.toLowerCase().replace(/[_-]/g, '')
+  const normalized = normalizeKey(key)
   const singular = normalized.endsWith('s') ? normalized.slice(0, -1) : normalized
   return [normalized, singular].some(
     (name) =>
       SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix))
   )
+}
+
+/**
+ * True for a key that may hold a count of language-model tokens (`inputTokens`, `total_tokens`).
+ * Such a key is sensitive by its name, but a number under it is a usage figure that metering
+ * needs in the logs, not a credential; anything else under it is still redacted.
+ */
+function mayBeTokenCount(key: string): boolean {
+  return normalizeKey(key).endsWith('tokens')
+}
+
+/** Counts one value written below the top level; false once the value budget is spent. */
+function spend(state: State, depth: number): boolean {
+  if (depth === 0) {
+    return true
+  }
+  state.values++
+  return state.values <= MAX_VALUES
 }
 
 /** Runs a read that may throw (a getter, a Proxy trap) and returns a marker if it does. */
@@ -133,6 +159,10 @@ function redactList(
     if (out.length >= MAX_ARRAY_ITEMS) {
       break
     }
+    if (!spend(state, depth + 1)) {
+      out.push(TRUNCATED)
+      return out
+    }
     out.push(redactValue(item, state, ancestors, depth + 1))
   }
   if (size > MAX_ARRAY_ITEMS) {
@@ -154,11 +184,12 @@ function redactMap(
       break
     }
     const name = typeof key === 'string' ? key : `[key ${index}]`
-    put(
-      out,
-      name,
-      isSensitiveKey(name) ? REDACTED : redactValue(value, state, ancestors, depth + 1)
-    )
+    if (!spend(state, depth + 1)) {
+      put(out, '[more]', TRUNCATED)
+      return out
+    }
+    const hidden = isSensitiveKey(name) && !(mayBeTokenCount(name) && typeof value === 'number')
+    put(out, name, hidden ? REDACTED : redactValue(value, state, ancestors, depth + 1))
     index++
   }
   if (map.size > MAX_OBJECT_KEYS) {
@@ -177,14 +208,26 @@ function redactRecord(
   const kept = keys.slice(0, MAX_OBJECT_KEYS)
   const out: Record<string, unknown> = {}
   const nested: Array<[string, object]> = []
+  let spent = false
   // Pass one writes every primitive (they cost no budget) and keeps each key's position; pass two
   // walks the objects, so a spent budget never costs the fields needed to trace a log line.
   for (const key of kept) {
-    if (isSensitiveKey(key)) {
+    // The top level is `depth` 0 and always written; anything deeper spends the value budget.
+    if (!spend(state, depth)) {
+      spent = true
+      break
+    }
+    const sensitive = isSensitiveKey(key)
+    // A sensitive key's value is read only when it could be a token count, never otherwise.
+    if (sensitive && !mayBeTokenCount(key)) {
       put(out, key, REDACTED)
       continue
     }
     const value = attempt(() => (record as Record<string, unknown>)[key])
+    if (sensitive && typeof value !== 'number') {
+      put(out, key, REDACTED)
+      continue
+    }
     if (typeof value === 'object' && value !== null) {
       put(out, key, undefined)
       nested.push([key, value])
@@ -195,7 +238,9 @@ function redactRecord(
   for (const [key, value] of nested) {
     put(out, key, redactValue(value, state, ancestors, depth + 1))
   }
-  if (keys.length > MAX_OBJECT_KEYS) {
+  if (spent) {
+    put(out, '[more]', TRUNCATED)
+  } else if (keys.length > MAX_OBJECT_KEYS) {
     put(out, '[more]', `[+${keys.length - MAX_OBJECT_KEYS} more]`)
   }
   return out
@@ -251,7 +296,7 @@ function redactValue(value: unknown, state: State, ancestors: Set<object>, depth
 /** Copies log fields with every sensitive key replaced by `[redacted]` at any depth; never throws. */
 export function redactFields(fields: Record<string, unknown>): Record<string, unknown> {
   try {
-    return redactRecord(fields, { nodes: 0 }, new Set<object>([fields]), 0)
+    return redactRecord(fields, { nodes: 0, values: 0 }, new Set<object>([fields]), 0)
   } catch {
     return { fields: UNSERIALIZABLE }
   }
