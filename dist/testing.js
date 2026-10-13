@@ -43,6 +43,7 @@ async function mintTestToken(options) {
   const header = {
     alg: "EdDSA",
     kid: options.keyPair.kid,
+    typ: "at+jwt",
     ...options.header
   };
   const jwt = new SignJWT(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));

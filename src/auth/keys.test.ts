@@ -1,7 +1,14 @@
 import { beforeAll, describe, expect, test } from 'bun:test'
-import { createFixedClock } from '../clock'
+import { type Clock, createFixedClock } from '../clock'
+import type { Logger } from '../logger'
 import { createMemoryLogger } from '../testing'
-import { createRemoteKeySet, createStaticKeySet, MAX_JWKS_BYTES, MAX_JWKS_KEYS } from './keys'
+import {
+  createRemoteKeySet,
+  createStaticKeySet,
+  MAX_JWKS_BYTES,
+  MAX_JWKS_KEYS,
+  type RemoteKeySetOptions,
+} from './keys'
 import { createTestJwks, createTestKeyPair, mintTestToken, type TestKeyPair } from './testing'
 import { createTokenVerifier } from './verifier'
 
@@ -53,9 +60,14 @@ describe('createStaticKeySet', () => {
     expect(await set.getKey('k3')).toBeUndefined()
     expect(await set.getKey('__proto__')).toBeUndefined()
   })
+
+  test('is always available, so an unknown kid is a bad token and never an outage', async () => {
+    const set = await createStaticKeySet(createTestJwks(k1))
+    expect(set.available()).toBe(true)
+  })
 })
 
-function setup(options: { retries?: number; timeoutMs?: number; cooldownMs?: number } = {}) {
+function setup(options: Partial<RemoteKeySetOptions> = {}) {
   const clock = createFixedClock('2026-06-01T12:00:00.000Z')
   const logger = createMemoryLogger()
   let body: () => Response = () => Response.json(createTestJwks(k1))
@@ -89,12 +101,53 @@ function setup(options: { retries?: number; timeoutMs?: number; cooldownMs?: num
 }
 
 describe('createRemoteKeySet failure paths', () => {
-  test('refuses a JWKS URL that is not https, unless it is local', () => {
+  test('refuses a JWKS URL that is not https, and http even for localhost by default', () => {
     const clock = createFixedClock('2026-06-01T00:00:00Z')
     expect(() => createRemoteKeySet({ url: 'http://auth.test/jwks', clock })).toThrow(TypeError)
     expect(() => createRemoteKeySet({ url: 'ftp://auth.test/jwks', clock })).toThrow(TypeError)
     expect(() => createRemoteKeySet({ url: 'not a url', clock })).toThrow()
-    expect(() => createRemoteKeySet({ url: 'http://localhost:4000/jwks', clock })).not.toThrow()
+    expect(() => createRemoteKeySet({ url: 'http://localhost:4000/jwks', clock })).toThrow(
+      TypeError
+    )
+    expect(() => createRemoteKeySet({ url: 'http://127.0.0.1:4000/jwks', clock })).toThrow(
+      TypeError
+    )
+    expect(() => createRemoteKeySet({ url: 'https://auth.test/jwks', clock })).not.toThrow()
+  })
+
+  test('allowInsecureLocalhost permits http for localhost only', () => {
+    const clock = createFixedClock('2026-06-01T00:00:00Z')
+    const allow = { clock, allowInsecureLocalhost: true }
+    expect(() => createRemoteKeySet({ url: 'http://localhost:4000/jwks', ...allow })).not.toThrow()
+    expect(() => createRemoteKeySet({ url: 'http://127.0.0.1:4000/jwks', ...allow })).not.toThrow()
+    expect(() => createRemoteKeySet({ url: 'http://auth.test/jwks', ...allow })).toThrow(TypeError)
+    expect(() => createRemoteKeySet({ url: 'http://localhost.evil.test/jwks', ...allow })).toThrow(
+      TypeError
+    )
+  })
+
+  test.each([
+    ['a user and password', 'https://user:pw@auth.test/jwks'],
+    ['a user alone', 'https://user@auth.test/jwks'],
+    ['credentials on an allowed local http URL', 'http://user:pw@localhost:4000/jwks'],
+  ])('refuses a JWKS URL with %s, without echoing it', (_name, url) => {
+    const clock = createFixedClock('2026-06-01T00:00:00Z')
+    let message = ''
+    try {
+      createRemoteKeySet({ url, clock, allowInsecureLocalhost: true })
+    } catch (error) {
+      message = error instanceof TypeError ? error.message : 'wrong error'
+    }
+    expect(message).toContain('credentials')
+    expect(message).not.toContain('pw')
+  })
+
+  test('refuses a stale limit that is not longer than the refresh age', () => {
+    const clock = createFixedClock('2026-06-01T00:00:00Z')
+    expect(() =>
+      createRemoteKeySet({ url: URL_, clock, maxAgeMs: 60_000, maxStaleMs: 60_000 })
+    ).toThrow(TypeError)
+    expect(() => createRemoteKeySet({ url: URL_, clock, lookupDeadlineMs: 0 })).toThrow(TypeError)
   })
 
   test('a failed refresh keeps serving the last good keys and logs a warning', async () => {
@@ -114,7 +167,6 @@ describe('createRemoteKeySet failure paths', () => {
     ['a 404', () => new Response('nope', { status: 404 })],
     ['invalid JSON', () => new Response('{not json')],
     ['a body that is not a JWKS', () => Response.json({ hello: 'world' })],
-    ['an empty JWKS', () => Response.json({ keys: [] })],
     ['a JWKS of only unusable keys', () => Response.json({ keys: [{ kty: 'RSA', kid: 'r' }] })],
     [
       'too many keys',
@@ -133,6 +185,69 @@ describe('createRemoteKeySet failure paths', () => {
     expect(await t.keys.getKey('k2')).toBeUndefined()
     expect(await t.keys.getKey('k1')).toBeDefined()
     expect(t.logger.entries).toHaveLength(1)
+  })
+
+  // The padding sits in a field the JWKS schema ignores, so each body would be accepted, k2
+  // included, if the size cap did not refuse it first.
+  describe('size caps that a parser alone would not enforce', () => {
+    const padded = (extra: number) =>
+      JSON.stringify({ keys: [k1.publicJwk, k2.publicJwk], pad: 'x'.repeat(extra) })
+
+    test('a valid JWKS padded past the cap with a declared length is refused', async () => {
+      const t = setup({ retries: 0 })
+      await t.keys.getKey('k1')
+      const body = padded(MAX_JWKS_BYTES)
+      t.respond(() => new Response(body, { headers: { 'content-length': String(body.length) } }))
+      t.clock.advance('31s')
+      expect(await t.keys.getKey('k2')).toBeUndefined()
+      expect(await t.keys.getKey('k1')).toBeDefined()
+      expect(t.logger.entries.map((e) => e.message)).toEqual(['jwks refresh failed'])
+    })
+
+    test('a small valid JWKS that declares a length past the cap is refused', async () => {
+      const t = setup({ retries: 0 })
+      await t.keys.getKey('k1')
+      t.respond(
+        () => new Response(padded(0), { headers: { 'content-length': String(MAX_JWKS_BYTES + 1) } })
+      )
+      t.clock.advance('31s')
+      expect(await t.keys.getKey('k2')).toBeUndefined()
+      expect(await t.keys.getKey('k1')).toBeDefined()
+      expect(t.logger.entries.map((e) => e.message)).toEqual(['jwks refresh failed'])
+    })
+
+    test('a valid JWKS streamed past the cap with no declared length is refused', async () => {
+      const t = setup({ retries: 0 })
+      await t.keys.getKey('k1')
+      const bytes = new TextEncoder().encode(padded(MAX_JWKS_BYTES))
+      t.respond(() => {
+        let offset = 0
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset >= bytes.length) {
+              controller.close()
+              return
+            }
+            controller.enqueue(bytes.slice(offset, offset + 4096))
+            offset += 4096
+          },
+        })
+        return new Response(stream)
+      })
+      t.clock.advance('31s')
+      expect(await t.keys.getKey('k2')).toBeUndefined()
+      expect(await t.keys.getKey('k1')).toBeDefined()
+      expect(t.logger.entries.map((e) => e.message)).toEqual(['jwks refresh failed'])
+    })
+
+    test('the same JWKS just under the cap is accepted', async () => {
+      const t = setup({ retries: 0 })
+      await t.keys.getKey('k1')
+      const base = padded(0).length
+      t.respond(() => new Response(padded(MAX_JWKS_BYTES - base)))
+      t.clock.advance('31s')
+      expect(await t.keys.getKey('k2')).toBeDefined()
+    })
   })
 
   test('with nothing cached, a failed fetch leaves every kid unknown', async () => {
@@ -251,13 +366,54 @@ describe('createRemoteKeySet refresh policy', () => {
     expect(await t.keys.getKey('k2')).toBeDefined()
   })
 
-  test('skips unusable and private entries but keeps the good ones', async () => {
+  test('skips unusable and private entries but keeps the good ones, and says how many', async () => {
     const t = setup()
     t.respond(() =>
       Response.json({ keys: [{ ...k1.publicJwk, d: 'c2VjcmV0' }, { kty: 'RSA' }, k2.publicJwk] })
     )
     expect(await t.keys.getKey('k1')).toBeUndefined()
     expect(await t.keys.getKey('k2')).toBeDefined()
+    expect(t.logger.entries).toEqual([
+      {
+        level: 'error',
+        message: 'jwks entry carries private key material',
+        fields: { privateEntries: 1 },
+      },
+      {
+        level: 'warn',
+        message: 'jwks entries skipped',
+        fields: { skipped: 2, received: 3 },
+      },
+    ])
+    const logged = JSON.stringify(t.logger.entries)
+    expect(logged).not.toContain('c2VjcmV0')
+    expect(logged).not.toContain(k2.publicJwk.x)
+  })
+
+  test('a JWKS with no problems logs nothing', async () => {
+    const t = setup()
+    await t.keys.getKey('k1')
+    expect(t.logger.entries).toEqual([])
+  })
+
+  test('with a repeated kid the first entry wins and the repeat is counted as skipped', async () => {
+    const t = setup()
+    t.respond(() => Response.json({ keys: [k1.publicJwk, { ...k2.publicJwk, kid: 'k1' }] }))
+    const verifier = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys: t.keys,
+      clock: t.clock,
+    })
+    await expect(
+      verifier.verify(await mintTestToken({ keyPair: k1, clock: t.clock }))
+    ).resolves.toBeDefined()
+    await expect(
+      verifier.verify(await mintTestToken({ keyPair: k2, clock: t.clock, header: { kid: 'k1' } }))
+    ).rejects.toMatchObject({ reason: 'invalid' })
+    expect(t.logger.entries).toEqual([
+      { level: 'warn', message: 'jwks entries skipped', fields: { skipped: 1, received: 2 } },
+    ])
   })
 
   test('warm fetches immediately, ignoring the cooldown, and shares an in-flight fetch', async () => {
@@ -266,6 +422,158 @@ describe('createRemoteKeySet refresh policy', () => {
     expect(t.calls).toHaveLength(1)
     await t.keys.warm()
     expect(t.calls).toHaveLength(2)
+  })
+})
+
+describe('createRemoteKeySet staleness', () => {
+  test('keys that could not be refreshed for a day are dropped, with an error logged', async () => {
+    const t = setup({ retries: 0 })
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('25h')
+    expect(await t.keys.getKey('k1')).toBeUndefined()
+    expect(t.keys.available()).toBe(false)
+    expect(t.logger.entries.filter((e) => e.level === 'error')).toEqual([
+      { level: 'error', message: 'jwks keys dropped as stale', fields: { maxStaleMs: 86_400_000 } },
+    ])
+  })
+
+  test('keys are still served just inside the stale limit, and a late refresh revives them', async () => {
+    const t = setup({ retries: 0 })
+    await t.keys.getKey('k1')
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('1439m')
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    expect(t.keys.available()).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    t.respond(() => Response.json(createTestJwks(k1)))
+    t.clock.advance('2m')
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    expect(t.keys.available()).toBe(true)
+  })
+
+  test('maxStaleMs is configurable', async () => {
+    const t = setup({ retries: 0, maxAgeMs: 60_000, maxStaleMs: 600_000 })
+    await t.keys.getKey('k1')
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('9m')
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    t.clock.advance('2m')
+    expect(await t.keys.getKey('k1')).toBeUndefined()
+  })
+
+  test('a well-formed empty JWKS withdraws every key, and that is not an outage', async () => {
+    const t = setup()
+    await t.keys.getKey('k1')
+    t.respond(() => Response.json({ keys: [] }))
+    t.clock.advance('31s')
+    expect(await t.keys.getKey('unknown')).toBeUndefined()
+    expect(await t.keys.getKey('k1')).toBeUndefined()
+    expect(t.keys.available()).toBe(true)
+    expect(t.logger.entries).toEqual([])
+  })
+
+  test('is unavailable until the first successful fetch', async () => {
+    const t = setup({ retries: 0 })
+    expect(t.keys.available()).toBe(false)
+    t.respond(() => new Response('down', { status: 503 }))
+    expect(await t.keys.getKey('k1')).toBeUndefined()
+    expect(t.keys.available()).toBe(false)
+    t.respond(() => Response.json(createTestJwks(k1)))
+    t.clock.advance('31s')
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    expect(t.keys.available()).toBe(true)
+  })
+})
+
+describe('createRemoteKeySet with a logger that throws', () => {
+  const throwingLogger = () => {
+    const boom = () => {
+      throw new Error('logger down')
+    }
+    const logger: Logger = { debug: boom, info: boom, warn: boom, error: boom, child: () => logger }
+    return logger
+  }
+
+  test('getKey still resolves when the refresh fails', async () => {
+    const t = setup({ retries: 0, logger: throwingLogger() })
+    t.respond(() => new Response('down', { status: 503 }))
+    await expect(t.keys.getKey('unknown')).resolves.toBeUndefined()
+  })
+
+  test('getKey still resolves when skipped entries are reported', async () => {
+    const t = setup({ logger: throwingLogger() })
+    t.respond(() => Response.json({ keys: [{ ...k1.publicJwk, d: 'c2VjcmV0' }, k2.publicJwk] }))
+    await expect(t.keys.getKey('k2')).resolves.toBeDefined()
+  })
+
+  test('a background refresh from a cached hit raises no unhandled rejection', async () => {
+    const t = setup({ retries: 0, logger: throwingLogger() })
+    await t.keys.getKey('k1')
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('61m')
+    const seen: unknown[] = []
+    const listener = (reason: unknown) => seen.push(reason)
+    process.on('unhandledRejection', listener)
+    try {
+      await expect(t.keys.getKey('k1')).resolves.toBeDefined()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+    expect(seen).toEqual([])
+    expect(t.calls).toHaveLength(2)
+  })
+})
+
+describe('createRemoteKeySet time handling', () => {
+  test('a clock that steps backwards does not stall refreshes', async () => {
+    let at = new Date('2026-06-01T12:00:00.000Z').getTime()
+    const clock: Clock = { now: () => new Date(at) }
+    let fetches = 0
+    const keys = createRemoteKeySet({
+      url: URL_,
+      clock,
+      retries: 0,
+      fetch: (async () => {
+        fetches++
+        return Response.json(createTestJwks(k1))
+      }) as unknown as typeof fetch,
+    })
+    await keys.getKey('k1')
+    at -= 3_600_000
+    await keys.getKey('unknown')
+    expect(fetches).toBe(2)
+  })
+
+  test('one lookup waits no longer than the overall deadline for a slow key server', async () => {
+    const clock = createFixedClock('2026-06-01T12:00:00.000Z')
+    const logger = createMemoryLogger()
+    let calls = 0
+    const stuck = (() => {
+      calls++
+      return new Promise<Response>(() => {})
+    }) as unknown as typeof fetch
+    const keys = createRemoteKeySet({
+      url: URL_,
+      clock,
+      logger,
+      fetch: stuck,
+      timeoutMs: 60_000,
+      lookupDeadlineMs: 30,
+    })
+    const started = performance.now()
+    const results = await Promise.all([keys.getKey('a'), keys.getKey('b')])
+    expect(results).toEqual([undefined, undefined])
+    expect(performance.now() - started).toBeLessThan(1_000)
+    expect(calls).toBe(1)
+    expect(logger.entries.map((e) => e.message)).toContain('jwks lookup deadline exceeded')
+  })
+
+  test('the deadline does not cut short a refresh that finishes in time', async () => {
+    const t = setup({ lookupDeadlineMs: 1_000 })
+    expect(await t.keys.getKey('k1')).toBeDefined()
+    expect(t.logger.entries).toEqual([])
   })
 })
 
@@ -301,5 +609,35 @@ describe('createRemoteKeySet with a verifier', () => {
       await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'invalid' })
     }
     expect(t.calls).toHaveLength(2)
+  })
+
+  test('an outage with nothing cached is unavailable, not an invalid token', async () => {
+    const t = setup({ retries: 0 })
+    t.respond(() => new Response('down', { status: 503 }))
+    const verifier = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys: t.keys,
+      clock: t.clock,
+    })
+    const token = await mintTestToken({ keyPair: k1, clock: t.clock })
+    await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'unavailable' })
+  })
+
+  test('a key set gone stale is unavailable, and an unknown kid on a fresh set is invalid', async () => {
+    const t = setup({ retries: 0 })
+    await t.keys.warm()
+    const verifier = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys: t.keys,
+      clock: t.clock,
+    })
+    const unknown = await mintTestToken({ keyPair: k3, clock: t.clock })
+    await expect(verifier.verify(unknown)).rejects.toMatchObject({ reason: 'invalid' })
+    t.respond(() => new Response('down', { status: 503 }))
+    t.clock.advance('25h')
+    const token = await mintTestToken({ keyPair: k1, clock: t.clock })
+    await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'unavailable' })
   })
 })

@@ -55,7 +55,11 @@ export interface MintTokenOptions {
   issuedAtOffsetSeconds?: number
   /** Claims to add or override, e.g. `{ role: 'admin' }`; `undefined` removes a claim. */
   claims?: Record<string, unknown>
-  /** Header fields to add or override, e.g. `{ kid: 'other' }`; `undefined` removes one. */
+  /**
+   * Header fields to add or override, e.g. `{ kid: 'other' }`; `undefined` removes one. The
+   * default header is `alg: EdDSA`, the key's `kid` and `typ: at+jwt`; `{ typ: undefined }`
+   * omits the type and `{ typ: 'refresh' }` changes it.
+   */
   header?: Record<string, unknown>
 }
 
@@ -85,6 +89,7 @@ export async function mintTestToken(options: MintTokenOptions): Promise<string> 
   const header: Record<string, unknown> = {
     alg: 'EdDSA',
     kid: options.keyPair.kid,
+    typ: 'at+jwt',
     ...options.header,
   }
   const jwt = new SignJWT(

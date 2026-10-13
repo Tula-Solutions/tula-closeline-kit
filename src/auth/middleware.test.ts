@@ -4,7 +4,8 @@ import { createFixedClock } from '../clock'
 import { isAppError, toErrorBody } from '../errors'
 import { createMemoryLogger } from '../testing'
 import { MAX_TOKEN_LENGTH } from './claims'
-import { createStaticKeySet } from './keys'
+import { TokenVerificationError } from './errors'
+import { createRemoteKeySet, createStaticKeySet } from './keys'
 import { type AuthEnv, createAuthMiddleware } from './middleware'
 import {
   createTestJwks,
@@ -25,7 +26,7 @@ function build(v: TokenVerifier = verifier) {
   const app = new Hono<AuthEnv>()
   app.onError((error, c) => {
     if (isAppError(error)) {
-      return c.newResponse(JSON.stringify(toErrorBody(error)), error.status as 401, {
+      return c.newResponse(JSON.stringify(toErrorBody(error)), error.status as 401 | 503, {
         'content-type': 'application/json',
       })
     }
@@ -55,8 +56,8 @@ beforeAll(async () => {
   })
 })
 
-async function expectRejected(res: Response, code: string) {
-  expect(res.status).toBe(401)
+async function expectRejected(res: Response, code: string, status = 401) {
+  expect(res.status).toBe(status)
   const body = (await res.json()) as { error: { code: string } }
   expect(body.error.code).toBe(code)
 }
@@ -107,14 +108,77 @@ describe('requests that must be turned away', () => {
     await expectRejected(await build().app.request('/me', bearer(token)), 'auth.token_expired')
   })
 
-  test('a verifier that fails unexpectedly still ends in a 401', async () => {
-    const broken: TokenVerifier = {
+  test('a key set outage is a 503 that is not mistaken for a bad token', async () => {
+    const down: TokenVerifier = {
       verify: async () => {
-        throw new Error('key store exploded')
+        throw new TokenVerificationError('unavailable')
       },
     }
-    const res = await build(broken).app.request('/me', bearer('a.b.c'))
-    await expectRejected(res, 'auth.token_invalid')
+    const t = build(down)
+    const res = await t.app.request('/me', bearer('a.b.c'))
+    await expectRejected(res, 'auth.unavailable', 503)
+    expect(t.logger.entries).toEqual([
+      {
+        level: 'error',
+        message: 'token verification unavailable',
+        fields: { reason: 'unavailable' },
+      },
+    ])
+  })
+
+  test('a verifier that fails unexpectedly is a 503, logged by class name only', async () => {
+    class KeyStoreError extends Error {}
+    const token = 'a.b.c'
+    const broken: TokenVerifier = {
+      verify: async () => {
+        throw new KeyStoreError(`key store exploded for ${token}`)
+      },
+    }
+    const t = build(broken)
+    const res = await t.app.request('/me', bearer(token))
+    await expectRejected(res, 'auth.unavailable', 503)
+    expect(t.logger.entries).toEqual([
+      {
+        level: 'error',
+        message: 'token verification failed unexpectedly',
+        fields: { errorClass: 'KeyStoreError' },
+      },
+    ])
+    const logs = JSON.stringify(t.logger.entries)
+    expect(logs).not.toContain('exploded')
+    expect(logs).not.toContain(token)
+  })
+
+  test('a thrown value that is not an Error is still a 503 and logs no content', async () => {
+    const broken: TokenVerifier = {
+      verify: async () => {
+        throw 'secret-string-token'
+      },
+    }
+    const t = build(broken)
+    await expectRejected(await t.app.request('/me', bearer('a.b.c')), 'auth.unavailable', 503)
+    expect(JSON.stringify(t.logger.entries)).not.toContain('secret-string-token')
+  })
+
+  test('a token from a key set that is down for good ends as a 503 end to end', async () => {
+    const keys = createRemoteKeySet({
+      url: 'https://auth.test/.well-known/jwks.json',
+      clock,
+      retries: 0,
+      fetch: (async () => new Response('down', { status: 503 })) as unknown as typeof fetch,
+    })
+    const real = createTokenVerifier({
+      issuer: 'https://auth.test',
+      audience: 'closeline',
+      keys,
+      clock,
+    })
+    const token = await mintTestToken({ keyPair: pair, clock })
+    await expectRejected(
+      await build(real).app.request('/me', bearer(token)),
+      'auth.unavailable',
+      503
+    )
   })
 
   test('neither the response nor the logs hold the token or say which check failed', async () => {

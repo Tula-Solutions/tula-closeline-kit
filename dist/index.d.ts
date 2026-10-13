@@ -34,9 +34,12 @@ interface VerifiedToken {
 	/** When the token stops being valid. */
 	expiresAt: Date;
 }
-/** Why a token was rejected. Deliberately coarse: it is safe to return to a client and to log. */
-type TokenRejection = "expired" | "invalid";
-/** Thrown by a TokenVerifier for any token it will not accept; carries no token content. */
+/**
+* Why a token was not accepted. Deliberately coarse: it is safe to return to a client and to log.
+* `unavailable` means the signing keys could not be loaded, which says nothing about the token.
+*/
+type TokenRejection = "expired" | "invalid" | "unavailable";
+/** Thrown by a TokenVerifier for any token it will not accept, or cannot check; carries no token content. */
 declare class TokenVerificationError extends Error {
 	readonly reason: TokenRejection;
 	constructor(reason: TokenRejection);
@@ -93,6 +96,11 @@ declare const MAX_JWKS_BYTES: number;
 interface KeySet {
 	/** Returns the key for `kid`, or undefined when it is unknown. Never throws. */
 	getKey(kid: string): Promise<CryptoKey | undefined>;
+	/**
+	* Whether the set currently holds a loaded, fresh answer from the issuer. When false, an
+	* unknown `kid` means the keys could not be loaded, not that the token is bad. Never throws.
+	*/
+	available(): boolean;
 }
 /** A JSON Web Key Set as published by the auth service. */
 interface Jwks {
@@ -102,8 +110,10 @@ interface Jwks {
 declare function createStaticKeySet(jwks: Jwks): Promise<KeySet>;
 /** Options for createRemoteKeySet. */
 interface RemoteKeySetOptions {
-	/** The issuer's JWKS URL; must be https unless it points at localhost. */
+	/** The issuer's JWKS URL; must be https, carry no credentials, and not be http unless allowed. */
 	url: string;
+	/** Allows an http URL when the host is localhost or 127.0.0.1; defaults to false. Local only. */
+	allowInsecureLocalhost?: boolean;
 	/** Time source for the cooldown and cache age. */
 	clock: Clock;
 	/** Receives a warning when a refresh fails. Never receives token content. */
@@ -118,6 +128,13 @@ interface RemoteKeySetOptions {
 	cooldownMs?: number;
 	/** Age after which a cached key set is refreshed in the background; defaults to 3600000. */
 	maxAgeMs?: number;
+	/**
+	* Age after which the cached keys are dropped if no refresh has succeeded; defaults to 86400000.
+	* Must exceed `maxAgeMs`. Lookups then find nothing and `available()` is false.
+	*/
+	maxStaleMs?: number;
+	/** The longest one lookup waits for a refresh before giving up; defaults to 5000. */
+	lookupDeadlineMs?: number;
 	/** Waits before a retry; defaults to a timer. Tests inject a no-op. */
 	sleep?: (ms: number) => Promise<void>;
 	/** Source of jitter in [0, 1); defaults to Math.random. */
@@ -130,8 +147,9 @@ interface RemoteKeySet extends KeySet {
 }
 /**
 * Creates a key set backed by the issuer's JWKS URL. Lookups of a cached `kid` do no I/O. An
-* unknown `kid` triggers at most one refresh per cooldown window, shared by concurrent callers;
-* a failed refresh keeps serving the last good keys.
+* unknown `kid` triggers at most one refresh per cooldown window, shared by concurrent callers,
+* and no lookup waits longer than the deadline. A failed refresh keeps serving the last good keys
+* until they are `maxStaleMs` old, after which they are dropped and `available()` is false.
 */
 declare function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet;
 import { MiddlewareHandler } from "hono";
@@ -151,7 +169,10 @@ interface TokenVerifierOptions {
 }
 /** Checks access tokens offline against a key set. */
 interface TokenVerifier {
-	/** Returns the identity in a valid token, or throws a TokenVerificationError. */
+	/**
+	* Returns the identity in a valid token, or throws a TokenVerificationError: `expired` or
+	* `invalid` for the token, `unavailable` when the signing keys could not be loaded.
+	*/
 	verify(token: string): Promise<VerifiedToken>;
 }
 /**
@@ -178,13 +199,17 @@ interface AuthVariables {
 interface AuthMiddlewareOptions {
 	/** Verifies the bearer token. */
 	verifier: TokenVerifier;
-	/** Receives a warning, with only a coarse reason, for each rejected request. */
+	/**
+	* Receives a warning with only a coarse reason for each rejected request, and an error for each
+	* request that failed because verification was unavailable or threw (error class name only).
+	*/
 	logger?: Logger;
 }
 /**
 * Creates Hono middleware that requires a valid `Authorization: Bearer` access token. On success
-* it sets organizationId, userId, role and region; on failure it throws a 401 AppError with
-* `auth.unauthenticated`, `auth.token_expired` or `auth.token_invalid`.
+* it sets organizationId, userId, role and region; on failure it throws an AppError: 401 with
+* `auth.unauthenticated`, `auth.token_expired` or `auth.token_invalid`, or 503 with
+* `auth.unavailable` when the signing keys could not be loaded or verification threw.
 */
 declare function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv>;
 /** Everything needed to build an AppError. */

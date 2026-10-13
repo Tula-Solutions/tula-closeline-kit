@@ -23,7 +23,9 @@ Other scripts are in `package.json`.
 - `TokenVerifier.verify` (`src/auth/verifier.ts`) runs on every request. It is O(token length) with
   one Ed25519 verification and a Map lookup, and does no I/O when the key is cached. Budget:
   mean under 0.5 ms and p99 under 2 ms, enforced by `bench/verify.bench.ts` (`bun run bench`,
-  part of `bun run verify`). Any change to it re-runs the benchmark.
+  part of `bun run verify`). The same file budgets the bad-signature path (mean 0.3 ms, p99
+  0.5 ms) and the middleware (mean 0.3 ms, p99 0.9 ms), each about 5x what it measures. Any change
+  to it re-runs the benchmark.
 
 ## Issues
 

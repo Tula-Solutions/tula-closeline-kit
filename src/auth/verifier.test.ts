@@ -28,7 +28,10 @@ const mint = (
   overrides: Parameters<typeof mintTestToken>[0] extends infer T ? Partial<T> : never
 ) => mintTestToken({ keyPair: pair, clock, ...overrides })
 
-async function rejectedWith(token: string, reason: 'expired' | 'invalid' = 'invalid') {
+async function rejectedWith(
+  token: string,
+  reason: 'expired' | 'invalid' | 'unavailable' = 'invalid'
+) {
   const error = await verifier.verify(token).then(
     () => undefined,
     (e: unknown) => e
@@ -47,6 +50,7 @@ beforeAll(async () => {
       lookups.push(kid)
       return inner.getKey(kid)
     },
+    available: () => inner.available(),
   }
   verifier = createTokenVerifier({ issuer: ISSUER, audience: AUDIENCE, keys, clock })
 })
@@ -85,6 +89,62 @@ describe('algorithm and header', () => {
 
   test('a token signed by a key that is not the one named by its kid is rejected', async () => {
     await rejectedWith(await mint({ keyPair: other, header: { kid: 'key-1' } }))
+  })
+})
+
+describe('token type (RFC 9068)', () => {
+  test('a token stamped at+jwt is accepted', async () => {
+    await expect(verifier.verify(await mint({}))).resolves.toBeDefined()
+  })
+
+  test.each([
+    ['a missing typ', undefined],
+    ['a refresh token', 'refresh'],
+    ['a plain JWT', 'JWT'],
+    ['at+jwt in another letter case', 'AT+JWT'],
+    ['the media-type form', 'application/at+jwt'],
+    ['an empty typ', ''],
+    ['a typ that is not a string', 7],
+  ])('%s is rejected before any key is looked up', async (_name, typ) => {
+    lookups.length = 0
+    await rejectedWith(await mint({ header: { typ } }))
+    expect(lookups).toEqual([])
+  })
+})
+
+describe('an unavailable key set', () => {
+  const unknownKid = () => mint({ header: { kid: 'nobody' } })
+
+  test('is reported as unavailable, not as an invalid token', async () => {
+    const v = createTokenVerifier({
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      keys: { getKey: async () => undefined, available: () => false },
+      clock,
+    })
+    const error = await v.verify(await unknownKid()).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(TokenVerificationError)
+    expect((error as TokenVerificationError).reason).toBe('unavailable')
+  })
+
+  test('a kid the loaded keys do not hold is still an invalid token', async () => {
+    const v = createTokenVerifier({
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      keys: { getKey: async () => undefined, available: () => true },
+      clock,
+    })
+    await expect(v.verify(await unknownKid())).rejects.toMatchObject({ reason: 'invalid' })
+  })
+
+  test('a token that was malformed anyway is invalid, whatever the key set is doing', async () => {
+    const v = createTokenVerifier({
+      issuer: ISSUER,
+      audience: AUDIENCE,
+      keys: { getKey: async () => undefined, available: () => false },
+      clock,
+    })
+    await expect(v.verify('not.a.token')).rejects.toMatchObject({ reason: 'invalid' })
   })
 })
 

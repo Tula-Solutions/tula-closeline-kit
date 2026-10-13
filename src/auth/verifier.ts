@@ -1,11 +1,13 @@
 import { decodeProtectedHeader, errors as joseErrors, jwtVerify } from 'jose'
 import type { Clock } from '../clock'
 import { accessTokenClaimsSchema, MAX_TOKEN_LENGTH, type VerifiedToken } from './claims'
-import { TokenVerificationError } from './errors'
+import { type TokenRejection, TokenVerificationError } from './errors'
 import type { KeySet } from './keys'
 
 /** The only signature algorithm Closeline access tokens use. */
 const ALGORITHM = 'EdDSA'
+/** The header `typ` of every access token (RFC 9068), so no other JWT can pass as one. */
+const TOKEN_TYPE = 'at+jwt'
 const MAX_KID_LENGTH = 128
 const MAX_CLOCK_TOLERANCE_SECONDS = 120
 
@@ -25,11 +27,14 @@ export interface TokenVerifierOptions {
 
 /** Checks access tokens offline against a key set. */
 export interface TokenVerifier {
-  /** Returns the identity in a valid token, or throws a TokenVerificationError. */
+  /**
+   * Returns the identity in a valid token, or throws a TokenVerificationError: `expired` or
+   * `invalid` for the token, `unavailable` when the signing keys could not be loaded.
+   */
   verify(token: string): Promise<VerifiedToken>
 }
 
-function reject(reason: 'expired' | 'invalid' = 'invalid'): never {
+function reject(reason: TokenRejection = 'invalid'): never {
   throw new TokenVerificationError(reason)
 }
 
@@ -62,6 +67,10 @@ export function createTokenVerifier(options: TokenVerifierOptions): TokenVerifie
     if (header.alg !== ALGORITHM) {
       return reject()
     }
+    // Exactly `at+jwt`, checked here so a refresh token or other JWT never costs a key lookup.
+    if (header.typ !== TOKEN_TYPE) {
+      return reject()
+    }
     const kid = header.kid
     if (typeof kid !== 'string' || kid === '' || kid.length > MAX_KID_LENGTH) {
       return reject()
@@ -76,13 +85,15 @@ export function createTokenVerifier(options: TokenVerifierOptions): TokenVerifie
       }
       const key = await keys.getKey(readKid(token))
       if (key === undefined) {
-        return reject()
+        // An unknown kid on keys we hold is a bad token; without loaded keys it is our outage.
+        return reject(keys.available() ? 'invalid' : 'unavailable')
       }
       const now = clock.now()
       let payload: unknown
       try {
         const result = await jwtVerify(token, key, {
           algorithms: [ALGORITHM],
+          typ: TOKEN_TYPE,
           issuer,
           audience,
           clockTolerance: toleranceSeconds,

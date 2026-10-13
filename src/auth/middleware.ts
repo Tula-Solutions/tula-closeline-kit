@@ -27,7 +27,10 @@ export interface AuthVariables {
 export interface AuthMiddlewareOptions {
   /** Verifies the bearer token. */
   verifier: TokenVerifier
-  /** Receives a warning, with only a coarse reason, for each rejected request. */
+  /**
+   * Receives a warning with only a coarse reason for each rejected request, and an error for each
+   * request that failed because verification was unavailable or threw (error class name only).
+   */
   logger?: Logger
 }
 
@@ -41,10 +44,44 @@ function unauthenticated(): AppError {
   })
 }
 
+// Only the class name is logged: a message or cause could carry the token or key material.
+function errorClass(error: unknown): string {
+  return error instanceof Error ? (error.constructor?.name ?? 'Error') : typeof error
+}
+
+function unavailable(): AppError {
+  return new AppError({
+    code: 'auth.unavailable',
+    status: 503,
+    message: 'Authentication is temporarily unavailable.',
+  })
+}
+
+function toAppError(error: unknown, logger: Logger | undefined): AppError {
+  if (!(error instanceof TokenVerificationError)) {
+    logger?.error('token verification failed unexpectedly', { errorClass: errorClass(error) })
+    return unavailable()
+  }
+  if (error.reason === 'unavailable') {
+    logger?.error('token verification unavailable', { reason: error.reason })
+    return unavailable()
+  }
+  logger?.warn('request rejected', { reason: error.reason })
+  return new AppError({
+    code: error.reason === 'expired' ? 'auth.token_expired' : 'auth.token_invalid',
+    status: 401,
+    message:
+      error.reason === 'expired'
+        ? 'The access token has expired.'
+        : 'The access token is not valid.',
+  })
+}
+
 /**
  * Creates Hono middleware that requires a valid `Authorization: Bearer` access token. On success
- * it sets organizationId, userId, role and region; on failure it throws a 401 AppError with
- * `auth.unauthenticated`, `auth.token_expired` or `auth.token_invalid`.
+ * it sets organizationId, userId, role and region; on failure it throws an AppError: 401 with
+ * `auth.unauthenticated`, `auth.token_expired` or `auth.token_invalid`, or 503 with
+ * `auth.unavailable` when the signing keys could not be loaded or verification threw.
  */
 export function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv> {
   const { verifier, logger } = options
@@ -62,14 +99,7 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): Middleware
     try {
       verified = await verifier.verify(token)
     } catch (error) {
-      const reason = error instanceof TokenVerificationError ? error.reason : 'invalid'
-      logger?.warn('request rejected', { reason })
-      throw new AppError({
-        code: reason === 'expired' ? 'auth.token_expired' : 'auth.token_invalid',
-        status: 401,
-        message:
-          reason === 'expired' ? 'The access token has expired.' : 'The access token is not valid.',
-      })
+      throw toAppError(error, logger)
     }
     c.set('organizationId', verified.organizationId)
     c.set('userId', verified.userId)

@@ -22,10 +22,16 @@ var accessTokenClaimsSchema = z.object({
   exp: z.number().finite()
 });
 // src/auth/errors.ts
+var MESSAGES = {
+  expired: "Token expired",
+  invalid: "Token rejected",
+  unavailable: "Token verification unavailable"
+};
+
 class TokenVerificationError extends Error {
   reason;
   constructor(reason) {
-    super(reason === "expired" ? "Token expired" : "Token rejected");
+    super(MESSAGES[reason]);
     this.name = "TokenVerificationError";
     this.reason = reason;
   }
@@ -58,19 +64,27 @@ async function importPublicKey(raw) {
     return;
   }
 }
+function carriesPrivateKey(raw) {
+  return typeof raw === "object" && raw !== null && Object.hasOwn(raw, "d");
+}
 async function importAll(jwks) {
   const parsed = jwksSchema.safeParse(jwks);
   if (!parsed.success) {
     return;
   }
   const keys = new Map;
+  let privateEntries = 0;
   for (const raw of parsed.data.keys) {
+    if (carriesPrivateKey(raw)) {
+      privateEntries++;
+    }
     const entry = await importPublicKey(raw);
     if (entry !== undefined && !keys.has(entry[0])) {
       keys.set(entry[0], entry[1]);
     }
   }
-  return keys;
+  const received = parsed.data.keys.length;
+  return { keys, received, skipped: received - keys.size, privateEntries };
 }
 async function createStaticKeySet(jwks) {
   const parsed = jwksSchema.safeParse(jwks);
@@ -85,18 +99,26 @@ async function createStaticKeySet(jwks) {
     }
     keys.set(entry[0], entry[1]);
   }
-  return { getKey: async (kid) => keys.get(kid) };
+  return { getKey: async (kid) => keys.get(kid), available: () => true };
 }
 
 class RetryableFetchError extends Error {
 }
-function assertUrl(raw) {
+function assertUrl(raw, allowInsecureLocalhost) {
   const url = new URL(raw);
+  if (url.username !== "" || url.password !== "") {
+    throw new TypeError("The JWKS URL must not carry credentials");
+  }
   const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) {
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local && allowInsecureLocalhost)) {
     throw new TypeError("The JWKS URL must be https");
   }
   return url;
+}
+function assertPositive(name, value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive number`);
+  }
 }
 async function readBounded(response) {
   const declared = Number(response.headers.get("content-length") ?? 0);
@@ -124,12 +146,19 @@ async function readBounded(response) {
   }
 }
 function createRemoteKeySet(options) {
-  const url = assertUrl(options.url);
+  const url = assertUrl(options.url, options.allowInsecureLocalhost === true);
   const doFetch = options.fetch ?? fetch;
   const timeoutMs = options.timeoutMs ?? 3000;
   const retries = options.retries ?? 1;
   const cooldownMs = options.cooldownMs ?? 30000;
   const maxAgeMs = options.maxAgeMs ?? 3600000;
+  const maxStaleMs = options.maxStaleMs ?? 86400000;
+  const lookupDeadlineMs = options.lookupDeadlineMs ?? 5000;
+  assertPositive("maxStaleMs", maxStaleMs);
+  assertPositive("lookupDeadlineMs", lookupDeadlineMs);
+  if (maxStaleMs <= maxAgeMs) {
+    throw new TypeError("maxStaleMs must be greater than maxAgeMs");
+  }
   const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const random = options.random ?? Math.random;
   let keys = new Map;
@@ -137,6 +166,18 @@ function createRemoteKeySet(options) {
   let lastAttemptAt;
   let inflight;
   const now = () => options.clock.now().getTime();
+  function log(level, message, fields) {
+    try {
+      options.logger?.[level](message, fields);
+    } catch {}
+  }
+  const hasElapsed = (since, ms) => {
+    const elapsed = now() - since;
+    return elapsed < 0 || elapsed >= ms;
+  };
+  function isStale() {
+    return loadedAt !== undefined && Math.max(0, now() - loadedAt) >= maxStaleMs;
+  }
   async function fetchOnce() {
     let response;
     try {
@@ -173,13 +214,24 @@ function createRemoteKeySet(options) {
   async function refresh() {
     try {
       const fresh = await importAll(await fetchWithRetry());
-      if (fresh === undefined || fresh.size === 0) {
+      if (fresh === undefined) {
+        throw new Error("JWKS was not well-formed");
+      }
+      if (fresh.privateEntries > 0) {
+        log("error", "jwks entry carries private key material", {
+          privateEntries: fresh.privateEntries
+        });
+      }
+      if (fresh.keys.size === 0 && fresh.received > 0) {
         throw new Error("JWKS held no usable key");
       }
-      keys = fresh;
+      if (fresh.skipped > 0) {
+        log("warn", "jwks entries skipped", { skipped: fresh.skipped, received: fresh.received });
+      }
+      keys = fresh.keys;
       loadedAt = now();
     } catch (error) {
-      options.logger?.warn("jwks refresh failed", {
+      log("warn", "jwks refresh failed", {
         reason: error instanceof Error ? error.message : "unknown",
         keysServed: keys.size
       });
@@ -196,24 +248,45 @@ function createRemoteKeySet(options) {
     return run;
   }
   function cooldownElapsed() {
-    return lastAttemptAt === undefined || now() - lastAttemptAt >= cooldownMs;
+    return lastAttemptAt === undefined || hasElapsed(lastAttemptAt, cooldownMs);
+  }
+  function dropIfStale() {
+    if (isStale()) {
+      keys = new Map;
+      loadedAt = undefined;
+      log("error", "jwks keys dropped as stale", { maxStaleMs });
+    }
+  }
+  async function waitForRefresh(run) {
+    let timer;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve("deadline"), lookupDeadlineMs);
+    });
+    try {
+      if (await Promise.race([run, deadline]) === "deadline") {
+        log("warn", "jwks lookup deadline exceeded", { lookupDeadlineMs });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
   return {
     async getKey(kid) {
+      dropIfStale();
       const cached = keys.get(kid);
       if (cached !== undefined) {
-        if (loadedAt !== undefined && now() - loadedAt >= maxAgeMs && !inflight && cooldownElapsed()) {
+        if (loadedAt !== undefined && hasElapsed(loadedAt, maxAgeMs) && !inflight && cooldownElapsed()) {
           startRefresh();
         }
         return cached;
       }
-      if (inflight) {
-        await inflight;
-      } else if (cooldownElapsed()) {
-        await startRefresh();
+      const pending = inflight ?? (cooldownElapsed() ? startRefresh() : undefined);
+      if (pending !== undefined) {
+        await waitForRefresh(pending);
       }
       return keys.get(kid);
     },
+    available: () => loadedAt !== undefined && !isStale(),
     warm() {
       return inflight ?? startRefresh();
     }
@@ -262,6 +335,32 @@ function unauthenticated() {
     message: "Authentication is required."
   });
 }
+function errorClass(error) {
+  return error instanceof Error ? error.constructor?.name ?? "Error" : typeof error;
+}
+function unavailable() {
+  return new AppError({
+    code: "auth.unavailable",
+    status: 503,
+    message: "Authentication is temporarily unavailable."
+  });
+}
+function toAppError(error, logger) {
+  if (!(error instanceof TokenVerificationError)) {
+    logger?.error("token verification failed unexpectedly", { errorClass: errorClass(error) });
+    return unavailable();
+  }
+  if (error.reason === "unavailable") {
+    logger?.error("token verification unavailable", { reason: error.reason });
+    return unavailable();
+  }
+  logger?.warn("request rejected", { reason: error.reason });
+  return new AppError({
+    code: error.reason === "expired" ? "auth.token_expired" : "auth.token_invalid",
+    status: 401,
+    message: error.reason === "expired" ? "The access token has expired." : "The access token is not valid."
+  });
+}
 function createAuthMiddleware(options) {
   const { verifier, logger } = options;
   return async (c, next) => {
@@ -275,13 +374,7 @@ function createAuthMiddleware(options) {
     try {
       verified = await verifier.verify(token);
     } catch (error) {
-      const reason = error instanceof TokenVerificationError ? error.reason : "invalid";
-      logger?.warn("request rejected", { reason });
-      throw new AppError({
-        code: reason === "expired" ? "auth.token_expired" : "auth.token_invalid",
-        status: 401,
-        message: reason === "expired" ? "The access token has expired." : "The access token is not valid."
-      });
+      throw toAppError(error, logger);
     }
     c.set("organizationId", verified.organizationId);
     c.set("userId", verified.userId);
@@ -293,6 +386,7 @@ function createAuthMiddleware(options) {
 // src/auth/verifier.ts
 import { decodeProtectedHeader, errors as joseErrors, jwtVerify } from "jose";
 var ALGORITHM = "EdDSA";
+var TOKEN_TYPE = "at+jwt";
 var MAX_KID_LENGTH = 128;
 var MAX_CLOCK_TOLERANCE_SECONDS = 120;
 function reject(reason = "invalid") {
@@ -317,6 +411,9 @@ function createTokenVerifier(options) {
     if (header.alg !== ALGORITHM) {
       return reject();
     }
+    if (header.typ !== TOKEN_TYPE) {
+      return reject();
+    }
     const kid = header.kid;
     if (typeof kid !== "string" || kid === "" || kid.length > MAX_KID_LENGTH) {
       return reject();
@@ -330,13 +427,14 @@ function createTokenVerifier(options) {
       }
       const key = await keys.getKey(readKid(token));
       if (key === undefined) {
-        return reject();
+        return reject(keys.available() ? "invalid" : "unavailable");
       }
       const now = clock.now();
       let payload;
       try {
         const result = await jwtVerify(token, key, {
           algorithms: [ALGORITHM],
+          typ: TOKEN_TYPE,
           issuer,
           audience,
           clockTolerance: toleranceSeconds,
