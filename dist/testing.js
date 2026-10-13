@@ -2,8 +2,17 @@ import {
   createFixedClock2,
   scrubText2,
   prepareFields,
+  QUEUE_ERROR_CODES2,
+  QueueError2,
+  MAX_MESSAGE_BYTES2,
+  defineMessage2,
+  createMessageRegistry2,
+  assertReceiveOptions2,
+  assertVisibility2,
+  assertBatchCount2,
+  systemSleep2,
   shouldReportError2
-} from "./shared/chunk-r1sa3cwf.js";
+} from "./shared/chunk-ssb6j420.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -88,6 +97,232 @@ async function mintTestToken(options) {
   jwt.setProtectedHeader(Object.fromEntries(Object.entries(header).filter(([, value]) => value !== undefined)));
   return jwt.sign(options.keyPair.privateKey);
 }
+// src/queue/memory.ts
+function bytesOf(body) {
+  return new TextEncoder().encode(body).length;
+}
+function createMemoryQueue(options) {
+  const { registry, clock } = options;
+  const sleep = options.sleep ?? systemSleep2;
+  const maxReceiveCount = options.maxReceiveCount ?? 5;
+  const entries = new Map;
+  const dead = [];
+  let nextId = 1;
+  const waiters = new Set;
+  function add(body) {
+    const id = nextId++;
+    entries.set(id, { id, body, receiveCount: 0, visibleAt: 0, inFlight: false });
+    for (const wake of [...waiters]) {
+      wake();
+    }
+  }
+  function findByReceipt(receipt) {
+    const id = Number(receipt.split(".")[0]?.slice(1));
+    return receipt.startsWith("m") && Number.isInteger(id) ? entries.get(id) : undefined;
+  }
+  function inFlight(receipt) {
+    const entry = findByReceipt(receipt);
+    const count = Number(receipt.split(".")[1]);
+    if (entry === undefined || !entry.inFlight || entry.receiveCount !== count || entry.visibleAt <= clock.now().getTime()) {
+      throw new QueueError2(QUEUE_ERROR_CODES2.receiptInvalid, "the message is not in flight");
+    }
+    return entry;
+  }
+  function take(max, visibilityTimeoutSeconds) {
+    const now = clock.now().getTime();
+    const out = [];
+    for (const entry of [...entries.values()]) {
+      if (out.length >= max) {
+        break;
+      }
+      if (entry.visibleAt > now) {
+        continue;
+      }
+      if (entry.receiveCount >= maxReceiveCount) {
+        entries.delete(entry.id);
+        const decoded = registry.decode(entry.body);
+        dead.push({
+          messageId: decoded.ok ? decoded.envelope.id : decoded.messageId,
+          receiveCount: entry.receiveCount
+        });
+        continue;
+      }
+      entry.receiveCount += 1;
+      entry.inFlight = true;
+      entry.visibleAt = now + visibilityTimeoutSeconds * 1000;
+      const receipt = `m${entry.id}.${entry.receiveCount}`;
+      const decoded = registry.decode(entry.body);
+      out.push(decoded.ok ? {
+        kind: "message",
+        envelope: decoded.envelope,
+        receipt,
+        receiveCount: entry.receiveCount
+      } : {
+        kind: "invalid",
+        reason: decoded.reason,
+        issues: decoded.issues,
+        ...decoded.messageId === undefined ? {} : { messageId: decoded.messageId },
+        receipt,
+        receiveCount: entry.receiveCount
+      });
+    }
+    return out;
+  }
+  function encodeChecked(envelope) {
+    const body = registry.encode(envelope);
+    if (bytesOf(body) > MAX_MESSAGE_BYTES2) {
+      throw new QueueError2(QUEUE_ERROR_CODES2.messageTooLarge, "the message is over 256 KiB");
+    }
+    return body;
+  }
+  function setVisibility(receipt, seconds) {
+    assertVisibility2(seconds);
+    const entry = inFlight(receipt);
+    entry.visibleAt = clock.now().getTime() + seconds * 1000;
+    if (seconds === 0) {
+      entry.inFlight = false;
+      for (const wake of [...waiters]) {
+        wake();
+      }
+    }
+  }
+  return {
+    async publish(envelope) {
+      add(encodeChecked(envelope));
+    },
+    async publishBatch(envelopes) {
+      assertBatchCount2(envelopes.length);
+      const bodies = envelopes.map(encodeChecked);
+      if (bodies.reduce((sum, body) => sum + bytesOf(body), 0) > MAX_MESSAGE_BYTES2) {
+        throw new QueueError2(QUEUE_ERROR_CODES2.batchTooLarge, "a batch is at most 256 KiB in total");
+      }
+      for (const body of bodies) {
+        add(body);
+      }
+      const result = { sent: envelopes.map((envelope) => envelope.id), failed: [] };
+      return result;
+    },
+    async receive(receiveOptions) {
+      assertReceiveOptions2(receiveOptions);
+      const { maxMessages, visibilityTimeoutSeconds, waitSeconds, signal } = receiveOptions;
+      let found = take(maxMessages, visibilityTimeoutSeconds);
+      if (found.length > 0 || waitSeconds === 0 || signal?.aborted) {
+        return found;
+      }
+      const wake = new AbortController;
+      const published = new Promise((resolve) => {
+        const listener = () => {
+          waiters.delete(listener);
+          resolve();
+        };
+        waiters.add(listener);
+        wake.signal.addEventListener("abort", () => waiters.delete(listener), { once: true });
+      });
+      const stop = new AbortController;
+      signal?.addEventListener("abort", () => stop.abort(), { once: true });
+      try {
+        await Promise.race([published, sleep(waitSeconds * 1000, stop.signal)]);
+      } finally {
+        wake.abort();
+        stop.abort();
+      }
+      found = signal?.aborted ? [] : take(maxMessages, visibilityTimeoutSeconds);
+      return found;
+    },
+    async acknowledge(receipt) {
+      const entry = findByReceipt(receipt);
+      if (entry !== undefined) {
+        entries.delete(entry.id);
+      }
+    },
+    async extendVisibility(receipt, seconds) {
+      setVisibility(receipt, seconds);
+    },
+    async release(receipt) {
+      setVisibility(receipt, 0);
+    },
+    deadLetters: () => [...dead],
+    depth() {
+      const now = clock.now().getTime();
+      let visible = 0;
+      let hidden = 0;
+      for (const entry of entries.values()) {
+        if (entry.visibleAt > now) {
+          hidden += 1;
+        } else {
+          visible += 1;
+        }
+      }
+      return { visible, inFlight: hidden };
+    },
+    publishRaw: add
+  };
+}
+// src/queue/testing.ts
+import { z } from "zod";
+var SETTLE_ROUNDS = 8;
+function createVirtualTime() {
+  const clock = createFixedClock2("2026-01-01T00:00:00.000Z");
+  const sleepers = new Set;
+  const settle = async () => {
+    for (let round = 0;round < SETTLE_ROUNDS; round++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  return {
+    clock,
+    settle,
+    pending: () => sleepers.size,
+    sleep: (ms, signal) => new Promise((resolve) => {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      const sleeper = {
+        due: clock.now().getTime() + ms,
+        wake: () => {
+          sleepers.delete(sleeper);
+          signal?.removeEventListener("abort", sleeper.wake);
+          resolve();
+        }
+      };
+      sleepers.add(sleeper);
+      signal?.addEventListener("abort", sleeper.wake, { once: true });
+    }),
+    async advance(ms) {
+      const target = clock.now().getTime() + ms;
+      await settle();
+      for (;; ) {
+        const due = [...sleepers].filter((sleeper) => sleeper.due <= target);
+        const next = due.sort((a, b) => a.due - b.due)[0];
+        if (next === undefined) {
+          break;
+        }
+        const step = Math.max(0, next.due - clock.now().getTime());
+        clock.advance(`${step}ms`);
+        next.wake();
+        await settle();
+      }
+      clock.advance(`${Math.max(0, target - clock.now().getTime())}ms`);
+      await settle();
+    }
+  };
+}
+var testPing = defineMessage2({
+  type: "test.ping",
+  version: 1,
+  scope: "organization",
+  payload: z.object({ n: z.number().int() })
+});
+var testNote = defineMessage2({
+  type: "test.note",
+  version: 1,
+  scope: "global",
+  payload: z.object({ text: z.string() })
+});
+function createTestRegistry(options = {}) {
+  return createMessageRegistry2([testPing, testNote], options);
+}
 
 // src/testing.ts
 function build(entries, bound) {
@@ -122,10 +357,15 @@ export {
   DEFAULT_TEST_USER_ID,
   createMemoryErrorReporter,
   createMemoryLogger,
+  createMemoryQueue,
   createTestDeps,
   createTestJwks,
   createTestKeyPair,
+  createTestRegistry,
+  createVirtualTime,
   mintTestToken,
+  testNote,
   testOrganizationId,
+  testPing,
   testUserId
 };

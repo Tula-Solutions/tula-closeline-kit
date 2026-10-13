@@ -974,6 +974,233 @@ function prepareFields(fields) {
   return prepared;
 }
 
+// src/queue/errors.ts
+var QUEUE_ERROR_CODES2 = {
+  invalidMessage: "queue.invalid_message",
+  messageTooLarge: "queue.message_too_large",
+  batchTooLarge: "queue.batch_too_large",
+  invalidRequest: "queue.invalid_request",
+  receiptInvalid: "queue.receipt_invalid",
+  unavailable: "queue.unavailable",
+  badResponse: "queue.bad_response"
+};
+var STATUS = {
+  "queue.invalid_message": 422,
+  "queue.message_too_large": 413,
+  "queue.batch_too_large": 413,
+  "queue.invalid_request": 400,
+  "queue.receipt_invalid": 409,
+  "queue.unavailable": 503,
+  "queue.bad_response": 502
+};
+
+class QueueError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "QueueError";
+  }
+}
+
+// src/queue/envelope.ts
+import { z } from "zod";
+var MAX_MESSAGE_BYTES2 = 262144;
+var TYPE_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
+function defineMessage2(definition) {
+  if (!TYPE_PATTERN.test(definition.type)) {
+    throw new TypeError(`message type must look like "area.event_name", got "${definition.type}"`);
+  }
+  if (!Number.isInteger(definition.version) || definition.version < 1) {
+    throw new TypeError(`message version must be a positive integer, got ${definition.version}`);
+  }
+  return Object.freeze({ ...definition });
+}
+var INVALID_REASONS2 = [
+  "malformed",
+  "unknown_type",
+  "unsupported_version",
+  "invalid_scope",
+  "invalid_payload"
+];
+var envelopeSchema = z.object({
+  id: z.string().min(1).max(128),
+  type: z.string().min(1).max(128),
+  version: z.number().int().min(1),
+  occurredAt: z.iso.datetime(),
+  organizationId: z.string().min(1).max(128).optional(),
+  traceId: z.string().min(1).max(128),
+  payload: z.unknown()
+});
+function issuesOf(error) {
+  return error.issues.slice(0, 20).map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.code}`);
+}
+function invalid(reason, issues) {
+  return new QueueError2(QUEUE_ERROR_CODES2.invalidMessage, `message is not valid: ${reason}`, {
+    details: { reason, issues }
+  });
+}
+function createMessageRegistry2(definitions, options = {}) {
+  const byType = new Map;
+  for (const definition of definitions) {
+    if (byType.has(definition.type)) {
+      throw new TypeError(`message type ${definition.type} is defined twice`);
+    }
+    byType.set(definition.type, definition);
+  }
+  const clock = options.clock ?? systemClock2;
+  const newId = options.newId ?? (() => crypto.randomUUID());
+  function check(candidate) {
+    const shape = envelopeSchema.safeParse(candidate);
+    if (!shape.success) {
+      const id = typeof candidate === "object" && candidate !== null && "id" in candidate ? candidate.id : undefined;
+      return {
+        ok: false,
+        reason: "malformed",
+        issues: issuesOf(shape.error),
+        ...typeof id === "string" && id.length <= 128 ? { messageId: id } : {}
+      };
+    }
+    const value = shape.data;
+    const base = { messageId: value.id };
+    const definition = byType.get(value.type);
+    if (definition === undefined) {
+      return {
+        ok: false,
+        reason: "unknown_type",
+        issues: [`type: ${value.type.slice(0, 64)}`],
+        ...base
+      };
+    }
+    if (value.version !== definition.version) {
+      return {
+        ok: false,
+        reason: "unsupported_version",
+        issues: [`version: ${value.version}, accepted ${definition.version}`],
+        ...base
+      };
+    }
+    if (definition.scope === "organization" && value.organizationId === undefined) {
+      return { ok: false, reason: "invalid_scope", issues: ["organizationId: required"], ...base };
+    }
+    if (definition.scope === "global" && value.organizationId !== undefined) {
+      return {
+        ok: false,
+        reason: "invalid_scope",
+        issues: ["organizationId: not allowed"],
+        ...base
+      };
+    }
+    const payload = definition.payload.safeParse(value.payload);
+    if (!payload.success) {
+      return { ok: false, reason: "invalid_payload", issues: issuesOf(payload.error), ...base };
+    }
+    const envelope = {
+      id: value.id,
+      type: value.type,
+      version: value.version,
+      occurredAt: value.occurredAt,
+      traceId: value.traceId,
+      payload: payload.data
+    };
+    if (value.organizationId !== undefined) {
+      envelope.organizationId = value.organizationId;
+    }
+    return { ok: true, envelope };
+  }
+  return {
+    definitions: byType,
+    create(input) {
+      const request = input;
+      const definition = byType.get(request.type);
+      if (definition === undefined) {
+        throw invalid("unknown_type", [`type: ${String(request.type).slice(0, 64)}`]);
+      }
+      const envelope = {
+        id: request.id ?? newId(),
+        type: definition.type,
+        version: definition.version,
+        occurredAt: (request.occurredAt ?? clock.now()).toISOString(),
+        traceId: request.traceId,
+        payload: definition.payload.parse(request.payload)
+      };
+      if (request.organizationId !== undefined) {
+        envelope.organizationId = request.organizationId;
+      }
+      const result = check(envelope);
+      if (!result.ok) {
+        throw invalid(result.reason, result.issues);
+      }
+      return result.envelope;
+    },
+    encode(envelope) {
+      const result = check(envelope);
+      if (!result.ok) {
+        throw invalid(result.reason, result.issues);
+      }
+      return JSON.stringify(result.envelope);
+    },
+    decode(body) {
+      if (body.length > MAX_MESSAGE_BYTES2) {
+        return { ok: false, reason: "malformed", issues: ["body: too large"] };
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        return { ok: false, reason: "malformed", issues: ["body: not JSON"] };
+      }
+      return check(parsed);
+    }
+  };
+}
+
+// src/queue/port.ts
+var MAX_BATCH_SIZE2 = 10;
+var MAX_WAIT_SECONDS2 = 20;
+var MAX_VISIBILITY_SECONDS2 = 43200;
+function assertReceiveOptions2(options) {
+  const { maxMessages, visibilityTimeoutSeconds, waitSeconds } = options;
+  if (!Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > MAX_BATCH_SIZE2) {
+    throw new QueueError2(QUEUE_ERROR_CODES2.invalidRequest, "maxMessages must be 1 to 10");
+  }
+  assertVisibility2(visibilityTimeoutSeconds);
+  if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > MAX_WAIT_SECONDS2) {
+    throw new QueueError2(QUEUE_ERROR_CODES2.invalidRequest, "waitSeconds must be 0 to 20");
+  }
+}
+function assertVisibility2(seconds) {
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_VISIBILITY_SECONDS2) {
+    throw new QueueError2(QUEUE_ERROR_CODES2.invalidRequest, "visibility timeout must be 0 to 43200 whole seconds");
+  }
+}
+function assertBatchCount2(count) {
+  if (count < 1 || count > MAX_BATCH_SIZE2) {
+    throw new QueueError2(QUEUE_ERROR_CODES2.batchTooLarge, "a batch holds 1 to 10 messages", {
+      details: { count }
+    });
+  }
+}
+
+// src/queue/sleep.ts
+var systemSleep2 = (ms, signal) => new Promise((resolve) => {
+  if (signal?.aborted) {
+    resolve();
+    return;
+  }
+  const done = () => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", done);
+    resolve();
+  };
+  const timer = setTimeout(done, ms);
+  signal?.addEventListener("abort", done, { once: true });
+});
+
 // src/reporting/port.ts
 function isAppErrorShaped(error) {
   return typeof error === "object" && error !== null && error.name === "AppError" && typeof error.status === "number";
@@ -989,4 +1216,4 @@ function shouldReportError2(error) {
   }
 }
 
-export { systemClock2, createFixedClock2, AppError2, isAppError2, toErrorBody2, isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2 };
+export { systemClock2, createFixedClock2, AppError2, isAppError2, toErrorBody2, isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, QUEUE_ERROR_CODES2, QueueError2, MAX_MESSAGE_BYTES2, defineMessage2, INVALID_REASONS2, createMessageRegistry2, MAX_BATCH_SIZE2, MAX_WAIT_SECONDS2, MAX_VISIBILITY_SECONDS2, assertReceiveOptions2, assertVisibility2, assertBatchCount2, systemSleep2, shouldReportError2 };

@@ -420,6 +420,276 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
+import { z as z3 } from "zod";
+/** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
+declare const MAX_MESSAGE_BYTES = 262144;
+/** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
+type MessageScope = "organization" | "global";
+/** What one kind of message is: its name, its current version, its scope and its payload schema. */
+interface MessageDefinition<
+	T extends string = string,
+	P extends z3.ZodType = z3.ZodType,
+	S extends MessageScope = MessageScope
+> {
+	readonly type: T;
+	readonly version: number;
+	readonly scope: S;
+	readonly payload: P;
+}
+/** A definition of any type, for code that accepts every kind. */
+type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
+/**
+* Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
+* `version` is a positive integer you raise when the payload changes incompatibly. A consumer
+* accepts only the version its registry holds, so a newer message waits in the queue (and reaches
+* the dead-letter queue) until the consumer is deployed with the new definition.
+*/
+declare function defineMessage<
+	const T extends string,
+	P extends z3.ZodType,
+	const S extends MessageScope
+>(definition: {
+	type: T;
+	version: number;
+	scope: S;
+	payload: P;
+}): MessageDefinition<T, P, S>;
+/** The fields every envelope has. */
+interface EnvelopeBase<
+	T extends string,
+	P
+> {
+	/** Unique id of this message; stays the same when the publisher retries, so consumers can dedupe. */
+	id: string;
+	/** The message type, such as `core.organization_created`. */
+	type: T;
+	/** The version of the type's definition this was written with. */
+	version: number;
+	/** When the thing happened, ISO 8601 UTC. */
+	occurredAt: string;
+	/** The request or trace id that caused it, for finding the log lines. */
+	traceId: string;
+	/** The validated payload. */
+	payload: P;
+}
+type ScopeField<S> = S extends "organization" ? {
+	organizationId: string;
+} : {
+	organizationId?: undefined;
+};
+/** The envelope of a definition, or the union of the envelopes of a union of definitions. */
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
+/** The shape every envelope has, whatever its type. */
+interface AnyEnvelope {
+	id: string;
+	type: string;
+	version: number;
+	occurredAt: string;
+	organizationId?: string | undefined;
+	traceId: string;
+	payload: unknown;
+}
+/** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
+type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
+	type: T;
+	payload: z3.input<P>;
+	traceId: string;
+	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
+	id?: string;
+	/** Defaults to the registry clock's now. */
+	occurredAt?: Date;
+} & ScopeField<S> : never;
+/** Why a received body is not a message this registry accepts. */
+declare const INVALID_REASONS: readonly ["malformed", "unknown_type", "unsupported_version", "invalid_scope", "invalid_payload"];
+/** One of {@link INVALID_REASONS}. */
+type InvalidReason = (typeof INVALID_REASONS)[number];
+/** The outcome of {@link MessageRegistry.decode}. `issues` are field paths and codes, never values. */
+type DecodeResult<E> = {
+	ok: true;
+	envelope: E;
+} | {
+	ok: false;
+	reason: InvalidReason;
+	issues: string[];
+	messageId?: string;
+};
+/** Knows every message type a service handles; builds, encodes and decodes envelopes. */
+interface MessageRegistry<D extends AnyDefinition> {
+	/** The definitions, by type. */
+	readonly definitions: ReadonlyMap<string, D>;
+	/** Builds a validated envelope. Throws a ZodError when the payload does not fit its schema. */
+	create(input: CreateInput<D>): EnvelopeOf<D>;
+	/**
+	* Validates an envelope and turns it into the JSON body to send. Throws a QueueError with code
+	* `queue.invalid_message` for an unknown type, a wrong version or scope, or a bad payload.
+	* Complexity O(body size).
+	*/
+	encode(envelope: EnvelopeOf<D>): string;
+	/**
+	* Parses and validates a received body. Never throws: a body that is not an accepted message
+	* comes back as `ok: false` so the caller decides what happens to it. O(body size).
+	*/
+	decode(body: string): DecodeResult<EnvelopeOf<D>>;
+}
+/** Options for {@link createMessageRegistry}. */
+interface MessageRegistryOptions {
+	/** Time source for `occurredAt`; defaults to the system clock. */
+	clock?: Clock;
+	/** Id source; defaults to `crypto.randomUUID`. */
+	newId?: () => string;
+}
+/**
+* Builds a registry from the message definitions a service knows. Two definitions with the same
+* type are a mistake and throw.
+*/
+declare function createMessageRegistry<const D extends AnyDefinition>(definitions: readonly D[], options?: MessageRegistryOptions): MessageRegistry<D>;
+/** The `area.reason` codes the queue adapters throw. */
+declare const QUEUE_ERROR_CODES: {
+	/** An envelope failed validation before sending. */
+	readonly invalidMessage: "queue.invalid_message";
+	/** A message body is over the 256 KiB limit. */
+	readonly messageTooLarge: "queue.message_too_large";
+	/** A batch has more than 10 messages or more than 256 KiB in total. */
+	readonly batchTooLarge: "queue.batch_too_large";
+	/** A call argument is outside what the queue accepts (batch size, visibility, wait). */
+	readonly invalidRequest: "queue.invalid_request";
+	/** The receipt is not for a message that is in flight any more. */
+	readonly receiptInvalid: "queue.receipt_invalid";
+	/** The queue did not answer, in time or at all, after the bounded retries. */
+	readonly unavailable: "queue.unavailable";
+	/** The queue answered with something this adapter cannot use. */
+	readonly badResponse: "queue.bad_response";
+};
+/** One of {@link QUEUE_ERROR_CODES}'s values. */
+type QueueErrorCode = (typeof QUEUE_ERROR_CODES)[keyof typeof QUEUE_ERROR_CODES];
+/** What a queue port or adapter throws. Its message never holds a message body. */
+declare class QueueError extends AppError {
+	readonly code: QueueErrorCode;
+	constructor(code: QueueErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** Opaque handle for one delivery of a message; pass it back to acknowledge or change visibility. */
+type Receipt = string;
+/** The largest batch SQS takes or gives. */
+declare const MAX_BATCH_SIZE = 10;
+/** The longest long-poll wait SQS allows, in seconds. */
+declare const MAX_WAIT_SECONDS = 20;
+/** The longest visibility timeout SQS allows, in seconds (12 hours). */
+declare const MAX_VISIBILITY_SECONDS = 43200;
+/** A message that arrived and passed validation. */
+interface ValidDelivery<E> {
+	kind: "message";
+	/** The validated envelope. */
+	envelope: E;
+	/** Handle for acknowledging this delivery. */
+	receipt: Receipt;
+	/** How many times the queue has handed this message out, this delivery included (1 on the first). */
+	receiveCount: number;
+}
+/**
+* A message that arrived but is not one this service accepts: not JSON, an unknown type, a
+* different version, a wrong scope or a payload that fails its schema. It is handed to the caller
+* rather than dropped, so it can be logged, reported and left to reach the dead-letter queue. It
+* carries no body: only the reason, field paths and the envelope id when one could be read.
+*/
+interface InvalidDelivery {
+	kind: "invalid";
+	/** Why it was rejected. */
+	reason: InvalidReason;
+	/** Field paths and codes of what failed; never values. */
+	issues: string[];
+	/** The envelope's id, when the body had one. */
+	messageId?: string;
+	/** Handle for acknowledging, or delaying, this delivery. */
+	receipt: Receipt;
+	/** How many times the queue has handed this message out. */
+	receiveCount: number;
+}
+/** One thing {@link Queue.receive} returns. */
+type Delivery<E> = ValidDelivery<E> | InvalidDelivery;
+/** What {@link Queue.receive} is asked for. */
+interface ReceiveOptions {
+	/** How many messages at most, 1 to 10. */
+	maxMessages: number;
+	/** How long the messages stay hidden from other receivers, in seconds, 0 to 43200. */
+	visibilityTimeoutSeconds: number;
+	/** How long to wait for a message when the queue is empty (long poll), in seconds, 0 to 20. */
+	waitSeconds: number;
+	/** Ends the wait early; the call then returns an empty list. */
+	signal?: AbortSignal;
+}
+/** What {@link Queue.publishBatch} reports for one message that was not accepted. */
+interface BatchFailure {
+	/** The envelope id. */
+	id: string;
+	/** The queue's error code, such as `InternalError` or `ServiceUnavailable`. */
+	code: string;
+	/** True when the failure is the sender's fault (retrying the same message will not help). */
+	senderFault: boolean;
+}
+/** The outcome of a batch publish: which envelope ids were accepted and which were not. */
+interface BatchResult {
+	/** Ids of the envelopes the queue accepted, in input order. */
+	sent: string[];
+	/** The ones it did not; the caller retries these (the same envelope, so the id is stable). */
+	failed: BatchFailure[];
+}
+/**
+* A queue of typed messages. Delivery is at-least-once and unordered: a message can be handed out
+* more than once (a consumer that is slow, crashes, or a duplicate in the queue itself) and two
+* messages can arrive in either order, so a handler must be idempotent (see
+* {@link createConsumer}). An envelope is validated against the registry on the way in and on the
+* way out. The queue holds the message until it is acknowledged; after the queue's
+* `maxReceiveCount` deliveries it moves to the dead-letter queue instead of being delivered again.
+*/
+interface Queue<E extends AnyEnvelope = AnyEnvelope> {
+	/**
+	* Sends one message. Resolves when the queue has accepted it. Throws a QueueError: invalid
+	* message, message too large, or unavailable (after the adapter's bounded, jittered retries).
+	* A retry after an `unavailable` error can leave two copies in the queue with the same envelope
+	* id; the idempotent consumer drops the second. O(message size).
+	*/
+	publish(envelope: E): Promise<void>;
+	/**
+	* Sends up to 10 messages (and up to 256 KiB in total) in one call. Everything is validated
+	* before anything is sent. A message the queue refuses comes back in `failed`; the call throws
+	* only when the whole request fails. O(total size).
+	*/
+	publishBatch(envelopes: readonly E[]): Promise<BatchResult>;
+	/**
+	* Receives up to `maxMessages` messages and hides them for `visibilityTimeoutSeconds`. With
+	* `waitSeconds` above 0 it waits that long for a message when the queue is empty. Messages that
+	* are not valid come back as `kind: 'invalid'`. O(batch size).
+	*/
+	receive(options: ReceiveOptions): Promise<Delivery<E>[]>;
+	/**
+	* Removes the message for good. Safe to call twice and for a delivery that was already
+	* redelivered: it resolves either way.
+	*/
+	acknowledge(receipt: Receipt): Promise<void>;
+	/**
+	* Hides the message for `seconds` more from now (a lease extension, or a delay before retry).
+	* Throws a QueueError `queue.receipt_invalid` when the message is no longer in flight.
+	*/
+	extendVisibility(receipt: Receipt, seconds: number): Promise<void>;
+	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
+	release(receipt: Receipt): Promise<void>;
+}
+/** Throws the QueueError for a `receive` call whose numbers are out of range. */
+declare function assertReceiveOptions(options: ReceiveOptions): void;
+/** Throws the QueueError for a visibility timeout outside 0 to 43200 whole seconds. */
+declare function assertVisibility(seconds: number): void;
+/** Throws the QueueError for a batch of 0 or more than 10 messages. */
+declare function assertBatchCount(count: number): void;
+/**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+/** The real {@link Sleep}, on `setTimeout`. */
+declare const systemSleep: Sleep;
 import { Region as Region3 } from "tula-closeline-contract";
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
@@ -499,4 +769,4 @@ declare function cutText(text: string, max: number): string;
 declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, Clock, CreateInput, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_MESSAGE_BYTES, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, PACKAGE, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, Sleep, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
