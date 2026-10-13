@@ -32,11 +32,6 @@ const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'sessionid',
   'sessid',
   'signature',
-  'dsn',
-  'otp',
-  'cvv',
-  'credential',
-  'credentials',
 ])
 const SENSITIVE_SUFFIXES = [
   'token',
@@ -59,6 +54,12 @@ const SENSITIVE_SUFFIXES = [
   'sessid',
   'authorizationheader',
   'body',
+  // One-time codes, card codes, connection strings and credentials, as the last word of a longer
+  // key (`smsOtp`, `card_cvv`, `SENTRY_DSN`, `dbCredentials`; the plural is the singular's `s`).
+  'otp',
+  'cvv',
+  'dsn',
+  'credential',
   // The irregular plural: stripping one `s` from `bodies` does not give `body`.
   'bodies',
 ]

@@ -90,12 +90,14 @@ printed to the console. An `http:` DSN is accepted only when `ENVIRONMENT` is `l
 The event's `exception` entries are rebuilt by the adapter from known fields (type, value, frames
 with file, function, line and column, and the mechanism's type, handled flag and cause links), not
 kept from the SDK, so nothing another event processor adds to them is sent; there is no
-`debug_meta`. The other kept fields are rebuilt or checked too: `sdk` and `contexts.runtime` keep
-a name and a version string only, `release`, `environment` and `platform` are the adapter's own
+`debug_meta`. The other kept fields are rebuilt or checked too: `sdk` is the SDK's own name
+and version and `contexts.runtime` is the adapter's own (`bun` and its version), never read from the
+event, so free text a processor writes there is not sent; `release`, `environment` and `platform` are the adapter's own
 values, `event_id` must be 32 hex digits and `timestamp` a number. The `organization_id` and
-`request_id` tags are sent only if they fit `[A-Za-z0-9_.:-]` and 64 characters and `scrubText`
-would leave them as they are; they are never masked, so a value that fails either test (a key, a
-token or a card number passed by mistake) is sent as `[invalid]`.
+`request_id` tags are sent only if they have a shape this system makes: `<prefix>_<32 lowercase hex>`
+with a 2 to 5 letter prefix (as `tula-closeline-contract` makes `org_`, `usr_`, `req_`), a UUID, or
+32 hex digits (a trace id). They are never masked, so anything else (a key, a token, a hash, a ULID,
+a card number passed by mistake) is sent as `[invalid]`.
 
 Every event then passes the kit's key-based redaction and `scrubText` on every string, in
 `beforeSend`. Only the fields this adapter set are kept: the SDK merges its process-wide global
@@ -130,8 +132,10 @@ It masks:
 - the value in a Postgres constraint detail, `Key (email)=([redacted]) already exists.`;
 - email addresses, including letters beyond ASCII (`jörg.müller@acme.de`, `田中@example.jp`);
 - telephone numbers written with a `+` (8 to 15 digits), with a parenthesised area code
-  (`(415) 555-0199`, `+1 (415) 555-0199`) or in the national trunk form, a first group that starts
-  with `0` and has 2 to 5 digits (`020 7946 0958`, `06 12 34 56 78`, `0171-123-4567`);
+  (`(415) 555-0199`, `+1 (415) 555-0199`), with the `00` international prefix and a country code
+  (`0044 20 7946 0958`, `00 33 6 12 34 56 78`, `001 415 555 0100`) or in the national trunk form, a
+  first group that starts with `0` and has 2 to 5 digits (`020 7946 0958`, `06 12 34 56 78`,
+  `0171-123-4567`);
 - payment card numbers: 13 to 19 digits, bare or written in the usual groups (4-4-4-4, 4-6-5), in a
   card issuer's range (3x, 4, 5, 6, 2221 to 2720) that pass the Luhn check. A run that starts with
   `1` (epoch timestamps in milliseconds, microseconds and nanoseconds do, and must stay readable) is
@@ -150,7 +154,7 @@ test holds this to 20,000 UUIDs and thousands of ids of every other kind from a 
 identifiers intact; the main protection is key-based redaction of structured fields, so put personal
 data in fields, not in messages. These are not masked in free text:
 - telephone numbers written as bare digits, or with separators but without a `+`, a parenthesised
-  area code or a trunk zero (`4155550199`, `415-555-0199`, `1-800-555-0199`, French dotted
+  area code, `00` or a trunk zero (`4155550199`, `415-555-0199`, `1-800-555-0199`, French dotted
   `01.23.45.67.89`, which reads as an IPv4 address);
 - IBANs and other bank account identifiers, and national ids;
 - postal addresses and names.
@@ -164,8 +168,12 @@ The places an id can still be altered, and the only ones:
   (and start in an issuer's range, unless they start with 1);
 - digit groups of 9 to 15 digits written with one kind of separator whose first group has 2 to 5
   digits and starts with a single `0` followed by a non-zero digit, because that is how a national
-  telephone number opens (`invoice 0123-4567-8901`). A first group starting `00` is left alone, so
-  zero-padded counters (`0042-0017-0231`) stay readable.
+  telephone number opens (`invoice 0123-4567-8901`);
+- a group run opening with `00` followed by a valid country code in the first group (or as the
+  second) is read as an international number, unless it has three or more groups of one width of
+  three or more digits. So `0044 0017 0231` and `0020-0021-0022` stay readable, and a real number
+  written that way (`0049 3012 3456 7890`) is not masked; padded counters whose first group is not
+  `00` and a country code (`0042-0017-0231`, `0012-3456-7890`) stay readable too.
 
 **It over-masks on purpose.** Prose after a sensitive key goes with the value, because a free-text
 value cannot be told from a secret: `Invalid token: expired` becomes `Invalid token: [redacted]`,
@@ -195,14 +203,12 @@ For callers of the logger and `scrubText` before this version:
   trailing newline now boots.
 - **The memory reporter** drops captures, and its `flush` resolves `false`, after `close`.
 - **Tags set from typed context** (`organization_id`, `request_id`) are sent as they are when they
-  match `[A-Za-z0-9_.:-]{1,64}` and hold nothing `scrubText` would mask, and as `[invalid]`
-  otherwise.
-- **A bare hex value of 40 or more characters** as `organization_id` or `request_id` is sent as
-  `[invalid]`; a 32-hex trace id, a UUID, a ULID or a prefixed id is unchanged.
+  have one of the id shapes in the contract (see above), and as `[invalid]` otherwise.
 - **More field names are redacted**: `passwordHash`, `sessionKey`, `accessKey`, `connectionString`,
-  `dsn`, `credential(s)`, `otp`, `cvv` and `X-Hub-Signature-256`. `accessKeyId` stays readable.
-- **A number group written with a trunk zero** is a telephone number only if the zero is followed
-  by a non-zero digit (`00` opens counters, not telephone numbers).
+  `X-Hub-Signature-256`, and keys ending in `dsn`, `credential(s)`, `otp` or `cvv` (`SENTRY_DSN`,
+  `smsOtp`, `card_cvv`, `dbCredentials`). `accessKeyId` stays readable.
+- **A number group written with `00`** is a telephone number only if a country code follows (see
+  above); other `00` groups are counters.
 - **The Sentry event's `sdk` keeps a name and version** (the SDK adds its own package list after),
   and its `release`, `environment` and `platform` are always the adapter's own values.
 

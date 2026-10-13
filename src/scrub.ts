@@ -145,7 +145,7 @@ function valueEnd(text: string, start: number, inQuery: boolean, jsonKey: boolea
     }
     return end
   }
-  while (end < text.length && text[end] !== '\n' && text[end] !== '\r') {
+  while (end < text.length && text.charCodeAt(end) !== 10 && text.charCodeAt(end) !== 13) {
     end++
   }
   return end
@@ -255,7 +255,7 @@ function maskPairs(text: string): string {
       // A figure under a token-count key is usage, not a credential, and what follows it is prose.
       // Checked on a short slice before `valueEnd` scans to the end of the line, so a run of such
       // pairs costs a constant each.
-      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
+      if (mayBeTokenCount(key) && /^[0-9]{1,24}(?=[\s,;&]|$)/.test(text.slice(start, start + 25))) {
         continue
       }
       const end = valueEnd(text, start, before === '?' || before === '&', jsonKey)

@@ -4,6 +4,18 @@ import { cutText, scrubText } from './scrub'
 const JWT =
   'eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c3JfMSIsIm9yZyI6Im9yZ18xIn0.c2lnbmF0dXJlLWJ5dGVz'
 
+describe('scrubText: suffix keys (N4)', () => {
+  test.each([
+    'card_cvv=123',
+    'smsOtp=482913',
+    'user_otp: 482913',
+    'dbCredentials=admin:hunter2',
+    'SENTRY_DSN=https://k@o1.ingest.sentry.io/2',
+  ])('%s is masked', (text) => {
+    expect(scrubText(text)).toMatch(/=\[redacted\]$|: \[redacted\]$/)
+  })
+})
+
 describe('scrubText masks secrets inside free text', () => {
   test.each([
     ['a bearer token', 'request failed with Bearer abc123.def-456_ghi', 'abc123'],
@@ -162,6 +174,10 @@ describe('scrubText is bounded and never throws', () => {
     expect(elapsed).toBeLessThan(LIMIT_MS)
   })
 
+  // The work is counted, not timed, so the check cannot flake on a busy machine: every string
+  // primitive the scrubber loops with is counted at two input sizes. Linear work costs 4x for 4x the
+  // input; a quadratic scan costs 16x. (The regular expressions' own backtracking is not counted;
+  // the "finishes quickly" cases above cover it with generous absolute limits.)
   test('work grows in proportion to the input, not its square', () => {
     const shapes = [
       'password="',
@@ -171,21 +187,60 @@ describe('scrubText is bounded and never throws', () => {
       'http://u:',
       'tokens=1 ',
       'max_tokens=1,',
+      '+44 20 ',
+      '0044 20 ',
+      '4111 1111 ',
+      '(415) ',
+      '00 1 ',
+      'a@',
     ]
-    for (const shape of shapes) {
-      const small = shape.repeat(Math.ceil(8_000 / shape.length))
-      const large = shape.repeat(Math.ceil(32_000 / shape.length))
-      scrubText(large)
-      const time = (input: string) => {
-        const start = performance.now()
-        for (let i = 0; i < 5; i++) {
-          scrubText(input)
+    const counted: Array<[object, string]> = [
+      [String.prototype, 'charCodeAt'],
+      [String.prototype, 'slice'],
+      [String.prototype, 'indexOf'],
+      [String.prototype, 'substring'],
+      [RegExp.prototype, 'test'],
+      [RegExp.prototype, 'exec'],
+    ]
+    const operations = (input: string): number => {
+      let calls = 0
+      const originals = counted.map(([target, name]) => {
+        const original = (target as Record<string, unknown>)[name] as (
+          ...args: unknown[]
+        ) => unknown
+        ;(target as Record<string, unknown>)[name] = function (this: unknown, ...args: unknown[]) {
+          calls++
+          return original.apply(this, args)
         }
-        return performance.now() - start
+        return original
+      })
+      try {
+        scrubText(input)
+      } finally {
+        counted.forEach(([target, name], i) => {
+          ;(target as Record<string, unknown>)[name] = originals[i]
+        })
       }
-      // 4x the input should cost about 4x; a quadratic scan would cost 16x.
-      expect(time(large)).toBeLessThan(Math.max(time(small) * 10, 20))
+      return calls
     }
+    for (const shape of shapes) {
+      const small = operations(shape.repeat(Math.ceil(4_000 / shape.length)))
+      const large = operations(shape.repeat(Math.ceil(16_000 / shape.length)))
+      // 4x the input: 4x the operations, with room for the fixed cost; 16x would be quadratic.
+      expect({ shape, within: large <= small * 6 + 200 }).toEqual({ shape, within: true })
+    }
+  })
+
+  test.each([
+    [
+      'a count of twenty digits',
+      'tokens=12345678901234567890 ok',
+      'tokens=12345678901234567890 ok',
+    ],
+    ['digits and letters after 25 digits', `tokens=${'7'.repeat(25)}abc`, 'tokens=[redacted]'],
+    ['a count that runs on for 30 digits', `tokens=${'7'.repeat(30)} ok`, 'tokens=[redacted]'],
+  ])('%s (the token-count slice)', (_name, text, expected) => {
+    expect(scrubText(text)).toBe(expected)
   })
 
   test.each([

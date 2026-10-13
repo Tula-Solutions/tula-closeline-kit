@@ -49,6 +49,16 @@ describe('isSensitiveKey', () => {
     'cvv',
     'X-Hub-Signature-256',
     'X-Hub-Signature',
+    'card_cvv',
+    'cardCvv',
+    'smsOtp',
+    'user_otp',
+    'totp',
+    'dbCredentials',
+    'db_credentials',
+    'AWS_CREDENTIALS',
+    'SENTRY_DSN',
+    'sentryDsn',
   ])('%s is sensitive', (key) => {
     expect(isSensitiveKey(key)).toBe(true)
   })
@@ -81,6 +91,9 @@ describe('isSensitiveKey', () => {
     'dsnHost',
     'cvvLength',
     'credentialType',
+    'otpEnabled',
+    'credentialsExpireAt',
+    'accessKeyId',
     'recordingUrl',
     'isRecording',
     'tokenizer',
