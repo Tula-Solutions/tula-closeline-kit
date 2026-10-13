@@ -252,6 +252,118 @@ declare class AppError extends Error {
 declare function isAppError(value: unknown): value is AppError;
 /** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
 declare function toErrorBody(error: AppError): ErrorBody;
+import { Region as Region3 } from "tula-closeline-contract";
+import { z as z2 } from "zod";
+/** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
+declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
+/** One of the deployment environments. */
+type Environment = (typeof ENVIRONMENTS)[number];
+/** Zod schema for the `ENVIRONMENT` variable. */
+declare const environmentSchema: z2.ZodEnum<{
+	dev: "dev";
+	local: "local";
+	prod: "prod";
+	staging: "staging";
+}>;
+/**
+* True for a string the Sentry SDK takes as a DSN: `https://<public key>@<host>/<project id>`, with
+* an optional secret, port and path prefix and no trailing slash. A DSN with the `http:` scheme
+* passes only when `environment` is `local`, so events and the project key are never sent in clear
+* text from a deployed service. It checks the shape only; whether the project exists, and in which
+* data region, is Sentry's.
+*/
+declare function isSentryDsn(value: string, environment: Environment): boolean;
+/**
+* Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". Surrounding
+* whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
+* the value a service boots with is the one the reporter uses.
+*/
+declare const sentryDsnSchema: z2.ZodPreprocess<z2.ZodOptional<z2.ZodString>, unknown>;
+/**
+* Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
+* `dev`, `staging` and `prod`, where it must use `https:`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
+* so boot fails when a deployed service has no error tracker.
+*/
+declare function requireSentryDsn(env: {
+	ENVIRONMENT: Environment;
+	SENTRY_DSN?: string | undefined;
+}, ctx: z2.RefinementCtx): void;
+/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
+interface ErrorContext {
+	/** The request's id, for finding the log lines. */
+	requestId?: string;
+	/** The Organization the request was for, so one customer's errors can be filtered. */
+	organizationId?: string;
+	/** HTTP method of the failed request. */
+	method?: string;
+	/** Request path without its query string. */
+	path?: string;
+	/** HTTP status the service answered with. */
+	status?: number;
+	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
+	tags?: Record<string, string>;
+}
+/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
+interface ErrorReporter {
+	/**
+	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
+	* and never waits for the network.
+	*/
+	capture(error: unknown, context?: ErrorContext): void;
+	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
+	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
+}
+/** Options for createErrorReporter. */
+interface ErrorReporterOptions {
+	/** The Sentry DSN of this Region's project; no DSN gives a reporter that sends nothing. */
+	dsn?: string | undefined;
+	/** Service name, sent as the `service` tag. */
+	service: string;
+	/** The `ENVIRONMENT` the service runs in, sent as the `environment` tag. */
+	environment: Environment;
+	/** The Region this deployment serves, sent as the `region` tag. */
+	region: Region3;
+	/** The git SHA of the running build, sent as the event's release. */
+	release?: string | undefined;
+	/** Where the reporter says that it is off or that a send failed; errors themselves never go here. */
+	logger: Logger;
+}
+/**
+* True for an error worth reporting: any unknown error, and an AppError with status 500 or above.
+* An AppError below 500 is an expected outcome (bad input, expired token) and is never sent.
+*/
+declare function shouldReportError(error: unknown): boolean;
+/**
+* Picks the error reporter for a service: the Sentry adapter when a DSN is given, otherwise the
+* no-op one, so `local` and tests run without Sentry. The DSN is per Region (ADR 0001): give each
+* deployment the DSN of a Sentry project in its own data region; the kit sends to whatever it is given.
+*/
+declare function createErrorReporter(options: ErrorReporterOptions): ErrorReporter;
+/** Returns the reporter that sends nothing, used when no DSN is configured; it costs one empty call. It is one shared object with no state, so `flush` after `close` is still true: there is nothing to deliver. */
+declare function createNoopErrorReporter(): ErrorReporter;
+/**
+* Cuts text to at most `max` characters, drops a trailing partial word (it could be the front of a
+* secret) and marks the cut. Text that fits is returned as it is. Work is bounded by `max`.
+*/
+declare function cutText(text: string, max: number): string;
+/**
+* Masks secrets and personal data inside free text (an error message, a log message): bearer
+* tokens, JWTs and common API-key shapes, URL credentials, connection strings, the value in a
+* Postgres `Key (column)=(value)` detail, the value of any `key=value` or `key: value` pair whose
+* key the kit treats as sensitive (to the end of the line when unquoted, to the end of the JSON
+* value after a quoted key), email addresses, telephone numbers written with a `+`, `(area code)` or
+* trunk zero, and payment card numbers. An identifier (a UUID, a prefixed id, a timestamp, a
+* version, a count) is never altered: where a pattern cannot tell, the text is left alone. Input
+* over 32 KiB is cut. Runs in time linear in the input and never throws; if it somehow fails it
+* returns a fixed placeholder.
+*/
+declare function scrubText(text: string): string;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ErrorBody, FixedClock, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createFixedClock, createLogger, createRemoteKeySet, createStaticKeySet, createTokenVerifier, isAppError, systemClock, toErrorBody };
+export { AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, Clock, ENVIRONMENTS, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, Jwks, KeySet, LogDestination, LogLevel, Logger, LoggerOptions, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_TOKEN_LENGTH, PACKAGE, RemoteKeySet, RemoteKeySetOptions, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VerifiedToken, accessTokenClaimsSchema, createAuthMiddleware, createErrorReporter, createFixedClock, createLogger, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, toErrorBody };

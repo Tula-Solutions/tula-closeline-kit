@@ -1,3 +1,6 @@
+import { scrubText } from './scrub'
+import { isSensitiveKey, mayBeTokenCount } from './sensitive'
+
 const REDACTED = '[redacted]'
 const CIRCULAR = '[circular]'
 const TRUNCATED = '[truncated]'
@@ -13,39 +16,6 @@ const MAX_NODES = 5_000
 // entry. Top-level fields are exempt: they are what identifies the entry.
 const MAX_VALUES = 20_000
 
-// Compared after lowercasing and dropping `_` and `-`, so `apiKey`, `API_KEY` and `api-key` match.
-// A key is sensitive when it, or it without one trailing `s`, is a listed word or ends with a
-// suffix (`clientSecret`, `set-cookie`, `x-api-key`, `cookies`, `secretKey`, `requestBody`,
-// `messageBodies`). `recording` and `transcript` only match as a whole key, so `recordingUrl` and
-// `isRecording` stay readable.
-const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
-  'password',
-  'token',
-  'accesstoken',
-  'refreshtoken',
-  'authorization',
-  'cookie',
-  'secret',
-  'apikey',
-  'recording',
-  'transcript',
-  'body',
-])
-const SENSITIVE_SUFFIXES = [
-  'token',
-  'secret',
-  'password',
-  'apikey',
-  'cookie',
-  'authorization',
-  'secretkey',
-  'privatekey',
-  'authorizationheader',
-  'body',
-  // The irregular plural: stripping one `s` from `bodies` does not give `body`.
-  'bodies',
-]
-
 // Keys pino writes itself; a caller field with one of these names is renamed, not allowed to
 // overwrite it.
 const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
@@ -53,28 +23,6 @@ const RESERVED_KEYS = ['level', 'time', 'msg', 'service'] as const
 interface State {
   nodes: number
   values: number
-}
-
-function normalizeKey(key: string): string {
-  return key.toLowerCase().replace(/[_-]/g, '')
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = normalizeKey(key)
-  const singular = normalized.endsWith('s') ? normalized.slice(0, -1) : normalized
-  return [normalized, singular].some(
-    (name) =>
-      SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix))
-  )
-}
-
-/**
- * True for a key that may hold a count of language-model tokens (`inputTokens`, `total_tokens`).
- * Such a key is sensitive by its name, but a number under it is a usage figure that metering
- * needs in the logs, not a credential; anything else under it is still redacted.
- */
-function mayBeTokenCount(key: string): boolean {
-  return normalizeKey(key).endsWith('tokens')
 }
 
 /** Counts one value written below the top level; false once the value budget is spent. */
@@ -118,6 +66,12 @@ function isBinary(value: object): boolean {
   )
 }
 
+/** Reads an error's text field and masks secrets inside it; an unreadable field becomes a marker. */
+function scrubbedErrorText(read: () => unknown): unknown {
+  const value = attempt(read)
+  return typeof value === 'string' && value !== UNSERIALIZABLE ? scrubText(value) : value
+}
+
 function redactError(
   error: Error,
   state: State,
@@ -133,12 +87,12 @@ function redactError(
   put(
     out,
     'message',
-    attempt(() => error.message)
+    scrubbedErrorText(() => error.message)
   )
   put(
     out,
     'stack',
-    attempt(() => error.stack)
+    scrubbedErrorText(() => error.stack)
   )
   const code = attempt(() => (error as { code?: unknown }).code)
   if (code !== undefined) {
