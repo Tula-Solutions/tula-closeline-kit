@@ -653,8 +653,11 @@ a key, so a forged one cannot start outside the Organization.
 
 **Content is untrusted.** Bodies are bytes; the store never looks inside them. The content type
 is stored as given (it must look like `type/subtype` with optional parameters, no control
-characters) and returned as given; do not branch on it or serve an object with it without your own
-check. An object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most): bodies are
+characters) and returned as the store holds it: a store may normalise insignificant whitespace in
+the parameters (S3Mock turns `text/plain; charset=utf-8` into `text/plain;charset=utf-8`; real S3
+returns it as stored, and a type without parameters always comes back byte for byte). Never compare
+a content type as a raw string, and never use a stored content type to decide behaviour or to
+serve an object; check the bytes yourself. An object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most): bodies are
 held in memory, so there is no streaming. A larger object is `storage.object_too_large` on `put`
 and on `get` (the S3 adapter checks the announced length before it reads).
 

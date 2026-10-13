@@ -357,7 +357,12 @@ interface ObjectEntry {
 }
 /** What {@link ObjectStore.head} says about one object. */
 interface ObjectInfo extends ObjectEntry {
-	/** The content type as the writer gave it. Informational only: nothing may branch on it. */
+	/**
+	* The content type as the store holds it, which is what the writer gave except that a store may
+	* normalise insignificant whitespace in the parameters (`text/plain; charset=utf-8` can come back
+	* as `text/plain;charset=utf-8`). Never compare it as a raw string, and never use it to decide
+	* behaviour: it is informational and untrusted.
+	*/
 	contentType: string;
 }
 /** An object with its body. */
@@ -393,7 +398,7 @@ interface ListPage {
 * id that starts with another id) can name another Organization's data. Keys are relative to the
 * Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
 * starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
-* keeps the content type as given and never looks at the content. Bodies are held in memory, so an
+* keeps the content type as given (returned as the store holds it, see {@link ObjectInfo}) and never looks at the content. Bodies are held in memory, so an
 * object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
 * {@link StorageError}; only `storage.unavailable` is worth retrying.
 */

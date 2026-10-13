@@ -13,6 +13,32 @@ export interface ObjectStoreSubject {
   close(): Promise<void>
 }
 
+/**
+ * True when two content types are the same media type: `type/subtype` equal ignoring case, and the
+ * parameters equal as a set, names ignoring case and values exact. A store may normalise the
+ * whitespace around parameters (`a; b=c` against `a;b=c`), so a raw string comparison is wrong.
+ */
+function sameMediaType(x: string | undefined, y: string): boolean {
+  if (x === undefined) {
+    return false
+  }
+  const parse = (value: string) => {
+    const [type = '', ...params] = value.split(';')
+    return {
+      type: type.trim().toLowerCase(),
+      params: params
+        .map((param) => {
+          const at = param.indexOf('=')
+          return `${param.slice(0, at).trim().toLowerCase()}=${param.slice(at + 1).trim()}`
+        })
+        .sort(),
+    }
+  }
+  const left = parse(x)
+  const right = parse(y)
+  return left.type === right.type && left.params.join(';') === right.params.join(';')
+}
+
 const bytes = (text: string) => new TextEncoder().encode(text)
 const text = (data: Uint8Array) => new TextDecoder().decode(data)
 
@@ -135,15 +161,30 @@ export function objectStoreBehaviour(
       expect(got?.key).toBe('docs/one.txt')
       expect(text(got?.body ?? new Uint8Array())).toBe('hello')
       expect(got?.size).toBe(5)
-      expect(got?.contentType).toBe('text/plain; charset=utf-8')
+      expect(sameMediaType(got?.contentType, 'text/plain; charset=utf-8')).toBe(true)
       expect(got?.lastModified).toBeInstanceOf(Date)
       expect(Number.isNaN(got?.lastModified.getTime())).toBe(false)
       const info = await s.store.head(a, 'docs/one.txt')
-      expect(info).toMatchObject({
-        key: 'docs/one.txt',
-        size: 5,
-        contentType: 'text/plain; charset=utf-8',
-      })
+      expect(info).toMatchObject({ key: 'docs/one.txt', size: 5 })
+      expect(sameMediaType(info?.contentType, 'text/plain; charset=utf-8')).toBe(true)
+    })
+
+    test('a content type without parameters comes back byte for byte', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+      await s.store.put(a, 'a.pdf', bytes('%PDF'), { contentType: 'application/pdf' })
+      expect((await s.store.get(a, 'a.pdf'))?.contentType).toBe('application/pdf')
+      expect((await s.store.head(a, 'a.pdf'))?.contentType).toBe('application/pdf')
+    })
+
+    test('a different media type or parameter value is not the same content type', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+      await s.store.put(a, 'k', bytes('x'), { contentType: 'text/plain; charset=utf-8' })
+      const got = await s.store.head(a, 'k')
+      expect(sameMediaType(got?.contentType, 'text/html; charset=utf-8')).toBe(false)
+      expect(sameMediaType(got?.contentType, 'text/plain; charset=latin1')).toBe(false)
+      expect(sameMediaType(got?.contentType, 'text/plain')).toBe(false)
     })
 
     test('without a content type the store says application/octet-stream', async () => {
