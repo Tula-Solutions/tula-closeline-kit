@@ -58,7 +58,9 @@ var SENSITIVE_SUFFIXES = [
   "authorization",
   "secretkey",
   "privatekey",
-  "authorizationheader"
+  "authorizationheader",
+  "body",
+  "bodies"
 ];
 var RESERVED_KEYS = ["level", "time", "msg", "service"];
 function normalizeKey(key) {

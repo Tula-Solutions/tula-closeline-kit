@@ -1,6 +1,24 @@
 import { describe, expect, test } from 'bun:test'
 import { redactFields } from './redact'
 
+describe('message bodies', () => {
+  test.each([
+    'body',
+    'bodies',
+    'requestBody',
+    'response_body',
+    'rawBody',
+    'messageBodies',
+    'email-body',
+  ])('%s is redacted', (key) => {
+    expect(redactFields({ [key]: ['hello'] })).toEqual({ [key]: '[redacted]' })
+  })
+
+  test.each(['bodyLength', 'bodySize', 'body_bytes', 'hasBody2'])('%s is kept', (key) => {
+    expect(redactFields({ [key]: 12 })).toEqual({ [key]: 12 })
+  })
+})
+
 describe('language-model token counts', () => {
   test.each([
     'inputTokens',

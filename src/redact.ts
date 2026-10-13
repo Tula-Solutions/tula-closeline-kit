@@ -15,8 +15,9 @@ const MAX_VALUES = 20_000
 
 // Compared after lowercasing and dropping `_` and `-`, so `apiKey`, `API_KEY` and `api-key` match.
 // A key is sensitive when it, or it without one trailing `s`, is a listed word or ends with a
-// suffix (`clientSecret`, `set-cookie`, `x-api-key`, `cookies`, `secretKey`). `recording`,
-// `transcript` and `body` only match as a whole key.
+// suffix (`clientSecret`, `set-cookie`, `x-api-key`, `cookies`, `secretKey`, `requestBody`,
+// `messageBodies`). `recording` and `transcript` only match as a whole key, so `recordingUrl` and
+// `isRecording` stay readable.
 const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'password',
   'token',
@@ -40,6 +41,9 @@ const SENSITIVE_SUFFIXES = [
   'secretkey',
   'privatekey',
   'authorizationheader',
+  'body',
+  // The irregular plural: stripping one `s` from `bodies` does not give `body`.
+  'bodies',
 ]
 
 // Keys pino writes itself; a caller field with one of these names is renamed, not allowed to
