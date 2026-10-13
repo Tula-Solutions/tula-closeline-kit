@@ -333,6 +333,38 @@ For callers of the logger and `scrubText` before this version:
 - **The Sentry event's `sdk` keeps a name and version** (the SDK adds its own package list after),
   and its `release`, `environment` and `platform` are always the adapter's own values.
 
+### Behaviour changes in 0.8.1
+
+Log fields are copied within shared budgets per entry: 5,000 objects, 20,000 nested values (error
+fields count as values) and 1 MiB of text, counted in UTF-16 code units over string values, object
+and Map keys, and error name, message, stack and code. One string is cut at 16 KiB and one key at
+256 characters; a cut drops a trailing partial word and ends in `[truncated]`. Once the text budget
+is spent, strings become `[truncated]` and further keys are dropped with a `[+N more]` count.
+Redaction runs first (a redacted value costs only its marker). Error text is cut to the room
+left and scrubbed before it is written, so a cut leaves no part of a secret in error text or under
+a sensitive key. Plain string fields are not scrubbed (as before): a plain string is written as it
+is, or cut. Only 200 Errors of an entry are copied, shared by its fields, plus 2 for each top-level field, so
+a single `err` survives whatever its key position; the rest are `[truncated]` and their text is
+never read. Only real `Error` instances are scrubbed; an error-like plain object (`{ message,
+stack }`) is treated as plain data.
+
+A plain string over 16 KiB is now cut and ends in `[truncated]`, and a single unbroken word over
+16 KiB (a base64 blob) becomes only `[truncated]`, because a cut drops a trailing partial word. A
+cut never leaves half of a surrogate pair.
+
+Before: once a large field spent the object budget, every later object field was written as
+`[truncated]`, so a small `tenant: { organizationId }` after a big payload was lost, and the text
+was not bounded at all (an entry could reach hundreds of megabytes). Now each top-level object
+field also gets its own allowance of 50 objects, 200 nested values and 1 KiB of text after the
+shared budgets are spent, whatever its position among the keys, so a small context object
+survives. The allowance only covers a field that fits in it: a larger field after the shared budget
+is spent is cut.
+
+Bounds, both counts and bytes: at most 5,000 + 200 x 50 objects, 20,000 + 200 x 200 nested
+values and 200 + 200 x 2 Errors, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
+12 MB in the worst case (control characters, which escape to six bytes) and about 2 MB for ordinary
+text. `bench/redact.bench.ts` budgets a typical entry, an oversized one and the worst case.
+
 ### Wiring it into a service
 
 In `src/env.ts`:

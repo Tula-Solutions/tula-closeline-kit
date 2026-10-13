@@ -1,5 +1,6 @@
 import {
   isSensitiveKey,
+  dropHighSurrogate2,
   cutText2,
   scrubText2,
   redactFields,
@@ -14,7 +15,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-a054qyze.js";
+} from "./shared/chunk-sf8f3fp3.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -1655,6 +1656,7 @@ export {
   createTokenVerifier,
   cutText2 as cutText,
   defineMessage2 as defineMessage,
+  dropHighSurrogate2 as dropHighSurrogate,
   environmentSchema,
   isAppError2 as isAppError,
   isSentryDsn,
