@@ -6,12 +6,14 @@ const UNSERIALIZABLE = '[unserializable]'
 const MAX_DEPTH = 32
 const MAX_ARRAY_ITEMS = 100
 const MAX_OBJECT_KEYS = 200
-// Total values visited by one call, so shared references cannot multiply the work.
+// Objects (including arrays, Maps, Sets and Errors) visited by one call, so shared references
+// cannot multiply the work. Primitives are free: the caps above already bound them per object.
 const MAX_NODES = 5_000
 
 // Compared after lowercasing and dropping `_` and `-`, so `apiKey`, `API_KEY` and `api-key` match.
-// These words match as a whole key, and the first six also match as the end of a key
-// (`clientSecret`, `set-cookie`, `x-api-key`).
+// A key is sensitive when it, or it without one trailing `s`, is a listed word or ends with a
+// suffix (`clientSecret`, `set-cookie`, `x-api-key`, `cookies`, `secretKey`). `recording`,
+// `transcript` and `body` only match as a whole key.
 const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'password',
   'token',
@@ -25,7 +27,17 @@ const SENSITIVE_WORDS: ReadonlySet<string> = new Set([
   'transcript',
   'body',
 ])
-const SENSITIVE_SUFFIXES = ['token', 'secret', 'password', 'apikey', 'cookie', 'authorization']
+const SENSITIVE_SUFFIXES = [
+  'token',
+  'secret',
+  'password',
+  'apikey',
+  'cookie',
+  'authorization',
+  'secretkey',
+  'privatekey',
+  'authorizationheader',
+]
 
 // Keys pino writes itself; a caller field with one of these names is renamed, not allowed to
 // overwrite it.
@@ -37,9 +49,10 @@ interface State {
 
 function isSensitiveKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[_-]/g, '')
-  return (
-    SENSITIVE_WORDS.has(normalized) ||
-    SENSITIVE_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
+  const singular = normalized.endsWith('s') ? normalized.slice(0, -1) : normalized
+  return [normalized, singular].some(
+    (name) =>
+      SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix))
   )
 }
 
@@ -161,18 +174,26 @@ function redactRecord(
   depth: number
 ): Record<string, unknown> {
   const keys = Object.keys(record)
+  const kept = keys.slice(0, MAX_OBJECT_KEYS)
   const out: Record<string, unknown> = {}
-  for (const key of keys.slice(0, MAX_OBJECT_KEYS)) {
+  const nested: Array<[string, object]> = []
+  // Pass one writes every primitive (they cost no budget) and keeps each key's position; pass two
+  // walks the objects, so a spent budget never costs the fields needed to trace a log line.
+  for (const key of kept) {
     if (isSensitiveKey(key)) {
       put(out, key, REDACTED)
       continue
     }
     const value = attempt(() => (record as Record<string, unknown>)[key])
-    put(
-      out,
-      key,
-      value === UNSERIALIZABLE ? value : redactValue(value, state, ancestors, depth + 1)
-    )
+    if (typeof value === 'object' && value !== null) {
+      put(out, key, undefined)
+      nested.push([key, value])
+    } else {
+      put(out, key, value)
+    }
+  }
+  for (const [key, value] of nested) {
+    put(out, key, redactValue(value, state, ancestors, depth + 1))
   }
   if (keys.length > MAX_OBJECT_KEYS) {
     put(out, '[more]', `[+${keys.length - MAX_OBJECT_KEYS} more]`)
@@ -207,17 +228,14 @@ function redactObject(value: object, state: State, ancestors: Set<object>, depth
 }
 
 function redactValue(value: unknown, state: State, ancestors: Set<object>, depth: number): unknown {
-  state.nodes++
-  if (state.nodes > MAX_NODES) {
-    return TRUNCATED
-  }
   if (typeof value !== 'object' || value === null) {
     return value
   }
   if (ancestors.has(value)) {
     return CIRCULAR
   }
-  if (depth >= MAX_DEPTH) {
+  state.nodes++
+  if (state.nodes > MAX_NODES || depth >= MAX_DEPTH) {
     return TRUNCATED
   }
   ancestors.add(value)

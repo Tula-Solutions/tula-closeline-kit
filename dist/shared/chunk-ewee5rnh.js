@@ -48,11 +48,22 @@ var SENSITIVE_WORDS = new Set([
   "transcript",
   "body"
 ]);
-var SENSITIVE_SUFFIXES = ["token", "secret", "password", "apikey", "cookie", "authorization"];
+var SENSITIVE_SUFFIXES = [
+  "token",
+  "secret",
+  "password",
+  "apikey",
+  "cookie",
+  "authorization",
+  "secretkey",
+  "privatekey",
+  "authorizationheader"
+];
 var RESERVED_KEYS = ["level", "time", "msg", "service"];
 function isSensitiveKey(key) {
   const normalized = key.toLowerCase().replace(/[_-]/g, "");
-  return SENSITIVE_WORDS.has(normalized) || SENSITIVE_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+  const singular = normalized.endsWith("s") ? normalized.slice(0, -1) : normalized;
+  return [normalized, singular].some((name) => SENSITIVE_WORDS.has(name) || SENSITIVE_SUFFIXES.some((suffix) => name.endsWith(suffix)));
 }
 function attempt(read) {
   try {
@@ -122,14 +133,24 @@ function redactMap(map, state, ancestors, depth) {
 }
 function redactRecord(record, state, ancestors, depth) {
   const keys = Object.keys(record);
+  const kept = keys.slice(0, MAX_OBJECT_KEYS);
   const out = {};
-  for (const key of keys.slice(0, MAX_OBJECT_KEYS)) {
+  const nested = [];
+  for (const key of kept) {
     if (isSensitiveKey(key)) {
       put(out, key, REDACTED);
       continue;
     }
     const value = attempt(() => record[key]);
-    put(out, key, value === UNSERIALIZABLE ? value : redactValue(value, state, ancestors, depth + 1));
+    if (typeof value === "object" && value !== null) {
+      put(out, key, undefined);
+      nested.push([key, value]);
+    } else {
+      put(out, key, value);
+    }
+  }
+  for (const [key, value] of nested) {
+    put(out, key, redactValue(value, state, ancestors, depth + 1));
   }
   if (keys.length > MAX_OBJECT_KEYS) {
     put(out, "[more]", `[+${keys.length - MAX_OBJECT_KEYS} more]`);
@@ -162,17 +183,14 @@ function redactObject(value, state, ancestors, depth) {
   return redactRecord(value, state, ancestors, depth);
 }
 function redactValue(value, state, ancestors, depth) {
-  state.nodes++;
-  if (state.nodes > MAX_NODES) {
-    return TRUNCATED;
-  }
   if (typeof value !== "object" || value === null) {
     return value;
   }
   if (ancestors.has(value)) {
     return CIRCULAR;
   }
-  if (depth >= MAX_DEPTH) {
+  state.nodes++;
+  if (state.nodes > MAX_NODES || depth >= MAX_DEPTH) {
     return TRUNCATED;
   }
   ancestors.add(value);

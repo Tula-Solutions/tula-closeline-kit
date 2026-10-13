@@ -2,7 +2,7 @@ import {
   systemClock2,
   createFixedClock2,
   prepareFields
-} from "./shared/chunk-67sxzn8d.js";
+} from "./shared/chunk-ewee5rnh.js";
 // src/errors.ts
 var CODE_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
 

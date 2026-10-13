@@ -262,6 +262,14 @@ describe('credential-shaped keys', () => {
     'sessionToken',
     'newPassword',
     'Proxy-Authorization',
+    'cookies',
+    'tokens',
+    'secrets',
+    'passwords',
+    'apiKeys',
+    'secretKey',
+    'privateKey',
+    'authorizationHeader',
   ])('%s is redacted', (key) => {
     const { logger, lines } = capture()
     logger.info('x', { [key]: 'SECRET-VALUE', visible: 'ok' })
@@ -269,14 +277,22 @@ describe('credential-shaped keys', () => {
     expect(lines.join('')).toContain('"visible":"ok"')
   })
 
-  test.each(['recordingUrl', 'transcriptId', 'bodyLength', 'tokenCount', 'secretary', 'cookies'])(
-    '%s is not redacted',
-    (key) => {
-      const { logger, lines } = capture()
-      logger.info('x', { [key]: 'KEEP-VALUE' })
-      expect(lines.join('')).toContain('KEEP-VALUE')
-    }
-  )
+  test.each([
+    'recordingUrl',
+    'transcriptId',
+    'bodyLength',
+    'tokenCount',
+    'secretary',
+    'status',
+    'address',
+    'class',
+    'keys',
+    'pass',
+  ])('%s is not redacted', (key) => {
+    const { logger, lines } = capture()
+    logger.info('x', { [key]: 'KEEP-VALUE' })
+    expect(lines.join('')).toContain('KEEP-VALUE')
+  })
 })
 
 function throwingGetter(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -479,12 +495,60 @@ describe('bounded work and output', () => {
     expect(logged['[more]']).toBe('[+50 more]')
   })
 
+  const manyObjects = () =>
+    Array.from({ length: 100 }, () => Array.from({ length: 60 }, (_, i) => ({ i })))
+
   test('a sensitive key is still redacted when the budget is spent', () => {
     const { logger, lines } = capture()
-    const wide = Array.from({ length: 100 }, () => Array.from({ length: 100 }, (_, i) => i))
-    logger.info('x', { wide, password: 'SECRET-VALUE', later: [{ token: 'SECRET-VALUE' }] })
+    logger.info('x', {
+      wide: manyObjects(),
+      password: 'SECRET-VALUE',
+      later: [{ token: 'SECRET-VALUE' }],
+    })
     expect(lines.join('')).toContain('[truncated]')
     expect(lines.join('')).not.toContain('SECRET-VALUE')
+  })
+
+  test('a wide log of primitive rows keeps its identifying fields and redacts the token', () => {
+    const { logger, parsed } = capture()
+    const rows = Array.from({ length: 100 }, () => Array.from({ length: 60 }, (_, i) => i))
+    logger.info('x', {
+      rows,
+      orgId: 'org_1',
+      requestId: 'req_1',
+      token: 'SECRET-VALUE',
+      nested: { a: 1 },
+    })
+    const entry = parsed()[0]
+    expect(entry).toMatchObject({
+      orgId: 'org_1',
+      requestId: 'req_1',
+      token: '[redacted]',
+      nested: { a: 1 },
+    })
+    expect(JSON.stringify(entry)).not.toContain('truncated')
+  })
+
+  test('top-level primitives survive even when nested objects spend the whole budget', () => {
+    const { logger, parsed, lines } = capture()
+    logger.info('x', {
+      wide: manyObjects(),
+      orgId: 'org_1',
+      requestId: 'req_1',
+      token: 'SECRET-VALUE',
+    })
+    const entry = parsed()[0]
+    expect(entry).toMatchObject({ orgId: 'org_1', requestId: 'req_1', token: '[redacted]' })
+    expect(lines.join('')).toContain('[truncated]')
+  })
+
+  test('keys keep the caller order even though primitives are written first', () => {
+    const { logger, parsed } = capture()
+    logger.info('x', { first: { a: 1 }, second: 2, third: [3] })
+    const keys = Object.keys(parsed()[0] ?? {}).filter((key) =>
+      ['first', 'second', 'third'].includes(key)
+    )
+    expect(keys).toEqual(['first', 'second', 'third'])
   })
 })
 
