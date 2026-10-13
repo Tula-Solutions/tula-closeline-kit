@@ -26,16 +26,7 @@ function createFixedClock2(start) {
   };
 }
 
-// src/redact.ts
-var REDACTED = "[redacted]";
-var CIRCULAR = "[circular]";
-var TRUNCATED = "[truncated]";
-var UNSERIALIZABLE = "[unserializable]";
-var MAX_DEPTH = 32;
-var MAX_ARRAY_ITEMS = 100;
-var MAX_OBJECT_KEYS = 200;
-var MAX_NODES = 5000;
-var MAX_VALUES = 20000;
+// src/sensitive.ts
 var SENSITIVE_WORDS = new Set([
   "password",
   "token",
@@ -62,7 +53,6 @@ var SENSITIVE_SUFFIXES = [
   "body",
   "bodies"
 ];
-var RESERVED_KEYS = ["level", "time", "msg", "service"];
 function normalizeKey(key) {
   return key.toLowerCase().replace(/[_-]/g, "");
 }
@@ -74,6 +64,127 @@ function isSensitiveKey(key) {
 function mayBeTokenCount(key) {
   return normalizeKey(key).endsWith("tokens");
 }
+
+// src/scrub.ts
+var MASK = "[redacted]";
+var TRUNCATED = "[truncated]";
+var UNSCRUBBABLE = "[unscrubbable]";
+var MAX_TEXT_LENGTH = 32768;
+var CONNECTION_STRING = /\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver|nats|kafka|jdbc:[a-z0-9]{1,20}):\/\/)\S+/gi;
+var URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/?#]+@/gi;
+var BEARER = /\bbearer\s+[A-Za-z0-9._~+/=-]+/gi;
+var TOKEN_WORD = /[A-Za-z0-9_.-]{16,}/g;
+var SECRET_WORDS = [
+  /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.?$/,
+  /^(?:AKIA|ASIA)[0-9A-Z]{16}/,
+  /^(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/,
+  /^(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}/,
+  /^sk-[A-Za-z0-9_-]{16,}/,
+  /^xox[abprs]-[A-Za-z0-9-]{10,}/
+];
+var KEY_AND_SEPARATOR = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{1,64})["']?\s*[:=]\s*/g;
+var LINE_VALUE_KEYS = new Set([
+  "authorization",
+  "proxyauthorization",
+  "cookie",
+  "setcookie"
+]);
+function isWordCode(code) {
+  return code >= 48 && code <= 57 || code >= 65 && code <= 90 || code >= 97 && code <= 122 || code === 95 || code === 46 || code === 45 || code === 126 || code === 43 || code === 47 || code === 61;
+}
+function cap(text) {
+  if (text.length <= MAX_TEXT_LENGTH) {
+    return text;
+  }
+  let end = MAX_TEXT_LENGTH;
+  while (end > 0 && isWordCode(text.charCodeAt(end - 1))) {
+    end--;
+  }
+  return `${text.slice(0, end)}${TRUNCATED}`;
+}
+function maskSecretWords(text) {
+  return text.replace(TOKEN_WORD, (word) => SECRET_WORDS.some((pattern) => pattern.test(word)) ? MASK : word);
+}
+function valueEnd(text, start, lineValue) {
+  const first = text[start];
+  if (first === '"' || first === "'") {
+    for (let i = start + 1;i < text.length; i++) {
+      if (text[i] === "\\") {
+        i++;
+      } else if (text[i] === first) {
+        return i + 1;
+      }
+    }
+    return text.length;
+  }
+  if (lineValue) {
+    const newline = text.indexOf(`
+`, start);
+    return newline === -1 ? text.length : newline;
+  }
+  let end = start;
+  while (end < text.length && !/[\s,;&"']/.test(text[end])) {
+    end++;
+  }
+  return end;
+}
+function maskPairs(text) {
+  const pattern = KEY_AND_SEPARATOR;
+  pattern.lastIndex = 0;
+  let out = "";
+  let copied = 0;
+  try {
+    for (let match = pattern.exec(text);match !== null; match = pattern.exec(text)) {
+      const key = match[1];
+      const start = pattern.lastIndex;
+      if (!isSensitiveKey(key)) {
+        continue;
+      }
+      const end = valueEnd(text, start, LINE_VALUE_KEYS.has(normalizeKey(key)));
+      if (end === start) {
+        continue;
+      }
+      if (mayBeTokenCount(key) && /^[0-9]+$/.test(text.slice(start, end))) {
+        continue;
+      }
+      out += text.slice(copied, start) + MASK;
+      copied = end;
+      pattern.lastIndex = end;
+    }
+  } finally {
+    pattern.lastIndex = 0;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+function scrubText2(text) {
+  try {
+    const raw = typeof text === "string" ? text : String(text);
+    if (raw.length === 0) {
+      return raw;
+    }
+    let value = cap(raw);
+    if (value.includes("://")) {
+      value = value.replace(CONNECTION_STRING, `$1${MASK}`).replace(URL_CREDENTIALS, `$1${MASK}@`);
+    }
+    value = value.replace(BEARER, `Bearer ${MASK}`);
+    value = maskSecretWords(value);
+    return maskPairs(value);
+  } catch {
+    return UNSCRUBBABLE;
+  }
+}
+
+// src/redact.ts
+var REDACTED = "[redacted]";
+var CIRCULAR = "[circular]";
+var TRUNCATED2 = "[truncated]";
+var UNSERIALIZABLE = "[unserializable]";
+var MAX_DEPTH = 32;
+var MAX_ARRAY_ITEMS = 100;
+var MAX_OBJECT_KEYS = 200;
+var MAX_NODES = 5000;
+var MAX_VALUES = 20000;
+var RESERVED_KEYS = ["level", "time", "msg", "service"];
 function spend(state, depth) {
   if (depth === 0) {
     return true;
@@ -103,11 +214,15 @@ function summarizeBinary(value) {
 function isBinary(value) {
   return ArrayBuffer.isView(value) || value instanceof ArrayBuffer || typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer;
 }
+function scrubbedErrorText(read) {
+  const value = attempt(read);
+  return typeof value === "string" && value !== UNSERIALIZABLE ? scrubText2(value) : value;
+}
 function redactError(error, state, ancestors, depth) {
   const out = {};
   put(out, "name", attempt(() => error.name));
-  put(out, "message", attempt(() => error.message));
-  put(out, "stack", attempt(() => error.stack));
+  put(out, "message", scrubbedErrorText(() => error.message));
+  put(out, "stack", scrubbedErrorText(() => error.stack));
   const code = attempt(() => error.code);
   if (code !== undefined) {
     put(out, "code", redactValue(code, state, ancestors, depth + 1));
@@ -125,7 +240,7 @@ function redactList(items, size, state, ancestors, depth) {
       break;
     }
     if (!spend(state, depth + 1)) {
-      out.push(TRUNCATED);
+      out.push(TRUNCATED2);
       return out;
     }
     out.push(redactValue(item, state, ancestors, depth + 1));
@@ -144,7 +259,7 @@ function redactMap(map, state, ancestors, depth) {
     }
     const name = typeof key === "string" ? key : `[key ${index}]`;
     if (!spend(state, depth + 1)) {
-      put(out, "[more]", TRUNCATED);
+      put(out, "[more]", TRUNCATED2);
       return out;
     }
     const hidden = isSensitiveKey(name) && !(mayBeTokenCount(name) && typeof value === "number");
@@ -188,7 +303,7 @@ function redactRecord(record, state, ancestors, depth) {
     put(out, key, redactValue(value, state, ancestors, depth + 1));
   }
   if (spent) {
-    put(out, "[more]", TRUNCATED);
+    put(out, "[more]", TRUNCATED2);
   } else if (keys.length > MAX_OBJECT_KEYS) {
     put(out, "[more]", `[+${keys.length - MAX_OBJECT_KEYS} more]`);
   }
@@ -228,7 +343,7 @@ function redactValue(value, state, ancestors, depth) {
   }
   state.nodes++;
   if (state.nodes > MAX_NODES || depth >= MAX_DEPTH) {
-    return TRUNCATED;
+    return TRUNCATED2;
   }
   ancestors.add(value);
   try {
@@ -257,4 +372,16 @@ function prepareFields(fields) {
   return prepared;
 }
 
-export { systemClock2, createFixedClock2, prepareFields };
+// src/reporting/port.ts
+function isAppErrorShaped(error) {
+  return typeof error === "object" && error !== null && error.name === "AppError" && typeof error.status === "number";
+}
+function shouldReportError2(error) {
+  try {
+    return !(isAppErrorShaped(error) && error.status < 500);
+  } catch {
+    return true;
+  }
+}
+
+export { systemClock2, createFixedClock2, isSensitiveKey, scrubText2, redactFields, prepareFields, shouldReportError2 };

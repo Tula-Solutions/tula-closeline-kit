@@ -670,3 +670,42 @@ describe('inputs that used to be lost', () => {
     expect(lines[1]).toContain('"__proto__":{"inMap":1}')
   })
 })
+
+describe('secrets inside message strings', () => {
+  test('a secret in the log message is masked', () => {
+    const { logger, lines, parsed } = capture()
+    logger.info('login failed password=hunter2 for ann')
+    expect(parsed()[0]?.msg).toBe('login failed password=[redacted] for ann')
+    expect(lines.join('')).not.toContain('hunter2')
+  })
+
+  test('a secret in an error message and in its stack is masked', () => {
+    const { logger, lines, parsed } = capture()
+    const error = new Error('upstream said Bearer abc123def456 is invalid')
+    logger.error('failed', { error })
+    const logged = parsed()[0]?.error as Record<string, string>
+    expect(logged.message).toBe('upstream said Bearer [redacted] is invalid')
+    expect(logged.stack).not.toContain('abc123def456')
+    expect(lines.join('')).not.toContain('abc123def456')
+  })
+
+  test('a secret in a cause message is masked', () => {
+    const { logger, lines } = capture()
+    const error = new Error('outer', { cause: new Error('connect postgres://app:pa55@db/x') })
+    logger.error('failed', { error })
+    expect(lines.join('')).not.toContain('pa55')
+  })
+
+  test('a secret in a child logger message is masked', () => {
+    const { logger, lines } = capture()
+    logger.child({ a: 1 }).warn('retry with token=zzz999')
+    expect(lines.join('')).not.toContain('zzz999')
+  })
+
+  test('ordinary messages and unreadable error fields are unchanged', () => {
+    const { logger, parsed } = capture()
+    logger.info('user signed in', { error: new TypeError('bad input') })
+    expect(parsed()[0]?.msg).toBe('user signed in')
+    expect((parsed()[0]?.error as Record<string, string> | undefined)?.message).toBe('bad input')
+  })
+})

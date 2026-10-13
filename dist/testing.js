@@ -1,7 +1,39 @@
 import {
   createFixedClock2,
-  prepareFields
-} from "./shared/chunk-gxr4ppv8.js";
+  scrubText2,
+  prepareFields,
+  shouldReportError2
+} from "./shared/chunk-2mcekygv.js";
+
+// src/reporting/testing.ts
+function copyContext(context) {
+  try {
+    const copy = { ...context };
+    if (context?.tags !== undefined) {
+      copy.tags = { ...context.tags };
+    }
+    return copy;
+  } catch {
+    return {};
+  }
+}
+function createMemoryErrorReporter() {
+  const captured = [];
+  const flushes = [];
+  return {
+    captured,
+    flushes,
+    capture(error, context) {
+      if (shouldReportError2(error)) {
+        captured.push({ error, context: copyContext(context) });
+      }
+    },
+    flush(timeoutMs) {
+      flushes.push(timeoutMs);
+      return Promise.resolve(true);
+    }
+  };
+}
 
 // src/auth/testing.ts
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -54,7 +86,11 @@ async function mintTestToken(options) {
 // src/testing.ts
 function build(entries, bound) {
   const record = (level) => (message, fields) => {
-    entries.push({ level, message, fields: { ...bound, ...prepareFields(fields) } });
+    entries.push({
+      level,
+      message: scrubText2(message),
+      fields: { ...bound, ...prepareFields(fields) }
+    });
   };
   return {
     entries,
@@ -71,12 +107,14 @@ function createMemoryLogger() {
 function createTestDeps(overrides = {}) {
   return {
     clock: overrides.clock ?? createFixedClock2("2026-01-01T00:00:00.000Z"),
-    logger: overrides.logger ?? createMemoryLogger()
+    logger: overrides.logger ?? createMemoryLogger(),
+    errorReporter: overrides.errorReporter ?? createMemoryErrorReporter()
   };
 }
 export {
   DEFAULT_TEST_ORGANIZATION_ID,
   DEFAULT_TEST_USER_ID,
+  createMemoryErrorReporter,
   createMemoryLogger,
   createTestDeps,
   createTestJwks,

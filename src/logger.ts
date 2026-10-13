@@ -1,5 +1,6 @@
 import pino from 'pino'
 import { prepareFields } from './redact'
+import { scrubText } from './scrub'
 
 /** Where log lines go: anything with a `write` that takes one newline-terminated JSON line. */
 export interface LogDestination {
@@ -39,7 +40,7 @@ function wrap(base: pino.Logger): Logger {
   // Check the level first: a disabled call must not pay for walking its fields.
   const emit = (level: EmitLevel) => (message: string, fields?: Record<string, unknown>) => {
     if (base.isLevelEnabled(level)) {
-      base[level](prepareFields(fields), message)
+      base[level](prepareFields(fields), scrubText(message))
     }
   }
   return {

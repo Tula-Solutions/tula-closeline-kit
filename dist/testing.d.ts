@@ -21,6 +21,45 @@ interface Logger {
 	/** Returns a logger that adds `fields` to every entry. */
 	child(fields: Record<string, unknown>): Logger;
 }
+/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
+interface ErrorContext {
+	/** The request's id, for finding the log lines. */
+	requestId?: string;
+	/** The Organization the request was for, so one customer's errors can be filtered. */
+	organizationId?: string;
+	/** HTTP method of the failed request. */
+	method?: string;
+	/** Request path without its query string. */
+	path?: string;
+	/** HTTP status the service answered with. */
+	status?: number;
+	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
+	tags?: Record<string, string>;
+}
+/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
+interface ErrorReporter {
+	/**
+	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
+	* and never waits for the network.
+	*/
+	capture(error: unknown, context?: ErrorContext): void;
+	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
+	flush(timeoutMs: number): Promise<boolean>;
+}
+/** One error a MemoryErrorReporter recorded, with the context it was reported with. */
+interface CapturedError {
+	error: unknown;
+	context: ErrorContext;
+}
+/** An ErrorReporter that keeps what it is given in memory so tests can assert on it. */
+interface MemoryErrorReporter extends ErrorReporter {
+	/** Every error that would have been sent, in order; expected (below 500) AppErrors are left out. */
+	readonly captured: CapturedError[];
+	/** The timeout of every flush, in order. */
+	readonly flushes: number[];
+}
+/** Creates an ErrorReporter that records reported errors in memory instead of sending them. */
+declare function createMemoryErrorReporter(): MemoryErrorReporter;
 /** A JSON Web Key Set as published by the auth service. */
 interface Jwks {
 	keys: readonly unknown[];
@@ -96,9 +135,10 @@ interface MemoryLogger extends Logger {
 interface TestDeps {
 	clock: FixedClock;
 	logger: MemoryLogger;
+	errorReporter: MemoryErrorReporter;
 }
 /** Creates a Logger that records redacted entries in memory instead of writing them. */
 declare function createMemoryLogger(): MemoryLogger;
-/** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z and a memory logger. */
+/** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, LogEntry, MemoryLogger, MintTokenOptions, TestDeps, TestKeyPair, createMemoryLogger, createTestDeps, createTestJwks, createTestKeyPair, mintTestToken, testOrganizationId, testUserId };
+export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, LogEntry, MemoryErrorReporter, MemoryLogger, MintTokenOptions, TestDeps, TestKeyPair, createMemoryErrorReporter, createMemoryLogger, createTestDeps, createTestJwks, createTestKeyPair, mintTestToken, testOrganizationId, testUserId };

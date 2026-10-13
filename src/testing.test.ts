@@ -85,6 +85,16 @@ describe('createMemoryLogger', () => {
   })
 })
 
+describe('secrets inside message strings', () => {
+  test('the memory logger masks a secret in the message and in an error message', () => {
+    const logger = createMemoryLogger()
+    logger.error('failed password=hunter2', { error: new Error('Bearer abc123def456') })
+    const entry = logger.entries[0]
+    expect(entry?.message).toBe('failed password=[redacted]')
+    expect(JSON.stringify(entry)).not.toContain('abc123def456')
+  })
+})
+
 describe('createTestDeps', () => {
   test('returns a clock fixed at 2026-01-01T00:00:00.000Z and a memory logger', () => {
     const deps = createTestDeps()

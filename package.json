@@ -1,6 +1,6 @@
 {
   "name": "tula-closeline-kit",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Closeline shared runtime helpers: token verification, queue port and adapters, logging, test fixtures",
   "private": true,
   "type": "module",
@@ -32,7 +32,7 @@
     "precommit:dist": "bunup && git add dist",
     "verify": "bun run check && bun run typecheck && bun run test:coverage && bun run bench && bun run dist:check && bun run shared:check",
     "verify:changed": "biome check --changed --no-errors-on-unmatched src scripts && bun run typecheck && bun run test",
-    "bench": "bun run bench/verify.bench.ts"
+    "bench": "bun run bench/verify.bench.ts && bun run bench/reporting.bench.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
@@ -44,6 +44,7 @@
     "zod": "^4.6.5"
   },
   "dependencies": {
+    "@sentry/bun": "^11.6.0",
     "jose": "^6.2.12",
     "pino": "^10.4.0",
     "tula-closeline-contract": "git+ssh://git@github.com/Tula-Solutions/tula-closeline-contract.git#v0.3.0"

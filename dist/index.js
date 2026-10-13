@@ -1,8 +1,12 @@
 import {
   systemClock2,
   createFixedClock2,
-  prepareFields
-} from "./shared/chunk-gxr4ppv8.js";
+  isSensitiveKey,
+  scrubText2,
+  redactFields,
+  prepareFields,
+  shouldReportError2
+} from "./shared/chunk-2mcekygv.js";
 
 // src/auth/claims.ts
 import {
@@ -505,7 +509,7 @@ import pino from "pino";
 function wrap(base) {
   const emit = (level) => (message, fields) => {
     if (base.isLevelEnabled(level)) {
-      base[level](prepareFields(fields), message);
+      base[level](prepareFields(fields), scrubText2(message));
     }
   };
   return {
@@ -525,11 +529,296 @@ function createLogger(options) {
   };
   return wrap(options.destination ? pino(config, options.destination) : pino(config));
 }
+// src/reporting/env.ts
+import { z as z3 } from "zod";
+var ENVIRONMENTS = ["local", "dev", "staging", "prod"];
+var environmentSchema = z3.enum(ENVIRONMENTS);
+function isSentryDsn(value) {
+  try {
+    const url = new URL(value);
+    const projectId = url.pathname.split("/").filter(Boolean).at(-1) ?? "";
+    return (url.protocol === "https:" || url.protocol === "http:") && url.username !== "" && url.hostname !== "" && /^[0-9]+$/.test(projectId);
+  } catch {
+    return false;
+  }
+}
+var sentryDsnSchema = z3.preprocess((value) => typeof value === "string" && value.trim() === "" ? undefined : value, z3.string().refine(isSentryDsn, { message: "SENTRY_DSN must look like https://<key>@<host>/<project id>" }).optional());
+function requireSentryDsn(env, ctx) {
+  if (env.ENVIRONMENT !== "local" && env.SENTRY_DSN === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["SENTRY_DSN"],
+      message: `SENTRY_DSN is required when ENVIRONMENT is ${env.ENVIRONMENT}`
+    });
+  }
+}
+
+// src/reporting/noop.ts
+var NOOP = Object.freeze({
+  capture: () => {
+    return;
+  },
+  flush: () => Promise.resolve(true)
+});
+function createNoopErrorReporter() {
+  return NOOP;
+}
+
+// src/reporting/sentry.ts
+import {
+  defaultStackParser,
+  linkedErrorsIntegration,
+  makeFetchTransport,
+  NodeClient,
+  Scope
+} from "@sentry/bun";
+
+// src/reporting/scrub-event.ts
+var CODE_KEYS = new Set([
+  "vars",
+  "pre_context",
+  "context_line",
+  "post_context"
+]);
+function isPlain(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function scrubTree(value) {
+  if (typeof value === "string") {
+    return scrubText2(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(scrubTree);
+  }
+  if (isPlain(value) && !(value instanceof Date)) {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (!CODE_KEYS.has(key)) {
+        Object.defineProperty(out, scrubText2(key), {
+          value: scrubTree(item),
+          enumerable: true,
+          writable: true,
+          configurable: true
+        });
+      }
+    }
+    return out;
+  }
+  return value;
+}
+function withoutQuery(url) {
+  const end = url.search(/[?#]/);
+  return end === -1 ? url : url.slice(0, end);
+}
+function scrubRequest(request) {
+  delete request.data;
+  delete request.cookies;
+  delete request.query_string;
+  if (typeof request.url === "string") {
+    request.url = withoutQuery(request.url);
+  }
+  if (isPlain(request.headers)) {
+    for (const name of Object.keys(request.headers)) {
+      if (isSensitiveKey(name)) {
+        delete request.headers[name];
+      }
+    }
+  }
+}
+function scrubEvent(event) {
+  try {
+    const { sdkProcessingMetadata, ...rest } = event;
+    const clean = scrubTree(redactFields(rest));
+    delete clean.user;
+    if (isPlain(clean.request)) {
+      scrubRequest(clean.request);
+    }
+    if (sdkProcessingMetadata !== undefined) {
+      clean.sdkProcessingMetadata = sdkProcessingMetadata;
+    }
+    return clean;
+  } catch {
+    return null;
+  }
+}
+
+// src/reporting/sentry.ts
+var MAX_TAGS = 20;
+var MAX_TAG_VALUE = 200;
+var MAX_FLUSH_MS = 60000;
+var CLOSE_MS = 250;
+var DATA_COLLECTION_OFF = {
+  userInfo: false,
+  cookies: false,
+  httpHeaders: false,
+  httpBodies: [],
+  urlQueryParams: false,
+  graphQL: { document: false, variables: false },
+  genAI: { inputs: false, outputs: false },
+  databaseQueryData: false,
+  queues: false,
+  stackFrameVariables: false,
+  frameContextLines: 0
+};
+var TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/;
+function text(value, max) {
+  return scrubText2(String(value)).slice(0, max);
+}
+function pathWithoutQuery(path) {
+  const end = path.search(/[?#]/);
+  return end === -1 ? path : path.slice(0, end);
+}
+function buildTags(base, context, error) {
+  const tags = {};
+  if (context.tags !== undefined) {
+    for (const [key, value] of Object.entries(context.tags).slice(0, MAX_TAGS)) {
+      if (TAG_KEY.test(key)) {
+        tags[key] = text(value, MAX_TAG_VALUE);
+      }
+    }
+  }
+  Object.assign(tags, base);
+  if (context.organizationId !== undefined) {
+    tags.organization_id = text(context.organizationId, MAX_TAG_VALUE);
+  }
+  if (context.requestId !== undefined) {
+    tags.request_id = text(context.requestId, MAX_TAG_VALUE);
+  }
+  if (context.method !== undefined) {
+    tags.http_method = text(context.method, 16);
+  }
+  if (typeof context.status === "number" && Number.isFinite(context.status)) {
+    tags.http_status = String(Math.trunc(context.status));
+  }
+  if (isAppError(error)) {
+    tags.error_code = error.code;
+  }
+  return tags;
+}
+function buildRequestContext(context) {
+  const out = {};
+  if (context.method !== undefined) {
+    out.method = text(context.method, 16);
+  }
+  if (context.path !== undefined) {
+    out.path = text(pathWithoutQuery(String(context.path)), 512);
+  }
+  if (typeof context.status === "number" && Number.isFinite(context.status)) {
+    out.status = Math.trunc(context.status);
+  }
+  return out;
+}
+function withDeadline(work, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    work.then((done) => {
+      clearTimeout(timer);
+      resolve(done);
+    }, () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+function boundedTimeout(timeoutMs) {
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, MAX_FLUSH_MS) : 1;
+}
+function createSentryReporter(options) {
+  const client = new NodeClient({
+    dsn: isSentryDsn(options.dsn) ? options.dsn : undefined,
+    release: options.release,
+    environment: options.environment,
+    stackParser: defaultStackParser,
+    transport: options.transport ?? makeFetchTransport,
+    runtime: { name: "bun", version: typeof Bun === "undefined" ? "unknown" : Bun.version },
+    includeServerName: false,
+    integrations: [linkedErrorsIntegration()],
+    dataCollection: DATA_COLLECTION_OFF,
+    maxBreadcrumbs: 0,
+    sendClientReports: false,
+    traceLifecycle: "static",
+    enableRuntimeChannelInjection: false,
+    beforeSend: (event) => scrubEvent(event)
+  });
+  client.init();
+  const integrations = client.getOptions().integrations.map((integration) => integration.name);
+  const base = {
+    service: text(options.service, MAX_TAG_VALUE),
+    environment: options.environment,
+    region: options.region
+  };
+  const warn = (message) => {
+    try {
+      options.logger.warn(message);
+    } catch {}
+  };
+  if (client.getDsn() === undefined) {
+    warn("error reporting is off: SENTRY_DSN is not a valid Sentry DSN");
+  }
+  const reporter = {
+    client,
+    integrations,
+    capture(error, context) {
+      try {
+        if (!shouldReportError2(error)) {
+          return;
+        }
+        const scope = new Scope;
+        try {
+          const given = context ?? {};
+          scope.setTags(buildTags(base, given, error));
+          scope.setContext("closeline", buildRequestContext(given));
+        } catch {
+          warn("error reporter could not read the error context");
+          scope.setTags(base);
+        }
+        client.captureException(error, {
+          originalException: error,
+          ...error instanceof Error ? {} : { syntheticException: new Error("not an Error") }
+        }, scope);
+      } catch {
+        warn("error reporter failed to capture an error");
+      }
+    },
+    flush(timeoutMs) {
+      try {
+        const ms = boundedTimeout(timeoutMs);
+        return withDeadline(Promise.resolve(client.flush(ms)), ms);
+      } catch {
+        return Promise.resolve(false);
+      }
+    },
+    async close() {
+      await withDeadline(Promise.resolve(client.close(1)), CLOSE_MS);
+    }
+  };
+  return reporter;
+}
+
+// src/reporting/create.ts
+function createErrorReporter(options) {
+  const dsn = options.dsn?.trim();
+  if (dsn === undefined || dsn === "") {
+    const message = "error reporting is off: no SENTRY_DSN";
+    if (options.environment === "local") {
+      options.logger.info(message);
+    } else {
+      options.logger.warn(message);
+    }
+    return createNoopErrorReporter();
+  }
+  if (!isSentryDsn(dsn)) {
+    options.logger.warn("error reporting is off: SENTRY_DSN is not a valid Sentry DSN");
+    return createNoopErrorReporter();
+  }
+  return createSentryReporter({ ...options, dsn });
+}
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
 export {
   AppError,
+  ENVIRONMENTS,
   MAX_JWKS_BYTES,
   MAX_JWKS_KEYS,
   MAX_TOKEN_LENGTH,
@@ -537,12 +826,20 @@ export {
   TokenVerificationError,
   accessTokenClaimsSchema,
   createAuthMiddleware,
+  createErrorReporter,
   createFixedClock2 as createFixedClock,
   createLogger,
+  createNoopErrorReporter,
   createRemoteKeySet,
   createStaticKeySet,
   createTokenVerifier,
+  environmentSchema,
   isAppError,
+  isSentryDsn,
+  requireSentryDsn,
+  scrubText2 as scrubText,
+  sentryDsnSchema,
+  shouldReportError2 as shouldReportError,
   systemClock2 as systemClock,
   toErrorBody
 };

@@ -1,6 +1,8 @@
 import { createFixedClock, type FixedClock } from './clock'
 import type { Logger } from './logger'
 import { prepareFields } from './redact'
+import { createMemoryErrorReporter, type MemoryErrorReporter } from './reporting/testing'
+import { scrubText } from './scrub'
 
 /** One recorded log call, with fields already redacted. */
 export interface LogEntry {
@@ -19,12 +21,17 @@ export interface MemoryLogger extends Logger {
 export interface TestDeps {
   clock: FixedClock
   logger: MemoryLogger
+  errorReporter: MemoryErrorReporter
 }
 
 function build(entries: LogEntry[], bound: Record<string, unknown>): MemoryLogger {
   const record =
     (level: LogEntry['level']) => (message: string, fields?: Record<string, unknown>) => {
-      entries.push({ level, message, fields: { ...bound, ...prepareFields(fields) } })
+      entries.push({
+        level,
+        message: scrubText(message),
+        fields: { ...bound, ...prepareFields(fields) },
+      })
     }
   return {
     entries,
@@ -41,12 +48,14 @@ export function createMemoryLogger(): MemoryLogger {
   return build([], {})
 }
 
-/** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z and a memory logger. */
+/** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 export function createTestDeps(overrides: Partial<TestDeps> = {}): TestDeps {
   return {
     clock: overrides.clock ?? createFixedClock('2026-01-01T00:00:00.000Z'),
     logger: overrides.logger ?? createMemoryLogger(),
+    errorReporter: overrides.errorReporter ?? createMemoryErrorReporter(),
   }
 }
 
 export * from './auth/testing'
+export * from './reporting/testing'
