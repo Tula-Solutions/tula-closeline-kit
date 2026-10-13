@@ -61,6 +61,12 @@ function isWordCode(code: number): boolean {
   )
 }
 
+/** Drops a trailing high surrogate, which a cut inside a pair leaves alone. */
+export function dropHighSurrogate(text: string): string {
+  const last = text.charCodeAt(text.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, -1) : text
+}
+
 /**
  * Cuts text to at most `max` characters, drops a trailing partial word (it could be the front of a
  * secret) and marks the cut. Text that fits is returned as it is. Work is bounded by `max`.
@@ -73,7 +79,7 @@ export function cutText(text: string, max: number): string {
   while (end > 0 && isWordCode(text.charCodeAt(end - 1))) {
     end--
   }
-  return `${text.slice(0, end)}${TRUNCATED}`
+  return `${dropHighSurrogate(text.slice(0, end))}${TRUNCATED}`
 }
 
 function maskSecretWords(text: string): string {

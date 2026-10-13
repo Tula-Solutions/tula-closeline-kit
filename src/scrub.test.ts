@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { cutText, scrubText } from './scrub'
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+const wellFormed = (text: string): boolean => !LONE_SURROGATE.test(text)
+
 const JWT =
   'eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c3JfMSIsIm9yZyI6Im9yZ18xIn0.c2lnbmF0dXJlLWJ5dGVz'
 
@@ -479,6 +482,12 @@ describe('scrubText: the new passes stay linear', () => {
 })
 
 describe('cutText', () => {
+  test('a cut inside a surrogate pair leaves no lone surrogate', () => {
+    for (let max = 1; max < 12; max++) {
+      expect(wellFormed(cutText('\u{1F600}'.repeat(10), max))).toBe(true)
+    }
+  })
+
   test('returns text that fits as it is', () => {
     expect(cutText('short', 10)).toBe('short')
     expect(cutText('exactly10!', 10)).toBe('exactly10!')

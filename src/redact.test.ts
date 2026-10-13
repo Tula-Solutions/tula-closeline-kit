@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { redactFields } from './redact'
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+const wellFormed = (text: string): boolean => !LONE_SURROGATE.test(text)
+
 describe('message bodies', () => {
   test.each([
     'body',
@@ -336,5 +339,65 @@ describe('text budget', () => {
 
     expect(JSON.stringify(redactFields(make()))).toBe(first)
     expect(JSON.stringify(input)).toBe(before)
+  })
+})
+describe('cuts and error cap', () => {
+  test('a cut never leaves a lone surrogate, at every offset around the string cap', () => {
+    for (let pad = 16_340; pad <= 16_400; pad++) {
+      const text = `${'a'.repeat(pad)}${'\u{1F600}'.repeat(50)}`
+      const out = redactFields({ note: text, list: [text] })
+
+      expect(wellFormed(out.note as string)).toBe(true)
+      expect(wellFormed((out.list as string[])[0] as string)).toBe(true)
+    }
+  })
+
+  test('a cut key is well formed too', () => {
+    for (let pad = 0; pad < 4; pad++) {
+      const key = `${'a'.repeat(pad)}${'\u{1F600}'.repeat(300)}`
+      const names = Object.keys(redactFields({ [key]: 1, nested: { [key]: 1 } }))
+
+      for (const name of names) {
+        expect(wellFormed(name)).toBe(true)
+      }
+      const nested = Object.keys(redactFields({ nested: { [key]: 1 } }).nested as object)
+      for (const name of nested) {
+        expect(wellFormed(name)).toBe(true)
+      }
+    }
+  })
+
+  test('only the first 200 Errors are scrubbed, the rest are the truncation marker', () => {
+    const many = redactFields(
+      Object.fromEntries(
+        Array.from({ length: 6 }, (_, field) => [
+          `f${field}`,
+          Array.from({ length: 100 }, (_, index) => new Error(`failed password=hunter${index}`)),
+        ])
+      )
+    )
+    const kinds = Object.values(many).flat() as unknown[]
+
+    expect(kinds.filter((item) => typeof item === 'object')).toHaveLength(200)
+    expect(kinds.filter((item) => item === '[truncated]')).toHaveLength(400)
+    expect(JSON.stringify(many)).not.toContain('hunter')
+  })
+
+  test('200 fields of 100 Errors with 30,000 character texts take well under 100 ms', () => {
+    const text = 'lorem ipsum '.repeat(2_500)
+    const input = Object.fromEntries(
+      Array.from({ length: 200 }, (_, field) => [
+        `f${field}`,
+        Array.from({ length: 100 }, () => {
+          const error = new Error(text)
+          error.stack = text
+          return error
+        }),
+      ])
+    )
+    const started = performance.now()
+    redactFields(input)
+
+    expect(performance.now() - started).toBeLessThan(250)
   })
 })

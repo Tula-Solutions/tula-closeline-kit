@@ -519,6 +519,10 @@ var MAX_KEY_DETAIL_VALUE = 500;
 function isWordCode(code) {
   return code >= 48 && code <= 57 || code >= 65 && code <= 90 || code >= 97 && code <= 122 || code === 95 || code === 46 || code === 45 || code === 126 || code === 43 || code === 47 || code === 61;
 }
+function dropHighSurrogate2(text) {
+  const last = text.charCodeAt(text.length - 1);
+  return last >= 55296 && last <= 56319 ? text.slice(0, -1) : text;
+}
 function cutText2(text, max) {
   if (text.length <= max) {
     return text;
@@ -527,7 +531,7 @@ function cutText2(text, max) {
   while (end > 0 && isWordCode(text.charCodeAt(end - 1))) {
     end--;
   }
-  return `${text.slice(0, end)}${TRUNCATED}`;
+  return `${dropHighSurrogate2(text.slice(0, end))}${TRUNCATED}`;
 }
 function maskSecretWords(text) {
   return text.replace(TOKEN_WORD, (word) => SECRET_WORDS.some((pattern) => pattern.test(word)) ? MASK : word);
@@ -729,6 +733,7 @@ var MAX_ARRAY_ITEMS = 100;
 var MAX_OBJECT_KEYS = 200;
 var MAX_NODES = 5000;
 var MAX_VALUES = 20000;
+var MAX_ERRORS = 200;
 var FIELD_NODE_ALLOWANCE = 50;
 var FIELD_VALUE_ALLOWANCE = 200;
 var MAX_ENTRY_CHARS = 1048576;
@@ -763,7 +768,7 @@ function clip(state, text) {
   return got <= TRUNCATED2.length ? TRUNCATED2 : cutText2(text, got - TRUNCATED2.length);
 }
 function clipKey(state, key) {
-  const shown = key.length > MAX_KEY_CHARS ? `${key.slice(0, MAX_KEY_CHARS - TRUNCATED2.length)}${TRUNCATED2}` : key;
+  const shown = key.length > MAX_KEY_CHARS ? `${dropHighSurrogate2(key.slice(0, MAX_KEY_CHARS - TRUNCATED2.length))}${TRUNCATED2}` : key;
   return grant(state, shown.length) < shown.length ? undefined : shown;
 }
 function spend(state, depth) {
@@ -948,6 +953,10 @@ function redactObject(value, state, ancestors, depth) {
     return summarizeBinary(value);
   }
   if (value instanceof Error) {
+    if (state.errors >= MAX_ERRORS) {
+      return TRUNCATED2;
+    }
+    state.errors++;
     return redactError(value, state, ancestors, depth);
   }
   if (Array.isArray(value)) {
@@ -989,7 +998,7 @@ function redactValue(value, state, ancestors, depth) {
 }
 function redactFields(fields) {
   try {
-    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0 }, new Set([fields]), 0);
+    return redactRecord(fields, { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0, errors: 0 }, new Set([fields]), 0);
   } catch {
     return { fields: UNSERIALIZABLE };
   }
@@ -1058,4 +1067,4 @@ var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { isSensitiveKey, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

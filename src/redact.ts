@@ -1,4 +1,4 @@
-import { cutText, scrubText } from './scrub'
+import { cutText, dropHighSurrogate, scrubText } from './scrub'
 import { isSensitiveKey, mayBeTokenCount } from './sensitive'
 
 const REDACTED = '[redacted]'
@@ -21,6 +21,8 @@ const MAX_VALUES = 20_000
 // per field and independent of key order, but it only covers a field that fits in it: a field
 // larger than its allowance is cut. Worst case per call: 5,000 + 200 x 50 objects and 20,000 +
 // 200 x 200 nested values (200 is the most top-level keys walked; error fields count as values).
+// Errors whose text is scrubbed and copied by one call; each costs a scrub of up to 16 KiB.
+const MAX_ERRORS = 200
 const FIELD_NODE_ALLOWANCE = 50
 const FIELD_VALUE_ALLOWANCE = 200
 
@@ -49,6 +51,8 @@ interface State {
   nodeReserve: number
   /** Values the current top-level field may still write after the shared budget is spent. */
   valueReserve: number
+  /** Errors copied so far; past MAX_ERRORS an Error is the truncation marker, its text unread. */
+  errors: number
   /** Text units written so far from the shared pool. */
   chars: number
   /** Text units the current top-level field may still write after the shared pool is spent. */
@@ -93,7 +97,7 @@ function clip(state: State, text: string): string {
 function clipKey(state: State, key: string): string | undefined {
   const shown =
     key.length > MAX_KEY_CHARS
-      ? `${key.slice(0, MAX_KEY_CHARS - TRUNCATED.length)}${TRUNCATED}`
+      ? `${dropHighSurrogate(key.slice(0, MAX_KEY_CHARS - TRUNCATED.length))}${TRUNCATED}`
       : key
   return grant(state, shown.length) < shown.length ? undefined : shown
 }
@@ -329,6 +333,10 @@ function redactObject(value: object, state: State, ancestors: Set<object>, depth
     return summarizeBinary(value)
   }
   if (value instanceof Error) {
+    if (state.errors >= MAX_ERRORS) {
+      return TRUNCATED
+    }
+    state.errors++
     return redactError(value, state, ancestors, depth)
   }
   if (Array.isArray(value)) {
@@ -373,7 +381,7 @@ function redactValue(value: unknown, state: State, ancestors: Set<object>, depth
 /**
  * Copies log fields with every sensitive key replaced by `[redacted]` at any depth; never throws.
  * O(fields + objects walked + text emitted): at most 5,000 objects and 20,000 nested values shared
- * by the call, plus 50 objects and 200 values guaranteed to each top-level object field (200 keys
+ * by the call, at most 200 Errors scrubbed (the rest are `[truncated]`, text unread), plus 50 objects and 200 values guaranteed to each top-level object field (200 keys
  * at most), and 1 MiB of text (UTF-16 code units, over strings, keys and error text; a string is
  * cut at 16 KiB, a key at 256) plus 1 KiB guaranteed to each top-level field. Serialised, an entry
  * is under 12 MB in the worst case (6 bytes per unit of control characters) and about 2 MB for
@@ -384,7 +392,7 @@ export function redactFields(fields: Record<string, unknown>): Record<string, un
   try {
     return redactRecord(
       fields,
-      { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0 },
+      { nodes: 0, values: 0, nodeReserve: 0, valueReserve: 0, chars: 0, charReserve: 0, errors: 0 },
       new Set<object>([fields]),
       0
     )

@@ -340,8 +340,15 @@ fields count as values) and 1 MiB of text, counted in UTF-16 code units over str
 and Map keys, and error name, message, stack and code. One string is cut at 16 KiB and one key at
 256 characters; a cut drops a trailing partial word and ends in `[truncated]`. Once the text budget
 is spent, strings become `[truncated]` and further keys are dropped with a `[+N more]` count.
-Redaction runs first (a redacted value costs only its marker) and error text is scrubbed before
-it is written, so a cut never leaves part of a secret.
+Redaction runs first (a redacted value costs only its marker). Error text is cut to the room
+left and scrubbed before it is written, so a cut leaves no part of a secret in error text or under
+a sensitive key. Plain string fields are not scrubbed (as before): a plain string is written as it
+is, or cut. Only the first 200 Errors of an entry are copied; the rest are `[truncated]` and their
+text is never read.
+
+A plain string over 16 KiB is now cut and ends in `[truncated]`, and a single unbroken word over
+16 KiB (a base64 blob) becomes only `[truncated]`, because a cut drops a trailing partial word. A
+cut never leaves half of a surrogate pair.
 
 Before: once a large field spent the object budget, every later object field was written as
 `[truncated]`, so a small `tenant: { organizationId }` after a big payload was lost, and the text
@@ -351,8 +358,8 @@ shared budgets are spent, whatever its position among the keys, so a small conte
 survives. The allowance only covers a field that fits in it: a larger field after the shared budget
 is spent is cut.
 
-Bounds, both counts and bytes: at most 5,000 + 200 x 50 objects and 20,000 + 200 x 200 nested
-values, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
+Bounds, both counts and bytes: at most 5,000 + 200 x 50 objects, 20,000 + 200 x 200 nested
+values and 200 Errors, and at most about 1.8 million code units of text. `JSON.stringify` of an entry is then under
 12 MB in the worst case (control characters, which escape to six bytes) and about 2 MB for ordinary
 text. `bench/redact.bench.ts` budgets a typical entry, an oversized one and the worst case.
 
