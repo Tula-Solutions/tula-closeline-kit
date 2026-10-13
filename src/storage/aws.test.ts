@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import net from 'node:net'
 import type {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -6,6 +7,7 @@ import type {
   ListObjectsV2Command,
   PutObjectCommand,
 } from '@aws-sdk/client-s3'
+import { createLogger } from '../logger'
 import { createS3ObjectStore, type S3Sender } from './aws'
 import { encodeCursor } from './validate'
 
@@ -275,7 +277,7 @@ describe('reading', () => {
     const { client } = stub(() => ({
       Body: {
         transformToByteArray: async () => {
-          throw new Error('connection reset')
+          throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' })
         },
       },
       ContentLength: 3,
@@ -313,7 +315,43 @@ describe('failures', () => {
       Object.assign(new Error('aborted'), { name: 'AbortError' }),
       'storage.unavailable',
     ],
-    ['a dropped connection', new Error('socket hang up'), 'storage.unavailable'],
+    [
+      'a dropped connection',
+      Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+      'storage.unavailable',
+    ],
+    [
+      'a refused connection',
+      Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }),
+      'storage.unavailable',
+    ],
+    [
+      'a name lookup failure',
+      Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' }),
+      'storage.unavailable',
+    ],
+    [
+      'a 502 with no fault named',
+      Object.assign(new Error('bad gateway'), { $metadata: { httpStatusCode: 502 } }),
+      'storage.unavailable',
+    ],
+    [
+      'a 400 with no fault named',
+      Object.assign(new Error('bad request'), { $metadata: { httpStatusCode: 400 } }),
+      'storage.rejected',
+    ],
+    [
+      'a credentials provider failure',
+      Object.assign(new Error('Could not load credentials from any providers'), {
+        name: 'CredentialsProviderError',
+      }),
+      'storage.rejected',
+    ],
+    [
+      'an error with no status and no name we know',
+      new Error('something broke'),
+      'storage.rejected',
+    ],
   ])('%s becomes %s', async (_label, error, code) => {
     const { client } = stub(() => error)
     const store = adapter(client)
@@ -330,7 +368,67 @@ describe('failures', () => {
     expect((error as Error).message).not.toContain('secret-name')
     expect((error as Error).message).not.toContain(ORG)
     expect(JSON.stringify(error)).not.toContain('SECRET BODY')
-    expect((error as Error).cause).toBeInstanceOf(Error)
+    expect((error as Error).cause).toMatchObject({ name: 'AccessDenied' })
+  })
+
+  /** Every string reachable from `value` through own properties, including non-enumerable ones. */
+  function allStrings(value: unknown, seen = new Set<unknown>(), out: string[] = []): string[] {
+    if (typeof value === 'string') {
+      out.push(value)
+    } else if (typeof value === 'object' && value !== null && !seen.has(value)) {
+      seen.add(value)
+      for (const name of Object.getOwnPropertyNames(value)) {
+        out.push(name)
+        allStrings((value as Record<string, unknown>)[name], seen, out)
+      }
+    }
+    return out
+  }
+
+  test('the cause is a reduced description: no key, Organization id, response or SDK object', async () => {
+    const sdkError = Object.assign(new Error(`Access denied to orgs/${ORG}/secret-name.txt`), {
+      name: 'AccessDenied',
+      $fault: 'client',
+      $metadata: { httpStatusCode: 403, requestId: 'REQ-123' },
+      $response: {
+        body: `orgs/${ORG}/secret-name.txt`,
+        headers: { 'x-amz-key': 'secret-name.txt' },
+      },
+      Key: `orgs/${ORG}/secret-name.txt`,
+    })
+    const { client } = stub(() => sdkError)
+    const store = adapter(client)
+    const attempts = [
+      store.put(ORG, 'secret-name.txt', new Uint8Array()),
+      store.get(ORG, 'secret-name.txt'),
+      store.head(ORG, 'secret-name.txt'),
+      store.delete(ORG, 'secret-name.txt'),
+      store.list(ORG, { prefix: 'secret-name' }),
+    ]
+    for (const attempt of attempts) {
+      const error = (await attempt.catch((e: unknown) => e)) as Error
+      expect((error as { code?: string }).code).toBe('storage.rejected')
+      expect(error.cause).not.toBe(sdkError)
+      expect(error.cause).toEqual({
+        name: 'AccessDenied',
+        httpStatus: 403,
+        requestId: 'REQ-123',
+        fault: 'client',
+      })
+      for (const text of allStrings(error)) {
+        expect(text).not.toContain('secret-name')
+        expect(text).not.toContain(ORG)
+      }
+      expect(JSON.stringify(error, Object.getOwnPropertyNames(error))).not.toContain('secret-name')
+      const lines: string[] = []
+      createLogger({
+        service: 't',
+        level: 'debug',
+        destination: { write: (l) => lines.push(l) },
+      }).error('failed', { err: error })
+      expect(lines.join('')).not.toContain('secret-name')
+      expect(lines.join('')).not.toContain(ORG)
+    }
   })
 
   test('deleting a key the store reports missing still resolves, and a refusal does not', async () => {
@@ -548,5 +646,91 @@ describe('against a real SDK client and a local server', () => {
       real({ timeoutMs: 1000, deadlineMs: 1000, maxAttempts: 5 }).get(ORG, 'k')
     ).rejects.toMatchObject({ code: 'storage.unavailable' })
     expect(performance.now() - started).toBeLessThan(4000)
+  })
+})
+
+describe('a response body that is refused is not left open', () => {
+  let open = 0
+  const sockets = new Set<net.Socket>()
+  // Answers every request with headers for `length` bytes and 5 bytes of body, then goes quiet,
+  // so a client that does not read or destroy the body keeps the connection open.
+  let announce = { length: 1000, withTime: true }
+  const server = net.createServer((socket) => {
+    open += 1
+    sockets.add(socket)
+    socket.on('error', () => undefined)
+    socket.on('close', () => {
+      open -= 1
+      sockets.delete(socket)
+    })
+    socket.on('data', () => {
+      socket.write(
+        `HTTP/1.1 200 OK\r\nContent-Length: ${announce.length}\r\nContent-Type: text/plain\r\n` +
+          (announce.withTime ? 'Last-Modified: Thu, 01 Jan 2026 00:00:00 GMT\r\n' : '') +
+          '\r\n12345'
+      )
+    })
+  })
+  let port = 0
+  const saved = { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY }
+  beforeAll(async () => {
+    process.env.AWS_ACCESS_KEY_ID = 'test'
+    process.env.AWS_SECRET_ACCESS_KEY = 'test'
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    port = (server.address() as net.AddressInfo).port
+  })
+  afterAll(() => {
+    for (const socket of sockets) {
+      socket.destroy()
+    }
+    server.close()
+    for (const [name, value] of [
+      ['AWS_ACCESS_KEY_ID', saved.id],
+      ['AWS_SECRET_ACCESS_KEY', saved.secret],
+    ] as const) {
+      if (value === undefined) {
+        delete process.env[name]
+      } else {
+        process.env[name] = value
+      }
+    }
+  })
+  const store = () =>
+    createS3ObjectStore({
+      bucket: 'closeline-test',
+      region: 'eu-west-1',
+      environment: 'local',
+      endpoint: `http://127.0.0.1:${port}`,
+      maxObjectBytes: 10,
+      timeoutMs: 5000,
+      maxAttempts: 1,
+    })
+  async function settle(): Promise<number> {
+    for (let i = 0; i < 40 && open > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    return open
+  }
+
+  test('several gets of an oversize object leave no connection open', async () => {
+    announce = { length: 1000, withTime: true }
+    const objects = store()
+    for (let i = 0; i < 5; i++) {
+      await expect(objects.get(ORG, `big${i}`)).rejects.toMatchObject({
+        code: 'storage.object_too_large',
+      })
+    }
+    expect(await settle()).toBe(0)
+  })
+
+  test('several gets of an object the store describes badly leave no connection open', async () => {
+    announce = { length: 8, withTime: false }
+    const objects = store()
+    for (let i = 0; i < 5; i++) {
+      await expect(objects.get(ORG, `odd${i}`)).rejects.toMatchObject({
+        code: 'storage.bad_response',
+      })
+    }
+    expect(await settle()).toBe(0)
   })
 })

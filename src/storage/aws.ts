@@ -9,6 +9,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3'
+import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
 import type { OrganizationIdCheck } from '../organization'
 import type { Environment } from '../reporting/env'
 import { STORAGE_ERROR_CODES, StorageError } from './errors'
@@ -80,25 +81,32 @@ const ENDPOINT_VARIABLES = ['AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_S3'] as const
 const MISSING = new Set(['NoSuchKey', 'NotFound'])
 
 /**
- * Turns an SDK failure into a StorageError. A fault the SDK blames on the client and does not call
- * retryable (access denied, no such bucket, bad request) can never succeed on retry: it is
- * `storage.rejected`. Everything else (server faults, throttling, timeouts, a dropped connection)
- * is `storage.unavailable`. The SDK has already retried what it considers retryable.
+ * Turns an SDK failure into a StorageError. A permanent failure (access denied, no such bucket, a
+ * credentials provider that found nothing) is `storage.rejected`; a transient one (server faults,
+ * throttling, timeouts, aborts, connection failures) is `storage.unavailable`, after the SDK's own
+ * retries. The cause is a reduced description, never the SDK error (see `reduceAwsCause`).
  */
 function mapFailure(operation: string, error: unknown): StorageError {
-  const fault = error as { $fault?: unknown; $retryable?: unknown } | null
-  if (fault?.$fault === 'client' && fault.$retryable === undefined) {
-    return new StorageError(STORAGE_ERROR_CODES.rejected, `the store refused ${operation}`, {
-      cause: error,
-    })
-  }
-  return new StorageError(
-    STORAGE_ERROR_CODES.unavailable,
-    `the store did not complete ${operation}`,
-    {
-      cause: error,
+  const cause = reduceAwsCause(error)
+  return isTransientAwsFailure(error)
+    ? new StorageError(STORAGE_ERROR_CODES.unavailable, `the store did not complete ${operation}`, {
+        cause,
+      })
+    : new StorageError(STORAGE_ERROR_CODES.rejected, `the store refused ${operation}`, { cause })
+}
+
+/** Closes a response body that will not be read, so its connection is released. */
+function discardBody(body: unknown): void {
+  const stream = body as { destroy?: () => unknown; cancel?: () => unknown } | undefined
+  try {
+    if (typeof stream?.destroy === 'function') {
+      stream.destroy()
+    } else if (typeof stream?.cancel === 'function') {
+      void Promise.resolve(stream.cancel()).catch(() => undefined)
     }
-  )
+  } catch {
+    // The body is already closed or failed; nothing is left to release.
+  }
 }
 
 function isMissing(error: unknown): boolean {
@@ -254,30 +262,36 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
         }
         throw mapFailure('a get', error)
       }
-      const described = infoOf(key, output)
-      if (described.size > check.maxObjectBytes) {
-        // Refuse before reading: an object written by someone else can be larger than this store accepts.
-        throw new StorageError(STORAGE_ERROR_CODES.objectTooLarge, 'the object is too large', {
-          details: { limitBytes: check.maxObjectBytes },
-        })
-      }
-      if (output.Body === undefined) {
-        throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no body')
-      }
-      let body: Uint8Array
       try {
-        body = await output.Body.transformToByteArray()
+        const described = infoOf(key, output)
+        if (described.size > check.maxObjectBytes) {
+          // Refuse before reading: an object written by someone else can be larger than this store accepts.
+          throw new StorageError(STORAGE_ERROR_CODES.objectTooLarge, 'the object is too large', {
+            details: { limitBytes: check.maxObjectBytes },
+          })
+        }
+        if (output.Body === undefined) {
+          throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no body')
+        }
+        let body: Uint8Array
+        try {
+          body = await output.Body.transformToByteArray()
+        } catch (error) {
+          throw mapFailure('reading a body', error)
+        }
+        if (body.byteLength !== described.size) {
+          throw new StorageError(
+            STORAGE_ERROR_CODES.badResponse,
+            'the body is not the size announced'
+          )
+        }
+        const stored: StoredObject = { ...described, body }
+        return stored
       } catch (error) {
-        throw mapFailure('reading a body', error)
+        // Whatever the reason for refusing the response, do not leave its connection waiting.
+        discardBody(output.Body)
+        throw error
       }
-      if (body.byteLength !== described.size) {
-        throw new StorageError(
-          STORAGE_ERROR_CODES.badResponse,
-          'the body is not the size announced'
-        )
-      }
-      const stored: StoredObject = { ...described, body }
-      return stored
     },
 
     head,

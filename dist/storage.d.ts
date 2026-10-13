@@ -69,7 +69,12 @@ interface ObjectStore {
 	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
-	/** Reads an object's metadata, or returns `undefined` when there is none. O(1). */
+	/**
+	* Reads an object's metadata, or returns `undefined` when there is none. O(1). On S3 a HEAD of a
+	* bucket that does not exist also reads as `undefined`, because a HEAD response carries no error
+	* body to tell the two apart; `get`, `put`, `delete` and `list` do report a missing bucket as
+	* `storage.rejected`.
+	*/
 	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
 	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
 	delete(organizationId: string, key: string): Promise<void>;

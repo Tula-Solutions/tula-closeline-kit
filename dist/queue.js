@@ -1,4 +1,7 @@
 import {
+  reduceAwsCause
+} from "./shared/chunk-3xpsbhky.js";
+import {
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2
@@ -31,11 +34,11 @@ function mapFailure(operation, error) {
   const fault = error;
   if (fault?.$fault === "client" && fault.$retryable === undefined) {
     return new QueueError2(QUEUE_ERROR_CODES2.rejected, `the queue refused ${operation}`, {
-      cause: error
+      cause: reduceAwsCause(error)
     });
   }
   return new QueueError2(QUEUE_ERROR_CODES2.unavailable, `the queue did not complete ${operation}`, {
-    cause: error
+    cause: reduceAwsCause(error)
   });
 }
 var STALE_RECEIPT_NAMES = new Set(["ReceiptHandleIsInvalid", "MessageNotInflight"]);
@@ -97,7 +100,7 @@ function createSqsQueue(options) {
     } catch (error) {
       if (isStaleReceipt(error)) {
         throw new QueueError2(QUEUE_ERROR_CODES2.receiptInvalid, "the message is not in flight", {
-          cause: error
+          cause: reduceAwsCause(error)
         });
       }
       throw mapFailure("a visibility change", error);

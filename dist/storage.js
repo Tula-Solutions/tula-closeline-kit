@@ -1,4 +1,8 @@
 import {
+  reduceAwsCause,
+  isTransientAwsFailure
+} from "./shared/chunk-3xpsbhky.js";
+import {
   STORAGE_ERROR_CODES2,
   StorageError2,
   DEFAULT_CONTENT_TYPE2
@@ -24,15 +28,22 @@ var S3_KEY_PREFIX = "orgs/";
 var ENDPOINT_VARIABLES = ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"];
 var MISSING = new Set(["NoSuchKey", "NotFound"]);
 function mapFailure(operation, error) {
-  const fault = error;
-  if (fault?.$fault === "client" && fault.$retryable === undefined) {
-    return new StorageError2(STORAGE_ERROR_CODES2.rejected, `the store refused ${operation}`, {
-      cause: error
-    });
-  }
-  return new StorageError2(STORAGE_ERROR_CODES2.unavailable, `the store did not complete ${operation}`, {
-    cause: error
-  });
+  const cause = reduceAwsCause(error);
+  return isTransientAwsFailure(error) ? new StorageError2(STORAGE_ERROR_CODES2.unavailable, `the store did not complete ${operation}`, {
+    cause
+  }) : new StorageError2(STORAGE_ERROR_CODES2.rejected, `the store refused ${operation}`, { cause });
+}
+function discardBody(body) {
+  const stream = body;
+  try {
+    if (typeof stream?.destroy === "function") {
+      stream.destroy();
+    } else if (typeof stream?.cancel === "function") {
+      Promise.resolve(stream.cancel()).catch(() => {
+        return;
+      });
+    }
+  } catch {}
 }
 function isMissing(error) {
   return error instanceof Error && MISSING.has(error.name);
@@ -141,26 +152,31 @@ function createS3ObjectStore(options) {
         }
         throw mapFailure("a get", error);
       }
-      const described = infoOf(key, output);
-      if (described.size > check.maxObjectBytes) {
-        throw new StorageError2(STORAGE_ERROR_CODES2.objectTooLarge, "the object is too large", {
-          details: { limitBytes: check.maxObjectBytes }
-        });
-      }
-      if (output.Body === undefined) {
-        throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned no body");
-      }
-      let body;
       try {
-        body = await output.Body.transformToByteArray();
+        const described = infoOf(key, output);
+        if (described.size > check.maxObjectBytes) {
+          throw new StorageError2(STORAGE_ERROR_CODES2.objectTooLarge, "the object is too large", {
+            details: { limitBytes: check.maxObjectBytes }
+          });
+        }
+        if (output.Body === undefined) {
+          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned no body");
+        }
+        let body;
+        try {
+          body = await output.Body.transformToByteArray();
+        } catch (error) {
+          throw mapFailure("reading a body", error);
+        }
+        if (body.byteLength !== described.size) {
+          throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the body is not the size announced");
+        }
+        const stored = { ...described, body };
+        return stored;
       } catch (error) {
-        throw mapFailure("reading a body", error);
+        discardBody(output.Body);
+        throw error;
       }
-      if (body.byteLength !== described.size) {
-        throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the body is not the size announced");
-      }
-      const stored = { ...described, body };
-      return stored;
     },
     head,
     async delete(organizationId, key) {
