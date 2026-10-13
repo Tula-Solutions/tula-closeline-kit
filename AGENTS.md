@@ -1,6 +1,6 @@
 # tula-closeline-kit
 
-Closeline shared runtime helpers: token verification, queue port and adapters, logging, test fixtures
+Closeline shared runtime helpers: token verification, queue, object storage and vector store ports and adapters, logging, test fixtures
 
 Kind: **library**. Common standards for every Closeline repo are in `.claude/COMMON.md`, synced
 from the hub (`tula-closeline`). This file holds only what is specific to this repo. Keep it under
@@ -52,6 +52,15 @@ Other scripts are in `package.json`.
   ordinary message mean 0.015 ms, decode of a 200 KiB message mean 0.15 ms, a memory publish,
   receive and acknowledge mean 0.02 ms and a whole consumer cycle on the memory adapters mean
   0.07 ms, each with a median and best-batch p95 budget as above.
+
+- The object and vector stores (`src/storage/`, `src/vector/`) are used on the playbook's ingestion
+  and live-search paths. Every operation validates the Organization id and key or vector first
+  (O(key length) and O(dimensions)), then makes one call: the S3 adapter is one HTTP request, a
+  list is O(page) with a page of at most 1,000, and `search` takes a `topK` of at most 100. The
+  memory adapters are for tests: object put plus get of 4 KiB mean 0.012 ms, a 100-item list of
+  1,000 objects mean 0.16 ms, a 10-vector upsert at 384 dimensions mean 0.33 ms and a search of
+  1,000 such vectors mean 2.7 ms, each with a median and best-batch p95 budget in
+  `bench/stores.bench.ts`, about five times what it measures.
 
 ## Issues
 

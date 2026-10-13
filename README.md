@@ -1,6 +1,6 @@
 # tula-closeline-kit
 
-Closeline shared runtime helpers: token verification, queue port and adapters, logging, test fixtures
+Closeline shared runtime helpers: token verification, queue, object storage and vector store ports and adapters, logging, test fixtures
 
 Part of Closeline. The hub repo [`tula-closeline`](https://github.com/Tula-Solutions/tula-closeline)
 holds the glossary, decision records, plans, issues and the shared workflow setup.
@@ -623,3 +623,122 @@ when `CI` is set. The test refuses any endpoint that is not local, so it can nev
 queues, each with a dead-letter queue, are created and deleted per test. As of 0.6.0 this suite has
 not been run against a live ElasticMQ by its author (no Docker on the machine it was written on):
 CI is its first execution, so expect a small fix or two on the first run.
+
+## Object storage (`ObjectStore`)
+
+Services keep uploaded files and other blobs through the kit's `ObjectStore` port (added in 0.8.0).
+There are two adapters, the S3 one (`createS3ObjectStore`, from `tula-closeline-kit/storage`, so
+the root does not load the AWS SDK) and a memory one for tests (`createMemoryObjectStore`, from
+`tula-closeline-kit/testing`). The port types, `StorageError` and the limits come from
+`tula-closeline-kit`. One behaviour suite (`objectStoreBehaviour`, from
+`tula-closeline-kit/testing/behaviour`) runs against both.
+
+```ts
+put(organizationId, key, body: Uint8Array, { contentType? }): Promise<void> // replaces; idempotent
+get(organizationId, key): Promise<StoredObject | undefined>
+head(organizationId, key): Promise<ObjectInfo | undefined>
+delete(organizationId, key): Promise<void> // resolves when it is gone, also when it never existed
+list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items; nextCursor? }>
+```
+
+**Organization scope.** Every call takes the Organization id first. The id must pass the contract's
+`org_` format (override with `isOrganizationId` in tests only) and, always, a character rule with
+no separator, dot or escape. The S3 adapter stores an object at `orgs/<organizationId>/<key>` and
+lists with that prefix, so no key a caller sends can name another Organization's object, and one id
+that starts with another id (`org_1`, `org_10`) cannot reach it because the prefix ends in `/`. A
+key is up to 16 `/`-separated segments of letters, digits, `.`, `_` and `-`, none empty or starting
+with `.`, at most 512 bytes: `..`, a leading slash, `%2e`, backslashes and spaces are refused
+before anything is sent. A list cursor is the last key of the previous page and is validated like
+a key, so a forged one cannot start outside the Organization.
+
+**Content is untrusted.** Bodies are bytes; the store never looks inside them. The content type
+is stored as given (it must look like `type/subtype` with optional parameters, no control
+characters) and returned as given; do not branch on it or serve an object with it without your own
+check. An object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most): bodies are
+held in memory, so there is no streaming. A larger object is `storage.object_too_large` on `put`
+and on `get` (the S3 adapter checks the announced length before it reads).
+
+**Failures and retries.** Errors are `StorageError` with codes `storage.invalid_request`,
+`object_too_large`, `rejected` (a retry cannot fix it: access denied, no such bucket),
+`unavailable` (the only retryable one) and `bad_response`. A missing object is `undefined`, not an
+error. The S3 adapter bounds every attempt (`timeoutMs`, default 5 s, connect and idle), the whole
+operation (`deadlineMs`, default 60 s, retries included) and the attempts (`maxAttempts`, default
+3, the SDK's `standard` mode with jittered exponential back-off, only for failures it calls
+retryable). Put and delete are idempotent, so the retry is safe. Nothing logs bodies, keys or
+URLs. Credentials come only from the SDK's default chain; `endpoint` (S3Mock,
+`http://127.0.0.1:9090`) throws unless `ENVIRONMENT=local`, as do `AWS_ENDPOINT_URL` and
+`AWS_ENDPOINT_URL_S3` outside `local`. The proxy variables are ignored, as for the queue.
+
+Not in 0.8.0: presigned URLs (the playbook service uploads through the service, so none is
+needed yet; add them with a short lifetime and a key and method binding when a browser must
+upload directly), streaming bodies, and per-object metadata beyond the content type.
+
+Complexity: put and get O(object size), head and delete O(1), list O(page) on S3 and O(n log n)
+in the Organization's n objects in memory (tests only). `bench/stores.bench.ts` budgets the memory
+adapter.
+
+```ts
+import { createS3ObjectStore } from 'tula-closeline-kit/storage'
+
+const objects = createS3ObjectStore({
+  bucket: env.STORAGE_BUCKET,
+  region: env.AWS_REGION,
+  environment: env.ENVIRONMENT,
+  endpoint: env.STORAGE_ENDPOINT, // S3Mock, http://127.0.0.1:9090; throws unless ENVIRONMENT=local
+})
+await objects.put(organizationId, `documents/${documentId}/original.pdf`, bytes, {
+  contentType: 'application/pdf',
+})
+```
+
+The dev stack already starts S3Mock with a `closeline-dev` bucket (hub `compose.dev.yaml`).
+
+## Vector store (`VectorStore`)
+
+Services index and search embeddings through the kit's `VectorStore` port (added in 0.8.0). The
+port types, `VectorError` and the limits come from `tula-closeline-kit`; the memory adapter
+(`createMemoryVectorStore`) from `tula-closeline-kit/testing`; the behaviour suite
+(`vectorStoreBehaviour`) from `tula-closeline-kit/testing/behaviour`. **There is no real adapter
+yet.** ADR 0010 chose turbopuffer, which has no local stand-in and no emulator, so an adapter
+could only be run against the vendor's cloud, and a unit test cannot show that a vendor call works.
+It is a follow-up that needs a dev-account API key (CI secret) and a scratch namespace;
+`vectorStoreBehaviour` is the acceptance test it has to pass.
+
+```ts
+const store = createMemoryVectorStore({ dimensions: 1536 }) // the embedding model's dimension count
+upsert(organizationId, [{ id, vector, attributes? }]): Promise<void> // 1 to 500, replaces by id, idempotent
+search(organizationId, { vector, topK /*1-100*/, filter? }): Promise<{ id; score; attributes }[]>
+delete(organizationId, ids): Promise<void> // 1 to 500, unknown ids ignored, idempotent
+deleteByFilter(organizationId, filter): Promise<void> // filter needs at least one entry; for queued jobs
+```
+
+**Organization scope.** Same rule as the object store: the id is validated (contract format plus a
+character rule) and an adapter derives its namespace or filter from it, never from a caller's
+string. The memory adapter keeps one map per Organization.
+
+**Vectors and attributes.** `dimensions` is fixed per store (1 to 4096). A vector of any other
+length is `vector.dimension_mismatch` (422), which no retry fixes; NaN, infinities, values too
+large for a 32-bit float and all-zero vectors are `vector.invalid_request`, and a batch is
+validated whole before anything is written. Scores are cosine similarity, higher is closer; the
+order of equal scores is not promised by the port (memory orders them by id). A `filter` keeps
+vectors whose attributes equal every entry. Attributes are flat: at most 16, lower-case snake_case
+names, values that are booleans, finite numbers or strings of at most 512 characters. Use them for
+ids you will filter or delete by (`document_id`), not for text. Ids are 1 to 128 of letters,
+digits, `.`, `_`, `:` and `-`; use deterministic ids (`<documentId>:<chunk>`) so a re-run of an
+ingestion replaces instead of duplicating. Errors never hold vectors, attribute values or query
+text. As the ADR says, vectors from two models cannot be compared: record the model name and
+dimension count with each Organization's index, and re-embed on a switch.
+
+Complexity: the memory adapter's search is an exact scan, O(n x dimensions + n log n) in the
+Organization's n vectors, for tests only; `bench/stores.bench.ts` budgets it.
+
+### Running the S3 suite against S3Mock
+
+`src/storage/aws.integration.ts` runs the shared suite against the S3 adapter on S3Mock (the hub's
+image, in `compose.yaml` next to ElasticMQ, with a `closeline-kit-test` bucket). It is an
+integration test, so `bun test src` does not run it; `bun run test:integration` runs it together
+with the SQS one, and CI starts `compose.yaml` first. Without `STORAGE_TEST_ENDPOINT` it is skipped
+with a notice on a developer machine and fails when `CI` is set; it refuses any endpoint that is
+not local. As of 0.8.0 this suite has not been run against a live S3Mock by its author (no Docker
+on the machine it was written on): CI is its first execution. The unit tests (`aws.test.ts`) do
+run the real SDK client against a local HTTP server for timeouts, retries and error mapping.
