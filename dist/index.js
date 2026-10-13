@@ -725,7 +725,12 @@ function createInternalClient(options) {
         let reason;
         try {
           const wire = await attempt(call.method, target, headers, payload, signal);
-          const settled = () => ({ status: wire.status, json: answerJson(wire), attempts });
+          const settled = () => ({
+            status: wire.status,
+            json: answerJson(wire),
+            attempts,
+            ...wire.retryAfter === undefined ? {} : { retryAfterMs: wire.retryAfter }
+          });
           if (!INTERNAL_RETRY_STATUSES.includes(wire.status)) {
             return settled();
           }

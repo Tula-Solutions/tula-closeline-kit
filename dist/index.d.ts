@@ -393,6 +393,13 @@ type InternalResponse = {
 	json: unknown;
 	/** Attempts made, the first included. */
 	attempts: number;
+	/**
+	* The answer's `Retry-After` in milliseconds, when the header was whole seconds (1 to 9 digits;
+	* the date form is ignored). It is not capped: the client's own retry cuts it at `retryAfterCapMs`,
+	* but this is the server's number, and the caller applies its own cap. Absent when there was no
+	* such header. No other header is exposed.
+	*/
+	retryAfterMs?: number;
 };
 /** A client for calls from one Closeline service to another. */
 interface InternalClient {

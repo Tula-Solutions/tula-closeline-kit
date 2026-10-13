@@ -69,11 +69,14 @@ const { status, json } = await core.request({
 })
 ```
 
-- `request` resolves with `{ status, json, attempts }` for every answer that is not a redirect,
+- `request` resolves with `{ status, json, attempts, retryAfterMs? }` for every answer that is not a redirect,
   4xx and 5xx included: the adapter maps statuses and validates `json` with the contract's schema.
   `json` is parsed whatever the content type says. It is `undefined` for an empty body (204,
   `HEAD`) and for a non-2xx answer that is not JSON. A 2xx answer with a non-empty body that is not
-  JSON (an HTML error or login page) is a failure, not an answer. `request` rejects with
+  JSON (an HTML error or login page) is a failure, not an answer. `retryAfterMs` is present when
+  the answer had a `Retry-After` of whole seconds (1 to 9 digits; the date form is ignored), in
+  milliseconds and uncapped, so a caller that cannot retry itself (a sign-up that must tell the
+  user to wait) applies its own cap; no other header is exposed. `request` rejects with
   `InternalCallError` (`failure`: `connection`, `timeout`, `aborted`, `redirect`,
   `response_too_large`, `response_invalid`), which carries `method`, `path` (no query), `status`
   and `attempts`, and never the secret, a body or the underlying error. `response_invalid`,
