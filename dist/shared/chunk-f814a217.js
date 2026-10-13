@@ -132,6 +132,7 @@ function readRun(text, from, maxDigits) {
   if (!isDigit(text.charCodeAt(p))) {
     return null;
   }
+  const doubleZero = !plus && text.charCodeAt(p) === 48 && text.charCodeAt(p + 1) === 48;
   const run = {
     start: from,
     end: p,
@@ -174,7 +175,7 @@ function readRun(text, from, maxDigits) {
     if (!isDigit(text.charCodeAt(k))) {
       break;
     }
-    if (!plus && !isDigit(text.charCodeAt(k + 1))) {
+    if (!(plus || doubleZero && run.groups.length <= 2) && !isDigit(text.charCodeAt(k + 1))) {
       break;
     }
     run.seps.push(sep);
@@ -214,7 +215,7 @@ function leadingNonPhoneGroups(run) {
 function isAlnum(code) {
   return isDigit(code) || isLetter(code);
 }
-function attachedBefore(text, index) {
+function attachedBefore(text, index, labelled) {
   if (index === 0) {
     return false;
   }
@@ -223,7 +224,8 @@ function attachedBefore(text, index) {
     return true;
   }
   if (code === 45 || code === 46) {
-    return index >= 2 && isAlnum(text.charCodeAt(index - 2));
+    const two = index >= 2 ? text.charCodeAt(index - 2) : 0;
+    return labelled ? isDigit(two) : isAlnum(two);
   }
   return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2));
 }
@@ -278,6 +280,47 @@ function isCard(text, run) {
   }
   return hasIssuerPrefix(digits) && passesLuhn(digits);
 }
+var TWO_DIGIT_CODES = new Set("20 27 30 31 32 33 34 36 39 40 41 43 44 45 46 47 48 49 51 52 53 54 55 56 57 58 60 61 62 63 64 65 66 81 82 84 86 90 91 92 93 94 95 98".split(" "));
+var THREE_DIGIT_PREFIXES = new Set("21 22 23 24 25 26 29 35 37 38 42 50 59 67 68 69 85 87 88 96 97 99".split(" "));
+function isCountryCode(code) {
+  if (code.length === 1) {
+    return code === "1" || code === "7";
+  }
+  if (code.length === 2) {
+    return TWO_DIGIT_CODES.has(code);
+  }
+  return code.length === 3 && THREE_DIGIT_PREFIXES.has(code.slice(0, 2));
+}
+function startsDoubleZero(text, run) {
+  return !run.plus && !run.paren && text.charCodeAt(run.start) === 48 && text.charCodeAt(run.start + 1) === 48;
+}
+function opensAsInternational(text, run) {
+  const { groups } = run;
+  const first = groups[0];
+  let rest;
+  if (first === 2) {
+    const code = text.slice(run.groupEnds[0] + 1, run.groupEnds[1]);
+    if (groups.length < 3 || !isCountryCode(code)) {
+      return false;
+    }
+    rest = groups.slice(3);
+    if (groups[2] < 1) {
+      return false;
+    }
+  } else {
+    if (first < 3 || first > 5 || groups.length < 2) {
+      return false;
+    }
+    if (!isCountryCode(text.slice(run.start + 2, run.groupEnds[0]))) {
+      return false;
+    }
+    rest = groups.slice(2);
+  }
+  if (!rest.every((length) => length >= 2)) {
+    return false;
+  }
+  return !(groups.length >= 3 && first >= 3 && groups.every((length) => length === first));
+}
 function hasPhoneLead(text, run) {
   if (run.plus) {
     return true;
@@ -285,8 +328,11 @@ function hasPhoneLead(text, run) {
   if (run.paren) {
     return run.seps[0]?.startsWith(")") === true;
   }
+  if (startsDoubleZero(text, run)) {
+    return opensAsInternational(text, run);
+  }
   const first = run.groups[0];
-  return text.charCodeAt(run.start) === 48 && text.charCodeAt(run.start + 1) !== 48 && first >= 2 && first <= 5 && run.seps.every((sep) => sep === run.seps[0]);
+  return text.charCodeAt(run.start) === 48 && first >= 2 && first <= 5 && run.seps.every((sep) => sep === run.seps[0]);
 }
 function isPhone(text, run) {
   if (!hasPhoneLead(text, run)) {
@@ -294,6 +340,9 @@ function isPhone(text, run) {
   }
   if (run.plus) {
     return run.digits >= 8 && run.digits <= 15;
+  }
+  if (startsDoubleZero(text, run)) {
+    return run.digits >= 10 && run.digits <= 17;
   }
   if (run.digits < 9 || run.digits > 15) {
     return false;
@@ -337,6 +386,10 @@ function maskNumbers(text, mask) {
       continue;
     }
     const before = i === 0 ? 0 : text.charCodeAt(i - 1);
+    if (run.paren && !run.plus && run.seps[0]?.startsWith(")") !== true) {
+      i++;
+      continue;
+    }
     if (isUuidLayout(run)) {
       i = run.end;
       continue;
@@ -346,10 +399,11 @@ function maskNumbers(text, mask) {
       i = run.groupEnds[skip - 1];
       continue;
     }
+    const labelled = run.plus || run.paren || startsDoubleZero(text, run);
     let masked = false;
     if (run.groups.length === 1 && !run.plus) {
-      masked = before !== 46 && !attachedBefore(text, i) && !attachedAfter(text, run.end) && isCard(text, run);
-    } else if (!attachedBefore(text, i) && !attachedAfter(text, run.end)) {
+      masked = before !== 46 && !attachedBefore(text, i, false) && !attachedAfter(text, run.end) && isCard(text, run);
+    } else if (!attachedBefore(text, i, labelled) && !attachedAfter(text, run.end)) {
       masked = isCard(text, run) || !inside && (isPhone(text, run) || isSeveralNumbers(text, run));
     }
     if (masked) {
@@ -390,12 +444,7 @@ var SENSITIVE_WORDS = new Set([
   "session",
   "sessionid",
   "sessid",
-  "signature",
-  "dsn",
-  "otp",
-  "cvv",
-  "credential",
-  "credentials"
+  "signature"
 ]);
 var SENSITIVE_SUFFIXES = [
   "token",
@@ -418,6 +467,10 @@ var SENSITIVE_SUFFIXES = [
   "sessid",
   "authorizationheader",
   "body",
+  "otp",
+  "cvv",
+  "dsn",
+  "credential",
   "bodies"
 ];
 var SENSITIVE_WORD_SEGMENTS = new Set(["pass", "sig", "sid", "auth"]);
@@ -541,8 +594,7 @@ function valueEnd(text, start, inQuery, jsonKey) {
     }
     return end;
   }
-  while (end < text.length && text[end] !== `
-` && text[end] !== "\r") {
+  while (end < text.length && text.charCodeAt(end) !== 10 && text.charCodeAt(end) !== 13) {
     end++;
   }
   return end;
@@ -641,7 +693,7 @@ function maskPairs(text) {
       }
       const before = text[match.index - 1];
       const jsonKey = match[0].charAt(key.length) === '"' || match[0].charAt(key.length) === "'";
-      if (mayBeTokenCount(key) && /^[0-9]+(?=[\s,;&]|$)/.test(text.slice(start, start + 24))) {
+      if (mayBeTokenCount(key) && /^[0-9]{1,24}(?=[\s,;&]|$)/.test(text.slice(start, start + 25))) {
         continue;
       }
       const end = valueEnd(text, start, before === "?" || before === "&", jsonKey);

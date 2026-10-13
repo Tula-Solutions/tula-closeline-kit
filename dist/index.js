@@ -10,7 +10,7 @@ import {
   redactFields,
   prepareFields,
   shouldReportError2
-} from "./shared/chunk-hqqw2v8v.js";
+} from "./shared/chunk-f814a217.js";
 
 // src/auth/claims.ts
 import {
@@ -642,9 +642,12 @@ var DATA_COLLECTION_OFF = {
   frameContextLines: 0
 };
 var TAG_KEY = /^[A-Za-z0-9_.:-]{1,32}$/;
-var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/;
+var ID_SHAPES = [
+  /^[a-z]{2,5}_[0-9a-f]{32}$/,
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/,
+  /^[0-9a-fA-F]{32}$/
+];
 var INVALID_IDENTIFIER = "[invalid]";
-var BARE_DIGEST = /^[0-9a-fA-F]{40,}$/;
 var MASK = "[redacted]";
 var MAX_MESSAGE = 8192;
 var MAX_NAME = 200;
@@ -658,12 +661,15 @@ var MAX_FRAMES = 200;
 var MAX_STRING_VALUE = 512;
 var EVENT_ID = /^[0-9a-f]{32}$/;
 var PLATFORM = "node";
-var MAX_VERSION_FIELD = 64;
+var RUNTIME = Object.freeze({
+  name: "bun",
+  version: typeof Bun === "undefined" ? "unknown" : Bun.version
+});
 function text(value, max) {
   return scrubText2(String(value)).slice(0, max);
 }
 function identifier(value) {
-  return typeof value === "string" && IDENTIFIER.test(value) && !BARE_DIGEST.test(value) && scrubText2(value) === value ? value : INVALID_IDENTIFIER;
+  return typeof value === "string" && ID_SHAPES.some((shape) => shape.test(value)) ? value : INVALID_IDENTIFIER;
 }
 function pathWithoutQuery(path) {
   const end = path.search(/[?#]/);
@@ -878,24 +884,6 @@ function ownException(exception) {
   }
   return { values };
 }
-function label(value) {
-  return typeof value === "string" && /^[\x20-\x7e]*$/.test(value) ? value.slice(0, MAX_VERSION_FIELD) : undefined;
-}
-function nameAndVersion(source) {
-  if (!isPlain2(source)) {
-    return;
-  }
-  const out = {};
-  const name = label(source.name);
-  const version = label(source.version);
-  if (name !== undefined) {
-    out.name = name;
-  }
-  if (version !== undefined) {
-    out.version = version;
-  }
-  return out;
-}
 function confine(event, hint, expected) {
   const own = hint.data;
   const kept = {};
@@ -911,9 +899,8 @@ function confine(event, hint, expected) {
     kept.release = expected.release;
   }
   kept.environment = expected.environment;
-  const sdk = nameAndVersion(event.sdk);
-  if (sdk !== undefined) {
-    kept.sdk = sdk;
+  if (expected.sdk !== undefined) {
+    kept.sdk = { name: expected.sdk.name, version: expected.sdk.version };
   }
   kept.level = "error";
   kept.tags = own?.tags ?? {};
@@ -921,9 +908,8 @@ function confine(event, hint, expected) {
   if (exception !== undefined) {
     kept.exception = exception;
   }
-  const runtime = nameAndVersion(event.contexts?.runtime);
   kept.contexts = {
-    ...runtime === undefined ? {} : { runtime },
+    runtime: RUNTIME,
     ...own === undefined ? {} : { closeline: own.closeline }
   };
   hint.attachments = [];
@@ -951,7 +937,7 @@ function createSentryReporter(options) {
     environment: options.environment,
     stackParser: defaultStackParser,
     transport: options.transport ?? makeFetchTransport,
-    runtime: { name: "bun", version: typeof Bun === "undefined" ? "unknown" : Bun.version },
+    runtime: { ...RUNTIME },
     includeServerName: false,
     integrations: [linkedErrorsIntegration()],
     dataCollection: DATA_COLLECTION_OFF,
@@ -961,7 +947,9 @@ function createSentryReporter(options) {
     enableRuntimeChannelInjection: false,
     beforeSend: (event, hint) => {
       try {
-        const { tags, ...rest } = confine(event, hint, options);
+        const metadata = client.getOptions()._metadata?.sdk;
+        const sdk = typeof metadata?.name === "string" && typeof metadata.version === "string" ? { name: metadata.name, version: metadata.version } : undefined;
+        const { tags, ...rest } = confine(event, hint, { ...options, sdk });
         const clean = scrubEvent(rest);
         return clean === null ? null : { ...clean, tags };
       } catch {

@@ -139,10 +139,21 @@ const idList = (): string => {
   }
 }
 // Counters and padded ids start with `00` (`0042-0017-0231`); a lone leading zero is a trunk zero.
+// A counter is padded to one width, so its groups are alike; one with groups of different widths
+// is generated only with a first group no country code can follow `00` in (`000…`), because
+// `0044 20 7946 0958` is a telephone number and the two cannot be told apart.
 const zeroPadded = (): string => {
   const separator = pick([' ', '-', '.'])
-  const groups = Array.from({ length: int(3, 5) }, () => chars('0123456789', int(2, 5)))
-  groups[0] = `00${chars('0123456789', int(0, 3))}`
+  const uniform = rand() < 0.6
+  const width = int(3, 5)
+  // Four groups of four after the first are written as a card is, and are read as one.
+  const count = uniform && width === 4 ? int(3, 4) : int(3, 5)
+  const groups = Array.from({ length: count }, () =>
+    uniform ? chars('0123456789', width) : chars('0123456789', int(2, 5))
+  )
+  groups[0] = uniform
+    ? `00${chars('0123456789', width - 2)}`
+    : `000${chars('0123456789', int(0, 2))}`
   return `${pick(['invoice', 'order', 'seq', 'id='])}${rand() < 0.5 ? ' ' : ''}${groups.join(separator)}`
 }
 // 13 to 19 digits that no card issuer uses: outside 4, 5, 6, 3[4-9], 2221 to 2720, 81 and 86.
@@ -330,6 +341,7 @@ describe('scrubText: an id is not a telephone number or a card (N1)', () => {
     ['a number attached to a word by a dot', 'node.415.555.0199'],
     ['a long id that happens to pass the Luhn check', 'order 4111111111111111abc'],
     ['a long digit id after a dash', 'txn-4111111111111111'],
+    ['a trunk-form number tied to a word after it by a dash', 'ref 0171-123-4567-ab'],
   ])('%s is left alone', (_name, text) => {
     expect(scrubText(text)).toBe(text)
   })

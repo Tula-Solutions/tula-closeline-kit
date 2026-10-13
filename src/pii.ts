@@ -119,6 +119,9 @@ function readRun(text: string, from: number, maxDigits: number): Run | null {
   if (!isDigit(text.charCodeAt(p))) {
     return null
   }
+  // A number written `00 33 6 12 34 56 78` or `0061 2 9876 5432` has a lone digit after its country
+  // code, as one written with a `+` can.
+  const doubleZero = !plus && text.charCodeAt(p) === 48 && text.charCodeAt(p + 1) === 48
   const run: Run = {
     start: from,
     end: p,
@@ -163,7 +166,7 @@ function readRun(text: string, from: number, maxDigits: number): Run | null {
     }
     // After the first group, a single digit does not belong to a telephone or card number (`1-1-1…`
     // is a list); stopping here also keeps a long chain of them from being rescanned at each digit.
-    if (!plus && !isDigit(text.charCodeAt(k + 1))) {
+    if (!(plus || (doubleZero && run.groups.length <= 2)) && !isDigit(text.charCodeAt(k + 1))) {
       break
     }
     run.seps.push(sep)
@@ -219,7 +222,7 @@ function isAlnum(code: number): boolean {
  * or a `-` or `.` that follows a letter or digit (`req-415-…`, `4815-9301-…` inside a UUID,
  * `2026.10.25.564`), or a `:` that follows a digit (`10:30:05.109`). Such a run is part of an identifier, not a number on its own.
  */
-function attachedBefore(text: string, index: number): boolean {
+function attachedBefore(text: string, index: number, labelled: boolean): boolean {
   if (index === 0) {
     return false
   }
@@ -228,7 +231,10 @@ function attachedBefore(text: string, index: number): boolean {
     return true
   }
   if (code === 45 || code === 46) {
-    return index >= 2 && isAlnum(text.charCodeAt(index - 2))
+    // A number that opens with `+`, `00` or an area code after a label (`Tel.+44 …`, `ph-0044 …`) is
+    // a number: only a digit before the dot or dash ties it to an id or a version.
+    const two = index >= 2 ? text.charCodeAt(index - 2) : 0
+    return labelled ? isDigit(two) : isAlnum(two)
   }
   // `10:30:05.109-0800`: the seconds of a time are not a telephone number.
   return code === 58 && index >= 2 && isDigit(text.charCodeAt(index - 2))
@@ -313,10 +319,81 @@ function isCard(text: string, run: Run): boolean {
   return hasIssuerPrefix(digits) && passesLuhn(digits)
 }
 
+// Country calling codes (ITU-T E.164). They are prefix-free: no code starts another. The three-digit
+// codes are given by their first two digits, a little wider than the assigned ranges, so that an
+// unassigned code is masked rather than missed.
+const TWO_DIGIT_CODES: ReadonlySet<string> = new Set(
+  '20 27 30 31 32 33 34 36 39 40 41 43 44 45 46 47 48 49 51 52 53 54 55 56 57 58 60 61 62 63 64 65 66 81 82 84 86 90 91 92 93 94 95 98'.split(
+    ' '
+  )
+)
+const THREE_DIGIT_PREFIXES: ReadonlySet<string> = new Set(
+  '21 22 23 24 25 26 29 35 37 38 42 50 59 67 68 69 85 87 88 96 97 99'.split(' ')
+)
+
+/** True for a country calling code: `1`, `7`, `44`, `353`. */
+function isCountryCode(code: string): boolean {
+  if (code.length === 1) {
+    return code === '1' || code === '7'
+  }
+  if (code.length === 2) {
+    return TWO_DIGIT_CODES.has(code)
+  }
+  return code.length === 3 && THREE_DIGIT_PREFIXES.has(code.slice(0, 2))
+}
+
+/** True when the run opens with the `00` international prefix (a trunk zero is a single zero). */
+function startsDoubleZero(text: string, run: Run): boolean {
+  return (
+    !run.plus &&
+    !run.paren &&
+    text.charCodeAt(run.start) === 48 &&
+    text.charCodeAt(run.start + 1) === 48
+  )
+}
+
+/**
+ * True when a run opening with `00` is written like an international number: the prefix is followed
+ * by a country code, either glued to it (`0044 20 7946 0958`) or as a group of its own
+ * (`00 44 20 …`). Padded counters and ids also open with `00` (`0042-0017-0231`, `0012-3456-7890`,
+ * `00 11 22 33`), but their first group is wider than a code makes it, their groups are all one
+ * width, or the digits after the zeros are no code, so they stay readable. Only one lone digit is
+ * allowed, right after the code (`00 33 6 12 34 56 78`), and every other group has two or more.
+ * Linear: it looks at the first two groups and the group widths once.
+ */
+function opensAsInternational(text: string, run: Run): boolean {
+  const { groups } = run
+  const first = groups[0] as number
+  let rest: number[]
+  if (first === 2) {
+    const code = text.slice((run.groupEnds[0] as number) + 1, run.groupEnds[1])
+    if (groups.length < 3 || !isCountryCode(code)) {
+      return false
+    }
+    rest = groups.slice(3)
+    if ((groups[2] as number) < 1) {
+      return false
+    }
+  } else {
+    if (first < 3 || first > 5 || groups.length < 2) {
+      return false
+    }
+    if (!isCountryCode(text.slice(run.start + 2, run.groupEnds[0]))) {
+      return false
+    }
+    rest = groups.slice(2)
+  }
+  if (!rest.every((length) => length >= 2)) {
+    return false
+  }
+  // Padded counters: three or more groups of one width (3 or wider).
+  return !(groups.length >= 3 && first >= 3 && groups.every((length) => length === first))
+}
+
 /**
  * True when a number written with separators opens the way telephone numbers do: a `+`, a
- * parenthesised area code `(415)`, or the national trunk zero (`020 7946 0958`, `06 12 34 56 78`;
- * a leading `00` is not one).
+ * parenthesised area code `(415)`, the national trunk zero (`020 7946 0958`, `06 12 34 56 78`), or the
+ * `00` international prefix followed by a country code (`0044 20 7946 0958`).
  * Without one of those it cannot be told from an id, a range or a count, and is left alone.
  */
 function hasPhoneLead(text: string, run: Run): boolean {
@@ -326,12 +403,13 @@ function hasPhoneLead(text: string, run: Run): boolean {
   if (run.paren) {
     return run.seps[0]?.startsWith(')') === true
   }
+  if (startsDoubleZero(text, run)) {
+    return opensAsInternational(text, run)
+  }
   const first = run.groups[0] as number
   // Written with one kind of separator throughout, so `05.109-0800` (seconds, then an offset) is not one.
-  // `00` is not a trunk zero: padded counters and ids (`0042-0017-0231`) open that way.
   return (
     text.charCodeAt(run.start) === 48 &&
-    text.charCodeAt(run.start + 1) !== 48 &&
     first >= 2 &&
     first <= 5 &&
     run.seps.every((sep) => sep === run.seps[0])
@@ -344,6 +422,10 @@ function isPhone(text: string, run: Run): boolean {
   }
   if (run.plus) {
     return run.digits >= 8 && run.digits <= 15
+  }
+  if (startsDoubleZero(text, run)) {
+    // The digits after the `00` are the number, as they are after a `+`.
+    return run.digits >= 10 && run.digits <= 17
   }
   if (run.digits < 9 || run.digits > 15) {
     return false
@@ -409,6 +491,11 @@ export function maskNumbers(text: string, mask: string): string {
       continue
     }
     const before = i === 0 ? 0 : text.charCodeAt(i - 1)
+    if (run.paren && !run.plus && run.seps[0]?.startsWith(')') !== true) {
+      // A bracket round the number (`(4111 1111 …)`), not an area code: read from the digit.
+      i++
+      continue
+    }
     if (isUuidLayout(run)) {
       // A UUID made of digits only is an id; it is never read as numbers.
       i = run.end
@@ -420,15 +507,17 @@ export function maskNumbers(text: string, mask: string): string {
       i = run.groupEnds[skip - 1] as number
       continue
     }
+    // Opens as a telephone number does, so a label right before it (`Tel.`) does not tie it to a word.
+    const labelled = run.plus || run.paren || startsDoubleZero(text, run)
     let masked = false
     if (run.groups.length === 1 && !run.plus) {
       // Bare digits: only a card number, and not inside a longer token or after a decimal point.
       masked =
         before !== 46 &&
-        !attachedBefore(text, i) &&
+        !attachedBefore(text, i, false) &&
         !attachedAfter(text, run.end) &&
         isCard(text, run)
-    } else if (!attachedBefore(text, i) && !attachedAfter(text, run.end)) {
+    } else if (!attachedBefore(text, i, labelled) && !attachedAfter(text, run.end)) {
       masked = isCard(text, run) || (!inside && (isPhone(text, run) || isSeveralNumbers(text, run)))
     }
     if (masked) {
