@@ -48,3 +48,5 @@ export function createTestDeps(overrides: Partial<TestDeps> = {}): TestDeps {
     logger: overrides.logger ?? createMemoryLogger(),
   }
 }
+
+export * from './auth/testing'

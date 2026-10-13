@@ -14,13 +14,20 @@ from the hub (`tula-closeline`). This file holds only what is specific to this r
 | `bun run verify` | the full gate, exactly what CI runs |
 | `bun run verify:changed` | the quick gate the Stop hook runs |
 | `bun test` | tests |
+| `bun run bench` | benchmark suite with budgets |
 
 Other scripts are in `package.json`.
 
 ## Hot paths
 
-None yet. When this repo gains a hot path (live audio, Playbook search, a queue consumer, send
-scheduling), name the function and its budget here; changes to it then need a benchmark.
+- `TokenVerifier.verify` (`src/auth/verifier.ts`) runs on every request. It is O(token length) with
+  one Ed25519 verification and a Map lookup, and does no I/O when the key is cached. Budget:
+  mean under 0.5 ms, median under 0.25 ms and best-of-five-batches p95 under 0.4 ms, enforced by
+  `bench/verify.bench.ts` (`bun run bench`, part of `bun run verify`). The median and the best
+  batch are used instead of one p99 so a single scheduler stall cannot fail the check. The same
+  file budgets the bad-signature path (mean 0.3 ms) and the middleware (mean 0.3 ms), each with
+  the same median and tail budgets, about 5x what it measures. Any change to it re-runs the
+  benchmark.
 
 ## Issues
 
