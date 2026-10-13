@@ -437,4 +437,86 @@ interface ObjectStoreSubject {
 * one and fails for the other is a bug in one of them.
 */
 declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
-export { ObjectStoreSubject, QueueSubject, StoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour };
+/** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
+type AttributeValue = string | number | boolean;
+/** Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`. */
+type VectorAttributes = Readonly<Record<string, AttributeValue>>;
+/** A vector to store. */
+interface VectorRecord {
+	/** Unique within the Organization; storing an id again replaces the vector. */
+	id: string;
+	/** Exactly the store's `dimensions` finite numbers, not all zero. */
+	vector: ArrayLike<number>;
+	/** Optional attributes (at most 16). */
+	attributes?: VectorAttributes;
+}
+/** A similarity search. */
+interface SearchQuery {
+	/** The query vector, the store's `dimensions` long. */
+	vector: ArrayLike<number>;
+	/** How many hits at most, 1 to 100. */
+	topK: number;
+	/** Keep only vectors whose attributes equal every entry here. */
+	filter?: VectorAttributes;
+}
+/** One search result. */
+interface SearchHit {
+	/** The vector's id. */
+	id: string;
+	/** Cosine similarity to the query, -1 to 1; higher is closer. */
+	score: number;
+	/** The vector's attributes (empty when it had none). */
+	attributes: VectorAttributes;
+}
+/**
+* Vector storage scoped by Organization. Every call takes the Organization id first and reaches
+* only that Organization's vectors: an adapter derives its namespace or filter from the validated
+* id, never from a caller's string, so a search, an upsert or a delete cannot touch another
+* Organization. A store is created for one embedding model's dimension count; a vector of any
+* other length is `vector.dimension_mismatch`, which no retry fixes. Scores are cosine similarity.
+* Throws {@link VectorError}; only `vector.unavailable` is worth retrying. Text and vectors are
+* data, never instructions, and no operation logs them.
+*/
+interface VectorStore {
+	/** The length every vector and query must have. */
+	readonly dimensions: number;
+	/**
+	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
+	* leaves the same data. Everything is validated before anything is written, so a bad record
+	* writes nothing. Memory adapter O(batch × dimensions).
+	*/
+	upsert(organizationId: string, records: readonly VectorRecord[]): Promise<void>;
+	/**
+	* Returns the `topK` closest vectors that match the filter, best first (the order of equal scores is not promised). Memory
+	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
+	*/
+	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
+	delete(organizationId: string, ids: readonly string[]): Promise<void>;
+	/**
+	* Deletes every vector whose attributes equal every entry of `filter` (at least one entry, so it
+	* cannot empty an Organization by accident). Idempotent. Memory adapter O(n). Work proportional
+	* to the Organization's size: call it from a queued job, not a request.
+	*/
+	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface VectorStoreSubject {
+	/** The store under test, empty for the Organizations below, with at least 3 dimensions. */
+	store: VectorStore;
+	/** Three Organization ids the store accepts: B is unrelated, and `aExtended` starts with `a`. */
+	organizations: {
+		a: string;
+		b: string;
+		aExtended: string;
+	};
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link VectorStore} must show. Run it with {@link vectorStoreBehaviour}
+* against the memory adapter and against any real adapter (a store with no local stand-in runs it
+* in an integration test against a scratch namespace in a dev account).
+*/
+declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
+export { ObjectStoreSubject, QueueSubject, StoreSubject, VectorStoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, vectorStoreBehaviour };

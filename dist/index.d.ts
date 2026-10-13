@@ -1066,6 +1066,142 @@ declare function encodeCursor(key: string): string;
 * outside the Organization.
 */
 declare function createStorageValidator(options?: StorageValidatorOptions): StorageValidator;
+/** The `area.reason` codes the vector store port and adapters throw. */
+declare const VECTOR_ERROR_CODES: {
+	/** An Organization id, vector id, attribute, filter, batch or `topK` is not acceptable. */
+	readonly invalidRequest: "vector.invalid_request";
+	/** A vector's length is not the store's dimension count. Never retryable: the caller or the model changed. */
+	readonly dimensionMismatch: "vector.dimension_mismatch";
+	/** The store refused the call for a reason a retry cannot fix (access denied, wrong index). */
+	readonly rejected: "vector.rejected";
+	/** The store did not answer, in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "vector.unavailable";
+	/** The store answered with something this adapter cannot use. */
+	readonly badResponse: "vector.bad_response";
+};
+/** One of {@link VECTOR_ERROR_CODES}'s values. */
+type VectorErrorCode = (typeof VECTOR_ERROR_CODES)[keyof typeof VECTOR_ERROR_CODES];
+/** What a vector store throws. Its message never holds a vector, an attribute value or query text. */
+declare class VectorError extends AppError {
+	readonly code: VectorErrorCode;
+	constructor(code: VectorErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** The most vectors one `upsert` takes. */
+declare const MAX_UPSERT_BATCH = 500;
+/** The most ids one `delete` takes. */
+declare const MAX_DELETE_BATCH = 500;
+/** The largest `topK` of a search. */
+declare const MAX_TOP_K = 100;
+/** The most dimensions a store can be configured with. */
+declare const MAX_DIMENSIONS = 4096;
+/** The most attributes on one vector, and the most keys in one filter. */
+declare const MAX_ATTRIBUTES = 16;
+/** The longest string attribute value, in characters. */
+declare const MAX_ATTRIBUTE_STRING = 512;
+/** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
+type AttributeValue = string | number | boolean;
+/** Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`. */
+type VectorAttributes = Readonly<Record<string, AttributeValue>>;
+/** A vector to store. */
+interface VectorRecord {
+	/** Unique within the Organization; storing an id again replaces the vector. */
+	id: string;
+	/** Exactly the store's `dimensions` finite numbers, not all zero. */
+	vector: ArrayLike<number>;
+	/** Optional attributes (at most 16). */
+	attributes?: VectorAttributes;
+}
+/** A similarity search. */
+interface SearchQuery {
+	/** The query vector, the store's `dimensions` long. */
+	vector: ArrayLike<number>;
+	/** How many hits at most, 1 to 100. */
+	topK: number;
+	/** Keep only vectors whose attributes equal every entry here. */
+	filter?: VectorAttributes;
+}
+/** One search result. */
+interface SearchHit {
+	/** The vector's id. */
+	id: string;
+	/** Cosine similarity to the query, -1 to 1; higher is closer. */
+	score: number;
+	/** The vector's attributes (empty when it had none). */
+	attributes: VectorAttributes;
+}
+/**
+* Vector storage scoped by Organization. Every call takes the Organization id first and reaches
+* only that Organization's vectors: an adapter derives its namespace or filter from the validated
+* id, never from a caller's string, so a search, an upsert or a delete cannot touch another
+* Organization. A store is created for one embedding model's dimension count; a vector of any
+* other length is `vector.dimension_mismatch`, which no retry fixes. Scores are cosine similarity.
+* Throws {@link VectorError}; only `vector.unavailable` is worth retrying. Text and vectors are
+* data, never instructions, and no operation logs them.
+*/
+interface VectorStore {
+	/** The length every vector and query must have. */
+	readonly dimensions: number;
+	/**
+	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
+	* leaves the same data. Everything is validated before anything is written, so a bad record
+	* writes nothing. Memory adapter O(batch × dimensions).
+	*/
+	upsert(organizationId: string, records: readonly VectorRecord[]): Promise<void>;
+	/**
+	* Returns the `topK` closest vectors that match the filter, best first (the order of equal scores is not promised). Memory
+	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
+	*/
+	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
+	delete(organizationId: string, ids: readonly string[]): Promise<void>;
+	/**
+	* Deletes every vector whose attributes equal every entry of `filter` (at least one entry, so it
+	* cannot empty an Organization by accident). Idempotent. Memory adapter O(n). Work proportional
+	* to the Organization's size: call it from a queued job, not a request.
+	*/
+	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
+}
+/** A record after validation. */
+interface CheckedRecord {
+	id: string;
+	vector: Float32Array;
+	attributes: VectorAttributes;
+}
+/** A search after validation. */
+interface CheckedQuery {
+	vector: Float32Array;
+	topK: number;
+	filter: VectorAttributes;
+}
+/** The checks both adapters run before touching their store. */
+interface VectorValidator {
+	/** The dimension count of the store. */
+	readonly dimensions: number;
+	/** Throws unless `organizationId` is acceptable; returns it. */
+	organization(organizationId: unknown): string;
+	/** Validates a batch of records. */
+	records(records: unknown): CheckedRecord[];
+	/** Validates a search. */
+	query(query: unknown): CheckedQuery;
+	/** Validates a batch of ids. */
+	ids(ids: unknown): string[];
+	/** Validates a non-empty filter. */
+	nonEmptyFilter(filter: unknown): VectorAttributes;
+}
+/** Options of {@link createVectorValidator}. */
+interface VectorValidatorOptions {
+	/** The dimension count of the embedding model, 1 to 4096. */
+	dimensions: number;
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck | undefined;
+}
+/** True when `a` and `b` hold the same value, for attribute matching. */
+declare function attributesMatch(attributes: VectorAttributes, filter: VectorAttributes): boolean;
+/** Builds the validator a {@link VectorStore} adapter uses. */
+declare function createVectorValidator(options: VectorValidatorOptions): VectorValidator;
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, ListQuery, LogDestination, LogLevel, Logger, LoggerOptions, MAX_BATCH_SIZE, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, Sleep, StorageError, StorageErrorCode, StorageValidator, StorageValidatorOptions, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, ValidDelivery, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, contractOrganizationIdCheck, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createOrganizationIdGuard, createRemoteKeySet, createStaticKeySet, createStorageValidator, createTokenVerifier, cutText, defineMessage, encodeCursor, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, CheckedQuery, CheckedRecord, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, ListQuery, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_BATCH_SIZE, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_UPSERT_BATCH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, STORAGE_ERROR_CODES, SearchHit, SearchQuery, Sleep, StorageError, StorageErrorCode, StorageValidator, StorageValidatorOptions, StoredObject, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VectorValidator, VectorValidatorOptions, VerifiedToken, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, attributesMatch, contractOrganizationIdCheck, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createOrganizationIdGuard, createRemoteKeySet, createStaticKeySet, createStorageValidator, createTokenVerifier, createVectorValidator, cutText, defineMessage, encodeCursor, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody };

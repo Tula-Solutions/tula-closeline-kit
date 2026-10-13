@@ -1,8 +1,10 @@
 import {
   scrubText2,
   prepareFields,
-  shouldReportError2
-} from "./shared/chunk-z6tfjj1b.js";
+  shouldReportError2,
+  attributesMatch2,
+  createVectorValidator2
+} from "./shared/chunk-z6zyk10w.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -415,6 +417,73 @@ function createMemoryObjectStore(options = {}) {
     }
   };
 }
+// src/vector/memory.ts
+function normalise(vector) {
+  let norm = 0;
+  for (const x of vector) {
+    norm += x * x;
+  }
+  const scale = 1 / Math.sqrt(norm);
+  return vector.map((x) => x * scale);
+}
+function createMemoryVectorStore(options) {
+  const check = createVectorValidator2(options);
+  const organizations = new Map;
+  return {
+    dimensions: check.dimensions,
+    async upsert(organizationId, records) {
+      const org = check.organization(organizationId);
+      const checked = check.records(records);
+      let vectors = organizations.get(org);
+      if (vectors === undefined) {
+        vectors = new Map;
+        organizations.set(org, vectors);
+      }
+      for (const record of checked) {
+        vectors.set(record.id, {
+          unit: normalise(record.vector),
+          attributes: { ...record.attributes }
+        });
+      }
+    },
+    async search(organizationId, query) {
+      const org = check.organization(organizationId);
+      const { vector, topK, filter } = check.query(query);
+      const unit = normalise(vector);
+      const hits = [];
+      for (const [id, stored] of organizations.get(org) ?? []) {
+        if (!attributesMatch2(stored.attributes, filter)) {
+          continue;
+        }
+        let dot = 0;
+        for (let i = 0;i < unit.length; i++) {
+          dot += unit[i] * stored.unit[i];
+        }
+        hits.push({ id, score: dot, attributes: { ...stored.attributes } });
+      }
+      hits.sort((x, y) => y.score - x.score || (x.id < y.id ? -1 : 1));
+      return hits.slice(0, topK);
+    },
+    async delete(organizationId, ids) {
+      const org = check.organization(organizationId);
+      const checked = check.ids(ids);
+      const vectors = organizations.get(org);
+      for (const id of checked) {
+        vectors?.delete(id);
+      }
+    },
+    async deleteByFilter(organizationId, filter) {
+      const org = check.organization(organizationId);
+      const checked = check.nonEmptyFilter(filter);
+      const vectors = organizations.get(org);
+      for (const [id, stored] of vectors ?? []) {
+        if (attributesMatch2(stored.attributes, checked)) {
+          vectors?.delete(id);
+        }
+      }
+    }
+  };
+}
 
 // src/testing.ts
 function build(entries, bound) {
@@ -451,6 +520,7 @@ export {
   createMemoryLogger,
   createMemoryObjectStore,
   createMemoryQueue,
+  createMemoryVectorStore,
   createTestDeps,
   createTestJwks,
   createTestKeyPair,

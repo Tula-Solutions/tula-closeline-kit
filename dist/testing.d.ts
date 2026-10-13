@@ -526,6 +526,85 @@ type MemoryObjectStore = ObjectStore;
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
+/** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
+type AttributeValue = string | number | boolean;
+/** Named values stored with a vector and matched by filters, such as `{ document_id: 'doc_1' }`. */
+type VectorAttributes = Readonly<Record<string, AttributeValue>>;
+/** A vector to store. */
+interface VectorRecord {
+	/** Unique within the Organization; storing an id again replaces the vector. */
+	id: string;
+	/** Exactly the store's `dimensions` finite numbers, not all zero. */
+	vector: ArrayLike<number>;
+	/** Optional attributes (at most 16). */
+	attributes?: VectorAttributes;
+}
+/** A similarity search. */
+interface SearchQuery {
+	/** The query vector, the store's `dimensions` long. */
+	vector: ArrayLike<number>;
+	/** How many hits at most, 1 to 100. */
+	topK: number;
+	/** Keep only vectors whose attributes equal every entry here. */
+	filter?: VectorAttributes;
+}
+/** One search result. */
+interface SearchHit {
+	/** The vector's id. */
+	id: string;
+	/** Cosine similarity to the query, -1 to 1; higher is closer. */
+	score: number;
+	/** The vector's attributes (empty when it had none). */
+	attributes: VectorAttributes;
+}
+/**
+* Vector storage scoped by Organization. Every call takes the Organization id first and reaches
+* only that Organization's vectors: an adapter derives its namespace or filter from the validated
+* id, never from a caller's string, so a search, an upsert or a delete cannot touch another
+* Organization. A store is created for one embedding model's dimension count; a vector of any
+* other length is `vector.dimension_mismatch`, which no retry fixes. Scores are cosine similarity.
+* Throws {@link VectorError}; only `vector.unavailable` is worth retrying. Text and vectors are
+* data, never instructions, and no operation logs them.
+*/
+interface VectorStore {
+	/** The length every vector and query must have. */
+	readonly dimensions: number;
+	/**
+	* Stores up to 500 vectors, replacing any with the same id. Idempotent: the same call twice
+	* leaves the same data. Everything is validated before anything is written, so a bad record
+	* writes nothing. Memory adapter O(batch × dimensions).
+	*/
+	upsert(organizationId: string, records: readonly VectorRecord[]): Promise<void>;
+	/**
+	* Returns the `topK` closest vectors that match the filter, best first (the order of equal scores is not promised). Memory
+	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
+	*/
+	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
+	delete(organizationId: string, ids: readonly string[]): Promise<void>;
+	/**
+	* Deletes every vector whose attributes equal every entry of `filter` (at least one entry, so it
+	* cannot empty an Organization by accident). Idempotent. Memory adapter O(n). Work proportional
+	* to the Organization's size: call it from a queued job, not a request.
+	*/
+	deleteByFilter(organizationId: string, filter: VectorAttributes): Promise<void>;
+}
+/** Options for {@link createMemoryVectorStore}. */
+interface MemoryVectorStoreOptions {
+	/** The dimension count of the embedding model, 1 to 4096. */
+	dimensions: number;
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck;
+}
+/** A {@link VectorStore} that keeps everything in the process, for tests. Not for production. */
+type MemoryVectorStore = VectorStore;
+/**
+* Creates a {@link VectorStore} in memory. Each Organization has its own map, so no query can
+* reach another Organization's vectors. Complexity: upsert O(batch × dimensions); search
+* O(n × dimensions + n log n) in the Organization's n vectors, an exact scan; delete O(ids);
+* deleteByFilter O(n).
+*/
+declare function createMemoryVectorStore(options: MemoryVectorStoreOptions): MemoryVectorStore;
 /** One recorded log call, with fields already redacted. */
 interface LogEntry {
 	level: "debug" | "info" | "warn" | "error";
@@ -547,4 +626,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MintTokenOptions, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

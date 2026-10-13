@@ -713,8 +713,250 @@ x-injected: 1`],
     });
   });
 }
+// src/vector/behaviour.ts
+import { afterEach as afterEach4, describe as describe4, expect as expect4, test as test4 } from "bun:test";
+function vectorStoreBehaviour(name, make, skip = false) {
+  const run = skip ? describe4.skip : describe4;
+  run(`VectorStore behaviour: ${name}`, () => {
+    const open = [];
+    afterEach4(async () => {
+      await Promise.all(open.splice(0).map((subject) => subject.close()));
+    });
+    async function subject() {
+      const made = await make();
+      open.push(made);
+      return made;
+    }
+    const vec = (s, ...lead) => Array.from({ length: s.store.dimensions }, (_, i) => lead[i] ?? 0);
+    const ids = (hits) => hits.map((hit) => hit.id);
+    const invalid = { code: "vector.invalid_request" };
+    async function seed(s, org = s.organizations.a) {
+      await s.store.upsert(org, [
+        { id: "x", vector: vec(s, 1, 0, 0), attributes: { document_id: "doc_1", page: 1 } },
+        { id: "y", vector: vec(s, 0, 1, 0), attributes: { document_id: "doc_1", page: 2 } },
+        {
+          id: "xy",
+          vector: vec(s, 1, 1, 0),
+          attributes: { document_id: "doc_2", page: 1, final: true }
+        },
+        { id: "z", vector: vec(s, 0, 0, 1) }
+      ]);
+    }
+    test4("a search returns the closest vectors first, with cosine scores and attributes", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await seed(s);
+      const hits = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 4 });
+      expect4(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
+      expect4(hits[0]?.score).toBeCloseTo(1, 4);
+      expect4(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
+      expect4(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+      expect4(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
+    });
+    test4("a score does not depend on the length of either vector", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.upsert(a, [{ id: "long", vector: vec(s, 50, 0, 0) }]);
+      const [hit] = await s.store.search(a, { vector: vec(s, 0.001, 0, 0), topK: 1 });
+      expect4(hit?.id).toBe("long");
+      expect4(hit?.score).toBeCloseTo(1, 4);
+    });
+    test4("topK bounds the results", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await seed(s);
+      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
+      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
+      expect4(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
+    });
+    test4.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
+      const s = await subject();
+      await expect4(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
+    });
+    test4("a filter keeps vectors whose attributes equal every entry", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await seed(s);
+      const search = async (filter) => ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10, filter })).sort();
+      expect4(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
+      expect4(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
+      expect4(await search({ final: true })).toEqual(["xy"]);
+      expect4(await search({ page: 1 })).toEqual(["x", "xy"]);
+      expect4(await search({ document_id: "nope" })).toEqual([]);
+      expect4(await search({ page: "1" })).toEqual([]);
+    });
+    test4("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const code = { code: "vector.dimension_mismatch" };
+      const short = Array.from({ length: s.store.dimensions - 1 }, () => 1);
+      const long = Array.from({ length: s.store.dimensions + 1 }, () => 1);
+      await expect4(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
+      await expect4(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
+      await expect4(s.store.upsert(a, [
+        { id: "fine", vector: vec(s, 1) },
+        { id: "short", vector: short }
+      ])).rejects.toMatchObject(code);
+      expect4(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+    });
+    test4.each([
+      ["NaN", (n) => Array.from({ length: n }, (_, i) => i === 0 ? Number.NaN : 1)],
+      [
+        "Infinity",
+        (n) => Array.from({ length: n }, (_, i) => i === 0 ? Number.POSITIVE_INFINITY : 1)
+      ],
+      [
+        "a value too large for a float",
+        (n) => Array.from({ length: n }, (_, i) => i === 0 ? 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 : 1)
+      ],
+      ["all zeros", (n) => Array.from({ length: n }, () => 0)],
+      [
+        "a string",
+        (n) => Array.from({ length: n }, (_, i) => i === 0 ? "1" : 1)
+      ]
+    ])("a vector with %s is refused", async (_label, build) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const vector = build(s.store.dimensions);
+      await expect4(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
+      await expect4(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
+    });
+    test4.each([
+      ["an empty id", ""],
+      ["a slash", "a/b"],
+      ["a leading dot", ".x"],
+      ["a space", "a b"],
+      ["a long id", "x".repeat(129)]
+    ])("an id with %s is refused", async (_label, id) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect4(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect4(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
+    });
+    test4("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect4(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
+      const many = Array.from({ length: 501 }, (_, i) => ({ id: `v${i}`, vector: vec(s, 1) }));
+      await expect4(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
+      await expect4(s.store.upsert(a, [
+        { id: "same", vector: vec(s, 1) },
+        { id: "same", vector: vec(s, 0, 1) }
+      ])).rejects.toMatchObject(invalid);
+      await expect4(s.store.delete(a, [])).rejects.toMatchObject(invalid);
+      await expect4(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
+      expect4(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+    });
+    test4.each([
+      ["an upper-case name", { Document: "x" }],
+      ["a name with a dot", { "a.b": "x" }],
+      ["an array value", { tags: ["x"] }],
+      ["a null value", { n: null }],
+      ["a non-finite number", { n: Number.NaN }],
+      ["a long string", { n: "x".repeat(513) }],
+      [
+        "too many entries",
+        Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, "v"]))
+      ]
+    ])("attributes with %s are refused", async (_label, attributes) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect4(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
+      await expect4(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
+      await expect4(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
+    });
+    test4("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes: { n: 1 } }]);
+      const replacement = [{ id: "v", vector: vec(s, 0, 1), attributes: { n: 2 } }];
+      await s.store.upsert(a, replacement);
+      await s.store.upsert(a, replacement);
+      const hits = await s.store.search(a, { vector: vec(s, 0, 1), topK: 10 });
+      expect4(ids(hits)).toEqual(["v"]);
+      expect4(hits[0]?.score).toBeCloseTo(1, 4);
+      expect4(hits[0]?.attributes).toEqual({ n: 2 });
+    });
+    test4("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await seed(s);
+      await s.store.delete(a, ["x", "missing"]);
+      await s.store.delete(a, ["x", "missing"]);
+      expect4(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+        "xy",
+        "y",
+        "z"
+      ]);
+    });
+    test4("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await seed(s);
+      await expect4(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
+      await s.store.deleteByFilter(a, { document_id: "doc_1" });
+      await s.store.deleteByFilter(a, { document_id: "doc_1" });
+      await s.store.deleteByFilter(a, { document_id: "never" });
+      expect4(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+        "xy",
+        "z"
+      ]);
+    });
+    test4("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await seed(s, a);
+      expect4(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
+      expect4(await s.store.search(b, {
+        vector: vec(s, 1, 0, 0),
+        topK: 100,
+        filter: { document_id: "doc_1" }
+      })).toEqual([]);
+      await s.store.upsert(b, [
+        { id: "x", vector: vec(s, 0, 0, 1), attributes: { document_id: "b_doc" } }
+      ]);
+      await s.store.delete(b, ["y", "xy"]);
+      await s.store.deleteByFilter(b, { document_id: "doc_1" });
+      const mine = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 100 });
+      expect4(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
+      expect4(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
+        document_id: "doc_1",
+        page: 1
+      });
+      const theirs = await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 });
+      expect4(ids(theirs)).toEqual(["x"]);
+      expect4(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
+    });
+    test4("an Organization whose id starts with another id is a different Organization", async () => {
+      const s = await subject();
+      const { a, aExtended } = s.organizations;
+      await s.store.upsert(a, [{ id: "one", vector: vec(s, 1) }]);
+      await s.store.upsert(aExtended, [{ id: "two", vector: vec(s, 1) }]);
+      expect4(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
+      expect4(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      await s.store.delete(a, ["two"]);
+      await s.store.deleteByFilter(a, { n: 1 });
+      expect4(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+    });
+    test4.each([
+      ["empty", ""],
+      ["a path", "org/../x"],
+      ["a separator", "x/y"],
+      ["an encoded separator", "x%2Fy"],
+      ["a wildcard", "x*"],
+      ["too long", "x".repeat(65)]
+    ])("an Organization id that is %s is refused by every operation", async (_label, id) => {
+      const s = await subject();
+      await expect4(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect4(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
+      await expect4(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
+      await expect4(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
+    });
+  });
+}
 export {
   objectStoreBehaviour,
   processedStoreBehaviour,
-  queueBehaviour
+  queueBehaviour,
+  vectorStoreBehaviour
 };
