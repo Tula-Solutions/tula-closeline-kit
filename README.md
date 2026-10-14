@@ -784,7 +784,7 @@ the stand-in (`createMemoryTranscriber`) from `tula-closeline-kit/testing`; the 
 (`transcriberBehaviour`) from `tula-closeline-kit/testing/behaviour`, which a real adapter must pass.
 
 ```ts
-submit(organizationId, { clientReference, audio: { url }, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
+submit(organizationId, { clientReference, audio: { url }, audioKey?, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
 getResult(organizationId, clientReference): Promise<{ status: 'pending' } | { status: 'done'; durationMs; turns } | { status: 'failed'; reason } | undefined>
 delete(organizationId, clientReference): Promise<{ existed: boolean }> // idempotent; needs no vendor id
 list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items: { clientReference; status }[]; nextCursor? }>
@@ -792,7 +792,8 @@ waitForTranscription(transcriber, organizationId, clientReference, { maxAttempts
 ```
 
 **Audio is a short-lived reference, not bytes.** `audio.url` is an `https:` URL (`http:` only for
-`ENVIRONMENT=local`; a real adapter refuses it elsewhere) that the vendor fetches, typically a
+`ENVIRONMENT=local`: the shared validator refuses it, for the audio and the callback URL, in
+`dev`, `staging` and `prod`) that the vendor fetches, typically a
 presigned GET of the object store valid for minutes. The reasons: the service never buffers or
 re-streams 500 MB, it is what ADR 0018 says ("sent to the vendor by a short-lived presigned URL"),
 and AssemblyAI takes an `audio_url`. The URL can carry credentials in its query string, so it is
@@ -804,7 +805,9 @@ S3 client until a later ticket adds it to `ObjectStore`.
 digits, `.`, `_`, `:` and `-`; the playbook service will use `<callId>:<sendNumber>`). `submit` is
 idempotent by `(organizationId, clientReference)`: the same request again returns
 `created: false` and sends nothing, so a worker that crashed can send again; the same reference
-with different audio, mode or speaker cap is `transcriber.conflict`. `speakers` is
+with a different mode, speaker cap or `audioKey` is `transcriber.conflict`. The audio URL is
+**not** part of a send's identity, because it is short-lived and the retry presigns a new one;
+`audioKey` (optional, such as `<objectKey>:<sha256>`) is what names the audio itself. `speakers` is
 `split_channels` (a stereo Recording, each channel a speaker, the turn carries its `channel`) or
 `diarize` (mono, the vendor separates speakers; `maxSpeakers` 1 to 10 caps them and is refused with
 `split_channels`). `callbackUrl` is an optional hint for a vendor webhook; a result is always

@@ -903,14 +903,25 @@ function transcriberBehaviour(name, make, skip = false) {
       });
       expect4(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test4("the same reference with different audio, mode or speaker cap is a conflict", async () => {
+    test4("the same reference with another mode, speaker cap or audio key is a conflict", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2 }));
+      await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2, audioKey: "rec/1:abc" }));
       const conflict = { code: "transcriber.conflict" };
-      await expect4(s.transcriber.submit(a, send("call_1:1", { audio: { url: "https://other.example.test/x" }, maxSpeakers: 2 }))).rejects.toMatchObject(conflict);
-      await expect4(s.transcriber.submit(a, send("call_1:1", { speakers: "split_channels" }))).rejects.toMatchObject(conflict);
-      await expect4(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 3 }))).rejects.toMatchObject(conflict);
+      await expect4(s.transcriber.submit(a, send("call_1:1", { speakers: "split_channels", audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
+      await expect4(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 3, audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
+      await expect4(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2, audioKey: "rec/2:def" }))).rejects.toMatchObject(conflict);
+      expect4(await references(s, a)).toEqual(["call_1:1"]);
+    });
+    test4("a retry with a freshly presigned URL is the same send, not a conflict", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1", { audioKey: "rec/1:abc" }));
+      const again = await s.transcriber.submit(a, send("call_1:1", {
+        audio: { url: "https://audio.example.test/call_1.mp3?sig=NEWSIGNATURE&expires=2" },
+        audioKey: "rec/1:abc"
+      }));
+      expect4(again.created).toBe(false);
       expect4(await references(s, a)).toEqual(["call_1:1"]);
     });
     test4("a result is pending, done with ordered turns, or failed with a listed reason", async () => {
@@ -1029,6 +1040,8 @@ function transcriberBehaviour(name, make, skip = false) {
         { audio: { url: `https://example.test/${"a".repeat(4100)}` } }
       ],
       ["an unknown speaker mode", { speakers: "both" }],
+      ["an audio key with a space", { audioKey: "rec 1" }],
+      ["an audio key over 256 characters", { audioKey: "a".repeat(257) }],
       ["a speaker cap of 0", { maxSpeakers: 0 }],
       ["a speaker cap of 11", { maxSpeakers: 11 }],
       ["a fractional speaker cap", { maxSpeakers: 1.5 }],

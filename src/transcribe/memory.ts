@@ -1,4 +1,5 @@
 import type { OrganizationIdCheck } from '../organization'
+import type { Environment } from '../reporting/env'
 import { TRANSCRIBER_ERROR_CODES, TranscriberError, type TranscriberErrorCode } from './errors'
 import type {
   Transcriber,
@@ -44,6 +45,8 @@ export type TranscriberOperation = 'submit' | 'getResult' | 'delete' | 'list'
 export interface MemoryTranscriberOptions {
   /** Extra Organization id rule; the contract's format by default. */
   isOrganizationId?: OrganizationIdCheck
+  /** The `ENVIRONMENT` to behave as: plain `http:` URLs are accepted only in `local`; default `local`. */
+  environment?: Environment
   /** Chooses what a send ends as when no outcome was scripted for its reference. */
   outcome?: (request: {
     speakers: 'split_channels' | 'diarize'
@@ -113,7 +116,10 @@ function checkOutcome(outcome: ScriptedOutcome): ScriptedOutcome {
  * sends.
  */
 export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}): MemoryTranscriber {
-  const check = createTranscriberValidator({ isOrganizationId: options.isOrganizationId })
+  const check = createTranscriberValidator({
+    isOrganizationId: options.isOrganizationId,
+    environment: options.environment ?? 'local',
+  })
   const organizations = new Map<string, Map<string, Copy>>()
   const scripts = new Map<string, ScriptedOutcome>()
   const failures: Array<{ operation: TranscriberOperation; code: TranscriberErrorCode }> = []

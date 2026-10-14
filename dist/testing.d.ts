@@ -21,6 +21,10 @@ interface Logger {
 	/** Returns a logger that adds `fields` to every entry. */
 	child(fields: Record<string, unknown>): Logger;
 }
+/** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
+declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
+/** One of the deployment environments. */
+type Environment = (typeof ENVIRONMENTS)[number];
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
 	/** The request's id, for finding the log lines. */
@@ -595,7 +599,7 @@ type TranscriberErrorCode = (typeof TRANSCRIBER_ERROR_CODES)[keyof typeof TRANSC
 /** The audio to transcribe: a short-lived reference the vendor fetches, never the bytes. */
 interface AudioReference {
 	/**
-	* An `https:` URL (`http:` only for `ENVIRONMENT=local`) that stays valid until the vendor has
+	* An `https:` URL (`http:` only when the adapter runs with `ENVIRONMENT=local`) that stays valid until the vendor has
 	* fetched the audio, typically a presigned GET of the object store, valid for minutes. It may
 	* carry credentials in its query string, so it is never logged, never put in an error and never
 	* stored. No user information (`user:pass@`) is accepted.
@@ -619,6 +623,13 @@ interface TranscribeRequest {
 	speakers: SpeakerMode;
 	/** With `diarize`: the most speakers to find, 1 to 10. Not allowed with `split_channels`. */
 	maxSpeakers?: number;
+	/**
+	* Optional: a stable name for the audio itself, such as the object key and content hash
+	* (`<key>:<sha256>`), 1 to 256 of letters, digits, `.`, `_`, `:`, `/` and `-`. The audio URL is
+	* short-lived and a retry gets a new one, so the URL is not part of what makes two sends "the
+	* same"; this is. Sending a reference again with a different `audioKey` is a conflict.
+	*/
+	audioKey?: string;
 	/**
 	* Optional: an `https:` URL the vendor may call when the result is ready, to save polling. The
 	* port never requires one: a result is always readable with {@link Transcriber.getResult}, and a
@@ -775,6 +786,8 @@ type TranscriberOperation = "submit" | "getResult" | "delete" | "list";
 interface MemoryTranscriberOptions {
 	/** Extra Organization id rule; the contract's format by default. */
 	isOrganizationId?: OrganizationIdCheck;
+	/** The `ENVIRONMENT` to behave as: plain `http:` URLs are accepted only in `local`; default `local`. */
+	environment?: Environment;
 	/** Chooses what a send ends as when no outcome was scripted for its reference. */
 	outcome?: (request: {
 		speakers: "split_channels" | "diarize";

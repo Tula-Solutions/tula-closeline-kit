@@ -1,5 +1,6 @@
 import type { OrganizationIdCheck } from '../organization'
 import { createOrganizationIdGuard } from '../organization-guard'
+import type { Environment } from '../reporting/env'
 import { TRANSCRIBER_ERROR_CODES, TranscriberError } from './errors'
 import {
   DEFAULT_TRANSCRIBER_LIST_LIMIT,
@@ -13,6 +14,7 @@ import {
 // Internal: the checks every adapter shares. Not exported from any entry of the package.
 
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
+const AUDIO_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/
 const CURSOR = /^[A-Za-z0-9_-]{1,300}$/
 
 const bad = (message: string) =>
@@ -24,6 +26,7 @@ export interface CheckedRequest {
   audioUrl: string
   speakers: 'split_channels' | 'diarize'
   maxSpeakers: number | undefined
+  audioKey: string | undefined
   callbackUrl: string | undefined
 }
 
@@ -51,7 +54,7 @@ export function encodeReferenceCursor(reference: string): string {
   return Buffer.from(reference, 'utf8').toString('base64url')
 }
 
-function checkUrl(value: unknown, what: string): string {
+function checkUrl(value: unknown, what: string, allowHttp: boolean): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > MAX_AUDIO_URL_LENGTH) {
     throw bad(`${what} must be a URL of at most 4096 characters`)
   }
@@ -62,12 +65,12 @@ function checkUrl(value: unknown, what: string): string {
     throw bad(`${what} must be a URL`)
   }
   if (
-    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
+    (url.protocol !== 'https:' && !(allowHttp && url.protocol === 'http:')) ||
     url.hostname === '' ||
     url.username !== '' ||
     url.password !== ''
   ) {
-    throw bad(`${what} must be an http(s) URL without user information`)
+    throw bad(`${what} must be an https URL without user information (http only in local)`)
   }
   return value
 }
@@ -75,7 +78,10 @@ function checkUrl(value: unknown, what: string): string {
 /** Builds the validator a {@link Transcriber} adapter uses. */
 export function createTranscriberValidator(options: {
   isOrganizationId?: OrganizationIdCheck | undefined
+  /** The `ENVIRONMENT`: plain `http:` URLs are accepted only in `local`. */
+  environment: Environment
 }): TranscriberValidator {
+  const allowHttp = options.environment === 'local'
   const isOrganization = createOrganizationIdGuard(options.isOrganizationId)
   const reference = (value: unknown): string => {
     if (
@@ -84,6 +90,15 @@ export function createTranscriberValidator(options: {
       !REFERENCE.test(value)
     ) {
       throw bad('a client reference is 1 to 128 letters, digits, ".", "_", ":" or "-"')
+    }
+    return value
+  }
+  const audioKey = (value: unknown): string | undefined => {
+    if (value === undefined) {
+      return undefined
+    }
+    if (typeof value !== 'string' || !AUDIO_KEY.test(value)) {
+      throw bad('the audio key is 1 to 256 letters, digits, ".", "_", ":", "/" or "-"')
     }
     return value
   }
@@ -122,11 +137,14 @@ export function createTranscriberValidator(options: {
       }
       return {
         clientReference: reference(raw.clientReference),
-        audioUrl: checkUrl((audio as { url?: unknown }).url, 'the audio url'),
+        audioUrl: checkUrl((audio as { url?: unknown }).url, 'the audio url', allowHttp),
         speakers: raw.speakers,
         maxSpeakers,
         callbackUrl:
-          raw.callbackUrl === undefined ? undefined : checkUrl(raw.callbackUrl, 'the callback url'),
+          raw.callbackUrl === undefined
+            ? undefined
+            : checkUrl(raw.callbackUrl, 'the callback url', allowHttp),
+        audioKey: audioKey(raw.audioKey),
       }
     },
     list(listOptions) {
@@ -170,7 +188,8 @@ export function createTranscriberValidator(options: {
   }
 }
 
-/** True when two checked requests ask for the same send (the callback is only a hint). */
+/** True when two checked requests ask for the same send (the URLs are only a means of fetching). */
 export function sameSend(x: CheckedRequest, y: CheckedRequest): boolean {
-  return x.audioUrl === y.audioUrl && x.speakers === y.speakers && x.maxSpeakers === y.maxSpeakers
+  // The audio URL is not compared: it is short-lived, and a retry presigns a new one.
+  return x.audioKey === y.audioKey && x.speakers === y.speakers && x.maxSpeakers === y.maxSpeakers
 }

@@ -491,7 +491,7 @@ declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectSt
 /** The audio to transcribe: a short-lived reference the vendor fetches, never the bytes. */
 interface AudioReference {
 	/**
-	* An `https:` URL (`http:` only for `ENVIRONMENT=local`) that stays valid until the vendor has
+	* An `https:` URL (`http:` only when the adapter runs with `ENVIRONMENT=local`) that stays valid until the vendor has
 	* fetched the audio, typically a presigned GET of the object store, valid for minutes. It may
 	* carry credentials in its query string, so it is never logged, never put in an error and never
 	* stored. No user information (`user:pass@`) is accepted.
@@ -515,6 +515,13 @@ interface TranscribeRequest {
 	speakers: SpeakerMode;
 	/** With `diarize`: the most speakers to find, 1 to 10. Not allowed with `split_channels`. */
 	maxSpeakers?: number;
+	/**
+	* Optional: a stable name for the audio itself, such as the object key and content hash
+	* (`<key>:<sha256>`), 1 to 256 of letters, digits, `.`, `_`, `:`, `/` and `-`. The audio URL is
+	* short-lived and a retry gets a new one, so the URL is not part of what makes two sends "the
+	* same"; this is. Sending a reference again with a different `audioKey` is a conflict.
+	*/
+	audioKey?: string;
 	/**
 	* Optional: an `https:` URL the vendor may call when the result is ready, to save polling. The
 	* port never requires one: a result is always readable with {@link Transcriber.getResult}, and a

@@ -148,6 +148,43 @@ describe('the memory transcriber', () => {
   })
 })
 
+describe('plain http URLs', () => {
+  const http = 'http://audio.example.test/a?sig=SECRETSIG'
+
+  test.each(['dev', 'staging', 'prod'] as const)(
+    'are refused in %s, for audio and callback',
+    async (environment) => {
+      const transcriber = createMemoryTranscriber({ environment })
+
+      for (const request of [
+        send('c:1', { audio: { url: http } }),
+        send('c:1', { callbackUrl: http }),
+      ]) {
+        try {
+          await transcriber.submit(A, request)
+          throw new Error('the send was accepted')
+        } catch (error) {
+          expect(error).toMatchObject({ code: 'transcriber.invalid_request' })
+          expect(String((error as Error).message)).not.toContain('SECRET')
+        }
+      }
+      expect(transcriber.copies()).toEqual([])
+      expect((await transcriber.submit(A, send('c:1'))).created).toBe(true)
+    }
+  )
+
+  test('are accepted in local, which is the default of the stand-in', async () => {
+    for (const transcriber of [
+      createMemoryTranscriber({ environment: 'local' }),
+      createMemoryTranscriber(),
+    ]) {
+      expect((await transcriber.submit(A, send('c:1', { audio: { url: http } }))).created).toBe(
+        true
+      )
+    }
+  })
+})
+
 describe('waitForTranscription', () => {
   test('reads until done, pausing with jitter between reads', async () => {
     const transcriber = createMemoryTranscriber()

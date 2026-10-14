@@ -498,12 +498,13 @@ function createMemoryObjectStore(options = {}) {
 }
 // src/transcribe/validate.ts
 var REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+var AUDIO_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 var CURSOR = /^[A-Za-z0-9_-]{1,300}$/;
 var bad = (message) => new TranscriberError2(TRANSCRIBER_ERROR_CODES2.invalidRequest, message);
 function encodeReferenceCursor(reference) {
   return Buffer.from(reference, "utf8").toString("base64url");
 }
-function checkUrl(value, what) {
+function checkUrl(value, what, allowHttp) {
   if (typeof value !== "string" || value.length < 1 || value.length > MAX_AUDIO_URL_LENGTH2) {
     throw bad(`${what} must be a URL of at most 4096 characters`);
   }
@@ -513,16 +514,26 @@ function checkUrl(value, what) {
   } catch {
     throw bad(`${what} must be a URL`);
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:" || url.hostname === "" || url.username !== "" || url.password !== "") {
-    throw bad(`${what} must be an http(s) URL without user information`);
+  if (url.protocol !== "https:" && !(allowHttp && url.protocol === "http:") || url.hostname === "" || url.username !== "" || url.password !== "") {
+    throw bad(`${what} must be an https URL without user information (http only in local)`);
   }
   return value;
 }
 function createTranscriberValidator(options) {
+  const allowHttp = options.environment === "local";
   const isOrganization = createOrganizationIdGuard(options.isOrganizationId);
   const reference = (value) => {
     if (typeof value !== "string" || value.length > MAX_CLIENT_REFERENCE_LENGTH2 || !REFERENCE.test(value)) {
       throw bad('a client reference is 1 to 128 letters, digits, ".", "_", ":" or "-"');
+    }
+    return value;
+  };
+  const audioKey = (value) => {
+    if (value === undefined) {
+      return;
+    }
+    if (typeof value !== "string" || !AUDIO_KEY.test(value)) {
+      throw bad('the audio key is 1 to 256 letters, digits, ".", "_", ":", "/" or "-"');
     }
     return value;
   };
@@ -555,10 +566,11 @@ function createTranscriberValidator(options) {
       }
       return {
         clientReference: reference(raw.clientReference),
-        audioUrl: checkUrl(audio.url, "the audio url"),
+        audioUrl: checkUrl(audio.url, "the audio url", allowHttp),
         speakers: raw.speakers,
         maxSpeakers,
-        callbackUrl: raw.callbackUrl === undefined ? undefined : checkUrl(raw.callbackUrl, "the callback url")
+        callbackUrl: raw.callbackUrl === undefined ? undefined : checkUrl(raw.callbackUrl, "the callback url", allowHttp),
+        audioKey: audioKey(raw.audioKey)
       };
     },
     list(listOptions) {
@@ -593,7 +605,7 @@ function createTranscriberValidator(options) {
   };
 }
 function sameSend(x, y) {
-  return x.audioUrl === y.audioUrl && x.speakers === y.speakers && x.maxSpeakers === y.maxSpeakers;
+  return x.audioKey === y.audioKey && x.speakers === y.speakers && x.maxSpeakers === y.maxSpeakers;
 }
 
 // src/transcribe/memory.ts
@@ -624,7 +636,10 @@ function checkOutcome(outcome) {
   return { pendingReads: reads, result: outcome.result };
 }
 function createMemoryTranscriber(options = {}) {
-  const check = createTranscriberValidator({ isOrganizationId: options.isOrganizationId });
+  const check = createTranscriberValidator({
+    isOrganizationId: options.isOrganizationId,
+    environment: options.environment ?? "local"
+  });
   const organizations = new Map;
   const scripts = new Map;
   const failures = [];
