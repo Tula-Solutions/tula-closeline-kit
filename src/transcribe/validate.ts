@@ -8,13 +8,16 @@ import {
   MAX_CLIENT_REFERENCE_LENGTH,
   MAX_SPEAKERS,
   MAX_TRANSCRIBER_LIST_LIMIT,
+  MAX_VENDOR_ID_LENGTH,
   type TranscriptionListOptions,
+  type VendorIdHint,
 } from './port'
 
 // Internal: the checks every adapter shares. Not exported from any entry of the package.
 
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const AUDIO_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/
+const VENDOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const CURSOR = /^[A-Za-z0-9_-]{1,300}$/
 
 const bad = (message: string) =>
@@ -43,6 +46,10 @@ export interface TranscriberValidator {
   organization(organizationId: unknown): string
   /** Throws unless `reference` is a valid client reference; returns it. */
   reference(reference: unknown): string
+  /** Throws unless `vendorId` is a well-formed vendor id; returns it. */
+  vendorId(vendorId: unknown): string
+  /** Validates an optional hint; returns the id, or undefined when there is none. */
+  hint(hint: VendorIdHint | undefined): string | undefined
   /** Validates a send. The messages never hold the URLs. */
   request(request: unknown): CheckedRequest
   /** Validates the options of a list call. */
@@ -99,7 +106,27 @@ export function createTranscriberValidator(options: {
     }
     return value
   }
+  const vendorId = (value: unknown): string => {
+    if (
+      typeof value !== 'string' ||
+      value.length > MAX_VENDOR_ID_LENGTH ||
+      !VENDOR_ID.test(value)
+    ) {
+      throw bad('a vendor id is 1 to 128 letters, digits, ".", "_", ":" or "-"')
+    }
+    return value
+  }
   return {
+    vendorId,
+    hint(value) {
+      if (value === undefined) {
+        return undefined
+      }
+      if (typeof value !== 'object' || value === null) {
+        throw bad('the hint must be an object')
+      }
+      return value.vendorId === undefined ? undefined : vendorId(value.vendorId)
+    },
     organization(value) {
       if (!isOrganization(value)) {
         throw bad('the Organization id is not valid')

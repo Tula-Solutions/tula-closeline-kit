@@ -41,8 +41,9 @@ import {
   MAX_SPEAKERS2,
   DEFAULT_TRANSCRIBER_LIST_LIMIT2,
   MAX_TRANSCRIBER_LIST_LIMIT2,
+  MAX_VENDOR_ID_LENGTH2,
   checkTranscriptionResult2
-} from "./shared/chunk-mv441zb4.js";
+} from "./shared/chunk-5yzgse6v.js";
 import {
   assertReceiveOptions2,
   assertVisibility2,
@@ -533,9 +534,13 @@ ${expires}`).digest("hex");
     }
   };
 }
+// src/transcribe/memory.ts
+import { createHash as createHash2 } from "node:crypto";
+
 // src/transcribe/validate.ts
 var REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 var AUDIO_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+var VENDOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 var CURSOR = /^[A-Za-z0-9_-]{1,300}$/;
 var bad = (message) => new TranscriberError2(TRANSCRIBER_ERROR_CODES2.invalidRequest, message);
 function encodeReferenceCursor(reference) {
@@ -571,7 +576,23 @@ function createTranscriberValidator(options) {
     }
     return value;
   };
+  const vendorId = (value) => {
+    if (typeof value !== "string" || value.length > MAX_VENDOR_ID_LENGTH2 || !VENDOR_ID.test(value)) {
+      throw bad('a vendor id is 1 to 128 letters, digits, ".", "_", ":" or "-"');
+    }
+    return value;
+  };
   return {
+    vendorId,
+    hint(value) {
+      if (value === undefined) {
+        return;
+      }
+      if (typeof value !== "object" || value === null) {
+        throw bad("the hint must be an object");
+      }
+      return value.vendorId === undefined ? undefined : vendorId(value.vendorId);
+    },
     organization(value) {
       if (!isOrganization(value)) {
         throw bad("the Organization id is not valid");
@@ -679,7 +700,7 @@ function createMemoryTranscriber(options = {}) {
   const scripts = new Map;
   const failures = [];
   let acceptThenFail = 0;
-  let counter = 0;
+  const vendorIdOf = (org, reference) => `mem_${createHash2("sha256").update(`${org}\x00${reference}`).digest("hex").slice(0, 20)}`;
   const scriptKey = (org, reference) => `${org}\x00${reference}`;
   function maybeFail(operation) {
     const at = failures.findIndex((entry) => entry.operation === operation);
@@ -716,17 +737,21 @@ function createMemoryTranscriber(options = {}) {
         if (!sameSend(existing.request, checked)) {
           throw new TranscriberError2(TRANSCRIBER_ERROR_CODES2.conflict, "the client reference is already used by a different send");
         }
-        return { clientReference: checked.clientReference, created: false };
+        return {
+          clientReference: checked.clientReference,
+          created: false,
+          vendorId: existing.vendorId
+        };
       }
-      counter += 1;
       const scripted = scripts.get(scriptKey(org, checked.clientReference)) ?? options.outcome?.({
         speakers: checked.speakers,
         ...checked.maxSpeakers === undefined ? {} : { maxSpeakers: checked.maxSpeakers }
       }) ?? defaultOutcome(checked);
       const outcome = checkOutcome(scripted);
+      const vendorId = vendorIdOf(org, checked.clientReference);
       sends.set(checked.clientReference, {
         request: checked,
-        vendorId: `mem_${counter}`,
+        vendorId,
         pendingReads: outcome.pendingReads ?? 1,
         outcome: outcome.result
       });
@@ -734,19 +759,21 @@ function createMemoryTranscriber(options = {}) {
         acceptThenFail -= 1;
         throw new TranscriberError2(TRANSCRIBER_ERROR_CODES2.unavailable, "the stand-in accepted the send and then failed to answer");
       }
-      return { clientReference: checked.clientReference, created: true };
+      return { clientReference: checked.clientReference, created: true, vendorId };
     },
-    async getResult(organizationId, clientReference) {
+    async getResult(organizationId, clientReference, hint) {
       maybeFail("getResult");
       const org = check.organization(organizationId);
       const reference = check.reference(clientReference);
+      check.hint(hint);
       const copy = organizations.get(org)?.get(reference);
       return copy === undefined ? undefined : stateOf(copy, true);
     },
-    async delete(organizationId, clientReference) {
+    async delete(organizationId, clientReference, hint) {
       maybeFail("delete");
       const org = check.organization(organizationId);
       const reference = check.reference(clientReference);
+      check.hint(hint);
       const existed = organizations.get(org)?.delete(reference) === true;
       scripts.delete(scriptKey(org, reference));
       return { existed };
@@ -764,6 +791,7 @@ function createMemoryTranscriber(options = {}) {
       matches.sort((x, y) => x[0] < y[0] ? -1 : 1);
       const items = matches.slice(0, limit).map(([clientReference, copy]) => ({
         clientReference,
+        vendorId: copy.vendorId,
         status: stateOf(copy, false).status
       }));
       const last = items.at(-1);

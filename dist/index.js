@@ -51,6 +51,7 @@ import {
   MAX_TRANSCRIBER_LIST_LIMIT2,
   MAX_TRANSCRIPT_TURNS2,
   MAX_TURN_TEXT2,
+  MAX_VENDOR_ID_LENGTH2,
   MAX_TRANSCRIPT_RESPONSE_BYTES2,
   MAX_AUDIO_MS2,
   MAX_TRANSCRIPT_CHARS2,
@@ -58,7 +59,7 @@ import {
   MAX_CHANNELS2,
   TRANSCRIPTION_FAILURES2,
   checkTranscriptionResult2
-} from "./shared/chunk-mv441zb4.js";
+} from "./shared/chunk-5yzgse6v.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -70,7 +71,7 @@ import {
 } from "./shared/chunk-dpkegc79.js";
 import {
   waitForTranscription2
-} from "./shared/chunk-ybwrkc2f.js";
+} from "./shared/chunk-83cpvtqk.js";
 import {
   AppError2,
   isAppError2,
@@ -1669,6 +1670,7 @@ export {
   MAX_TURN_TEXT2 as MAX_TURN_TEXT,
   MAX_UPSERT_BATCH2 as MAX_UPSERT_BATCH,
   MAX_VECTOR_ID_LENGTH2 as MAX_VECTOR_ID_LENGTH,
+  MAX_VENDOR_ID_LENGTH2 as MAX_VENDOR_ID_LENGTH,
   MAX_VISIBILITY_SECONDS2 as MAX_VISIBILITY_SECONDS,
   MAX_WAIT_SECONDS2 as MAX_WAIT_SECONDS,
   PACKAGE,

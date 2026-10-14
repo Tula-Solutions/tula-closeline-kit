@@ -55,7 +55,11 @@ export async function waitForTranscription(
     if (options.signal?.aborted) {
       throw abortReason(options.signal)
     }
-    last = await transcriber.getResult(organizationId, clientReference)
+    last = await transcriber.getResult(
+      organizationId,
+      clientReference,
+      options.vendorId === undefined ? undefined : { vendorId: options.vendorId }
+    )
     if (last === undefined || last.status !== 'pending') {
       return last
     }

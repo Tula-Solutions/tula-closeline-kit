@@ -57,6 +57,21 @@ export function transcriberBehaviour(
       expect(result?.status === 'done' || result?.status === 'failed').toBe(true)
       return result as TranscriptionResult
     }
+    /** Like finalResult, passing the vendor id hint on every read. */
+    async function finalResultWith(
+      s: TranscriberSubject,
+      org: string,
+      reference: string,
+      vendorId: string
+    ) {
+      const result = await waitForTranscription(s.transcriber, org, reference, {
+        maxAttempts: 120,
+        intervalMs: s.pollIntervalMs ?? 0,
+        vendorId,
+      })
+      expect(result?.status === 'done' || result?.status === 'failed').toBe(true)
+      return result as TranscriptionResult
+    }
     const references = async (s: TranscriberSubject, org: string, prefix?: string) => {
       const found: string[] = []
       let cursor: string | undefined
@@ -79,14 +94,11 @@ export function transcriberBehaviour(
       const s = await subject()
       const { a } = s.organizations
 
-      expect(await s.transcriber.submit(a, send('call_1:1'))).toEqual({
-        clientReference: 'call_1:1',
-        created: true,
-      })
-      expect(await s.transcriber.submit(a, send('call_1:1'))).toEqual({
-        clientReference: 'call_1:1',
-        created: false,
-      })
+      const first = await s.transcriber.submit(a, send('call_1:1'))
+      const again = await s.transcriber.submit(a, send('call_1:1'))
+
+      expect(first).toMatchObject({ clientReference: 'call_1:1', created: true })
+      expect(again).toMatchObject({ clientReference: 'call_1:1', created: false })
       expect(await references(s, a)).toEqual(['call_1:1'])
     })
 
@@ -210,6 +222,139 @@ export function transcriberBehaviour(
         cursor = next.nextCursor
       }
       expect(seen).toEqual(['call_1:1', 'call_1:2', 'call_1:3'])
+    })
+
+    describe('the vendor id', () => {
+      test('submit returns an opaque bounded id, the same one when the send is repeated', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+
+        const first = await s.transcriber.submit(a, send('call_1:1'))
+        const again = await s.transcriber.submit(a, send('call_1:1'))
+
+        expect(first.vendorId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+        expect(again.vendorId).toBe(first.vendorId)
+      })
+
+      test('list carries the id of each send', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const one = await s.transcriber.submit(a, send('call_1:1'))
+        const two = await s.transcriber.submit(a, send('call_1:2'))
+
+        const page = await s.transcriber.list(a, { prefix: 'call_1:' })
+
+        const ids = new Map(page.items.map((item) => [item.clientReference, item.vendorId]))
+        expect(ids.get('call_1:1')).toBe(one.vendorId)
+        expect(ids.get('call_1:2')).toBe(two.vendorId)
+      })
+
+      test('a read and a delete with the right id work as they do by reference alone', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const { vendorId } = await s.transcriber.submit(a, send('call_1:1'))
+
+        const result = await finalResultWith(s, a, 'call_1:1', vendorId)
+        expect(result.status === 'done' || result.status === 'failed').toBe(true)
+        expect(await s.transcriber.delete(a, 'call_1:1', { vendorId })).toEqual({ existed: true })
+        expect(await s.transcriber.getResult(a, 'call_1:1', { vendorId })).toBeUndefined()
+        expect(await s.transcriber.delete(a, 'call_1:1', { vendorId })).toEqual({ existed: false })
+      })
+
+      test("an id that names another reference's send is ignored: the call is about the reference", async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.transcriber.submit(a, send('call_1:1'))
+        const other = await s.transcriber.submit(a, send('call_1:2'))
+
+        // Read and delete "call_1:1" with the id of "call_1:2": only "call_1:1" is touched.
+        expect(
+          await s.transcriber.getResult(a, 'call_1:1', { vendorId: other.vendorId })
+        ).toBeDefined()
+        expect(await s.transcriber.delete(a, 'call_1:1', { vendorId: other.vendorId })).toEqual({
+          existed: true,
+        })
+        expect(await references(s, a)).toEqual(['call_1:2'])
+        // And a reference with no send is not served by another send's id.
+        expect(
+          await s.transcriber.getResult(a, 'call_1:9', { vendorId: other.vendorId })
+        ).toBeUndefined()
+        expect(await s.transcriber.delete(a, 'call_1:9', { vendorId: other.vendorId })).toEqual({
+          existed: false,
+        })
+        expect(await references(s, a)).toEqual(['call_1:2'])
+      })
+
+      test("an id from another Organization is ignored and never reaches that Organization's send", async () => {
+        const s = await subject()
+        const { a, b } = s.organizations
+        const mine = await s.transcriber.submit(a, send('call_1:1'))
+        await s.transcriber.submit(b, send('call_1:1', { speakers: 'split_channels' }))
+
+        expect(await s.transcriber.delete(b, 'call_1:1', { vendorId: mine.vendorId })).toEqual({
+          existed: true,
+        })
+        expect(await references(s, a)).toEqual(['call_1:1'])
+        expect(await references(s, b)).toEqual([])
+        // With no send of its own, the other Organization learns nothing from the id.
+        expect(
+          await s.transcriber.getResult(b, 'call_1:1', { vendorId: mine.vendorId })
+        ).toBeUndefined()
+        expect(await s.transcriber.delete(b, 'call_1:1', { vendorId: mine.vendorId })).toEqual({
+          existed: false,
+        })
+        expect(await s.transcriber.getResult(a, 'call_1:1')).toBeDefined()
+      })
+
+      test('an id the vendor does not know falls back to the reference', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.transcriber.submit(a, send('call_1:1'))
+
+        expect(
+          await s.transcriber.getResult(a, 'call_1:1', { vendorId: 'unknown-id-1' })
+        ).toBeDefined()
+        expect(await s.transcriber.delete(a, 'call_1:1', { vendorId: 'unknown-id-1' })).toEqual({
+          existed: true,
+        })
+      })
+
+      test.each([
+        ['empty', ''],
+        ['with a space', 'a b'],
+        ['with a slash', 'a/b'],
+        ['over 128 characters', 'a'.repeat(129)],
+        ['not a string', 5 as unknown as string],
+      ])('an id that is %s is refused', async (_label, vendorId) => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.transcriber.submit(a, send('call_1:1'))
+
+        await expect(s.transcriber.getResult(a, 'call_1:1', { vendorId })).rejects.toMatchObject(
+          invalid
+        )
+        await expect(s.transcriber.delete(a, 'call_1:1', { vendorId })).rejects.toMatchObject(
+          invalid
+        )
+        expect(await references(s, a)).toEqual(['call_1:1'])
+      })
+
+      test('a send whose id was never kept is found by listing for its reference and deleted without it', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        // The caller crashed before it stored the id: the return value is simply lost.
+        await s.transcriber.submit(a, send('call_1:1'))
+        await s.transcriber.submit(a, send('call_1:2'))
+        await s.transcriber.submit(a, send('call_9:1'))
+
+        const found = await s.transcriber.list(a, { prefix: 'call_1:' })
+        for (const entry of found.items) {
+          expect(entry.vendorId).toBeDefined()
+          expect(await s.transcriber.delete(a, entry.clientReference)).toEqual({ existed: true })
+        }
+
+        expect(await references(s, a)).toEqual(['call_9:1'])
+      })
     })
 
     test('concurrent submits of one reference create it once', async () => {

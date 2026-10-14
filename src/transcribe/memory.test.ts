@@ -97,11 +97,76 @@ describe('the memory transcriber', () => {
 
     const held = transcriber.copies(A)
     expect(held).toHaveLength(1)
-    expect(held[0]).toMatchObject({ clientReference: 'call_1:1', vendorId: 'mem_1' })
+    expect(held[0]).toMatchObject({
+      clientReference: 'call_1:1',
+      vendorId: expect.stringMatching(/^mem_/),
+    })
     for (const entry of (await transcriber.list(A, { prefix: 'call_1:' })).items) {
       await transcriber.delete(A, entry.clientReference)
     }
     expect(transcriber.copies()).toEqual([])
+  })
+
+  test('the accepted copy has an id the caller never learned, and a fresh instance with no memory of it still deletes by reference', async () => {
+    const transcriber = createMemoryTranscriber()
+    transcriber.acceptThenFailNext()
+    await transcriber.submit(A, send('call_1:1')).catch(() => undefined)
+    const { vendorId } = transcriber.copies(A)[0] as { vendorId: string }
+
+    // The listing shows the id the failed submit never returned.
+    expect((await transcriber.list(A, { prefix: 'call_1:' })).items[0]?.vendorId).toBe(vendorId)
+    // The id is deterministic and opaque, so another instance hands out the same one.
+    const fresh = createMemoryTranscriber()
+    expect((await fresh.submit(A, send('call_1:1'))).vendorId).toBe(vendorId)
+    expect(vendorId).not.toContain('call_1')
+    // A caller with no id deletes by reference alone.
+    expect(await transcriber.delete(A, 'call_1:1')).toEqual({ existed: true })
+    expect(transcriber.copies()).toEqual([])
+  })
+
+  test('ids differ by Organization and by reference', async () => {
+    const transcriber = createMemoryTranscriber()
+    const ids = new Set([
+      (await transcriber.submit(A, send('c:1'))).vendorId,
+      (await transcriber.submit(A, send('c:2'))).vendorId,
+      (await transcriber.submit(B, send('c:1'))).vendorId,
+    ])
+
+    expect(ids.size).toBe(3)
+  })
+
+  test('a purge retries an unavailable delete with backoff and finishes when the vendor answers', async () => {
+    const transcriber = createMemoryTranscriber()
+    await transcriber.submit(A, send('call_1:1'))
+    transcriber.failNext('delete', 'transcriber.unavailable', 3)
+    const pauses: number[] = []
+
+    let existed: boolean | undefined
+    for (let attempt = 0; existed === undefined && attempt < 10; attempt++) {
+      try {
+        existed = (await transcriber.delete(A, 'call_1:1')).existed
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'transcriber.unavailable' })
+        pauses.push(1000 * 2 ** attempt)
+      }
+    }
+
+    expect(pauses).toEqual([1000, 2000, 4000])
+    expect(existed).toBe(true)
+    expect(transcriber.copies()).toEqual([])
+  })
+
+  test('a failed delete changes nothing, so the copy is still there to retry', async () => {
+    const transcriber = createMemoryTranscriber()
+    await transcriber.submit(A, send('call_1:1'))
+    transcriber.failNext('delete', 'transcriber.unavailable', 3)
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(transcriber.delete(A, 'call_1:1')).rejects.toMatchObject({
+        code: 'transcriber.unavailable',
+      })
+      expect(transcriber.copies(A)).toHaveLength(1)
+    }
   })
 
   test('a send that is retried after that crash finds the copy and creates nothing', async () => {
