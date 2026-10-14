@@ -13,6 +13,7 @@ import {
   PutObjectCommand,
   UploadPartCommand,
 } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
 import type { Logger } from '../logger'
 import type { OrganizationIdCheck } from '../organization'
@@ -230,6 +231,13 @@ function isMissing(error: unknown): boolean {
  * `storage.bad_response`, and the valid keys beyond the run cannot be reached through the port.
  * Accepted by design: this adapter is the only writer under the prefix, and it never writes one.
  *
+ * Presigned reads: `presignGet` signs a GetObject for `orgs/<organizationId>/<key>` with the SDK's
+ * presigner and makes no request. The URL is a bearer credential and is never logged. It lives for
+ * the shorter of the requested lifetime and the signing credentials' remaining life (a task-role
+ * session carries `X-Amz-Security-Token`), so the caller mints it just before use and again for a
+ * retry; the signing identity should be the service role with only `s3:GetObject` on its prefix,
+ * never long-lived user keys. No response header overrides are offered.
+ *
  * Streamed puts: a body of at most one part is one PutObject. A larger one is a multipart upload
  * with parts of `partBytes` (8 MiB), `partConcurrency` (2) at a time, so memory is about
  * (concurrency + 1) parts whatever the object size. Every request has the per-call deadline
@@ -351,7 +359,31 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     }
   }
 
+  // Signing needs a real SDK client (its credentials, region and endpoint); built on first use so
+  // a unit test with a stub `client` never creates one for anything else.
+  let signer: ReturnType<typeof createS3Client> | undefined
+
   return {
+    async presignGet(organizationId, key, presignOptions) {
+      const location = prefixOf(check.organization(organizationId)) + check.key(key)
+      const expiresIn = check.expiry(presignOptions)
+      signer ??= createS3Client({
+        region: options.region,
+        environment: options.environment,
+        endpoint: options.endpoint,
+        timeoutMs,
+        maxAttempts,
+      })
+      try {
+        return await getSignedUrl(signer, new GetObjectCommand({ Bucket: bucket, Key: location }), {
+          expiresIn,
+        })
+      } catch (error) {
+        // The message never holds the key or the URL; the cause is reduced.
+        throw mapFailure('a presign', error)
+      }
+    },
+
     async put(organizationId, key, body, putOptions) {
       const deadline = AbortSignal.timeout(deadlineMs)
       const location = prefixOf(check.organization(organizationId)) + check.key(key)

@@ -495,6 +495,11 @@ interface ObjectStream extends ObjectInfo {
 	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
 	body: ReadableStream<Uint8Array>;
 }
+/** Options of {@link ObjectStore.presignGet}. */
+interface PresignOptions {
+	/** How long the URL works, a whole number of seconds from 1 to 900; default 300. */
+	expiresInSeconds?: number;
+}
 /** Options of {@link ObjectStore.list}. */
 interface ListOptions {
 	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
@@ -553,6 +558,24 @@ interface ObjectStore {
 	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
 	*/
 	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
+	/**
+	* Returns a short-lived URL that reads one object with a plain GET and no credentials, so the
+	* playbook can hand a Recording to the transcriber as `audio.url` without the service re-sending
+	* 500 MB. The URL is for the Organization's own object only (the same key under another
+	* Organization is another location), expires after `expiresInSeconds` (1 to 900, default 300), and
+	* is not checked against the object: a URL for a missing key is returned and answers 404. It is
+	* **a bearer credential**: never log it, never put it in an error or a stored field, never show it
+	* to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
+	* because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
+	* would only widen the window in which a leaked URL reads a customer's call. Signing makes no
+	* request; O(1). **The URL lives for the shorter of `expiresInSeconds` and the remaining life of
+	* the credentials that signed it** (a task-role session adds `X-Amz-Security-Token` and may end
+	* sooner), so mint it immediately before `submit`, and mint a new one for a retry. Sign with the
+	* service's own role holding only `s3:GetObject` on its prefix, never long-lived user keys. No
+	* response content-type or content-disposition overrides are offered. The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
+	* back, which a transcriber accepts only in `local`.
+	*/
+	presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
 	/**
@@ -581,7 +604,14 @@ interface MemoryObjectStoreOptions {
 	isOrganizationId?: OrganizationIdCheck;
 }
 /** An {@link ObjectStore} that keeps everything in the process, for tests. Not for production. */
-type MemoryObjectStore = ObjectStore;
+interface MemoryObjectStore extends ObjectStore {
+	/**
+	* Safe to destructure (it does not use `this`). Reads the object a URL from this store's `presignGet` names, or returns `undefined` when the
+	* URL is not this store's, was altered, has expired by the store's clock or names no object. For
+	* tests: it stands in for the vendor's GET.
+	*/
+	resolvePresigned(url: string): Promise<StoredObject | undefined>;
+}
 /**
 * Creates an {@link ObjectStore} in memory. Each Organization has its own map, so no key can reach
 * another Organization's objects. Bodies are copied on the way in and out. Complexity: put and get
@@ -621,8 +651,8 @@ interface TranscribeRequest {
 	/**
 	* Chosen by the caller, unique per Organization, 1 to 128 of letters, digits, `.`, `_`, `:` and
 	* `-`: the playbook service uses `<callId>:<sendNumber>`. It is the only key the caller needs
-	* for {@link Transcriber.getResult} and {@link Transcriber.delete}; the vendor's own id is never
-	* required.
+	* for {@link Transcriber.getResult} and {@link Transcriber.delete}; the vendor's id
+	* ({@link Submission.vendorId}) is an optional shortcut, never required.
 	*/
 	clientReference: string;
 	/** The audio. */
@@ -652,6 +682,34 @@ interface Submission {
 	clientReference: string;
 	/** True when this call created the copy; false when the same send was already there. */
 	created: boolean;
+	/**
+	* The vendor's id of the job: an opaque string of 1 to 128 letters, digits, `.`, `_`, `:` and `-`
+	* (never parse it). Present whenever the vendor accepted the job, including `created: false`,
+	* where it is the existing copy's id. **The caller stores it** beside its own record of the send
+	* and passes it back as the `vendorId` hint of {@link Transcriber.getResult} and
+	* {@link Transcriber.delete}. It is an identifier, not a secret, but it is not logged either.
+	*/
+	vendorId: string;
+}
+/** The optional hint of {@link Transcriber.getResult} and {@link Transcriber.delete}. */
+interface VendorIdHint {
+	/**
+	* The id {@link Submission.vendorId} returned. With it the adapter goes straight to that job
+	* and scans nothing. It is only a hint, and a wrong one is **ignored, not refused**: an id that
+	* names a job with another client reference, another Organization's job, or no job at all makes
+	* the call behave exactly as if no hint had been given (found by the client reference and no
+	* other), so a stale or mixed-up id can neither act on a job the call is not about nor tell a
+	* caller whether another Organization's job exists. Only an id of the wrong shape is refused
+	* (`transcriber.invalid_request`).
+	*
+	* **How an adapter honours a hint safely:** "straight to the job" means one vendor read of the
+	* hinted job, never acting unchecked. The adapter reads that job and confirms that its stored
+	* client reference and Organization equal the call's before it returns its result or deletes it;
+	* if they differ, or the job is gone, it ignores the hint and looks up by reference. If the
+	* vendor cannot store the reference and the Organization on a job, the adapter must ignore
+	* hints entirely.
+	*/
+	vendorId?: string;
 }
 /** Why a transcription failed. A closed list; none says more than the reason. */
 type TranscriptionFailure = "audio_unreachable" | "audio_invalid" | "no_speech" | "too_long" | "vendor_failed" | "timed_out";
@@ -688,6 +746,8 @@ type TranscriptionResult = {
 interface TranscriptionEntry {
 	/** The client reference. */
 	clientReference: string;
+	/** The vendor's id of this copy, as {@link Submission.vendorId} returned it. */
+	vendorId: string;
 	/** `pending`, `done` or `failed`. */
 	status: TranscriptionResult["status"];
 }
@@ -727,12 +787,22 @@ interface TranscriptionPage {
 * an audio URL, transcript text, speaker labels or a vendor id. Audio and text are personal data
 * of Prospects; the vendor must not train on them and must delete them (see `delete`).
 *
+* **The vendor id (decided, hub issue 75):** `submit` returns the vendor's job id, the caller
+* stores it beside its own record of the send (the playbook service keeps it next to
+* `vendor_send_seq`), and passes it back as a hint so a read or delete goes straight to the job: one vendor read that
+* confirms the job's stored client reference and Organization equal the call's (see
+* {@link VendorIdHint}), never an unchecked act.
+* The adapter owns no storage of its own: no mapping table. The fallback for a crash after the
+* vendor accepted the job and before the caller stored the id is `list`, which finds every copy
+* for a client reference, so `getResult` and `delete` still work with the reference alone.
+*
 * **A blocker for the real adapter, unverified:** whether AssemblyAI lets the caller give a
-* reference of its own, or look a transcript up by one, is not established (its transcript object
-* has no such field in the documentation read so far). If it does not, the adapter owns a mapping
-* store (a table of `(organizationId, clientReference) -> vendor id`, written before the vendor
-* call and so recoverable after a crash) and `delete` and `list` run on that mapping plus the
-* vendor's own list, which is a design of its own and not a thing this port can paper over. The
+* reference of its own, or list its jobs by one (for example through metadata or a webhook query
+* parameter echoed on the job), is not established; its transcript object has no such field in the
+* documentation read so far. The fallback above needs exactly that listing, so until it is shown
+* to work against the vendor no real adapter may be written, and this port cannot paper over it. The
+* same holds for the hint check: the vendor must be able to store the reference and the
+* Organization on a job, or hints are ignored. The
 * other open questions (ADR 0018, "before real audio"): can a stereo file be transcribed per
 * channel with its own speaker label (`multichannel`) and what does it bill, the EU endpoint for
 * the EU Region, and how soon after a delete the vendor's copy is gone and whether it confirms
@@ -752,9 +822,11 @@ interface Transcriber {
 	/**
 	* Reads one send's state, or returns `undefined` when there is no send with that reference (never
 	* submitted, or deleted). A `done` result is final and can be read again. Poll with
-	* {@link waitForTranscription}. O(result size).
+	* {@link waitForTranscription}. With a `vendorId` hint the adapter reads that job directly (see
+	* {@link VendorIdHint}: a wrong id is ignored); without one it finds the copy through `list`.
+	* O(result size) with the hint, O(the Organization's size) without it on a real vendor.
 	*/
-	getResult(organizationId: string, clientReference: string): Promise<TranscriptionResult | undefined>;
+	getResult(organizationId: string, clientReference: string, hint?: VendorIdHint): Promise<TranscriptionResult | undefined>;
 	/**
 	* Deletes the vendor's copy (audio, transcript and metadata) of the send with this reference,
 	* every copy that carries it, and returns `existed: true` when at least one was found and
@@ -766,9 +838,17 @@ interface Transcriber {
 	* `transcriber.unavailable` (retryable) and the caller retries: a purge is not done until
 	* `delete` has resolved for every reference. It resolves only when the vendor confirmed the
 	* deletion. **The caller must stop new submits for a Call before it lists and deletes**, or a
-	* send made in between survives. O(1).
+	* send made in between survives. With a `vendorId` hint the adapter deletes that job directly (a
+	* wrong id is ignored, see {@link VendorIdHint}); the reference is still deleted, so a hint never
+	* narrows a purge. O(1) with the hint.
+	*
+	* **A purge retries.** `transcriber.unavailable` is the one retryable code: a purge retries each
+	* `delete` with exponential backoff and jitter for at least the vendor's longest processing time
+	* (a send still processing may only be deletable after it ends), then escalates, for example by
+	* reporting the Call as not purged and alerting an operator, rather than dropping it. A failed
+	* `delete` changes nothing, so the retry is always safe.
 	*/
-	delete(organizationId: string, clientReference: string): Promise<{
+	delete(organizationId: string, clientReference: string, hint?: VendorIdHint): Promise<{
 		existed: boolean;
 	}>;
 	/**

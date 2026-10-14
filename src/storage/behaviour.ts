@@ -8,6 +8,11 @@ export interface ObjectStoreSubject {
   store: ObjectStore
   /** Three Organization ids the store accepts, none empty of data: B is unrelated, and `aExtended` starts with `a`. */
   organizations: { a: string; b: string; aExtended: string }
+  /**
+   * Fetches a presigned URL the way a vendor would and returns the body, or `undefined` for a 404
+   * or a refusal. The memory adapter resolves its own URLs; the S3 subject does a real GET.
+   */
+  readPresigned(url: string): Promise<Uint8Array | undefined>
   /** The store's `maxObjectBytes`, small (a few KiB) so the suite can cross it. */
   maxObjectBytes: number
   /** Removes what the subject created. */
@@ -598,6 +603,80 @@ export function objectStoreBehaviour(
 
         expect(await s.store.getStream(b, 'rec')).toBeUndefined()
         expect(await s.store.getStream(a, 'missing')).toBeUndefined()
+      })
+    })
+
+    describe('presigned reads', () => {
+      test('a presigned URL returns the object, and a missing object gives nothing', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.store.put(a, 'rec/one.mp3', bytes('the audio'))
+
+        const url = await s.store.presignGet(a, 'rec/one.mp3', { expiresInSeconds: 300 })
+        const missing = await s.store.presignGet(a, 'rec/none.mp3', { expiresInSeconds: 300 })
+
+        expect(typeof url).toBe('string')
+        expect(['http:', 'https:']).toContain(new URL(url).protocol)
+        expect(text((await s.readPresigned(url)) ?? new Uint8Array())).toBe('the audio')
+        expect(await s.readPresigned(missing)).toBeUndefined()
+      })
+
+      test("a second Organization's URL for the same key reaches only its own object", async () => {
+        const s = await subject()
+        const { a, b } = s.organizations
+        await s.store.put(a, 'rec/one.mp3', bytes('first org'))
+
+        const other = await s.store.presignGet(b, 'rec/one.mp3', { expiresInSeconds: 300 })
+        const mine = await s.store.presignGet(a, 'rec/one.mp3', { expiresInSeconds: 300 })
+
+        expect(other).not.toBe(mine)
+        expect(await s.readPresigned(other)).toBeUndefined()
+        await s.store.put(b, 'rec/one.mp3', bytes('second org'))
+        expect(text((await s.readPresigned(other)) ?? new Uint8Array())).toBe('second org')
+        expect(text((await s.readPresigned(mine)) ?? new Uint8Array())).toBe('first org')
+      })
+
+      test('the expiry is 1 to 900 seconds and defaults to 300', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+
+        for (const expiresInSeconds of [1, 300, 900]) {
+          expect(typeof (await s.store.presignGet(a, 'k', { expiresInSeconds }))).toBe('string')
+        }
+        expect(typeof (await s.store.presignGet(a, 'k'))).toBe('string')
+        for (const expiresInSeconds of [
+          0,
+          -1,
+          901,
+          3600,
+          1.5,
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          '5',
+        ]) {
+          await expect(
+            s.store.presignGet(a, 'k', { expiresInSeconds: expiresInSeconds as number })
+          ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        }
+      })
+
+      test('a bad key or Organization is refused, and the refusal does not repeat the key', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+
+        for (const key of BAD_KEYS.slice(0, 6)) {
+          await expect(s.store.presignGet(a, key, { expiresInSeconds: 60 })).rejects.toMatchObject({
+            code: 'storage.invalid_request',
+          })
+        }
+        await expect(
+          s.store.presignGet('bad/org', 'k', { expiresInSeconds: 60 })
+        ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        try {
+          await s.store.presignGet(a, 'secret-name/../x', { expiresInSeconds: 60 })
+        } catch (error) {
+          expect(String((error as Error).message)).not.toContain('secret-name')
+        }
       })
     })
   })

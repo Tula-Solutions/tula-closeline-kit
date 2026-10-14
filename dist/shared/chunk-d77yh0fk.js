@@ -9,8 +9,10 @@ import {
   MAX_LIST_LIMIT2,
   DEFAULT_CONTENT_TYPE2,
   MAX_STREAM_BYTES_LIMIT2,
+  MAX_PRESIGN_SECONDS2,
+  DEFAULT_PRESIGN_SECONDS2,
   STREAM_IDLE_TIMEOUT_MS2
-} from "./chunk-60y8a3sa.js";
+} from "./chunk-5sf8d2rb.js";
 
 // src/storage/stream.ts
 function checkStreamLimit(maxBytes) {
@@ -204,6 +206,19 @@ function createStorageValidator(options = {}) {
         throw bad('the content type must look like "type/subtype" with optional parameters');
       }
       return value;
+    },
+    expiry(options) {
+      const raw = options?.expiresInSeconds;
+      if (options !== undefined && (typeof options !== "object" || options === null)) {
+        throw bad("the presign options must be an object");
+      }
+      if (raw === undefined) {
+        return DEFAULT_PRESIGN_SECONDS2;
+      }
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > MAX_PRESIGN_SECONDS2) {
+        throw bad("expiresInSeconds must be a whole number from 1 to 900");
+      }
+      return raw;
     },
     list(listOptions) {
       const limit = listOptions?.limit ?? DEFAULT_LIST_LIMIT2;

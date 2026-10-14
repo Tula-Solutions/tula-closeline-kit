@@ -61,6 +61,12 @@ if (endpoint === undefined || endpoint === '') {
       store,
       organizations,
       maxObjectBytes: MAX_OBJECT_BYTES,
+      // A real GET of the presigned URL, as the vendor would make. S3Mock serves it without
+      // checking the signature or the expiry, so those two are covered by the offline signer test.
+      readPresigned: async (url) => {
+        const response = await fetch(url)
+        return response.ok ? new Uint8Array(await response.arrayBuffer()) : undefined
+      },
       close: async () => {
         for (const id of Object.values(organizations)) {
           let cursor: string | undefined

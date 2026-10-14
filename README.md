@@ -757,9 +757,28 @@ list past them fail with `storage.bad_response`, and the valid keys beyond the r
 reach through the port. The adapter is the only writer under the prefix and never writes such a
 key, so this needs someone to write 9,000 of them by hand.
 
-Not in 0.8.0: presigned URLs (the playbook service uploads through the service, so none is
+**Presigned reads (`presignGet`, 0.11.0).** `presignGet(organizationId, key, { expiresInSeconds? })`
+returns a URL that lets a vendor fetch one object (for example a Recording for the Transcriber)
+without credentials. The lifetime is whole seconds from 1 to `MAX_PRESIGN_SECONDS` (900, 15 minutes)
+and defaults to `DEFAULT_PRESIGN_SECONDS` (300); anything else is `storage.invalid_request`. The cap is
+short on purpose: a vendor fetches within seconds or minutes, and a longer window only widens how long
+a leaked URL works. The URL is a bearer credential: never log it, put it in an error, an event or a
+response, and do not store it; mint one per use. Signing makes no request, so it does not check that
+the object exists (a missing object is the vendor's 404), and the key stays inside the Organization's
+prefix. The S3 adapter signs locally with the SDK's presigner. The memory adapter returns
+`http://memory.object-store.invalid/<org>/<key>?expires=<ms>&sig=<hmac>` (plain `http:` so a
+Transcriber refuses it outside `local`) and `resolvePresigned(url)` (safe to destructure) reads it
+back, rejecting an expired, tampered or foreign URL.
+
+**The URL lives for the shorter of `expiresInSeconds` and the signing credentials' remaining life**:
+a task-role session carries an `X-Amz-Security-Token` and may end sooner. So mint the URL
+immediately before `submit`, and mint a new one for a retry. Sign with the service's own role,
+holding only `s3:GetObject` on its prefix, never long-lived user keys. There are no response
+content-type or content-disposition overrides.
+
+Not in 0.8.0: browser upload URLs (the playbook service uploads through the service, so none is
 needed yet; add them with a short lifetime and a key and method binding when a browser must
-upload directly), streaming bodies, and per-object metadata beyond the content type.
+upload directly), and per-object metadata beyond the content type.
 
 Complexity: put and get O(object size), head and delete O(1), list O(page) on S3 and O(n log n)
 in the Organization's n objects in memory (tests only). `bench/stores.bench.ts` budgets the memory
@@ -791,11 +810,11 @@ the stand-in (`createMemoryTranscriber`) from `tula-closeline-kit/testing`; the 
 (`transcriberBehaviour`) from `tula-closeline-kit/testing/behaviour`, which a real adapter must pass.
 
 ```ts
-submit(organizationId, { clientReference, audio: { url }, audioKey, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
-getResult(organizationId, clientReference): Promise<{ status: 'pending' } | { status: 'done'; durationMs; turns } | { status: 'failed'; reason } | undefined>
-delete(organizationId, clientReference): Promise<{ existed: boolean }> // idempotent; needs no vendor id
-list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items: { clientReference; status }[]; nextCursor? }>
-waitForTranscription(transcriber, organizationId, clientReference, { maxAttempts?, intervalMs?, ... }) // bounded, jittered polling
+submit(organizationId, { clientReference, audio: { url }, audioKey, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created; vendorId }> // vendorId: opaque, 1-128 of [A-Za-z0-9._:-]; store it
+getResult(organizationId, clientReference, { vendorId? }?): Promise<{ status: 'pending' } | { status: 'done'; durationMs; turns } | { status: 'failed'; reason } | undefined>
+delete(organizationId, clientReference, { vendorId? }?): Promise<{ existed: boolean }> // idempotent; the id is only a shortcut
+list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items: { clientReference; vendorId; status }[]; nextCursor? }>
+waitForTranscription(transcriber, organizationId, clientReference, { maxAttempts?, intervalMs?, vendorId?, ... }) // bounded, jittered polling
 ```
 
 **Audio is a short-lived reference, not bytes.** `audio.url` is an `https:` URL (`http:` only for
@@ -830,11 +849,31 @@ readable by `getResult`, so nothing requires a webhook.
 `too_long`, `vendor_failed`, `timed_out`. `getResult` is `undefined` for a reference with no send.
 Turn text and speaker labels are untrusted data and are never logged.
 
-**Deleting without an id.** `delete` takes only the client reference, removes **every copy**
+**The vendor id (decided in hub issue 75, 0.11.0).** `submit` returns the vendor's job id, also
+when `created` is `false` (the existing copy's id). **The caller stores it** beside its own record
+of the send (the playbook service keeps it next to `vendor_send_seq`) and passes it as the
+`{ vendorId }` hint to `getResult`, `delete` and `waitForTranscription`, so the adapter goes
+straight to the job and scans nothing. Why the caller and not the adapter: the adapter owns no
+storage, so there is no mapping table to keep consistent, migrate or purge. The fallback for a crash
+between the vendor accepting the job and the caller storing the id is `list`, which finds every
+copy for a client reference and carries each one's `vendorId`; `getResult` and `delete` without a
+hint do the same lookup. An adapter honours a hint with one vendor read of the hinted job that
+confirms its stored client reference and Organization equal the call's before it reads or deletes
+it; if the vendor cannot store those two on a job, the adapter ignores hints entirely.
+**A wrong hint is ignored, not refused**: an id naming a job with another
+client reference, another Organization's job, or no job at all makes the call behave exactly as if
+there were no hint, so it can never act on a job the call is not about and never tells one
+Organization whether another's job exists. Only an id of the wrong shape is
+`transcriber.invalid_request`. The id is an identifier, not a secret, and still never logged.
+
+**Deleting without an id.** `delete` needs only the client reference, removes **every copy**
 carrying it, and resolves when the vendor confirmed the deletion, returning whether a copy was
 found (`existed`). A send still processing is cancelled or waited for a bounded time; if the vendor
 can do neither in that time, `delete` throws `transcriber.unavailable` (retryable), and a purge is
-not done until it has resolved for every reference. A purge also calls `list` with a reference
+not done until it has resolved for every reference. **A purge retries `transcriber.unavailable` with
+exponential backoff and jitter for at least the vendor's longest processing time, then escalates**
+(reports the Call as not purged and alerts an operator) and never drops it; a failed `delete` changes
+nothing, so every retry is safe (the stand-in test with `failNext('delete', 'transcriber.unavailable', 3)` shows it). A purge also calls `list` with a reference
 prefix and deletes each entry, which removes a copy even when the worker died after the vendor
 accepted the send and before it stored anything. **`list` is for background jobs only**: it may
 scan the vendor's account; its order is stable and its cursor opaque; a page may be short, even
@@ -871,12 +910,16 @@ makes calls fail, `acceptThenFailNext()` accepts a send and then throws `unavail
 `copies(org?)` lists what the stand-in still holds (reference, its own id, status; never the URL or
 the text), which is how a test proves a purge left no copy.
 
+The stand-in's ids are deterministic and opaque (`mem_` and a hash of the Organization and
+reference), so a fresh instance hands out the same id and a test can show that a caller with no id
+still deletes a copy it never learned (`acceptThenFailNext()`, then `list` and `delete`).
+
 **A blocker for the real adapter, unverified:** whether AssemblyAI lets the caller give a reference
-of its own or look a transcript up by one. Its transcript object has no such field in the
-documentation read so far, and nothing here has been checked against the vendor. If it does not,
-the adapter owns a **mapping store** (a table of `(organizationId, clientReference)` to vendor id,
-written before the vendor call so it survives a crash), and `delete` and `list` run on that
-mapping plus the vendor's own list. That is a design of its own.
+of its own, or list its jobs by one (for example through metadata or a webhook query parameter
+echoed on the job). Its transcript object has no such field in the documentation read so far, and
+nothing here has been checked against the vendor. The fallback above needs exactly that listing,
+so it is a pre-condition: until it is shown to work, no real adapter may be written. It is not
+papered over by a mapping store.
 
 **Other open questions** (ADR 0018, "before real audio"): can a stereo file be transcribed per channel with its
 own speaker label, and what that bills (ADR 0018: per channel); the EU endpoint for the EU Region;

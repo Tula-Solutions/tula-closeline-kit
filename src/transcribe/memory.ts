@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { OrganizationIdCheck } from '../organization'
 import type { Environment } from '../reporting/env'
 import { TRANSCRIBER_ERROR_CODES, TranscriberError, type TranscriberErrorCode } from './errors'
@@ -127,8 +128,9 @@ export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}):
   const scripts = new Map<string, ScriptedOutcome>()
   const failures: Array<{ operation: TranscriberOperation; code: TranscriberErrorCode }> = []
   let acceptThenFail = 0
-  let counter = 0
 
+  const vendorIdOf = (org: string, reference: string) =>
+    `mem_${createHash('sha256').update(`${org}\u0000${reference}`).digest('hex').slice(0, 20)}`
   const scriptKey = (org: string, reference: string) => `${org}\u0000${reference}`
   function maybeFail(operation: TranscriberOperation): void {
     const at = failures.findIndex((entry) => entry.operation === operation)
@@ -174,9 +176,12 @@ export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}):
             'the client reference is already used by a different send'
           )
         }
-        return { clientReference: checked.clientReference, created: false }
+        return {
+          clientReference: checked.clientReference,
+          created: false,
+          vendorId: existing.vendorId,
+        }
       }
-      counter += 1
       const scripted =
         scripts.get(scriptKey(org, checked.clientReference)) ??
         options.outcome?.({
@@ -185,9 +190,10 @@ export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}):
         }) ??
         defaultOutcome(checked)
       const outcome = checkOutcome(scripted)
+      const vendorId = vendorIdOf(org, checked.clientReference)
       sends.set(checked.clientReference, {
         request: checked,
-        vendorId: `mem_${counter}`,
+        vendorId,
         pendingReads: outcome.pendingReads ?? 1,
         outcome: outcome.result,
       })
@@ -198,21 +204,25 @@ export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}):
           'the stand-in accepted the send and then failed to answer'
         )
       }
-      return { clientReference: checked.clientReference, created: true }
+      return { clientReference: checked.clientReference, created: true, vendorId }
     },
 
-    async getResult(organizationId, clientReference) {
+    async getResult(organizationId, clientReference, hint) {
       maybeFail('getResult')
       const org = check.organization(organizationId)
       const reference = check.reference(clientReference)
+      // A hint is validated and then ignored: the copy is always the one this reference names in
+      // this Organization, so an id of another send or Organization can never redirect the call.
+      check.hint(hint)
       const copy = organizations.get(org)?.get(reference)
       return copy === undefined ? undefined : stateOf(copy, true)
     },
 
-    async delete(organizationId, clientReference) {
+    async delete(organizationId, clientReference, hint) {
       maybeFail('delete')
       const org = check.organization(organizationId)
       const reference = check.reference(clientReference)
+      check.hint(hint)
       const existed = organizations.get(org)?.delete(reference) === true
       scripts.delete(scriptKey(org, reference))
       return { existed }
@@ -233,6 +243,7 @@ export function createMemoryTranscriber(options: MemoryTranscriberOptions = {}):
         .slice(0, limit)
         .map(([clientReference, copy]) => ({
           clientReference,
+          vendorId: copy.vendorId,
           status: stateOf(copy, false).status,
         }))
       const last = items.at(-1)

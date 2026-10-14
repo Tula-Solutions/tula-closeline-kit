@@ -97,11 +97,57 @@ describe('the memory transcriber', () => {
 
     const held = transcriber.copies(A)
     expect(held).toHaveLength(1)
-    expect(held[0]).toMatchObject({ clientReference: 'call_1:1', vendorId: 'mem_1' })
+    expect(held[0]).toMatchObject({
+      clientReference: 'call_1:1',
+      vendorId: expect.stringMatching(/^mem_/),
+    })
     for (const entry of (await transcriber.list(A, { prefix: 'call_1:' })).items) {
       await transcriber.delete(A, entry.clientReference)
     }
     expect(transcriber.copies()).toEqual([])
+  })
+
+  test('a copy whose id the caller never learned is still listed with its id and deletable by reference', async () => {
+    const transcriber = createMemoryTranscriber()
+    transcriber.acceptThenFailNext()
+    await transcriber.submit(A, send('call_1:1')).catch(() => undefined)
+    const { vendorId } = transcriber.copies(A)[0] as { vendorId: string }
+
+    expect((await transcriber.list(A, { prefix: 'call_1:' })).items[0]?.vendorId).toBe(vendorId)
+    expect(vendorId).not.toContain('call_1')
+    expect(await transcriber.delete(A, 'call_1:1')).toEqual({ existed: true })
+    expect(transcriber.copies()).toEqual([])
+  })
+
+  test('ids are deterministic across instances', async () => {
+    const first = await createMemoryTranscriber().submit(A, send('call_1:1'))
+    const second = await createMemoryTranscriber().submit(A, send('call_1:1'))
+
+    expect(second.vendorId).toBe(first.vendorId)
+  })
+
+  test('ids differ by Organization and by reference', async () => {
+    const transcriber = createMemoryTranscriber()
+    const ids = new Set([
+      (await transcriber.submit(A, send('c:1'))).vendorId,
+      (await transcriber.submit(A, send('c:2'))).vendorId,
+      (await transcriber.submit(B, send('c:1'))).vendorId,
+    ])
+
+    expect(ids.size).toBe(3)
+  })
+
+  test('a failed delete changes nothing, so the copy is still there to retry', async () => {
+    const transcriber = createMemoryTranscriber()
+    await transcriber.submit(A, send('call_1:1'))
+    transcriber.failNext('delete', 'transcriber.unavailable', 3)
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(transcriber.delete(A, 'call_1:1')).rejects.toMatchObject({
+        code: 'transcriber.unavailable',
+      })
+      expect(transcriber.copies(A)).toHaveLength(1)
+    }
   })
 
   test('a send that is retried after that crash finds the copy and creates nothing', async () => {

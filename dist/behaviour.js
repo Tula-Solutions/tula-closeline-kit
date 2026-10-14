@@ -3,10 +3,10 @@ import {
 } from "./shared/chunk-mjkmsg3r.js";
 import {
   checkTranscriptionResult2
-} from "./shared/chunk-mv441zb4.js";
+} from "./shared/chunk-5yzgse6v.js";
 import {
   waitForTranscription2
-} from "./shared/chunk-ybwrkc2f.js";
+} from "./shared/chunk-83cpvtqk.js";
 
 // src/queue/behaviour.ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -187,13 +187,25 @@ function queueBehaviour(name, make, skip = false) {
       expect(first.length).toBeLessThanOrEqual(2);
       expect(first.length).toBeGreaterThan(0);
     });
+    test("the subject leaves room for an empty long poll inside the visibility timeout", () => {
+      return subject().then((s) => {
+        expect(s.visibilitySeconds).toBeGreaterThanOrEqual(s.emptyWaitSeconds + 3);
+      });
+    });
     test("a received message stays hidden until its visibility timeout, then returns with a higher count", async () => {
       const s = await subject();
       await s.queue.publish(ping(s, 1, "org_a", "msg_v"));
       expect(await take(s, 1)).toHaveLength(1);
       expect(await none(s)).toEqual([]);
-      await s.pass(s.visibilitySeconds + 1);
-      const [again] = await take(s, 1);
+      let again;
+      for (let waited = 0;waited <= s.visibilitySeconds + 20 && again === undefined; waited++) {
+        await s.pass(1);
+        [again] = await s.queue.receive({
+          maxMessages: 1,
+          visibilityTimeoutSeconds: s.visibilitySeconds,
+          waitSeconds: s.emptyWaitSeconds
+        });
+      }
       expect(again?.kind === "message" && again.envelope.id).toBe("msg_v");
       expect(again?.receiveCount).toBe(2);
     });
@@ -856,6 +868,66 @@ x-injected: 1`],
         expect3(await s.store.getStream(a, "missing")).toBeUndefined();
       });
     });
+    describe3("presigned reads", () => {
+      test3("a presigned URL returns the object, and a missing object gives nothing", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.store.put(a, "rec/one.mp3", bytes("the audio"));
+        const url = await s.store.presignGet(a, "rec/one.mp3", { expiresInSeconds: 300 });
+        const missing = await s.store.presignGet(a, "rec/none.mp3", { expiresInSeconds: 300 });
+        expect3(typeof url).toBe("string");
+        expect3(["http:", "https:"]).toContain(new URL(url).protocol);
+        expect3(text(await s.readPresigned(url) ?? new Uint8Array)).toBe("the audio");
+        expect3(await s.readPresigned(missing)).toBeUndefined();
+      });
+      test3("a second Organization's URL for the same key reaches only its own object", async () => {
+        const s = await subject();
+        const { a, b } = s.organizations;
+        await s.store.put(a, "rec/one.mp3", bytes("first org"));
+        const other = await s.store.presignGet(b, "rec/one.mp3", { expiresInSeconds: 300 });
+        const mine = await s.store.presignGet(a, "rec/one.mp3", { expiresInSeconds: 300 });
+        expect3(other).not.toBe(mine);
+        expect3(await s.readPresigned(other)).toBeUndefined();
+        await s.store.put(b, "rec/one.mp3", bytes("second org"));
+        expect3(text(await s.readPresigned(other) ?? new Uint8Array)).toBe("second org");
+        expect3(text(await s.readPresigned(mine) ?? new Uint8Array)).toBe("first org");
+      });
+      test3("the expiry is 1 to 900 seconds and defaults to 300", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        for (const expiresInSeconds of [1, 300, 900]) {
+          expect3(typeof await s.store.presignGet(a, "k", { expiresInSeconds })).toBe("string");
+        }
+        expect3(typeof await s.store.presignGet(a, "k")).toBe("string");
+        for (const expiresInSeconds of [
+          0,
+          -1,
+          901,
+          3600,
+          1.5,
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          "5"
+        ]) {
+          await expect3(s.store.presignGet(a, "k", { expiresInSeconds })).rejects.toMatchObject({ code: "storage.invalid_request" });
+        }
+      });
+      test3("a bad key or Organization is refused, and the refusal does not repeat the key", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        for (const key of BAD_KEYS.slice(0, 6)) {
+          await expect3(s.store.presignGet(a, key, { expiresInSeconds: 60 })).rejects.toMatchObject({
+            code: "storage.invalid_request"
+          });
+        }
+        await expect3(s.store.presignGet("bad/org", "k", { expiresInSeconds: 60 })).rejects.toMatchObject({ code: "storage.invalid_request" });
+        try {
+          await s.store.presignGet(a, "secret-name/../x", { expiresInSeconds: 60 });
+        } catch (error) {
+          expect3(String(error.message)).not.toContain("secret-name");
+        }
+      });
+    });
   });
 }
 // src/transcribe/behaviour.ts
@@ -888,6 +960,15 @@ function transcriberBehaviour(name, make, skip = false) {
       expect4(result?.status === "done" || result?.status === "failed").toBe(true);
       return result;
     }
+    async function finalResultWith(s, org, reference, vendorId) {
+      const result = await waitForTranscription2(s.transcriber, org, reference, {
+        maxAttempts: 120,
+        intervalMs: s.pollIntervalMs ?? 0,
+        vendorId
+      });
+      expect4(result?.status === "done" || result?.status === "failed").toBe(true);
+      return result;
+    }
     const references = async (s, org, prefix) => {
       const found = [];
       let cursor;
@@ -908,14 +989,10 @@ function transcriberBehaviour(name, make, skip = false) {
     test4("a send is created once and repeating it creates nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      expect4(await s.transcriber.submit(a, send("call_1:1"))).toEqual({
-        clientReference: "call_1:1",
-        created: true
-      });
-      expect4(await s.transcriber.submit(a, send("call_1:1"))).toEqual({
-        clientReference: "call_1:1",
-        created: false
-      });
+      const first = await s.transcriber.submit(a, send("call_1:1"));
+      const again = await s.transcriber.submit(a, send("call_1:1"));
+      expect4(first).toMatchObject({ clientReference: "call_1:1", created: true });
+      expect4(again).toMatchObject({ clientReference: "call_1:1", created: false });
       expect4(await references(s, a)).toEqual(["call_1:1"]);
     });
     test4("the same reference with another mode, speaker cap or audio key is a conflict", async () => {
@@ -1006,6 +1083,127 @@ function transcriberBehaviour(name, make, skip = false) {
         cursor = next.nextCursor;
       }
       expect4(seen).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
+    });
+    describe4("the vendor id", () => {
+      test4("submit returns an opaque bounded id, the same one when the send is repeated", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const first = await s.transcriber.submit(a, send("call_1:1"));
+        const again = await s.transcriber.submit(a, send("call_1:1"));
+        expect4(first.vendorId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+        expect4(again.vendorId).toBe(first.vendorId);
+      });
+      test4("list carries the id of each send", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const one = await s.transcriber.submit(a, send("call_1:1"));
+        const two = await s.transcriber.submit(a, send("call_1:2"));
+        const page = await s.transcriber.list(a, { prefix: "call_1:" });
+        const ids = new Map(page.items.map((item) => [item.clientReference, item.vendorId]));
+        expect4(ids.get("call_1:1")).toBe(one.vendorId);
+        expect4(ids.get("call_1:2")).toBe(two.vendorId);
+      });
+      test4("a read and a delete with the right id work as they do by reference alone", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const { vendorId } = await s.transcriber.submit(a, send("call_1:1"));
+        const result = await finalResultWith(s, a, "call_1:1", vendorId);
+        expect4(result.status === "done" || result.status === "failed").toBe(true);
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: true });
+        expect4(await s.transcriber.getResult(a, "call_1:1", { vendorId })).toBeUndefined();
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: false });
+      });
+      test4("an id that names another reference's send is ignored: the call is about the reference", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        const other = await s.transcriber.submit(a, send("call_1:2"));
+        expect4(await s.transcriber.getResult(a, "call_1:1", { vendorId: other.vendorId })).toBeDefined();
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId: other.vendorId })).toEqual({
+          existed: true
+        });
+        expect4(await references(s, a)).toEqual(["call_1:2"]);
+        expect4(await s.transcriber.getResult(a, "call_1:9", { vendorId: other.vendorId })).toBeUndefined();
+        expect4(await s.transcriber.delete(a, "call_1:9", { vendorId: other.vendorId })).toEqual({
+          existed: false
+        });
+        expect4(await references(s, a)).toEqual(["call_1:2"]);
+      });
+      test4("an id from another Organization is ignored and never reaches that Organization's send", async () => {
+        const s = await subject();
+        const { a, b } = s.organizations;
+        const mine = await s.transcriber.submit(a, send("call_1:1"));
+        await s.transcriber.submit(b, send("call_1:1", { speakers: "split_channels" }));
+        expect4(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
+          existed: true
+        });
+        expect4(await references(s, a)).toEqual(["call_1:1"]);
+        expect4(await references(s, b)).toEqual([]);
+        expect4(await s.transcriber.getResult(b, "call_1:1", { vendorId: mine.vendorId })).toBeUndefined();
+        expect4(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
+          existed: false
+        });
+        expect4(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
+      });
+      test4("an id the vendor does not know falls back to the reference", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        expect4(await s.transcriber.getResult(a, "call_1:1", { vendorId: "unknown-id-1" })).toBeDefined();
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId: "unknown-id-1" })).toEqual({
+          existed: true
+        });
+      });
+      test4.each([
+        ["empty", ""],
+        ["with a space", "a b"],
+        ["with a slash", "a/b"],
+        ["over 128 characters", "a".repeat(129)],
+        ["not a string", 5]
+      ])("an id that is %s is refused", async (_label, vendorId) => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        await expect4(s.transcriber.getResult(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
+        await expect4(s.transcriber.delete(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
+        expect4(await references(s, a)).toEqual(["call_1:1"]);
+      });
+      test4("a hint with the id of a deleted job is ignored and acts on the resubmitted one", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const old = await s.transcriber.submit(a, send("call_1:1"));
+        await s.transcriber.delete(a, "call_1:1");
+        const fresh = await s.transcriber.submit(a, send("call_1:1"));
+        expect4(fresh.created).toBe(true);
+        expect4(await s.transcriber.getResult(a, "call_1:1", { vendorId: old.vendorId })).toBeDefined();
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId: old.vendorId })).toEqual({
+          existed: true
+        });
+        expect4(await references(s, a)).toEqual([]);
+      });
+      test4("a send submitted through one instance is listed and deleted through another", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        const other = await s.reopen();
+        const found = await other.list(a, { prefix: "call_1:" });
+        expect4(found.items.map((item) => item.clientReference)).toEqual(["call_1:1"]);
+        expect4(await other.delete(a, "call_1:1")).toEqual({ existed: true });
+        expect4(await references(s, a)).toEqual([]);
+      });
+      test4("a send whose id was never kept is found by listing for its reference and deleted without it", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        await s.transcriber.submit(a, send("call_1:2"));
+        await s.transcriber.submit(a, send("call_9:1"));
+        const found = await s.transcriber.list(a, { prefix: "call_1:" });
+        for (const entry of found.items) {
+          expect4(entry.vendorId).toBeDefined();
+          expect4(await s.transcriber.delete(a, entry.clientReference)).toEqual({ existed: true });
+        }
+        expect4(await references(s, a)).toEqual(["call_9:1"]);
+      });
     });
     test4("concurrent submits of one reference create it once", async () => {
       const s = await subject();
