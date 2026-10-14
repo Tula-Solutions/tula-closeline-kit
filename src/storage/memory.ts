@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { type Clock, systemClock } from '../clock'
 import type { OrganizationIdCheck } from '../organization'
 import { STORAGE_ERROR_CODES, StorageError } from './errors'
@@ -23,7 +23,14 @@ interface Entry {
 }
 
 /** An {@link ObjectStore} that keeps everything in the process, for tests. Not for production. */
-export type MemoryObjectStore = ObjectStore
+export interface MemoryObjectStore extends ObjectStore {
+  /**
+   * Reads the object a URL from this store's `presignGet` names, or returns `undefined` when the
+   * URL is not this store's, was altered, has expired by the store's clock or names no object. For
+   * tests: it stands in for the vendor's GET.
+   */
+  resolvePresigned(url: string): Promise<StoredObject | undefined>
+}
 
 /**
  * Creates an {@link ObjectStore} in memory. Each Organization has its own map, so no key can reach
@@ -37,6 +44,10 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
     isOrganizationId: options.isOrganizationId,
   })
   const organizations = new Map<string, Map<string, Entry>>()
+  // A signing secret per store, so one store's URLs mean nothing to another.
+  const secret = randomBytes(32)
+  const sign = (org: string, name: string, expires: number) =>
+    createHmac('sha256', secret).update(`${org}\n${name}\n${expires}`).digest('hex')
 
   const info = (key: string, entry: Entry): ObjectInfo => ({
     key,
@@ -46,6 +57,42 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
   })
 
   return {
+    async presignGet(organizationId, key, presignOptions) {
+      const org = check.organization(organizationId)
+      const name = check.key(key)
+      const seconds = check.expiry(presignOptions)
+      const expires = clock.now().getTime() + seconds * 1000
+      return `http://memory.object-store.invalid/${org}/${name}?expires=${expires}&sig=${sign(org, name, expires)}`
+    },
+
+    async resolvePresigned(url) {
+      try {
+        const parsed = new URL(url)
+        const [, org, ...rest] = parsed.pathname.split('/')
+        const name = rest.join('/')
+        const expires = Number(parsed.searchParams.get('expires'))
+        const given = parsed.searchParams.get('sig') ?? ''
+        if (
+          parsed.host !== 'memory.object-store.invalid' ||
+          org === undefined ||
+          !Number.isSafeInteger(expires)
+        ) {
+          return undefined
+        }
+        const wanted = Buffer.from(sign(org, name, expires))
+        const got = Buffer.from(given)
+        if (got.length !== wanted.length || !timingSafeEqual(got, wanted)) {
+          return undefined
+        }
+        if (clock.now().getTime() > expires) {
+          return undefined
+        }
+        return await this.get(org, name)
+      } catch {
+        return undefined
+      }
+    },
+
     async put(organizationId, key, body, putOptions) {
       const org = check.organization(organizationId)
       const name = check.key(key)

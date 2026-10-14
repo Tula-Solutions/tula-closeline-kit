@@ -5,11 +5,13 @@ import {
   DEFAULT_CONTENT_TYPE,
   DEFAULT_LIST_LIMIT,
   DEFAULT_MAX_OBJECT_BYTES,
+  DEFAULT_PRESIGN_SECONDS,
   type ListOptions,
   MAX_KEY_BYTES,
   MAX_KEY_SEGMENTS,
   MAX_LIST_LIMIT,
   MAX_OBJECT_BYTES_LIMIT,
+  MAX_PRESIGN_SECONDS,
 } from './port'
 
 // Internal: the checks both adapters share. Not exported from any entry of the package.
@@ -40,6 +42,8 @@ export interface StorageValidator {
   body(body: unknown): Uint8Array
   /** Throws unless the content type is valid; returns it, or the default. */
   contentType(contentType: unknown): string
+  /** Throws unless the expiry is a whole number of seconds from 1 to 900; returns it or the default. */
+  expiry(options: unknown): number
   /** Validates and normalises the options of a list call. */
   list(options: ListOptions | undefined): ListQuery
   /** The largest object accepted, in bytes. */
@@ -162,6 +166,24 @@ export function createStorageValidator(options: StorageValidatorOptions = {}): S
         throw bad('the content type must look like "type/subtype" with optional parameters')
       }
       return value
+    },
+    expiry(options) {
+      const raw = (options as { expiresInSeconds?: unknown } | undefined)?.expiresInSeconds
+      if (options !== undefined && (typeof options !== 'object' || options === null)) {
+        throw bad('the presign options must be an object')
+      }
+      if (raw === undefined) {
+        return DEFAULT_PRESIGN_SECONDS
+      }
+      if (
+        typeof raw !== 'number' ||
+        !Number.isInteger(raw) ||
+        raw < 1 ||
+        raw > MAX_PRESIGN_SECONDS
+      ) {
+        throw bad('expiresInSeconds must be a whole number from 1 to 900')
+      }
+      return raw
     },
     list(listOptions) {
       const limit = listOptions?.limit ?? DEFAULT_LIST_LIMIT

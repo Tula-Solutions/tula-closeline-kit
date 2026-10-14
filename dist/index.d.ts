@@ -955,6 +955,10 @@ declare const MAX_LIST_LIMIT = 1e3;
 declare const DEFAULT_CONTENT_TYPE = "application/octet-stream";
 /** The largest `maxBytes` of a streamed put (2 GiB); streamed bodies are never held whole in memory. */
 declare const MAX_STREAM_BYTES_LIMIT: number;
+/** The longest a presigned read may stay valid, in seconds (15 minutes). */
+declare const MAX_PRESIGN_SECONDS = 900;
+/** How long a presigned read stays valid when the caller gives no expiry, in seconds (5 minutes). */
+declare const DEFAULT_PRESIGN_SECONDS = 300;
 /** The longest a source stream may stay silent before a streamed put gives up, in ms. */
 declare const STREAM_IDLE_TIMEOUT_MS = 3e4;
 /** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
@@ -1008,6 +1012,11 @@ interface PutStreamResult {
 interface ObjectStream extends ObjectInfo {
 	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
 	body: ReadableStream<Uint8Array>;
+}
+/** Options of {@link ObjectStore.presignGet}. */
+interface PresignOptions {
+	/** How long the URL works, a whole number of seconds from 1 to 900; default 300. */
+	expiresInSeconds?: number;
 }
 /** Options of {@link ObjectStore.list}. */
 interface ListOptions {
@@ -1067,6 +1076,20 @@ interface ObjectStore {
 	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
 	*/
 	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
+	/**
+	* Returns a short-lived URL that reads one object with a plain GET and no credentials, so the
+	* playbook can hand a Recording to the transcriber as `audio.url` without the service re-sending
+	* 500 MB. The URL is for the Organization's own object only (the same key under another
+	* Organization is another location), expires after `expiresInSeconds` (1 to 900, default 300), and
+	* is not checked against the object: a URL for a missing key is returned and answers 404. It is
+	* **a bearer credential**: never log it, never put it in an error or a stored field, never show it
+	* to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
+	* because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
+	* would only widen the window in which a leaked URL reads a customer's call. Signing makes no
+	* request; O(1). The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
+	* back, which a transcriber accepts only in `local`.
+	*/
+	presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
 	/**
@@ -1493,4 +1516,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ByteStream, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PreviousVersion, ProcessedStore, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StorageError, StorageErrorCode, StoredObject, Submission, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, WaitOptions, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, dropHighSurrogate, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody, waitForTranscription };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ByteStream, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PresignOptions, PreviousVersion, ProcessedStore, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StorageError, StorageErrorCode, StoredObject, Submission, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VerifiedToken, WaitOptions, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, dropHighSurrogate, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody, waitForTranscription };

@@ -59,6 +59,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1149.0",
     "@aws-sdk/client-sqs": "^3.1149.0",
+    "@aws-sdk/s3-request-presigner": "^3.1149.0",
     "@sentry/bun": "^11.6.0",
     "jose": "^6.2.12",
     "pino": "^10.4.0",

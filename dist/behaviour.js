@@ -187,13 +187,25 @@ function queueBehaviour(name, make, skip = false) {
       expect(first.length).toBeLessThanOrEqual(2);
       expect(first.length).toBeGreaterThan(0);
     });
+    test("the subject leaves room for an empty long poll inside the visibility timeout", () => {
+      return subject().then((s) => {
+        expect(s.visibilitySeconds).toBeGreaterThanOrEqual(s.emptyWaitSeconds + 3);
+      });
+    });
     test("a received message stays hidden until its visibility timeout, then returns with a higher count", async () => {
       const s = await subject();
       await s.queue.publish(ping(s, 1, "org_a", "msg_v"));
       expect(await take(s, 1)).toHaveLength(1);
       expect(await none(s)).toEqual([]);
-      await s.pass(s.visibilitySeconds + 1);
-      const [again] = await take(s, 1);
+      let again;
+      for (let waited = 0;waited <= s.visibilitySeconds + 20 && again === undefined; waited++) {
+        await s.pass(1);
+        [again] = await s.queue.receive({
+          maxMessages: 1,
+          visibilityTimeoutSeconds: s.visibilitySeconds,
+          waitSeconds: s.emptyWaitSeconds
+        });
+      }
       expect(again?.kind === "message" && again.envelope.id).toBe("msg_v");
       expect(again?.receiveCount).toBe(2);
     });
@@ -854,6 +866,66 @@ x-injected: 1`],
         await s.store.putStream(a, "rec", chunksOf(bytes("private")), { maxBytes: 100 });
         expect3(await s.store.getStream(b, "rec")).toBeUndefined();
         expect3(await s.store.getStream(a, "missing")).toBeUndefined();
+      });
+    });
+    describe3("presigned reads", () => {
+      test3("a presigned URL returns the object, and a missing object gives nothing", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.store.put(a, "rec/one.mp3", bytes("the audio"));
+        const url = await s.store.presignGet(a, "rec/one.mp3", { expiresInSeconds: 300 });
+        const missing = await s.store.presignGet(a, "rec/none.mp3", { expiresInSeconds: 300 });
+        expect3(typeof url).toBe("string");
+        expect3(["http:", "https:"]).toContain(new URL(url).protocol);
+        expect3(text(await s.readPresigned(url) ?? new Uint8Array)).toBe("the audio");
+        expect3(await s.readPresigned(missing)).toBeUndefined();
+      });
+      test3("a second Organization's URL for the same key reaches only its own object", async () => {
+        const s = await subject();
+        const { a, b } = s.organizations;
+        await s.store.put(a, "rec/one.mp3", bytes("first org"));
+        const other = await s.store.presignGet(b, "rec/one.mp3", { expiresInSeconds: 300 });
+        const mine = await s.store.presignGet(a, "rec/one.mp3", { expiresInSeconds: 300 });
+        expect3(other).not.toBe(mine);
+        expect3(await s.readPresigned(other)).toBeUndefined();
+        await s.store.put(b, "rec/one.mp3", bytes("second org"));
+        expect3(text(await s.readPresigned(other) ?? new Uint8Array)).toBe("second org");
+        expect3(text(await s.readPresigned(mine) ?? new Uint8Array)).toBe("first org");
+      });
+      test3("the expiry is 1 to 900 seconds and defaults to 300", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        for (const expiresInSeconds of [1, 300, 900]) {
+          expect3(typeof await s.store.presignGet(a, "k", { expiresInSeconds })).toBe("string");
+        }
+        expect3(typeof await s.store.presignGet(a, "k")).toBe("string");
+        for (const expiresInSeconds of [
+          0,
+          -1,
+          901,
+          3600,
+          1.5,
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          "5"
+        ]) {
+          await expect3(s.store.presignGet(a, "k", { expiresInSeconds })).rejects.toMatchObject({ code: "storage.invalid_request" });
+        }
+      });
+      test3("a bad key or Organization is refused, and the refusal does not repeat the key", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        for (const key of BAD_KEYS.slice(0, 6)) {
+          await expect3(s.store.presignGet(a, key, { expiresInSeconds: 60 })).rejects.toMatchObject({
+            code: "storage.invalid_request"
+          });
+        }
+        await expect3(s.store.presignGet("bad/org", "k", { expiresInSeconds: 60 })).rejects.toMatchObject({ code: "storage.invalid_request" });
+        try {
+          await s.store.presignGet(a, "secret-name/../x", { expiresInSeconds: 60 });
+        } catch (error) {
+          expect3(String(error.message)).not.toContain("secret-name");
+        }
       });
     });
   });

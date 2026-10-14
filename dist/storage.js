@@ -8,7 +8,7 @@ import {
   MAX_LIST_LIMIT2,
   DEFAULT_CONTENT_TYPE2,
   STREAM_IDLE_TIMEOUT_MS2
-} from "./shared/chunk-60y8a3sa.js";
+} from "./shared/chunk-5sf8d2rb.js";
 import {
   checkStreamLimit,
   checkIdleTimeout,
@@ -16,7 +16,7 @@ import {
   tooLarge,
   encodeCursor,
   createStorageValidator
-} from "./shared/chunk-9sd8894z.js";
+} from "./shared/chunk-d77yh0fk.js";
 
 // src/storage/aws.ts
 import { createHash } from "node:crypto";
@@ -31,6 +31,7 @@ import {
   PutObjectCommand,
   UploadPartCommand
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 // src/storage/client.ts
 import { S3Client } from "@aws-sdk/client-s3";
@@ -212,7 +213,26 @@ function createS3ObjectStore(options) {
       lastModified: output.LastModified
     };
   }
+  let signer;
   return {
+    async presignGet(organizationId, key, presignOptions) {
+      const location = prefixOf(check.organization(organizationId)) + check.key(key);
+      const expiresIn = check.expiry(presignOptions);
+      signer ??= createS3Client({
+        region: options.region,
+        environment: options.environment,
+        endpoint: options.endpoint,
+        timeoutMs,
+        maxAttempts
+      });
+      try {
+        return await getSignedUrl(signer, new GetObjectCommand({ Bucket: bucket, Key: location }), {
+          expiresIn
+        });
+      } catch (error) {
+        throw mapFailure("a presign", error);
+      }
+    },
     async put(organizationId, key, body, putOptions) {
       const deadline = AbortSignal.timeout(deadlineMs);
       const location = prefixOf(check.organization(organizationId)) + check.key(key);

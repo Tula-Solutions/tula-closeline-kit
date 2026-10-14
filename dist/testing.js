@@ -23,7 +23,7 @@ import {
 import {
   STORAGE_ERROR_CODES2,
   StorageError2
-} from "./shared/chunk-60y8a3sa.js";
+} from "./shared/chunk-5sf8d2rb.js";
 import {
   checkStreamLimit,
   checkIdleTimeout,
@@ -32,7 +32,7 @@ import {
   createOrganizationIdGuard,
   encodeCursor,
   createStorageValidator
-} from "./shared/chunk-9sd8894z.js";
+} from "./shared/chunk-d77yh0fk.js";
 import {
   TRANSCRIBER_ERROR_CODES2,
   TranscriberError2,
@@ -372,7 +372,7 @@ function createTestRegistry(options = {}) {
   });
 }
 // src/storage/memory.ts
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 function createMemoryObjectStore(options = {}) {
   const clock = options.clock ?? systemClock2;
   const check = createStorageValidator({
@@ -380,6 +380,10 @@ function createMemoryObjectStore(options = {}) {
     isOrganizationId: options.isOrganizationId
   });
   const organizations = new Map;
+  const secret = randomBytes(32);
+  const sign = (org, name, expires) => createHmac("sha256", secret).update(`${org}
+${name}
+${expires}`).digest("hex");
   const info = (key, entry) => ({
     key,
     size: entry.body.byteLength,
@@ -387,6 +391,36 @@ function createMemoryObjectStore(options = {}) {
     lastModified: new Date(entry.lastModified)
   });
   return {
+    async presignGet(organizationId, key, presignOptions) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const seconds = check.expiry(presignOptions);
+      const expires = clock.now().getTime() + seconds * 1000;
+      return `http://memory.object-store.invalid/${org}/${name}?expires=${expires}&sig=${sign(org, name, expires)}`;
+    },
+    async resolvePresigned(url) {
+      try {
+        const parsed = new URL(url);
+        const [, org, ...rest] = parsed.pathname.split("/");
+        const name = rest.join("/");
+        const expires = Number(parsed.searchParams.get("expires"));
+        const given = parsed.searchParams.get("sig") ?? "";
+        if (parsed.host !== "memory.object-store.invalid" || org === undefined || !Number.isSafeInteger(expires)) {
+          return;
+        }
+        const wanted = Buffer.from(sign(org, name, expires));
+        const got = Buffer.from(given);
+        if (got.length !== wanted.length || !timingSafeEqual(got, wanted)) {
+          return;
+        }
+        if (clock.now().getTime() > expires) {
+          return;
+        }
+        return await this.get(org, name);
+      } catch {
+        return;
+      }
+    },
     async put(organizationId, key, body, putOptions) {
       const org = check.organization(organizationId);
       const name = check.key(key);

@@ -77,4 +77,59 @@ describe('the memory object store', () => {
       expect((error as Error).message).not.toContain(OTHER)
     }
   })
+
+  describe('presigned reads', () => {
+    test('a URL stops working at its expiry, by the clock, and not before', async () => {
+      const clock = createFixedClock('2026-01-01T00:00:00.000Z')
+      const store = createMemoryObjectStore({ clock })
+      await store.put(ORG, 'k', new Uint8Array([9]))
+      const url = await store.presignGet(ORG, 'k', { expiresInSeconds: 60 })
+
+      clock.advance('59s')
+      expect((await store.resolvePresigned(url))?.body).toEqual(new Uint8Array([9]))
+      clock.advance('2s')
+      expect(await store.resolvePresigned(url)).toBeUndefined()
+    })
+
+    test('a changed Organization, key, expiry or signature does not resolve', async () => {
+      const store = createMemoryObjectStore()
+      await store.put(ORG, 'k', new Uint8Array([1]))
+      await store.put(OTHER, 'k', new Uint8Array([2]))
+      const url = new URL(await store.presignGet(ORG, 'k', { expiresInSeconds: 60 }))
+
+      const tamper = (change: (u: URL) => void) => {
+        const copy = new URL(url)
+        change(copy)
+        return copy.toString()
+      }
+      expect(await store.resolvePresigned(url.toString())).toBeDefined()
+      expect(
+        await store.resolvePresigned(tamper((u) => u.searchParams.set('sig', 'abc')))
+      ).toBeUndefined()
+      expect(
+        await store.resolvePresigned(tamper((u) => u.searchParams.set('expires', '9999999999999')))
+      ).toBeUndefined()
+      expect(
+        await store.resolvePresigned(tamper((u) => (u.pathname = u.pathname.replace(ORG, OTHER))))
+      ).toBeUndefined()
+      expect(await store.resolvePresigned('https://elsewhere.example.test/x')).toBeUndefined()
+      expect(await store.resolvePresigned('not a url')).toBeUndefined()
+    })
+
+    test("another store cannot resolve this store's URLs", async () => {
+      const one = createMemoryObjectStore()
+      const two = createMemoryObjectStore()
+      await one.put(ORG, 'k', new Uint8Array([1]))
+      await two.put(ORG, 'k', new Uint8Array([1]))
+
+      expect(await two.resolvePresigned(await one.presignGet(ORG, 'k'))).toBeUndefined()
+    })
+
+    test('the URL is plain http, which a transcriber refuses outside local', async () => {
+      const store = createMemoryObjectStore()
+      const url = await store.presignGet(ORG, 'k')
+
+      expect(new URL(url).protocol).toBe('http:')
+    })
+  })
 })

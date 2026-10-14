@@ -239,13 +239,30 @@ export function queueBehaviour(
       expect(first.length).toBeGreaterThan(0)
     })
 
+    test('the subject leaves room for an empty long poll inside the visibility timeout', () => {
+      // The hidden check below long-polls for `emptyWaitSeconds`; if the timeout is not clearly
+      // longer, the message comes back during the poll and the check fails on a slow runner.
+      return subject().then((s) => {
+        expect(s.visibilitySeconds).toBeGreaterThanOrEqual(s.emptyWaitSeconds + 3)
+      })
+    })
+
     test('a received message stays hidden until its visibility timeout, then returns with a higher count', async () => {
       const s = await subject()
       await s.queue.publish(ping(s, 1, 'org_a', 'msg_v'))
       expect(await take(s, 1)).toHaveLength(1)
       expect(await none(s)).toEqual([])
-      await s.pass(s.visibilitySeconds + 1)
-      const [again] = await take(s, 1)
+      // Wait on the condition, not on a fixed time: let a second go by, then look, until the
+      // message returns or a deadline of the timeout plus 20 seconds passes.
+      let again: Delivery<TestEnvelope> | undefined
+      for (let waited = 0; waited <= s.visibilitySeconds + 20 && again === undefined; waited++) {
+        await s.pass(1)
+        ;[again] = await s.queue.receive({
+          maxMessages: 1,
+          visibilityTimeoutSeconds: s.visibilitySeconds,
+          waitSeconds: s.emptyWaitSeconds,
+        })
+      }
       expect(again?.kind === 'message' && again.envelope.id).toBe('msg_v')
       expect(again?.receiveCount).toBe(2)
     })

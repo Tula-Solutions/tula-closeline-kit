@@ -495,6 +495,11 @@ interface ObjectStream extends ObjectInfo {
 	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
 	body: ReadableStream<Uint8Array>;
 }
+/** Options of {@link ObjectStore.presignGet}. */
+interface PresignOptions {
+	/** How long the URL works, a whole number of seconds from 1 to 900; default 300. */
+	expiresInSeconds?: number;
+}
 /** Options of {@link ObjectStore.list}. */
 interface ListOptions {
 	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
@@ -553,6 +558,20 @@ interface ObjectStore {
 	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
 	*/
 	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
+	/**
+	* Returns a short-lived URL that reads one object with a plain GET and no credentials, so the
+	* playbook can hand a Recording to the transcriber as `audio.url` without the service re-sending
+	* 500 MB. The URL is for the Organization's own object only (the same key under another
+	* Organization is another location), expires after `expiresInSeconds` (1 to 900, default 300), and
+	* is not checked against the object: a URL for a missing key is returned and answers 404. It is
+	* **a bearer credential**: never log it, never put it in an error or a stored field, never show it
+	* to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
+	* because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
+	* would only widen the window in which a leaked URL reads a customer's call. Signing makes no
+	* request; O(1). The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
+	* back, which a transcriber accepts only in `local`.
+	*/
+	presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
 	/**
@@ -581,7 +600,14 @@ interface MemoryObjectStoreOptions {
 	isOrganizationId?: OrganizationIdCheck;
 }
 /** An {@link ObjectStore} that keeps everything in the process, for tests. Not for production. */
-type MemoryObjectStore = ObjectStore;
+interface MemoryObjectStore extends ObjectStore {
+	/**
+	* Reads the object a URL from this store's `presignGet` names, or returns `undefined` when the
+	* URL is not this store's, was altered, has expired by the store's clock or names no object. For
+	* tests: it stands in for the vendor's GET.
+	*/
+	resolvePresigned(url: string): Promise<StoredObject | undefined>;
+}
 /**
 * Creates an {@link ObjectStore} in memory. Each Organization has its own map, so no key can reach
 * another Organization's objects. Bodies are copied on the way in and out. Complexity: put and get

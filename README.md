@@ -757,9 +757,22 @@ list past them fail with `storage.bad_response`, and the valid keys beyond the r
 reach through the port. The adapter is the only writer under the prefix and never writes such a
 key, so this needs someone to write 9,000 of them by hand.
 
-Not in 0.8.0: presigned URLs (the playbook service uploads through the service, so none is
+**Presigned reads (`presignGet`, 0.11.0).** `presignGet(organizationId, key, { expiresInSeconds? })`
+returns a URL that lets a vendor fetch one object (for example a Recording for the Transcriber)
+without credentials. The lifetime is whole seconds from 1 to `MAX_PRESIGN_SECONDS` (900, 15 minutes)
+and defaults to `DEFAULT_PRESIGN_SECONDS` (300); anything else is `storage.invalid_request`. The cap is
+short on purpose: a vendor fetches within seconds or minutes, and a longer window only widens how long
+a leaked URL works. The URL is a bearer credential: never log it, put it in an error, an event or a
+response, and do not store it; mint one per use. Signing makes no request, so it does not check that
+the object exists (a missing object is the vendor's 404), and the key stays inside the Organization's
+prefix. The S3 adapter signs locally with the SDK's presigner. The memory adapter returns
+`http://memory.object-store.invalid/<org>/<key>?expires=<ms>&sig=<hmac>` (plain `http:` so a
+Transcriber refuses it outside `local`) and `resolvePresigned(url)` reads it back, rejecting an
+expired, tampered or foreign URL.
+
+Not in 0.8.0: browser upload URLs (the playbook service uploads through the service, so none is
 needed yet; add them with a short lifetime and a key and method binding when a browser must
-upload directly), streaming bodies, and per-object metadata beyond the content type.
+upload directly), and per-object metadata beyond the content type.
 
 Complexity: put and get O(object size), head and delete O(1), list O(page) on S3 and O(n log n)
 in the Organization's n objects in memory (tests only). `bench/stores.bench.ts` budgets the memory
