@@ -1140,6 +1140,20 @@ interface VectorStore {
 	* adapter O(n × dimensions + n log n) in the Organization's n vectors (a scan, for tests only).
 	*/
 	search(organizationId: string, query: SearchQuery): Promise<SearchHit[]>;
+	/**
+	* Changes attributes on up to 500 existing vectors without touching or needing their vectors,
+	* and returns the ids it did not find, in the order given (empty when every id was found), so a
+	* caller can tell a complete update from a partial one. It merges: each attribute in
+	* `attributes` is set (replacing a value of the same name) and every other attribute of the
+	* vector stays. `attributes` has at least one entry and the same names and values `upsert`
+	* accepts; a vector that would end with more than 16 attributes makes the whole call
+	* `vector.invalid_request`. It never creates a vector: a missing id is only reported. Ids must
+	* be valid and distinct; a bad call writes nothing. Idempotent: the same call twice leaves the
+	* same data and reports the same ids. Memory adapter O(ids). A real adapter must patch
+	* attributes by id in the vendor's store (turbopuffer: a patch by id) and must not resend or
+	* re-embed vectors; a vendor that cannot patch has no business behind this port.
+	*/
+	setAttributes(organizationId: string, ids: readonly string[], attributes: VectorAttributes): Promise<string[]>;
 	/** Deletes up to 500 vectors by id. Ids that do not exist are ignored. Idempotent. O(ids). */
 	delete(organizationId: string, ids: readonly string[]): Promise<void>;
 	/**
