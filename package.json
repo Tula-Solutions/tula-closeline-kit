@@ -1,6 +1,6 @@
 {
   "name": "tula-closeline-kit",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Closeline shared runtime helpers: token verification, queue, object storage, vector store and transcriber ports and adapters, logging, test fixtures",
   "private": true,
   "type": "module",

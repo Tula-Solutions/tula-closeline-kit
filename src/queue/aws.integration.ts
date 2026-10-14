@@ -41,7 +41,7 @@ if (endpoint === undefined || endpoint === '') {
   // still-running test and a QueueDoesNotExist surfaced); no assertion looks at elapsed time.
   setDefaultTimeout(30_000)
   const MAX_RECEIVE_COUNT = 3
-  const VISIBILITY_SECONDS = 1
+  const VISIBILITY_SECONDS = 4
   const credentials = { accessKeyId: 'test', secretAccessKey: 'test' }
   const admin = new SQSClient({ region: 'eu-west-1', endpoint, credentials })
   // ElasticMQ builds queue URLs from its own node address, which can differ from the address the
