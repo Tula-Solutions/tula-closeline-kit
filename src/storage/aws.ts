@@ -28,6 +28,7 @@ import {
   type ObjectStore,
   type ObjectStream,
   type PutStreamResult,
+  STREAM_IDLE_TIMEOUT_MS,
   type StoredObject,
 } from './port'
 import { checkIdleTimeout, checkStreamLimit, readChunks, tooLarge } from './stream'
@@ -139,6 +140,61 @@ function discardBody(body: unknown): void {
   }
 }
 
+/**
+ * Wraps a response body so that a read that stalls for the idle timeout, or fails, becomes
+ * `storage.unavailable` instead of a raw socket error, and so that `cancel` destroys the
+ * underlying connection.
+ */
+function guardBody(source: ReadableStream<Uint8Array>, raw: unknown): ReadableStream<Uint8Array> {
+  const reader = source.getReader()
+  let released = false
+  const release = () => {
+    if (!released) {
+      released = true
+      discardBody(raw)
+    }
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const step = await Promise.race([
+          reader.read(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('the body stalled')), STREAM_IDLE_TIMEOUT_MS)
+          }),
+        ])
+        if (step.done) {
+          controller.close()
+        } else {
+          controller.enqueue(step.value)
+        }
+      } catch (error) {
+        if (released) {
+          return
+        }
+        release()
+        void reader.cancel().catch(() => undefined)
+        controller.error(
+          new StorageError(
+            STORAGE_ERROR_CODES.unavailable,
+            'the body could not be read to the end',
+            {
+              cause: reduceAwsCause(error),
+            }
+          )
+        )
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+    cancel() {
+      release()
+      return reader.cancel().catch(() => undefined)
+    },
+  })
+}
+
 function isMissing(error: unknown): boolean {
   return error instanceof Error && MISSING.has(error.name)
 }
@@ -173,10 +229,18 @@ function isMissing(error: unknown): boolean {
  * (concurrency + 1) parts whatever the object size. Every request has the per-call deadline
  * (`deadlineMs`) and the SDK's retries; the stream as a whole is bounded by `maxBytes` and by the
  * caller's `signal`. On any failure the in-flight parts are awaited and the multipart upload is
- * aborted, so no part stays billed; the bucket should also carry a lifecycle rule that aborts
- * incomplete multipart uploads (infra), for a process that dies mid-upload. The object appears
- * only when the upload completes, so a failed write leaves nothing readable and an object already
- * under the key stays as it was.
+ * aborted, so no part stays billed. The object appears only when the upload completes, so a write
+ * that fails before the completing request leaves nothing readable and an object already under
+ * the key stays as it was.
+ *
+ * Residual cases, which no code here can close: (1) a throw after the last part was sent (the
+ * completing request timed out or its answer was lost) means the content under the key is unknown,
+ * because S3 may have finished: the caller retries (put is idempotent) or heads and deletes before
+ * relying on absence; (2) the abort is best-effort; (3) a create or part request that timed out
+ * client-side but reached S3 can leave an incomplete upload that only the bucket's lifecycle rule
+ * removes, as does a process that dies mid-upload. The bucket must carry that rule: abort
+ * incomplete multipart uploads 1 day after initiation (`AbortIncompleteMultipartUpload`,
+ * `DaysAfterInitiation: 1`, the finest S3 offers).
  *
  * Complexity: put and get O(object size); putStream O(object size) time and O(part size)
  * memory; getStream, head and delete O(1); list O(limit); one HTTP call each, except a streamed
@@ -457,29 +521,32 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
     },
 
     async getStream(organizationId, key) {
-      const deadline = AbortSignal.timeout(deadlineMs)
+      // The deadline bounds getting the headers only. A large object read slowly must not be cut
+      // by it, so the timer is cleared once `send` answers and the body has an idle timeout.
+      const opening = new AbortController()
+      const timer = setTimeout(() => opening.abort(), deadlineMs)
       const location = prefixOf(check.organization(organizationId)) + check.key(key)
       let output: GetObjectCommandOutput
       try {
-        output = (await send(
-          deadline,
-          new GetObjectCommand({ Bucket: bucket, Key: location })
-        )) as GetObjectCommandOutput
+        output = (await client.send(new GetObjectCommand({ Bucket: bucket, Key: location }), {
+          requestTimeout: timeoutMs,
+          abortSignal: opening.signal,
+        })) as GetObjectCommandOutput
       } catch (error) {
         if (isMissing(error)) {
           return undefined
         }
         throw mapFailure('a get', error)
+      } finally {
+        clearTimeout(timer)
       }
       try {
         const described = infoOf(key, output)
         if (output.Body === undefined || typeof output.Body.transformToWebStream !== 'function') {
           throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no body')
         }
-        const stream: ObjectStream = {
-          ...described,
-          body: output.Body.transformToWebStream() as ReadableStream<Uint8Array>,
-        }
+        const source = output.Body.transformToWebStream() as ReadableStream<Uint8Array>
+        const stream: ObjectStream = { ...described, body: guardBody(source, output.Body) }
         return stream
       } catch (error) {
         discardBody(output.Body)

@@ -710,10 +710,15 @@ abort `storage.unavailable`. The S3 adapter sends a body of one part or less as 
 anything larger as a multipart upload in parts of 8 MiB (`partBytes`, 5 to 64 MiB), two at a time
 (`partConcurrency`, 1 to 8), so memory is about four parts whatever the size (`bench/storage-stream.bench.ts`
 puts 500 MiB through with about 25 MiB of growth, budget 64 MiB). On any failure the adapter waits for
-the parts in flight and aborts the multipart upload. A process that dies mid-upload leaves parts
-the adapter cannot clean: **the bucket must carry a lifecycle rule that aborts incomplete multipart
-uploads** (`INCOMPLETE_UPLOAD_PARTS_TTL_HOURS` of the playbook ticket; an infra setting, not a kit
-one). The memory adapter, for tests, holds the object. An object written this way may be larger
+the parts in flight and aborts the multipart upload. **Residual cases:** a throw after the last
+part was sent (the completing request timed out or its answer was lost) means the content under
+the key is **unknown**, because S3 may have finished: retry the write (it is idempotent), or `head`
+and `delete` before relying on absence. The abort is best-effort, and a create or part request that
+timed out client-side but reached S3, or a process that dies mid-upload, can leave an incomplete
+upload that only a lifecycle rule removes. **The bucket must carry the rule: abort incomplete
+multipart uploads 1 day after initiation** (`AbortIncompleteMultipartUpload` with
+`DaysAfterInitiation: 1`, the finest S3 offers; an infra setting, not a kit one; the playbook
+ticket's `INCOMPLETE_UPLOAD_PARTS_TTL_HOURS` should be 24). The memory adapter, for tests, holds the object. An object written this way may be larger
 than `maxObjectBytes`; `get` then refuses it (`object_too_large`), so read it with `getStream`,
 which opens the object and returns its info and a web stream (`undefined` if there is none), not
 limited by `maxObjectBytes`; read or cancel the body so the connection is released. Not yet run

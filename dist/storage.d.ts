@@ -112,7 +112,14 @@ interface ObjectStore {
 	* nothing becomes readable under the key; an object already there is left as it was. Returns the
 	* size and the SHA-256 of the content. Objects written this way can be larger than
 	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
-	* `storage.object_too_large`. Idempotent: the same stream twice leaves the same object. O(object
+	* `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
+	* completing request timed out or its answer was lost) means the content under the key is
+	* unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
+	* `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
+	* create or a part request that timed out client-side but reached the store can leave an
+	* incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
+	* uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
+	* Idempotent: the same stream twice leaves the same object. O(object
 	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
 	*/
 	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
@@ -223,10 +230,18 @@ declare const S3_KEY_PREFIX = "orgs/";
 * (concurrency + 1) parts whatever the object size. Every request has the per-call deadline
 * (`deadlineMs`) and the SDK's retries; the stream as a whole is bounded by `maxBytes` and by the
 * caller's `signal`. On any failure the in-flight parts are awaited and the multipart upload is
-* aborted, so no part stays billed; the bucket should also carry a lifecycle rule that aborts
-* incomplete multipart uploads (infra), for a process that dies mid-upload. The object appears
-* only when the upload completes, so a failed write leaves nothing readable and an object already
-* under the key stays as it was.
+* aborted, so no part stays billed. The object appears only when the upload completes, so a write
+* that fails before the completing request leaves nothing readable and an object already under
+* the key stays as it was.
+*
+* Residual cases, which no code here can close: (1) a throw after the last part was sent (the
+* completing request timed out or its answer was lost) means the content under the key is unknown,
+* because S3 may have finished: the caller retries (put is idempotent) or heads and deletes before
+* relying on absence; (2) the abort is best-effort; (3) a create or part request that timed out
+* client-side but reached S3 can leave an incomplete upload that only the bucket's lifecycle rule
+* removes, as does a process that dies mid-upload. The bucket must carry that rule: abort
+* incomplete multipart uploads 1 day after initiation (`AbortIncompleteMultipartUpload`,
+* `DaysAfterInitiation: 1`, the finest S3 offers).
 *
 * Complexity: put and get O(object size); putStream O(object size) time and O(part size)
 * memory; getStream, head and delete O(1); list O(limit); one HTTP call each, except a streamed

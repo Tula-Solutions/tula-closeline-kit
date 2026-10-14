@@ -6,7 +6,8 @@ import {
   STORAGE_ERROR_CODES2,
   StorageError2,
   MAX_LIST_LIMIT2,
-  DEFAULT_CONTENT_TYPE2
+  DEFAULT_CONTENT_TYPE2,
+  STREAM_IDLE_TIMEOUT_MS2
 } from "./shared/chunk-60y8a3sa.js";
 import {
   checkStreamLimit,
@@ -80,6 +81,53 @@ function discardBody(body) {
       });
     }
   } catch {}
+}
+function guardBody(source, raw) {
+  const reader = source.getReader();
+  let released = false;
+  const release = () => {
+    if (!released) {
+      released = true;
+      discardBody(raw);
+    }
+  };
+  return new ReadableStream({
+    async pull(controller) {
+      let timer;
+      try {
+        const step = await Promise.race([
+          reader.read(),
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("the body stalled")), STREAM_IDLE_TIMEOUT_MS2);
+          })
+        ]);
+        if (step.done) {
+          controller.close();
+        } else {
+          controller.enqueue(step.value);
+        }
+      } catch (error) {
+        if (released) {
+          return;
+        }
+        release();
+        reader.cancel().catch(() => {
+          return;
+        });
+        controller.error(new StorageError2(STORAGE_ERROR_CODES2.unavailable, "the body could not be read to the end", {
+          cause: reduceAwsCause(error)
+        }));
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    cancel() {
+      release();
+      return reader.cancel().catch(() => {
+        return;
+      });
+    }
+  });
 }
 function isMissing(error) {
   return error instanceof Error && MISSING.has(error.name);
@@ -303,26 +351,30 @@ function createS3ObjectStore(options) {
       }
     },
     async getStream(organizationId, key) {
-      const deadline = AbortSignal.timeout(deadlineMs);
+      const opening = new AbortController;
+      const timer = setTimeout(() => opening.abort(), deadlineMs);
       const location = prefixOf(check.organization(organizationId)) + check.key(key);
       let output;
       try {
-        output = await send(deadline, new GetObjectCommand({ Bucket: bucket, Key: location }));
+        output = await client.send(new GetObjectCommand({ Bucket: bucket, Key: location }), {
+          requestTimeout: timeoutMs,
+          abortSignal: opening.signal
+        });
       } catch (error) {
         if (isMissing(error)) {
           return;
         }
         throw mapFailure("a get", error);
+      } finally {
+        clearTimeout(timer);
       }
       try {
         const described = infoOf(key, output);
         if (output.Body === undefined || typeof output.Body.transformToWebStream !== "function") {
           throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned no body");
         }
-        const stream = {
-          ...described,
-          body: output.Body.transformToWebStream()
-        };
+        const source = output.Body.transformToWebStream();
+        const stream = { ...described, body: guardBody(source, output.Body) };
         return stream;
       } catch (error) {
         discardBody(output.Body);

@@ -1051,7 +1051,14 @@ interface ObjectStore {
 	* nothing becomes readable under the key; an object already there is left as it was. Returns the
 	* size and the SHA-256 of the content. Objects written this way can be larger than
 	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
-	* `storage.object_too_large`. Idempotent: the same stream twice leaves the same object. O(object
+	* `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
+	* completing request timed out or its answer was lost) means the content under the key is
+	* unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
+	* `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
+	* create or a part request that timed out client-side but reached the store can leave an
+	* incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
+	* uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
+	* Idempotent: the same stream twice leaves the same object. O(object
 	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
 	*/
 	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
