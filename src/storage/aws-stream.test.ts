@@ -168,9 +168,10 @@ describe('S3 streamed put', () => {
     const object = stub.object() as Buffer
     expect(object.equals(bytesOf(total))).toBe(true)
     expect(result).toEqual({ size: total, sha256: sha(bytesOf(total)) })
-    const listed = (
-      stub.seen.at(-1)?.input.MultipartUpload as { Parts: Array<{ PartNumber: number }> }
-    ).Parts
+    const complete = stub.seen.at(-1)?.input.MultipartUpload as {
+      Parts: Array<{ PartNumber: number }>
+    }
+    const listed = complete.Parts
     expect(listed.map((part) => part.PartNumber)).toEqual([1, 2, 3])
   })
 
@@ -456,7 +457,8 @@ describe('S3 streamed get', () => {
     const got = await store.getStream(ORG, 'k')
 
     const read = (async () => {
-      for await (const _chunk of got?.body as ReadableStream<Uint8Array>) {
+      const stream = got?.body as ReadableStream<Uint8Array>
+      for await (const _chunk of stream) {
         // read until it fails
       }
     })()
