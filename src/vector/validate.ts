@@ -47,6 +47,10 @@ export interface VectorValidator {
   query(query: unknown): CheckedQuery
   /** Validates a batch of ids. */
   ids(ids: unknown): string[]
+  /** Validates the ids of an attribute update: 1 to 500, distinct. */
+  updateIds(ids: unknown): string[]
+  /** Validates the attributes of an update: at least one entry. */
+  nonEmptyAttributes(attributes: unknown): VectorAttributes
   /** Validates a non-empty filter. */
   nonEmptyFilter(filter: unknown): VectorAttributes
 }
@@ -199,6 +203,23 @@ export function createVectorValidator(options: VectorValidatorOptions): VectorVa
         throw bad('a delete takes 1 to 500 ids')
       }
       return value.map(id)
+    },
+    updateIds(value) {
+      if (!Array.isArray(value) || value.length < 1 || value.length > MAX_UPSERT_BATCH) {
+        throw bad('an attribute update takes 1 to 500 ids')
+      }
+      const checked = value.map(id)
+      if (new Set(checked).size !== checked.length) {
+        throw bad('an attribute update holds each id once')
+      }
+      return checked
+    },
+    nonEmptyAttributes(value) {
+      const checked = attributes(value, 'attributes')
+      if (Object.keys(checked).length === 0) {
+        throw bad('attributes must have at least one entry')
+      }
+      return checked
     },
     nonEmptyFilter(value) {
       const filter = attributes(value, 'filter')

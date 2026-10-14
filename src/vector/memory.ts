@@ -1,5 +1,6 @@
 import type { OrganizationIdCheck } from '../organization'
-import type { SearchHit, VectorStore } from './port'
+import { VECTOR_ERROR_CODES, VectorError } from './errors'
+import { MAX_ATTRIBUTES, type SearchHit, type VectorStore } from './port'
 import { attributesMatch, type CheckedRecord, createVectorValidator } from './validate'
 
 /** Options for {@link createMemoryVectorStore}. */
@@ -32,7 +33,7 @@ function normalise(vector: Float32Array): Float32Array {
  * Creates a {@link VectorStore} in memory. Each Organization has its own map, so no query can
  * reach another Organization's vectors. Complexity: upsert O(batch × dimensions); search
  * O(n × dimensions + n log n) in the Organization's n vectors, an exact scan; delete O(ids);
- * deleteByFilter O(n); warm O(1); deleteAll O(1).
+ * setAttributes O(ids); deleteByFilter O(n); warm O(1); deleteAll O(1).
  */
 export function createMemoryVectorStore(options: MemoryVectorStoreOptions): MemoryVectorStore {
   const check = createVectorValidator(options)
@@ -82,6 +83,35 @@ export function createMemoryVectorStore(options: MemoryVectorStoreOptions): Memo
       }
       hits.sort((x, y) => y.score - x.score || (x.id < y.id ? -1 : 1))
       return hits.slice(0, topK)
+    },
+
+    async setAttributes(organizationId, ids, attributes) {
+      const org = check.organization(organizationId)
+      const checkedIds = check.updateIds(ids)
+      const changes = check.nonEmptyAttributes(attributes)
+      const vectors = organizations.get(org)
+      const missing: string[] = []
+      const merged: Array<[Stored, Stored['attributes']]> = []
+      for (const id of checkedIds) {
+        const stored = vectors?.get(id)
+        if (stored === undefined) {
+          missing.push(id)
+          continue
+        }
+        const next = { ...stored.attributes, ...changes }
+        if (Object.keys(next).length > MAX_ATTRIBUTES) {
+          throw new VectorError(
+            VECTOR_ERROR_CODES.invalidRequest,
+            'a vector has at most 16 attributes'
+          )
+        }
+        merged.push([stored, next])
+      }
+      // Everything is checked before anything is written, as in `upsert`.
+      for (const [stored, next] of merged) {
+        stored.attributes = next
+      }
+      return missing
     },
 
     async delete(organizationId, ids) {

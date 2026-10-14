@@ -767,9 +767,20 @@ warm(organizationId): Promise<void> // a hint that the index will be searched so
 deleteAll(organizationId): Promise<void> // everything the Organization has; offboarding, from a queued job // the embedding model's dimension count
 upsert(organizationId, [{ id, vector, attributes? }]): Promise<void> // 1 to 500, replaces by id, idempotent
 search(organizationId, { vector, topK /*1-100*/, filter? }): Promise<{ id; score; attributes }[]>
+setAttributes(organizationId, ids, attributes): Promise<string[]> // 1 to 500 ids; merges; returns the ids not found (added in 0.9.0)
 delete(organizationId, ids): Promise<void> // 1 to 500, unknown ids ignored, idempotent
 deleteByFilter(organizationId, filter): Promise<void> // filter needs at least one entry; for queued jobs
 ```
+
+**Changing attributes (`setAttributes`, 0.9.0).** Re-tags vectors without their vectors, so a
+change of a Deal's Outcome does not re-embed text that did not change. It **merges**: each given
+attribute is set (a value of the same name is replaced) and the vector's other attributes stay. It
+never creates a vector, and it returns the ids it did not find, in the order given, so
+`missing.length === 0` means a complete update. Up to 500 distinct ids (`MAX_UPSERT_BATCH`) and at
+least one attribute, with the names and values `upsert` accepts; a merge that would leave a vector
+with more than 16 attributes, or any invalid argument, is `vector.invalid_request` and writes
+nothing. Idempotent. A real adapter must patch attributes by id (turbopuffer: a patch by id) and
+must not resend vectors.
 
 **Organization scope.** Same rule as the object store: the id is validated (contract format plus a
 character rule) and an adapter derives its namespace or filter from it, never from a caller's

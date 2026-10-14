@@ -546,6 +546,23 @@ function createVectorValidator(options) {
       }
       return value.map(id);
     },
+    updateIds(value) {
+      if (!Array.isArray(value) || value.length < 1 || value.length > MAX_UPSERT_BATCH2) {
+        throw bad("an attribute update takes 1 to 500 ids");
+      }
+      const checked = value.map(id);
+      if (new Set(checked).size !== checked.length) {
+        throw bad("an attribute update holds each id once");
+      }
+      return checked;
+    },
+    nonEmptyAttributes(value) {
+      const checked = attributes(value, "attributes");
+      if (Object.keys(checked).length === 0) {
+        throw bad("attributes must have at least one entry");
+      }
+      return checked;
+    },
     nonEmptyFilter(value) {
       const filter = attributes(value, "filter");
       if (Object.keys(filter).length === 0) {
@@ -608,6 +625,30 @@ function createMemoryVectorStore(options) {
       }
       hits.sort((x, y) => y.score - x.score || (x.id < y.id ? -1 : 1));
       return hits.slice(0, topK);
+    },
+    async setAttributes(organizationId, ids, attributes) {
+      const org = check.organization(organizationId);
+      const checkedIds = check.updateIds(ids);
+      const changes = check.nonEmptyAttributes(attributes);
+      const vectors = organizations.get(org);
+      const missing = [];
+      const merged = [];
+      for (const id of checkedIds) {
+        const stored = vectors?.get(id);
+        if (stored === undefined) {
+          missing.push(id);
+          continue;
+        }
+        const next = { ...stored.attributes, ...changes };
+        if (Object.keys(next).length > MAX_ATTRIBUTES2) {
+          throw new VectorError2(VECTOR_ERROR_CODES2.invalidRequest, "a vector has at most 16 attributes");
+        }
+        merged.push([stored, next]);
+      }
+      for (const [stored, next] of merged) {
+        stored.attributes = next;
+      }
+      return missing;
     },
     async delete(organizationId, ids) {
       const org = check.organization(organizationId);
