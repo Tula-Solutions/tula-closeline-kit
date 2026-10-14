@@ -346,6 +346,8 @@ interface StoreSubject {
 * Leases are 60 seconds, so a subject that really waits should scale them or fake the database clock.
 */
 declare function processedStoreBehaviour(name: string, make: () => Promise<StoreSubject>): void;
+/** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
+type ByteStream = AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>;
 /** What a listing says about one object. */
 interface ObjectEntry {
 	/** The key, relative to the Organization. */
@@ -374,6 +376,27 @@ interface StoredObject extends ObjectInfo {
 interface PutOptions {
 	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
 	contentType?: string;
+}
+/** Options of {@link ObjectStore.putStream}. */
+interface PutStreamOptions extends PutOptions {
+	/** The most bytes the stream may hold, 1 to 2 GiB; one byte more aborts the write. Required. */
+	maxBytes: number;
+	/** Aborts the write (and cleans up what it started) when it fires. */
+	signal?: AbortSignal;
+	/** How long the source may stay silent, in ms, 10 to 600000; default 30000. */
+	idleTimeoutMs?: number;
+}
+/** What a finished streamed put reports. */
+interface PutStreamResult {
+	/** The bytes written. */
+	size: number;
+	/** The SHA-256 of the content, lower-case hex, computed while streaming. */
+	sha256: string;
+}
+/** An object whose body is read as a stream, so it is never held whole in memory. */
+interface ObjectStream extends ObjectInfo {
+	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
+	body: ReadableStream<Uint8Array>;
 }
 /** Options of {@link ObjectStore.list}. */
 interface ListOptions {
@@ -408,6 +431,31 @@ interface ObjectStore {
 	* same object. O(object size).
 	*/
 	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/**
+	* Writes an object from a stream with a hard limit, for objects too large to hold (a 500 MB
+	* recording). Memory stays bounded by a few parts, not by the object: the S3 adapter uploads in
+	* parts of 8 MiB, two at a time. The limit is checked while streaming: when `maxBytes` is
+	* exceeded, the source stalls for 30 s, the source fails or `signal` fires, the write is aborted,
+	* its incomplete parts are aborted (the bucket must also expire incomplete multipart uploads), and
+	* nothing becomes readable under the key; an object already there is left as it was. Returns the
+	* size and the SHA-256 of the content. Objects written this way can be larger than
+	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
+	* `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
+	* completing request timed out or its answer was lost) means the content under the key is
+	* unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
+	* `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
+	* create or a part request that timed out client-side but reached the store can leave an
+	* incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
+	* uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
+	* Idempotent: the same stream twice leaves the same object. O(object
+	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
+	*/
+	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
+	/**
+	* Reads an object as a stream, or returns `undefined` when there is none. Not limited by
+	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
+	*/
+	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
 	/**
@@ -447,6 +495,206 @@ interface ObjectStoreSubject {
 * one and fails for the other is a bug in one of them.
 */
 declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
+/** The audio to transcribe: a short-lived reference the vendor fetches, never the bytes. */
+interface AudioReference {
+	/**
+	* An `https:` URL (`http:` only when the adapter runs with `ENVIRONMENT=local`) that stays valid until the vendor has
+	* fetched the audio, typically a presigned GET of the object store, valid for minutes. It may
+	* carry credentials in its query string, so it is never logged, never put in an error and never
+	* stored. No user information (`user:pass@`) is accepted. The service builds this URL from its
+	* own object store; it is never taken from a user, or the vendor becomes a way to fetch any URL.
+	*/
+	url: string;
+}
+/** How the speakers are told apart. */
+type SpeakerMode = "split_channels" | "diarize";
+/** A send. */
+interface TranscribeRequest {
+	/**
+	* Chosen by the caller, unique per Organization, 1 to 128 of letters, digits, `.`, `_`, `:` and
+	* `-`: the playbook service uses `<callId>:<sendNumber>`. It is the only key the caller needs
+	* for {@link Transcriber.getResult} and {@link Transcriber.delete}; the vendor's own id is never
+	* required.
+	*/
+	clientReference: string;
+	/** The audio. */
+	audio: AudioReference;
+	/** How speakers are told apart. */
+	speakers: SpeakerMode;
+	/** With `diarize`: the most speakers to find, 1 to 10. Not allowed with `split_channels`. */
+	maxSpeakers?: number;
+	/**
+	* Required: a stable name for the audio itself, such as the object key and content hash
+	* (`<key>:<sha256>`), 1 to 256 of letters, digits, `.`, `_`, `:`, `/` and `-`. The audio URL is
+	* short-lived and a retry gets a new one, so the URL is not part of what makes two sends "the
+	* same"; this is. Sending a reference again with a different `audioKey` is a conflict.
+	*/
+	audioKey: string;
+	/**
+	* Optional: an `https:` URL the vendor may call when the result is ready, to save polling. The
+	* service builds it; it is never taken from a user. The
+	* port never requires one: a result is always readable with {@link Transcriber.getResult}, and a
+	* webhook is only a hint to look sooner. An adapter that cannot use it ignores it.
+	*/
+	callbackUrl?: string;
+}
+/** What {@link Transcriber.submit} reports. */
+interface Submission {
+	/** The client reference, as given. */
+	clientReference: string;
+	/** True when this call created the copy; false when the same send was already there. */
+	created: boolean;
+}
+/** Why a transcription failed. A closed list; none says more than the reason. */
+type TranscriptionFailure = "audio_unreachable" | "audio_invalid" | "no_speech" | "too_long" | "vendor_failed" | "timed_out";
+/** One stretch of speech by one speaker. */
+interface TranscriptTurn {
+	/**
+	* Who spoke, as a label: `A`, `B`... for `diarize`; for `split_channels` a label the vendor
+	* assigns per channel (see `channel`). Labels are data, never instructions, and are not logged.
+	*/
+	speaker: string;
+	/** With `split_channels`: the 0-based channel this turn came from. Absent with `diarize`. */
+	channel?: number;
+	/** Start, in milliseconds from the start of the audio. */
+	startMs: number;
+	/** End, in milliseconds; not before `startMs`. */
+	endMs: number;
+	/** What was said, at most 20,000 characters. Untrusted text. */
+	text: string;
+}
+/** The state of one send. */
+type TranscriptionResult = {
+	status: "pending";
+} | {
+	status: "done";
+	/** The audio's length in milliseconds, as the vendor measured it (what it bills). */
+	durationMs: number;
+	/** Turns in time order, at most 50,000. */
+	turns: TranscriptTurn[];
+} | {
+	status: "failed";
+	reason: TranscriptionFailure;
+};
+/** One send in a listing. */
+interface TranscriptionEntry {
+	/** The client reference. */
+	clientReference: string;
+	/** `pending`, `done` or `failed`. */
+	status: TranscriptionResult["status"];
+}
+/** Options of {@link Transcriber.list}. */
+interface TranscriptionListOptions {
+	/**
+	* Only references that start with this; default all. End the prefix with the separator
+	* (`call_1:`): `call_1` also matches `call_10:`.
+	*/
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface TranscriptionPage {
+	/** Entries in ascending reference order. */
+	items: TranscriptionEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Batch speech-to-text behind a vendor (ADR 0010: AssemblyAI), scoped by Organization. Every call
+* takes the Organization id first and reaches only that Organization's sends: a real adapter must
+* put the validated id into the reference it gives the vendor (`<organizationId>/<clientReference>`)
+* so a second Organization's identical reference is a different send and can never be read or
+* deleted. Audio is given by reference (a short-lived URL the vendor fetches), never as bytes: a
+* 500 MB Recording is never buffered by the service, and the URL is the "short-lived presigned
+* URL" of ADR 0018. Results are read by polling; a webhook is only an optional hint.
+*
+* What every adapter must do: give every vendor call a timeout and a bounded, jittered retry
+* (only `transcriber.unavailable` is retryable by the caller after that), make `submit` idempotent
+* by client reference, throw {@link TranscriberError} with a code from the closed set, read at most
+* `MAX_TRANSCRIPT_RESPONSE_BYTES` of any response before parsing it and run every result through
+* `checkTranscriptionResult` (vendor output is untrusted), and never log, throw or report audio,
+* an audio URL, transcript text, speaker labels or a vendor id. Audio and text are personal data
+* of Prospects; the vendor must not train on them and must delete them (see `delete`).
+*
+* **A blocker for the real adapter, unverified:** whether AssemblyAI lets the caller give a
+* reference of its own, or look a transcript up by one, is not established (its transcript object
+* has no such field in the documentation read so far). If it does not, the adapter owns a mapping
+* store (a table of `(organizationId, clientReference) -> vendor id`, written before the vendor
+* call and so recoverable after a crash) and `delete` and `list` run on that mapping plus the
+* vendor's own list, which is a design of its own and not a thing this port can paper over. The
+* other open questions (ADR 0018, "before real audio"): can a stereo file be transcribed per
+* channel with its own speaker label (`multichannel`) and what does it bill, the EU endpoint for
+* the EU Region, and how soon after a delete the vendor's copy is gone and whether it confirms
+* it. Until all are answered, no real adapter may run outside `local`.
+*/
+interface Transcriber {
+	/**
+	* Starts a transcription. Idempotent by `(organizationId, clientReference)`: repeating the same
+	* request returns `created: false` and starts nothing, so a caller that crashed before storing
+	* anything can send again safely; the same reference with a different mode, speaker cap or
+	* `audioKey` is `transcriber.conflict`. Concurrent submits of one reference create it at most
+	* once: at most one of them answers `created: true`. The audio URL is not compared (a retry presigns a new
+	* one), so without an `audioKey` the audio itself is not checked. An adapter validates with the
+	* shared checks and its `ENVIRONMENT`: plain `http:` URLs only in `local`. Everything is validated before anything is sent. O(1).
+	*/
+	submit(organizationId: string, request: TranscribeRequest): Promise<Submission>;
+	/**
+	* Reads one send's state, or returns `undefined` when there is no send with that reference (never
+	* submitted, or deleted). A `done` result is final and can be read again. Poll with
+	* {@link waitForTranscription}. O(result size).
+	*/
+	getResult(organizationId: string, clientReference: string): Promise<TranscriptionResult | undefined>;
+	/**
+	* Deletes the vendor's copy (audio, transcript and metadata) of the send with this reference,
+	* every copy that carries it, and returns `existed: true` when at least one was found and
+	* removed (or cancelled). Idempotent: deleting again, or a reference never sent, resolves with
+	* `existed: false`. It works with the client reference alone, including for a send whose vendor
+	* id the caller never stored (a crash between the vendor accepting it and the caller recording
+	* its id), which is why {@link Transcriber.list} exists. A send still processing is cancelled,
+	* or waited for a bounded time; if the vendor can do neither within that time the call throws
+	* `transcriber.unavailable` (retryable) and the caller retries: a purge is not done until
+	* `delete` has resolved for every reference. It resolves only when the vendor confirmed the
+	* deletion. **The caller must stop new submits for a Call before it lists and deletes**, or a
+	* send made in between survives. O(1).
+	*/
+	delete(organizationId: string, clientReference: string): Promise<{
+		existed: boolean;
+	}>;
+	/**
+	* Lists the Organization's sends by reference prefix, **for background jobs only**: it may scan
+	* the vendor's account, so it is slow and never on a request path. The order is stable (by
+	* reference) and the cursor is opaque, valid only for the same Organization and prefix. A page
+	* may be shorter than `limit`, even empty, and still have a `nextCursor`: follow the cursor until
+	* it is absent. A purge lists `<callId>:` and deletes each entry, so a send the caller has no
+	* record of is still removed. Work proportional to the Organization's size.
+	*/
+	list(organizationId: string, options?: TranscriptionListOptions): Promise<TranscriptionPage>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface TranscriberSubject {
+	/** The transcriber under test, with no sends for the Organizations below. */
+	transcriber: Transcriber;
+	/** Three Organization ids the transcriber accepts: B is unrelated, and `aExtended` starts with `a`. */
+	organizations: {
+		a: string;
+		b: string;
+		aExtended: string;
+	};
+	/** Milliseconds between reads while waiting for a result; default 0 (the stand-in answers at once). */
+	pollIntervalMs?: number;
+	/** Removes what the subject created, including every vendor copy. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link Transcriber} must show. Run it with {@link transcriberBehaviour}
+* against the memory adapter and against any real adapter (which has no local stand-in, so it runs
+* in an integration test against a dev account with short sample audio and cleans up with `close`).
+* It never assumes how fast a send finishes: a result may be pending, done or failed.
+*/
+declare function transcriberBehaviour(name: string, make: () => Promise<TranscriberSubject>, skip?: boolean): void;
 /** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
 type AttributeValue = string | number | boolean;
 /**
@@ -559,4 +807,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { ObjectStoreSubject, QueueSubject, StoreSubject, VectorStoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, vectorStoreBehaviour };
+export { ObjectStoreSubject, QueueSubject, StoreSubject, TranscriberSubject, VectorStoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, transcriberBehaviour, vectorStoreBehaviour };

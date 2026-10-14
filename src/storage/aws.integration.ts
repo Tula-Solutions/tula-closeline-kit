@@ -1,4 +1,5 @@
-import { setDefaultTimeout } from 'bun:test'
+import { describe, expect, setDefaultTimeout, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { createS3ObjectStore } from './aws'
 import { objectStoreBehaviour } from './behaviour'
 
@@ -74,5 +75,58 @@ if (endpoint === undefined || endpoint === '') {
         }
       },
     }
+  })
+
+  describe('S3 adapter on S3Mock: multipart', () => {
+    // 12 MiB with parts of 5 MiB is a real multipart upload of three parts on the stand-in.
+    test('a streamed put of about 12 MiB reads back byte for byte with its SHA-256', async () => {
+      process.env.AWS_ACCESS_KEY_ID ??= 'test'
+      process.env.AWS_SECRET_ACCESS_KEY ??= 'test'
+      const org = `org_${crypto.randomUUID().replaceAll('-', '')}`
+      const store = createS3ObjectStore({
+        bucket: BUCKET,
+        region: 'eu-west-1',
+        environment: 'local',
+        endpoint,
+        partBytes: 5 * 1024 * 1024,
+        isOrganizationId: () => true,
+      })
+      const total = 12 * 1024 * 1024 + 4321
+      const source = new Uint8Array(total)
+      let x = 0x9e3779b9
+      for (let i = 0; i < total; i++) {
+        x ^= x << 13
+        x ^= x >>> 17
+        x ^= x << 5
+        source[i] = x & 0xff
+      }
+      async function* chunks(): AsyncGenerator<Uint8Array> {
+        for (let at = 0; at < total; at += 100_003) {
+          yield source.slice(at, Math.min(at + 100_003, total))
+        }
+      }
+
+      try {
+        const result = await store.putStream(org, 'rec/big.bin', chunks(), {
+          maxBytes: 20 * 1024 * 1024,
+          contentType: 'audio/wav',
+        })
+        expect(result).toEqual({
+          size: total,
+          sha256: createHash('sha256').update(source).digest('hex'),
+        })
+        const got = await store.getStream(org, 'rec/big.bin')
+        expect(got?.size).toBe(total)
+        const back = new Uint8Array(await new Response(got?.body).arrayBuffer())
+        expect(createHash('sha256').update(back).digest('hex')).toBe(result.sha256)
+        expect(Buffer.from(back).equals(Buffer.from(source))).toBe(true)
+        await expect(
+          store.putStream(org, 'rec/over.bin', chunks(), { maxBytes: 8 * 1024 * 1024 })
+        ).rejects.toMatchObject({ code: 'storage.object_too_large' })
+        expect(await store.head(org, 'rec/over.bin')).toBeUndefined()
+      } finally {
+        await store.delete(org, 'rec/big.bin')
+      }
+    }, 60_000)
   })
 }

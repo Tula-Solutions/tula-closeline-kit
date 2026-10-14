@@ -5,4 +5,5 @@
 export * from './queue/behaviour'
 export * from './queue/store.behaviour'
 export * from './storage/behaviour'
+export * from './transcribe/behaviour'
 export * from './vector/behaviour'

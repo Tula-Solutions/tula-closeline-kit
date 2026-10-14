@@ -21,11 +21,28 @@ import {
   createMessageRegistry2
 } from "./shared/chunk-mjkmsg3r.js";
 import {
+  STORAGE_ERROR_CODES2,
+  StorageError2
+} from "./shared/chunk-60y8a3sa.js";
+import {
+  checkStreamLimit,
+  checkIdleTimeout,
+  readChunks,
+  tooLarge,
   createOrganizationIdGuard,
   encodeCursor,
   createStorageValidator
-} from "./shared/chunk-jstn60a3.js";
-import"./shared/chunk-r2rshw7g.js";
+} from "./shared/chunk-9sd8894z.js";
+import {
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  checkTranscriptionResult2
+} from "./shared/chunk-mv441zb4.js";
 import {
   assertReceiveOptions2,
   assertVisibility2,
@@ -355,6 +372,7 @@ function createTestRegistry(options = {}) {
   });
 }
 // src/storage/memory.ts
+import { createHash } from "node:crypto";
 function createMemoryObjectStore(options = {}) {
   const clock = options.clock ?? systemClock2;
   const check = createStorageValidator({
@@ -381,12 +399,68 @@ function createMemoryObjectStore(options = {}) {
       }
       objects.set(name, { body: bytes.slice(), contentType, lastModified: clock.now() });
     },
+    async putStream(organizationId, key, body, putOptions) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const contentType = check.contentType(putOptions?.contentType);
+      const maxBytes = checkStreamLimit(putOptions?.maxBytes);
+      const hash = createHash("sha256");
+      const parts = [];
+      let size = 0;
+      for await (const chunk of readChunks(body, putOptions?.signal, checkIdleTimeout(putOptions?.idleTimeoutMs))) {
+        size += chunk.byteLength;
+        if (size > maxBytes) {
+          throw tooLarge(maxBytes);
+        }
+        hash.update(chunk);
+        parts.push(chunk.slice());
+      }
+      const whole = new Uint8Array(size);
+      let offset = 0;
+      for (const part of parts) {
+        whole.set(part, offset);
+        offset += part.byteLength;
+      }
+      let objects = organizations.get(org);
+      if (objects === undefined) {
+        objects = new Map;
+        organizations.set(org, objects);
+      }
+      objects.set(name, { body: whole, contentType, lastModified: clock.now() });
+      return { size, sha256: hash.digest("hex") };
+    },
+    async getStream(organizationId, key) {
+      const org = check.organization(organizationId);
+      const name = check.key(key);
+      const entry = organizations.get(org)?.get(name);
+      if (entry === undefined) {
+        return;
+      }
+      const bytes = entry.body.slice();
+      let offset = 0;
+      const body = new ReadableStream({
+        pull(controller) {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes.subarray(offset, offset + 65536));
+          offset += 65536;
+        }
+      });
+      return { ...info(name, entry), body };
+    },
     async get(organizationId, key) {
       const org = check.organization(organizationId);
       const name = check.key(key);
       const entry = organizations.get(org)?.get(name);
       if (entry === undefined) {
         return;
+      }
+      if (entry.body.byteLength > check.maxObjectBytes) {
+        throw new StorageError2(STORAGE_ERROR_CODES2.objectTooLarge, "the object is too large", {
+          details: { limitBytes: check.maxObjectBytes }
+        });
       }
       const stored = { ...info(name, entry), body: entry.body.slice() };
       return stored;
@@ -425,11 +499,289 @@ function createMemoryObjectStore(options = {}) {
     }
   };
 }
+// src/transcribe/validate.ts
+var REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+var AUDIO_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+var CURSOR = /^[A-Za-z0-9_-]{1,300}$/;
+var bad = (message) => new TranscriberError2(TRANSCRIBER_ERROR_CODES2.invalidRequest, message);
+function encodeReferenceCursor(reference) {
+  return Buffer.from(reference, "utf8").toString("base64url");
+}
+function checkUrl(value, what, allowHttp) {
+  if (typeof value !== "string" || value.length < 1 || value.length > MAX_AUDIO_URL_LENGTH2) {
+    throw bad(`${what} must be a URL of at most 4096 characters`);
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw bad(`${what} must be a URL`);
+  }
+  if (url.protocol !== "https:" && !(allowHttp && url.protocol === "http:") || url.hostname === "" || url.username !== "" || url.password !== "") {
+    throw bad(`${what} must be an https URL without user information (http only in local)`);
+  }
+  return value;
+}
+function createTranscriberValidator(options) {
+  const allowHttp = options.environment === "local";
+  const isOrganization = createOrganizationIdGuard(options.isOrganizationId);
+  const reference = (value) => {
+    if (typeof value !== "string" || value.length > MAX_CLIENT_REFERENCE_LENGTH2 || !REFERENCE.test(value)) {
+      throw bad('a client reference is 1 to 128 letters, digits, ".", "_", ":" or "-"');
+    }
+    return value;
+  };
+  const audioKey = (value) => {
+    if (typeof value !== "string" || !AUDIO_KEY.test(value)) {
+      throw bad('an audio key is required: 1 to 256 letters, digits, ".", "_", ":", "/" or "-"');
+    }
+    return value;
+  };
+  return {
+    organization(value) {
+      if (!isOrganization(value)) {
+        throw bad("the Organization id is not valid");
+      }
+      return value;
+    },
+    reference,
+    request(value) {
+      if (typeof value !== "object" || value === null) {
+        throw bad("a send must be an object");
+      }
+      const raw = value;
+      const audio = raw.audio;
+      if (typeof audio !== "object" || audio === null) {
+        throw bad("audio must be an object with a url");
+      }
+      if (raw.speakers !== "split_channels" && raw.speakers !== "diarize") {
+        throw bad('speakers must be "split_channels" or "diarize"');
+      }
+      let maxSpeakers;
+      if (raw.maxSpeakers !== undefined) {
+        if (raw.speakers !== "diarize" || typeof raw.maxSpeakers !== "number" || !Number.isInteger(raw.maxSpeakers) || raw.maxSpeakers < 1 || raw.maxSpeakers > MAX_SPEAKERS2) {
+          throw bad('maxSpeakers is a whole number from 1 to 10 and only goes with "diarize"');
+        }
+        maxSpeakers = raw.maxSpeakers;
+      }
+      return {
+        clientReference: reference(raw.clientReference),
+        audioUrl: checkUrl(audio.url, "the audio url", allowHttp),
+        speakers: raw.speakers,
+        maxSpeakers,
+        callbackUrl: raw.callbackUrl === undefined ? undefined : checkUrl(raw.callbackUrl, "the callback url", allowHttp),
+        audioKey: audioKey(raw.audioKey)
+      };
+    },
+    list(listOptions) {
+      const raw = listOptions ?? {};
+      if (typeof raw !== "object" || raw === null) {
+        throw bad("list options must be an object");
+      }
+      let prefix = "";
+      if (raw.prefix !== undefined) {
+        if (typeof raw.prefix !== "string" || raw.prefix.length > MAX_CLIENT_REFERENCE_LENGTH2 || raw.prefix !== "" && !REFERENCE.test(raw.prefix)) {
+          throw bad('the prefix is up to 128 letters, digits, ".", "_", ":" or "-"');
+        }
+        prefix = raw.prefix;
+      }
+      let after;
+      if (raw.cursor !== undefined) {
+        if (typeof raw.cursor !== "string" || !CURSOR.test(raw.cursor)) {
+          throw bad("the cursor is not valid");
+        }
+        const decoded = Buffer.from(raw.cursor, "base64url").toString("utf8");
+        if (encodeReferenceCursor(decoded) !== raw.cursor || !REFERENCE.test(decoded)) {
+          throw bad("the cursor is not valid");
+        }
+        after = decoded;
+      }
+      const limit = raw.limit ?? DEFAULT_TRANSCRIBER_LIST_LIMIT2;
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_TRANSCRIBER_LIST_LIMIT2) {
+        throw bad("the limit is a whole number from 1 to 1000");
+      }
+      return { prefix, after, limit };
+    }
+  };
+}
+function sameSend(x, y) {
+  return x.audioKey === y.audioKey && x.speakers === y.speakers && x.maxSpeakers === y.maxSpeakers;
+}
+
+// src/transcribe/memory.ts
+function defaultTurns(request) {
+  const split = request.speakers === "split_channels";
+  return [0, 1, 2, 3].map((index) => {
+    const channel = index % 2;
+    return {
+      speaker: split ? `ch${channel}` : channel === 0 ? "A" : "B",
+      ...split ? { channel } : {},
+      startMs: index * 5000,
+      endMs: index * 5000 + 4000,
+      text: `Turn ${index + 1} of the scripted conversation.`
+    };
+  });
+}
+function defaultOutcome(request) {
+  return {
+    pendingReads: 1,
+    result: { status: "done", durationMs: 20000, turns: defaultTurns(request) }
+  };
+}
+function checkOutcome(outcome) {
+  checkTranscriptionResult2(outcome.result);
+  const reads = outcome.pendingReads ?? 1;
+  if (!Number.isInteger(reads) || reads < 0 || reads > 1000) {
+    throw new TypeError("pendingReads must be a whole number from 0 to 1000");
+  }
+  return { pendingReads: reads, result: outcome.result };
+}
+function createMemoryTranscriber(options = {}) {
+  const check = createTranscriberValidator({
+    isOrganizationId: options.isOrganizationId,
+    environment: options.environment ?? "local"
+  });
+  const organizations = new Map;
+  const scripts = new Map;
+  const failures = [];
+  let acceptThenFail = 0;
+  let counter = 0;
+  const scriptKey = (org, reference) => `${org}\x00${reference}`;
+  function maybeFail(operation) {
+    const at = failures.findIndex((entry) => entry.operation === operation);
+    if (at >= 0) {
+      const [entry] = failures.splice(at, 1);
+      throw new TranscriberError2(entry.code, "the scripted failure of the stand-in");
+    }
+  }
+  const stateOf = (copy, consume) => {
+    if (copy.pendingReads > 0) {
+      if (consume) {
+        copy.pendingReads -= 1;
+      }
+      return { status: "pending" };
+    }
+    return copy.outcome.status === "done" ? {
+      status: "done",
+      durationMs: copy.outcome.durationMs,
+      turns: copy.outcome.turns.map((turn) => ({ ...turn }))
+    } : { status: "failed", reason: copy.outcome.reason };
+  };
+  return {
+    async submit(organizationId, request) {
+      maybeFail("submit");
+      const org = check.organization(organizationId);
+      const checked = check.request(request);
+      let sends = organizations.get(org);
+      if (sends === undefined) {
+        sends = new Map;
+        organizations.set(org, sends);
+      }
+      const existing = sends.get(checked.clientReference);
+      if (existing !== undefined) {
+        if (!sameSend(existing.request, checked)) {
+          throw new TranscriberError2(TRANSCRIBER_ERROR_CODES2.conflict, "the client reference is already used by a different send");
+        }
+        return { clientReference: checked.clientReference, created: false };
+      }
+      counter += 1;
+      const scripted = scripts.get(scriptKey(org, checked.clientReference)) ?? options.outcome?.({
+        speakers: checked.speakers,
+        ...checked.maxSpeakers === undefined ? {} : { maxSpeakers: checked.maxSpeakers }
+      }) ?? defaultOutcome(checked);
+      const outcome = checkOutcome(scripted);
+      sends.set(checked.clientReference, {
+        request: checked,
+        vendorId: `mem_${counter}`,
+        pendingReads: outcome.pendingReads ?? 1,
+        outcome: outcome.result
+      });
+      if (acceptThenFail > 0) {
+        acceptThenFail -= 1;
+        throw new TranscriberError2(TRANSCRIBER_ERROR_CODES2.unavailable, "the stand-in accepted the send and then failed to answer");
+      }
+      return { clientReference: checked.clientReference, created: true };
+    },
+    async getResult(organizationId, clientReference) {
+      maybeFail("getResult");
+      const org = check.organization(organizationId);
+      const reference = check.reference(clientReference);
+      const copy = organizations.get(org)?.get(reference);
+      return copy === undefined ? undefined : stateOf(copy, true);
+    },
+    async delete(organizationId, clientReference) {
+      maybeFail("delete");
+      const org = check.organization(organizationId);
+      const reference = check.reference(clientReference);
+      const existed = organizations.get(org)?.delete(reference) === true;
+      scripts.delete(scriptKey(org, reference));
+      return { existed };
+    },
+    async list(organizationId, listOptions) {
+      maybeFail("list");
+      const org = check.organization(organizationId);
+      const { prefix, after, limit } = check.list(listOptions);
+      const matches = [];
+      for (const pair of organizations.get(org) ?? []) {
+        if (pair[0].startsWith(prefix) && (after === undefined || pair[0] > after)) {
+          matches.push(pair);
+        }
+      }
+      matches.sort((x, y) => x[0] < y[0] ? -1 : 1);
+      const items = matches.slice(0, limit).map(([clientReference, copy]) => ({
+        clientReference,
+        status: stateOf(copy, false).status
+      }));
+      const last = items.at(-1);
+      const page = { items };
+      if (matches.length > limit && last !== undefined) {
+        page.nextCursor = encodeReferenceCursor(last.clientReference);
+      }
+      return page;
+    },
+    script(organizationId, clientReference, outcome) {
+      const org = check.organization(organizationId);
+      const reference = check.reference(clientReference);
+      const checked = checkOutcome(outcome);
+      scripts.set(scriptKey(org, reference), checked);
+      const copy = organizations.get(org)?.get(reference);
+      if (copy !== undefined) {
+        copy.outcome = checked.result;
+        copy.pendingReads = checked.pendingReads ?? 1;
+      }
+    },
+    failNext(operation, code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        failures.push({ operation, code });
+      }
+    },
+    acceptThenFailNext(times = 1) {
+      acceptThenFail += times;
+    },
+    copies(organizationId) {
+      const held = [];
+      for (const [org, sends] of [...organizations].sort((x, y) => x[0] < y[0] ? -1 : 1)) {
+        if (organizationId !== undefined && org !== organizationId) {
+          continue;
+        }
+        for (const [clientReference, copy] of [...sends].sort((x, y) => x[0] < y[0] ? -1 : 1)) {
+          held.push({
+            organizationId: org,
+            clientReference,
+            vendorId: copy.vendorId,
+            status: stateOf(copy, false).status
+          });
+        }
+      }
+      return held;
+    }
+  };
+}
 // src/vector/validate.ts
 var VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 var ATTRIBUTE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 var RESERVED_ATTRIBUTE_NAMES = new Set(["id", "vector"]);
-var bad = (message) => new VectorError2(VECTOR_ERROR_CODES2.invalidRequest, message);
+var bad2 = (message) => new VectorError2(VECTOR_ERROR_CODES2.invalidRequest, message);
 function attributesMatch(attributes, filter) {
   for (const name of Object.keys(filter)) {
     if (!Object.hasOwn(attributes, name) || attributes[name] !== filter[name]) {
@@ -446,7 +798,7 @@ function createVectorValidator(options) {
   const isOrganization = createOrganizationIdGuard(options.isOrganizationId);
   function vector(value) {
     if (typeof value !== "object" || value === null || typeof value.length !== "number") {
-      throw bad("a vector must be an array of numbers");
+      throw bad2("a vector must be an array of numbers");
     }
     const source = value;
     if (source.length !== dimensions) {
@@ -457,34 +809,34 @@ function createVectorValidator(options) {
     for (let i = 0;i < dimensions; i++) {
       const x = source[i];
       if (typeof x !== "number") {
-        throw bad("a vector holds only finite numbers");
+        throw bad2("a vector holds only finite numbers");
       }
       out[i] = x;
       const stored = out[i];
       if (!Number.isFinite(stored)) {
-        throw bad("a vector holds only finite numbers");
+        throw bad2("a vector holds only finite numbers");
       }
       norm += stored * stored;
     }
     if (!(norm > 0) || !Number.isFinite(norm)) {
-      throw bad("a vector must not be all zeros or too large to compare");
+      throw bad2("a vector must not be all zeros or too large to compare");
     }
     return out;
   }
   function attributes(value, what) {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      throw bad(`${what} must be an object`);
+      throw bad2(`${what} must be an object`);
     }
     const names = Object.keys(value);
     if (names.length > MAX_ATTRIBUTES2) {
-      throw bad(`${what} has at most 16 entries`);
+      throw bad2(`${what} has at most 16 entries`);
     }
     const out = {};
     for (const name of names) {
       const item = value[name];
       const okValue = typeof item === "boolean" || typeof item === "number" && Number.isFinite(item) || typeof item === "string" && item.length <= MAX_ATTRIBUTE_STRING2;
       if (!ATTRIBUTE_NAME.test(name) || RESERVED_ATTRIBUTE_NAMES.has(name) || !okValue) {
-        throw bad(`${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters; "id" and "vector" are reserved`);
+        throw bad2(`${what} names are lower-case snake_case; values are booleans, finite numbers or strings of at most 512 characters; "id" and "vector" are reserved`);
       }
       out[name] = item;
     }
@@ -492,7 +844,7 @@ function createVectorValidator(options) {
   }
   function id(value) {
     if (typeof value !== "string" || !VECTOR_ID.test(value)) {
-      throw bad('a vector id is 1 to 64 letters, digits, ".", "_", ":" or "-"');
+      throw bad2('a vector id is 1 to 64 letters, digits, ".", "_", ":" or "-"');
     }
     return value;
   }
@@ -500,23 +852,23 @@ function createVectorValidator(options) {
     dimensions,
     organization(value) {
       if (!isOrganization(value)) {
-        throw bad("the Organization id is not valid");
+        throw bad2("the Organization id is not valid");
       }
       return value;
     },
     records(value) {
       if (!Array.isArray(value) || value.length < 1 || value.length > MAX_UPSERT_BATCH2) {
-        throw bad("an upsert takes 1 to 500 records");
+        throw bad2("an upsert takes 1 to 500 records");
       }
       const seen = new Set;
       return value.map((record) => {
         if (typeof record !== "object" || record === null) {
-          throw bad("a record must be an object");
+          throw bad2("a record must be an object");
         }
         const raw = record;
         const recordId = id(raw.id);
         if (seen.has(recordId)) {
-          throw bad("an upsert holds each id once");
+          throw bad2("an upsert holds each id once");
         }
         seen.add(recordId);
         return {
@@ -528,11 +880,11 @@ function createVectorValidator(options) {
     },
     query(value) {
       if (typeof value !== "object" || value === null) {
-        throw bad("a search must be an object");
+        throw bad2("a search must be an object");
       }
       const raw = value;
       if (typeof raw.topK !== "number" || !Number.isInteger(raw.topK) || raw.topK < 1 || raw.topK > MAX_TOP_K2) {
-        throw bad("topK must be a whole number from 1 to 100");
+        throw bad2("topK must be a whole number from 1 to 100");
       }
       return {
         vector: vector(raw.vector),
@@ -542,31 +894,31 @@ function createVectorValidator(options) {
     },
     ids(value) {
       if (!Array.isArray(value) || value.length < 1 || value.length > MAX_DELETE_BATCH2) {
-        throw bad("a delete takes 1 to 500 ids");
+        throw bad2("a delete takes 1 to 500 ids");
       }
       return value.map(id);
     },
     updateIds(value) {
       if (!Array.isArray(value) || value.length < 1 || value.length > MAX_UPSERT_BATCH2) {
-        throw bad("an attribute update takes 1 to 500 ids");
+        throw bad2("an attribute update takes 1 to 500 ids");
       }
       const checked = value.map(id);
       if (new Set(checked).size !== checked.length) {
-        throw bad("an attribute update holds each id once");
+        throw bad2("an attribute update holds each id once");
       }
       return checked;
     },
     nonEmptyAttributes(value) {
       const checked = attributes(value, "attributes");
       if (Object.keys(checked).length === 0) {
-        throw bad("attributes must have at least one entry");
+        throw bad2("attributes must have at least one entry");
       }
       return checked;
     },
     nonEmptyFilter(value) {
       const filter = attributes(value, "filter");
       if (Object.keys(filter).length === 0) {
-        throw bad("the filter must have at least one entry");
+        throw bad2("the filter must have at least one entry");
       }
       return filter;
     }
@@ -706,6 +1058,7 @@ export {
   createMemoryLogger,
   createMemoryObjectStore,
   createMemoryQueue,
+  createMemoryTranscriber,
   createMemoryVectorStore,
   createTestDeps,
   createTestJwks,

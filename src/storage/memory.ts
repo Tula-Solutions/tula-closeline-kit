@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto'
 import { type Clock, systemClock } from '../clock'
 import type { OrganizationIdCheck } from '../organization'
+import { STORAGE_ERROR_CODES, StorageError } from './errors'
 import type { ListPage, ObjectInfo, ObjectStore, StoredObject } from './port'
+import { checkIdleTimeout, checkStreamLimit, readChunks, tooLarge } from './stream'
 import { createStorageValidator, encodeCursor } from './validate'
 
 /** Options for {@link createMemoryObjectStore}. */
@@ -56,12 +59,75 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
       objects.set(name, { body: bytes.slice(), contentType, lastModified: clock.now() })
     },
 
+    async putStream(organizationId, key, body, putOptions) {
+      const org = check.organization(organizationId)
+      const name = check.key(key)
+      const contentType = check.contentType(putOptions?.contentType)
+      const maxBytes = checkStreamLimit(putOptions?.maxBytes)
+      const hash = createHash('sha256')
+      const parts: Uint8Array[] = []
+      let size = 0
+      // Nothing is stored until the whole stream is in, so an abort leaves the key as it was.
+      for await (const chunk of readChunks(
+        body,
+        putOptions?.signal,
+        checkIdleTimeout(putOptions?.idleTimeoutMs)
+      )) {
+        size += chunk.byteLength
+        if (size > maxBytes) {
+          throw tooLarge(maxBytes)
+        }
+        hash.update(chunk)
+        parts.push(chunk.slice())
+      }
+      const whole = new Uint8Array(size)
+      let offset = 0
+      for (const part of parts) {
+        whole.set(part, offset)
+        offset += part.byteLength
+      }
+      let objects = organizations.get(org)
+      if (objects === undefined) {
+        objects = new Map()
+        organizations.set(org, objects)
+      }
+      objects.set(name, { body: whole, contentType, lastModified: clock.now() })
+      return { size, sha256: hash.digest('hex') }
+    },
+
+    async getStream(organizationId, key) {
+      const org = check.organization(organizationId)
+      const name = check.key(key)
+      const entry = organizations.get(org)?.get(name)
+      if (entry === undefined) {
+        return undefined
+      }
+      const bytes = entry.body.slice()
+      let offset = 0
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset >= bytes.byteLength) {
+            controller.close()
+            return
+          }
+          controller.enqueue(bytes.subarray(offset, offset + 65_536))
+          offset += 65_536
+        },
+      })
+      return { ...info(name, entry), body }
+    },
+
     async get(organizationId, key) {
       const org = check.organization(organizationId)
       const name = check.key(key)
       const entry = organizations.get(org)?.get(name)
       if (entry === undefined) {
         return undefined
+      }
+      if (entry.body.byteLength > check.maxObjectBytes) {
+        throw new StorageError(STORAGE_ERROR_CODES.objectTooLarge, 'the object is too large', {
+          details: { limitBytes: check.maxObjectBytes },
+        })
       }
       const stored: StoredObject = { ...info(name, entry), body: entry.body.slice() }
       return stored

@@ -19,6 +19,15 @@ export const MAX_LIST_LIMIT = 1000
 /** The content type stored when the caller gives none. */
 export const DEFAULT_CONTENT_TYPE = 'application/octet-stream'
 
+/** The largest `maxBytes` of a streamed put (2 GiB); streamed bodies are never held whole in memory. */
+export const MAX_STREAM_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
+
+/** The longest a source stream may stay silent before a streamed put gives up, in ms. */
+export const STREAM_IDLE_TIMEOUT_MS = 30_000
+
+/** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
+export type ByteStream = AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>
+
 /** What a listing says about one object. */
 export interface ObjectEntry {
   /** The key, relative to the Organization. */
@@ -50,6 +59,30 @@ export interface StoredObject extends ObjectInfo {
 export interface PutOptions {
   /** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
   contentType?: string
+}
+
+/** Options of {@link ObjectStore.putStream}. */
+export interface PutStreamOptions extends PutOptions {
+  /** The most bytes the stream may hold, 1 to 2 GiB; one byte more aborts the write. Required. */
+  maxBytes: number
+  /** Aborts the write (and cleans up what it started) when it fires. */
+  signal?: AbortSignal
+  /** How long the source may stay silent, in ms, 10 to 600000; default 30000. */
+  idleTimeoutMs?: number
+}
+
+/** What a finished streamed put reports. */
+export interface PutStreamResult {
+  /** The bytes written. */
+  size: number
+  /** The SHA-256 of the content, lower-case hex, computed while streaming. */
+  sha256: string
+}
+
+/** An object whose body is read as a stream, so it is never held whole in memory. */
+export interface ObjectStream extends ObjectInfo {
+  /** The bytes, once. Cancel it if you stop reading, so the connection is released. */
+  body: ReadableStream<Uint8Array>
 }
 
 /** Options of {@link ObjectStore.list}. */
@@ -87,6 +120,36 @@ export interface ObjectStore {
    * same object. O(object size).
    */
   put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>
+  /**
+   * Writes an object from a stream with a hard limit, for objects too large to hold (a 500 MB
+   * recording). Memory stays bounded by a few parts, not by the object: the S3 adapter uploads in
+   * parts of 8 MiB, two at a time. The limit is checked while streaming: when `maxBytes` is
+   * exceeded, the source stalls for 30 s, the source fails or `signal` fires, the write is aborted,
+   * its incomplete parts are aborted (the bucket must also expire incomplete multipart uploads), and
+   * nothing becomes readable under the key; an object already there is left as it was. Returns the
+   * size and the SHA-256 of the content. Objects written this way can be larger than
+   * `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
+   * `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
+   * completing request timed out or its answer was lost) means the content under the key is
+   * unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
+   * `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
+   * create or a part request that timed out client-side but reached the store can leave an
+   * incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
+   * uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
+   * Idempotent: the same stream twice leaves the same object. O(object
+   * size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
+   */
+  putStream(
+    organizationId: string,
+    key: string,
+    body: ByteStream,
+    options: PutStreamOptions
+  ): Promise<PutStreamResult>
+  /**
+   * Reads an object as a stream, or returns `undefined` when there is none. Not limited by
+   * `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
+   */
+  getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>
   /** Reads an object, or returns `undefined` when there is none. O(object size). */
   get(organizationId: string, key: string): Promise<StoredObject | undefined>
   /**

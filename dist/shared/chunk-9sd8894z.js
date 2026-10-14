@@ -7,8 +7,102 @@ import {
   MAX_OBJECT_BYTES_LIMIT2,
   DEFAULT_LIST_LIMIT2,
   MAX_LIST_LIMIT2,
-  DEFAULT_CONTENT_TYPE2
-} from "./chunk-r2rshw7g.js";
+  DEFAULT_CONTENT_TYPE2,
+  MAX_STREAM_BYTES_LIMIT2,
+  STREAM_IDLE_TIMEOUT_MS2
+} from "./chunk-60y8a3sa.js";
+
+// src/storage/stream.ts
+function checkStreamLimit(maxBytes) {
+  if (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_STREAM_BYTES_LIMIT2) {
+    throw new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, "maxBytes must be a whole number from 1 to 2147483648");
+  }
+  return maxBytes;
+}
+function checkIdleTimeout(idleMs) {
+  if (idleMs === undefined) {
+    return STREAM_IDLE_TIMEOUT_MS2;
+  }
+  if (typeof idleMs !== "number" || !Number.isInteger(idleMs) || idleMs < 10 || idleMs > 600000) {
+    throw new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, "idleTimeoutMs must be a whole number from 10 to 600000");
+  }
+  return idleMs;
+}
+function puller(source) {
+  if (typeof source.getReader === "function") {
+    const reader = source.getReader();
+    return {
+      next: () => reader.read(),
+      close: () => {
+        reader.cancel().catch(() => {
+          return;
+        });
+      }
+    };
+  }
+  const iterator = source[Symbol.asyncIterator]();
+  return {
+    next: () => iterator.next(),
+    close: () => {
+      Promise.resolve(iterator.return?.()).catch(() => {
+        return;
+      });
+    }
+  };
+}
+async function* readChunks(source, signal, idleMs = STREAM_IDLE_TIMEOUT_MS2) {
+  if (typeof source !== "object" || source === null || typeof source.getReader !== "function" && typeof source[Symbol.asyncIterator] !== "function") {
+    throw new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, "the body must be a stream or an async iterable of bytes");
+  }
+  const pull = puller(source);
+  try {
+    for (;; ) {
+      if (signal?.aborted) {
+        throw new StorageError2(STORAGE_ERROR_CODES2.unavailable, "the write was aborted");
+      }
+      let timer;
+      let onAbort;
+      const guard = new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new StorageError2(STORAGE_ERROR_CODES2.unavailable, "the source stream stalled")), idleMs);
+        onAbort = () => reject(new StorageError2(STORAGE_ERROR_CODES2.unavailable, "the write was aborted"));
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      let step;
+      try {
+        step = await Promise.race([pull.next(), guard]);
+      } catch (error) {
+        if (error instanceof StorageError2) {
+          throw error;
+        }
+        throw new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, "the source stream failed", {
+          cause: error instanceof Error ? error.name : "unknown"
+        });
+      } finally {
+        clearTimeout(timer);
+        if (onAbort !== undefined) {
+          signal?.removeEventListener("abort", onAbort);
+        }
+        guard.catch(() => {
+          return;
+        });
+      }
+      if (step.done) {
+        return;
+      }
+      if (!(step.value instanceof Uint8Array)) {
+        throw new StorageError2(STORAGE_ERROR_CODES2.invalidRequest, "the stream must hold only bytes");
+      }
+      yield step.value;
+    }
+  } finally {
+    pull.close();
+  }
+}
+function tooLarge(maxBytes) {
+  return new StorageError2(STORAGE_ERROR_CODES2.objectTooLarge, "the stream is over its limit", {
+    details: { limitBytes: maxBytes }
+  });
+}
 
 // src/organization-guard.ts
 import { organizationIdSchema } from "tula-closeline-contract";
@@ -125,4 +219,4 @@ function createStorageValidator(options = {}) {
   };
 }
 
-export { createOrganizationIdGuard, encodeCursor, createStorageValidator };
+export { checkStreamLimit, checkIdleTimeout, readChunks, tooLarge, createOrganizationIdGuard, encodeCursor, createStorageValidator };

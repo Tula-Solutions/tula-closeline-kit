@@ -1,4 +1,8 @@
+import { createHash } from 'node:crypto'
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   type GetObjectCommandOutput,
@@ -7,6 +11,7 @@ import {
   ListObjectsV2Command,
   type ListObjectsV2CommandOutput,
   PutObjectCommand,
+  UploadPartCommand,
 } from '@aws-sdk/client-s3'
 import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
 import type { Logger } from '../logger'
@@ -21,8 +26,12 @@ import {
   type ObjectEntry,
   type ObjectInfo,
   type ObjectStore,
+  type ObjectStream,
+  type PutStreamResult,
+  STREAM_IDLE_TIMEOUT_MS,
   type StoredObject,
 } from './port'
+import { checkIdleTimeout, checkStreamLimit, readChunks, tooLarge } from './stream'
 import { createStorageValidator, encodeCursor } from './validate'
 
 /** The one SDK method the adapter uses; a test passes a stub with this shape. */
@@ -34,7 +43,11 @@ export interface S3Sender {
       | GetObjectCommand
       | HeadObjectCommand
       | DeleteObjectCommand
-      | ListObjectsV2Command,
+      | ListObjectsV2Command
+      | CreateMultipartUploadCommand
+      | UploadPartCommand
+      | CompleteMultipartUploadCommand
+      | AbortMultipartUploadCommand,
     options?: { requestTimeout?: number; abortSignal?: AbortSignal }
   ): Promise<unknown>
 }
@@ -64,6 +77,12 @@ export interface S3ObjectStoreOptions {
   deadlineMs?: number
   /** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
   maxAttempts?: number
+  /** How long a streamed get may wait for the next bytes, in ms, 10 to 600000; default 30000. */
+  streamIdleTimeoutMs?: number
+  /** Size of one part of a streamed put in bytes, 5 MiB to 64 MiB; default 8 MiB. */
+  partBytes?: number
+  /** Parts of one streamed put uploading at once, 1 to 8; default 2. */
+  partConcurrency?: number
   /** Where `list` reports, by number, the keys it skipped; nothing else is logged. */
   logger?: Logger
   /** A replacement for the SDK client, for unit tests with no network. */
@@ -78,6 +97,12 @@ export const S3_DEFAULT_DEADLINE_MS = 60_000
 
 /** The default number of attempts per call. */
 export const S3_DEFAULT_MAX_ATTEMPTS = 3
+
+/** The default size of a part of a streamed put, in bytes. */
+export const S3_DEFAULT_PART_BYTES = 8 * 1024 * 1024
+
+/** The default number of parts of one streamed put uploading at once. */
+export const S3_DEFAULT_PART_CONCURRENCY = 2
 
 /** Every object of every Organization lives under this prefix, then `<organizationId>/`. */
 export const S3_KEY_PREFIX = 'orgs/'
@@ -117,6 +142,65 @@ function discardBody(body: unknown): void {
   }
 }
 
+/**
+ * Wraps a response body so that a read that stalls for the idle timeout, or fails, becomes
+ * `storage.unavailable` instead of a raw socket error, and so that `cancel` destroys the
+ * underlying connection.
+ */
+function guardBody(
+  source: ReadableStream<Uint8Array>,
+  raw: unknown,
+  idleMs: number
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader()
+  let released = false
+  const release = () => {
+    if (!released) {
+      released = true
+      discardBody(raw)
+    }
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const step = await Promise.race([
+          reader.read(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('the body stalled')), idleMs)
+          }),
+        ])
+        if (step.done) {
+          controller.close()
+        } else {
+          controller.enqueue(step.value)
+        }
+      } catch (error) {
+        if (released) {
+          return
+        }
+        release()
+        void reader.cancel().catch(() => undefined)
+        controller.error(
+          new StorageError(
+            STORAGE_ERROR_CODES.unavailable,
+            'the body could not be read to the end',
+            {
+              cause: reduceAwsCause(error),
+            }
+          )
+        )
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+    cancel() {
+      release()
+      return reader.cancel().catch(() => undefined)
+    },
+  })
+}
+
 function isMissing(error: unknown): boolean {
   return error instanceof Error && MISSING.has(error.name)
 }
@@ -146,7 +230,27 @@ function isMissing(error: unknown): boolean {
  * `storage.bad_response`, and the valid keys beyond the run cannot be reached through the port.
  * Accepted by design: this adapter is the only writer under the prefix, and it never writes one.
  *
- * Complexity: put and get O(object size); head and delete O(1); list O(limit); one HTTP call each.
+ * Streamed puts: a body of at most one part is one PutObject. A larger one is a multipart upload
+ * with parts of `partBytes` (8 MiB), `partConcurrency` (2) at a time, so memory is about
+ * (concurrency + 1) parts whatever the object size. Every request has the per-call deadline
+ * (`deadlineMs`) and the SDK's retries; the stream as a whole is bounded by `maxBytes` and by the
+ * caller's `signal`. On any failure the in-flight parts are awaited and the multipart upload is
+ * aborted, so no part stays billed. The object appears only when the upload completes, so a write
+ * that fails before the completing request leaves nothing readable and an object already under
+ * the key stays as it was.
+ *
+ * Residual cases, which no code here can close: (1) a throw after the last part was sent (the
+ * completing request timed out or its answer was lost) means the content under the key is unknown,
+ * because S3 may have finished: the caller retries (put is idempotent) or heads and deletes before
+ * relying on absence; (2) the abort is best-effort; (3) a create or part request that timed out
+ * client-side but reached S3 can leave an incomplete upload that only the bucket's lifecycle rule
+ * removes, as does a process that dies mid-upload. The bucket must carry that rule: abort
+ * incomplete multipart uploads 1 day after initiation (`AbortIncompleteMultipartUpload`,
+ * `DaysAfterInitiation: 1`, the finest S3 offers).
+ *
+ * Complexity: put and get O(object size); putStream O(object size) time and O(part size)
+ * memory; getStream, head and delete O(1); list O(limit); one HTTP call each, except a streamed
+ * put (one call per part).
  */
 export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore {
   if (options.endpoint !== undefined && options.environment !== 'local') {
@@ -175,6 +279,18 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
   }
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new TypeError('maxAttempts must be a whole number from 1 to 10')
+  }
+  const streamIdleMs = options.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS
+  if (!Number.isInteger(streamIdleMs) || streamIdleMs < 10 || streamIdleMs > 600_000) {
+    throw new TypeError('streamIdleTimeoutMs must be a whole number from 10 to 600000')
+  }
+  const partBytes = options.partBytes ?? S3_DEFAULT_PART_BYTES
+  const partConcurrency = options.partConcurrency ?? S3_DEFAULT_PART_CONCURRENCY
+  if (!Number.isInteger(partBytes) || partBytes < 5 * 1024 * 1024 || partBytes > 64 * 1024 * 1024) {
+    throw new TypeError('partBytes must be a whole number from 5 MiB to 64 MiB')
+  }
+  if (!Number.isInteger(partConcurrency) || partConcurrency < 1 || partConcurrency > 8) {
+    throw new TypeError('partConcurrency must be a whole number from 1 to 8')
   }
   const check = createStorageValidator({
     maxObjectBytes: options.maxObjectBytes,
@@ -254,6 +370,200 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
         )
       } catch (error) {
         throw mapFailure('a put', error)
+      }
+    },
+
+    async putStream(organizationId, key, body, putOptions) {
+      const location = prefixOf(check.organization(organizationId)) + check.key(key)
+      const contentType = check.contentType(putOptions?.contentType)
+      const maxBytes = checkStreamLimit(putOptions?.maxBytes)
+      const stop = new AbortController()
+      const requestSignal = () =>
+        AbortSignal.any([
+          AbortSignal.timeout(deadlineMs),
+          stop.signal,
+          ...(putOptions?.signal === undefined ? [] : [putOptions.signal]),
+        ])
+      const hash = createHash('sha256')
+      let size = 0
+      let current = Buffer.allocUnsafe(partBytes)
+      let filled = 0
+      let uploadId: string | undefined
+      let partNumber = 0
+      const completed: Array<{ ETag: string; PartNumber: number }> = []
+      const inflight = new Set<Promise<void>>()
+      let failure: unknown
+
+      const uploadPart = async (data: Buffer, number: number): Promise<void> => {
+        const output = (await client.send(
+          new UploadPartCommand({
+            Bucket: bucket,
+            Key: location,
+            UploadId: uploadId as string,
+            PartNumber: number,
+            Body: data,
+            ContentLength: data.byteLength,
+          }),
+          { requestTimeout: timeoutMs, abortSignal: requestSignal() }
+        )) as { ETag?: string }
+        if (output.ETag === undefined) {
+          throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no part tag')
+        }
+        completed.push({ ETag: output.ETag, PartNumber: number })
+      }
+      const launch = async (data: Buffer): Promise<void> => {
+        if (uploadId === undefined) {
+          const created = (await client.send(
+            new CreateMultipartUploadCommand({
+              Bucket: bucket,
+              Key: location,
+              ContentType: contentType,
+            }),
+            { requestTimeout: timeoutMs, abortSignal: requestSignal() }
+          )) as { UploadId?: string }
+          if (created.UploadId === undefined) {
+            throw new StorageError(
+              STORAGE_ERROR_CODES.badResponse,
+              'the store returned no upload id'
+            )
+          }
+          uploadId = created.UploadId
+        }
+        // Wait for a free slot; a failed part surfaces here, before more is read.
+        while (inflight.size >= partConcurrency && failure === undefined) {
+          await Promise.race(inflight)
+        }
+        if (failure !== undefined) {
+          throw failure
+        }
+        partNumber += 1
+        const task: Promise<void> = uploadPart(data, partNumber).then(
+          () => {
+            inflight.delete(task)
+          },
+          (error: unknown) => {
+            failure ??= error
+            inflight.delete(task)
+            stop.abort()
+          }
+        )
+        inflight.add(task)
+      }
+
+      try {
+        for await (const chunk of readChunks(
+          body,
+          putOptions?.signal,
+          checkIdleTimeout(putOptions?.idleTimeoutMs)
+        )) {
+          size += chunk.byteLength
+          if (size > maxBytes) {
+            throw tooLarge(maxBytes)
+          }
+          hash.update(chunk)
+          let offset = 0
+          while (offset < chunk.byteLength) {
+            const take = Math.min(partBytes - filled, chunk.byteLength - offset)
+            current.set(chunk.subarray(offset, offset + take), filled)
+            filled += take
+            offset += take
+            if (filled === partBytes) {
+              await launch(current)
+              current = Buffer.allocUnsafe(partBytes)
+              filled = 0
+            }
+          }
+        }
+        if (uploadId === undefined) {
+          // At most one part: an ordinary put, which also covers an empty body.
+          await send(
+            requestSignal(),
+            new PutObjectCommand({
+              Bucket: bucket,
+              Key: location,
+              Body: current.subarray(0, filled),
+              ContentLength: filled,
+              ContentType: contentType,
+            })
+          )
+        } else {
+          if (filled > 0) {
+            await launch(current.subarray(0, filled))
+          }
+          while (inflight.size > 0) {
+            await Promise.all(inflight)
+          }
+          if (failure !== undefined) {
+            throw failure
+          }
+          completed.sort((x, y) => x.PartNumber - y.PartNumber)
+          await client.send(
+            new CompleteMultipartUploadCommand({
+              Bucket: bucket,
+              Key: location,
+              UploadId: uploadId,
+              MultipartUpload: { Parts: completed },
+            }),
+            { requestTimeout: timeoutMs, abortSignal: requestSignal() }
+          )
+        }
+        const result: PutStreamResult = { size, sha256: hash.digest('hex') }
+        return result
+      } catch (error) {
+        stop.abort()
+        await Promise.allSettled(inflight)
+        if (uploadId !== undefined) {
+          try {
+            await client.send(
+              new AbortMultipartUploadCommand({
+                Bucket: bucket,
+                Key: location,
+                UploadId: uploadId,
+              }),
+              { requestTimeout: timeoutMs, abortSignal: AbortSignal.timeout(timeoutMs * 2) }
+            )
+          } catch {
+            // Nothing more can be done from here; the bucket's lifecycle rule expires the parts.
+          }
+        }
+        throw error instanceof StorageError ? error : mapFailure('a streamed put', error)
+      }
+    },
+
+    async getStream(organizationId, key) {
+      // The deadline bounds getting the headers only. A large object read slowly must not be cut
+      // by it, so the timer is cleared once `send` answers and the body has an idle timeout.
+      const opening = new AbortController()
+      const timer = setTimeout(() => opening.abort(), deadlineMs)
+      const location = prefixOf(check.organization(organizationId)) + check.key(key)
+      let output: GetObjectCommandOutput
+      try {
+        output = (await client.send(new GetObjectCommand({ Bucket: bucket, Key: location }), {
+          requestTimeout: timeoutMs,
+          abortSignal: opening.signal,
+        })) as GetObjectCommandOutput
+      } catch (error) {
+        if (isMissing(error)) {
+          return undefined
+        }
+        throw mapFailure('a get', error)
+      } finally {
+        clearTimeout(timer)
+      }
+      try {
+        const described = infoOf(key, output)
+        if (output.Body === undefined || typeof output.Body.transformToWebStream !== 'function') {
+          throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no body')
+        }
+        const source = output.Body.transformToWebStream() as ReadableStream<Uint8Array>
+        const stream: ObjectStream = {
+          ...described,
+          body: guardBody(source, output.Body, streamIdleMs),
+        }
+        return stream
+      } catch (error) {
+        discardBody(output.Body)
+        throw error
       }
     },
 
