@@ -91,6 +91,16 @@ describe('the memory object store', () => {
       expect(await store.resolvePresigned(url)).toBeUndefined()
     })
 
+    test('resolvePresigned works when destructured from the store', async () => {
+      const store = createMemoryObjectStore()
+      await store.put(ORG, 'k', new Uint8Array([7]))
+      const { presignGet, resolvePresigned } = store
+
+      const url = await presignGet(ORG, 'k')
+
+      expect((await resolvePresigned(url))?.body).toEqual(new Uint8Array([7]))
+    })
+
     test('a changed Organization, key, expiry or signature does not resolve', async () => {
       const store = createMemoryObjectStore()
       await store.put(ORG, 'k', new Uint8Array([1]))

@@ -767,8 +767,14 @@ response, and do not store it; mint one per use. Signing makes no request, so it
 the object exists (a missing object is the vendor's 404), and the key stays inside the Organization's
 prefix. The S3 adapter signs locally with the SDK's presigner. The memory adapter returns
 `http://memory.object-store.invalid/<org>/<key>?expires=<ms>&sig=<hmac>` (plain `http:` so a
-Transcriber refuses it outside `local`) and `resolvePresigned(url)` reads it back, rejecting an
-expired, tampered or foreign URL.
+Transcriber refuses it outside `local`) and `resolvePresigned(url)` (safe to destructure) reads it
+back, rejecting an expired, tampered or foreign URL.
+
+**The URL lives for the shorter of `expiresInSeconds` and the signing credentials' remaining life**:
+a task-role session carries an `X-Amz-Security-Token` and may end sooner. So mint the URL
+immediately before `submit`, and mint a new one for a retry. Sign with the service's own role,
+holding only `s3:GetObject` on its prefix, never long-lived user keys. There are no response
+content-type or content-disposition overrides.
 
 Not in 0.8.0: browser upload URLs (the playbook service uploads through the service, so none is
 needed yet; add them with a short lifetime and a key and method binding when a browser must
@@ -851,7 +857,10 @@ straight to the job and scans nothing. Why the caller and not the adapter: the a
 storage, so there is no mapping table to keep consistent, migrate or purge. The fallback for a crash
 between the vendor accepting the job and the caller storing the id is `list`, which finds every
 copy for a client reference and carries each one's `vendorId`; `getResult` and `delete` without a
-hint do the same lookup. **A wrong hint is ignored, not refused**: an id naming a job with another
+hint do the same lookup. An adapter honours a hint with one vendor read of the hinted job that
+confirms its stored client reference and Organization equal the call's before it reads or deletes
+it; if the vendor cannot store those two on a job, the adapter ignores hints entirely.
+**A wrong hint is ignored, not refused**: an id naming a job with another
 client reference, another Organization's job, or no job at all makes the call behave exactly as if
 there were no hint, so it can never act on a job the call is not about and never tells one
 Organization whether another's job exists. Only an id of the wrong shape is
@@ -864,7 +873,7 @@ can do neither in that time, `delete` throws `transcriber.unavailable` (retryabl
 not done until it has resolved for every reference. **A purge retries `transcriber.unavailable` with
 exponential backoff and jitter for at least the vendor's longest processing time, then escalates**
 (reports the Call as not purged and alerts an operator) and never drops it; a failed `delete` changes
-nothing, so every retry is safe (`failNext('delete', 'transcriber.unavailable', 3)` shows it). A purge also calls `list` with a reference
+nothing, so every retry is safe (the stand-in test with `failNext('delete', 'transcriber.unavailable', 3)` shows it). A purge also calls `list` with a reference
 prefix and deletes each entry, which removes a copy even when the worker died after the vendor
 accepted the send and before it stored anything. **`list` is for background jobs only**: it may
 scan the vendor's account; its order is stable and its cursor opaque; a page may be short, even

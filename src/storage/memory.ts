@@ -25,7 +25,7 @@ interface Entry {
 /** An {@link ObjectStore} that keeps everything in the process, for tests. Not for production. */
 export interface MemoryObjectStore extends ObjectStore {
   /**
-   * Reads the object a URL from this store's `presignGet` names, or returns `undefined` when the
+   * Safe to destructure (it does not use `this`). Reads the object a URL from this store's `presignGet` names, or returns `undefined` when the
    * URL is not this store's, was altered, has expired by the store's clock or names no object. For
    * tests: it stands in for the vendor's GET.
    */
@@ -56,7 +56,7 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
     lastModified: new Date(entry.lastModified),
   })
 
-  return {
+  const store: MemoryObjectStore = {
     async presignGet(organizationId, key, presignOptions) {
       const org = check.organization(organizationId)
       const name = check.key(key)
@@ -87,7 +87,7 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
         if (clock.now().getTime() > expires) {
           return undefined
         }
-        return await this.get(org, name)
+        return await store.get(org, name)
       } catch {
         return undefined
       }
@@ -215,4 +215,5 @@ export function createMemoryObjectStore(options: MemoryObjectStoreOptions = {}):
       return result
     },
   }
+  return store
 }

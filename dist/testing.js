@@ -391,7 +391,7 @@ ${expires}`).digest("hex");
     contentType: entry.contentType,
     lastModified: new Date(entry.lastModified)
   });
-  return {
+  const store = {
     async presignGet(organizationId, key, presignOptions) {
       const org = check.organization(organizationId);
       const name = check.key(key);
@@ -417,7 +417,7 @@ ${expires}`).digest("hex");
         if (clock.now().getTime() > expires) {
           return;
         }
-        return await this.get(org, name);
+        return await store.get(org, name);
       } catch {
         return;
       }
@@ -533,6 +533,7 @@ ${expires}`).digest("hex");
       return result;
     }
   };
+  return store;
 }
 // src/transcribe/memory.ts
 import { createHash as createHash2 } from "node:crypto";

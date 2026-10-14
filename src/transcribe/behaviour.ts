@@ -11,6 +11,13 @@ export interface TranscriberSubject {
   organizations: { a: string; b: string; aExtended: string }
   /** Milliseconds between reads while waiting for a result; default 0 (the stand-in answers at once). */
   pollIntervalMs?: number
+  /**
+   * Opens another instance of the same adapter over the same vendor state, as a restarted service
+   * would, so a real-adapter run can submit through one instance and list and delete through
+   * another. The stand-in has no storage outside itself, so its `reopen` may return the same
+   * store.
+   */
+  reopen(): Promise<Transcriber>
   /** Removes what the subject created, including every vendor copy. */
   close(): Promise<void>
 }
@@ -337,6 +344,36 @@ export function transcriberBehaviour(
           invalid
         )
         expect(await references(s, a)).toEqual(['call_1:1'])
+      })
+
+      test('a hint with the id of a deleted job is ignored and acts on the resubmitted one', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const old = await s.transcriber.submit(a, send('call_1:1'))
+        await s.transcriber.delete(a, 'call_1:1')
+        const fresh = await s.transcriber.submit(a, send('call_1:1'))
+        expect(fresh.created).toBe(true)
+
+        expect(
+          await s.transcriber.getResult(a, 'call_1:1', { vendorId: old.vendorId })
+        ).toBeDefined()
+        expect(await s.transcriber.delete(a, 'call_1:1', { vendorId: old.vendorId })).toEqual({
+          existed: true,
+        })
+        expect(await references(s, a)).toEqual([])
+      })
+
+      test('a send submitted through one instance is listed and deleted through another', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.transcriber.submit(a, send('call_1:1'))
+        const other = await s.reopen()
+
+        const found = await other.list(a, { prefix: 'call_1:' })
+
+        expect(found.items.map((item) => item.clientReference)).toEqual(['call_1:1'])
+        expect(await other.delete(a, 'call_1:1')).toEqual({ existed: true })
+        expect(await references(s, a)).toEqual([])
       })
 
       test('a send whose id was never kept is found by listing for its reference and deleted without it', async () => {

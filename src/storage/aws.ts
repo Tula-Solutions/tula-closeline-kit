@@ -232,7 +232,11 @@ function isMissing(error: unknown): boolean {
  * Accepted by design: this adapter is the only writer under the prefix, and it never writes one.
  *
  * Presigned reads: `presignGet` signs a GetObject for `orgs/<organizationId>/<key>` with the SDK's
- * presigner and makes no request. The URL is a bearer credential and is never logged.
+ * presigner and makes no request. The URL is a bearer credential and is never logged. It lives for
+ * the shorter of the requested lifetime and the signing credentials' remaining life (a task-role
+ * session carries `X-Amz-Security-Token`), so the caller mints it just before use and again for a
+ * retry; the signing identity should be the service role with only `s3:GetObject` on its prefix,
+ * never long-lived user keys. No response header overrides are offered.
  *
  * Streamed puts: a body of at most one part is one PutObject. A larger one is a multipart upload
  * with parts of `partBytes` (8 MiB), `partConcurrency` (2) at a time, so memory is about

@@ -1168,6 +1168,29 @@ function transcriberBehaviour(name, make, skip = false) {
         await expect4(s.transcriber.delete(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
         expect4(await references(s, a)).toEqual(["call_1:1"]);
       });
+      test4("a hint with the id of a deleted job is ignored and acts on the resubmitted one", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const old = await s.transcriber.submit(a, send("call_1:1"));
+        await s.transcriber.delete(a, "call_1:1");
+        const fresh = await s.transcriber.submit(a, send("call_1:1"));
+        expect4(fresh.created).toBe(true);
+        expect4(await s.transcriber.getResult(a, "call_1:1", { vendorId: old.vendorId })).toBeDefined();
+        expect4(await s.transcriber.delete(a, "call_1:1", { vendorId: old.vendorId })).toEqual({
+          existed: true
+        });
+        expect4(await references(s, a)).toEqual([]);
+      });
+      test4("a send submitted through one instance is listed and deleted through another", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.transcriber.submit(a, send("call_1:1"));
+        const other = await s.reopen();
+        const found = await other.list(a, { prefix: "call_1:" });
+        expect4(found.items.map((item) => item.clientReference)).toEqual(["call_1:1"]);
+        expect4(await other.delete(a, "call_1:1")).toEqual({ existed: true });
+        expect4(await references(s, a)).toEqual([]);
+      });
       test4("a send whose id was never kept is found by listing for its reference and deleted without it", async () => {
         const s = await subject();
         const { a } = s.organizations;

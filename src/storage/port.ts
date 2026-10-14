@@ -172,7 +172,11 @@ export interface ObjectStore {
    * to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
    * because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
    * would only widen the window in which a leaked URL reads a customer's call. Signing makes no
-   * request; O(1). The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
+   * request; O(1). **The URL lives for the shorter of `expiresInSeconds` and the remaining life of
+   * the credentials that signed it** (a task-role session adds `X-Amz-Security-Token` and may end
+   * sooner), so mint it immediately before `submit`, and mint a new one for a retry. Sign with the
+   * service's own role holding only `s3:GetObject` on its prefix, never long-lived user keys. No
+   * response content-type or content-disposition overrides are offered. The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
    * back, which a transcriber accepts only in `local`.
    */
   presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>

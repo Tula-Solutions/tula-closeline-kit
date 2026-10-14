@@ -98,6 +98,13 @@ export interface VendorIdHint {
    * other), so a stale or mixed-up id can neither act on a job the call is not about nor tell a
    * caller whether another Organization's job exists. Only an id of the wrong shape is refused
    * (`transcriber.invalid_request`).
+   *
+   * **How an adapter honours a hint safely:** "straight to the job" means one vendor read of the
+   * hinted job, never acting unchecked. The adapter reads that job and confirms that its stored
+   * client reference and Organization equal the call's before it returns its result or deletes it;
+   * if they differ, or the job is gone, it ignores the hint and looks up by reference. If the
+   * vendor cannot store the reference and the Organization on a job, the adapter must ignore
+   * hints entirely.
    */
   vendorId?: string
 }
@@ -196,7 +203,9 @@ export interface TranscriptionPage {
  *
  * **The vendor id (decided, hub issue 75):** `submit` returns the vendor's job id, the caller
  * stores it beside its own record of the send (the playbook service keeps it next to
- * `vendor_send_seq`), and passes it back as a hint so a read or delete goes straight to the job.
+ * `vendor_send_seq`), and passes it back as a hint so a read or delete goes straight to the job: one vendor read that
+ * confirms the job's stored client reference and Organization equal the call's (see
+ * {@link VendorIdHint}), never an unchecked act.
  * The adapter owns no storage of its own: no mapping table. The fallback for a crash after the
  * vendor accepted the job and before the caller stored the id is `list`, which finds every copy
  * for a client reference, so `getResult` and `delete` still work with the reference alone.
@@ -206,6 +215,8 @@ export interface TranscriptionPage {
  * parameter echoed on the job), is not established; its transcript object has no such field in the
  * documentation read so far. The fallback above needs exactly that listing, so until it is shown
  * to work against the vendor no real adapter may be written, and this port cannot paper over it. The
+ * same holds for the hint check: the vendor must be able to store the reference and the
+ * Organization on a job, or hints are ignored. The
  * other open questions (ADR 0018, "before real audio"): can a stereo file be transcribed per
  * channel with its own speaker label (`multichannel`) and what does it bill, the EU endpoint for
  * the EU Region, and how soon after a delete the vendor's copy is gone and whether it confirms
