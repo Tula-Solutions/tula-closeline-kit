@@ -501,7 +501,8 @@ interface AudioReference {
 	* An `https:` URL (`http:` only when the adapter runs with `ENVIRONMENT=local`) that stays valid until the vendor has
 	* fetched the audio, typically a presigned GET of the object store, valid for minutes. It may
 	* carry credentials in its query string, so it is never logged, never put in an error and never
-	* stored. No user information (`user:pass@`) is accepted.
+	* stored. No user information (`user:pass@`) is accepted. The service builds this URL from its
+	* own object store; it is never taken from a user, or the vendor becomes a way to fetch any URL.
 	*/
 	url: string;
 }
@@ -523,14 +524,15 @@ interface TranscribeRequest {
 	/** With `diarize`: the most speakers to find, 1 to 10. Not allowed with `split_channels`. */
 	maxSpeakers?: number;
 	/**
-	* Optional: a stable name for the audio itself, such as the object key and content hash
+	* Required: a stable name for the audio itself, such as the object key and content hash
 	* (`<key>:<sha256>`), 1 to 256 of letters, digits, `.`, `_`, `:`, `/` and `-`. The audio URL is
 	* short-lived and a retry gets a new one, so the URL is not part of what makes two sends "the
 	* same"; this is. Sending a reference again with a different `audioKey` is a conflict.
 	*/
-	audioKey?: string;
+	audioKey: string;
 	/**
 	* Optional: an `https:` URL the vendor may call when the result is ready, to save polling. The
+	* service builds it; it is never taken from a user. The
 	* port never requires one: a result is always readable with {@link Transcriber.getResult}, and a
 	* webhook is only a hint to look sooner. An adapter that cannot use it ignores it.
 	*/
@@ -583,7 +585,10 @@ interface TranscriptionEntry {
 }
 /** Options of {@link Transcriber.list}. */
 interface TranscriptionListOptions {
-	/** Only references that start with this, such as `call_1:`; default all. */
+	/**
+	* Only references that start with this; default all. End the prefix with the separator
+	* (`call_1:`): `call_1` also matches `call_10:`.
+	*/
 	prefix?: string;
 	/** The `nextCursor` of the previous page. */
 	cursor?: string;
@@ -608,26 +613,30 @@ interface TranscriptionPage {
 *
 * What every adapter must do: give every vendor call a timeout and a bounded, jittered retry
 * (only `transcriber.unavailable` is retryable by the caller after that), make `submit` idempotent
-* by client reference, throw {@link TranscriberError} with a code from the closed set, and never
-* log, throw or report audio, an audio URL, transcript text, speaker labels or a vendor id. Audio
-* and text are personal data of Prospects; the vendor must not train on them and must delete them
-* (see `delete`).
+* by client reference, throw {@link TranscriberError} with a code from the closed set, read at most
+* `MAX_TRANSCRIPT_RESPONSE_BYTES` of any response before parsing it and run every result through
+* `checkTranscriptionResult` (vendor output is untrusted), and never log, throw or report audio,
+* an audio URL, transcript text, speaker labels or a vendor id. Audio and text are personal data
+* of Prospects; the vendor must not train on them and must delete them (see `delete`).
 *
-* Open questions the real adapter must answer before it is written (ADR 0018, "before real
-* audio"): (1) AssemblyAI's transcript has no client reference field, so does it accept a
-* caller-chosen id or metadata that a list can filter by (otherwise the adapter must persist the
-* reference-to-vendor-id mapping itself, and `delete` of a send whose id was never stored is
-* impossible by lookup alone), (2) can a stereo file be transcribed per channel with its own speaker
-* label (`multichannel`), and what does it bill, (3) the EU endpoint for the EU Region, (4) how soon
-* after a delete the vendor's copy is gone, and whether it confirms it. Until all four are
-* answered, no real adapter may run outside `local`.
+* **A blocker for the real adapter, unverified:** whether AssemblyAI lets the caller give a
+* reference of its own, or look a transcript up by one, is not established (its transcript object
+* has no such field in the documentation read so far). If it does not, the adapter owns a mapping
+* store (a table of `(organizationId, clientReference) -> vendor id`, written before the vendor
+* call and so recoverable after a crash) and `delete` and `list` run on that mapping plus the
+* vendor's own list, which is a design of its own and not a thing this port can paper over. The
+* other open questions (ADR 0018, "before real audio"): can a stereo file be transcribed per
+* channel with its own speaker label (`multichannel`) and what does it bill, the EU endpoint for
+* the EU Region, and how soon after a delete the vendor's copy is gone and whether it confirms
+* it. Until all are answered, no real adapter may run outside `local`.
 */
 interface Transcriber {
 	/**
 	* Starts a transcription. Idempotent by `(organizationId, clientReference)`: repeating the same
 	* request returns `created: false` and starts nothing, so a caller that crashed before storing
 	* anything can send again safely; the same reference with a different mode, speaker cap or
-	* `audioKey` is `transcriber.conflict`. The audio URL is not compared (a retry presigns a new
+	* `audioKey` is `transcriber.conflict`. Concurrent submits of one reference create it at most
+	* once: at most one of them answers `created: true`. The audio URL is not compared (a retry presigns a new
 	* one), so without an `audioKey` the audio itself is not checked. An adapter validates with the
 	* shared checks and its `ENVIRONMENT`: plain `http:` URLs only in `local`. Everything is validated before anything is sent. O(1).
 	*/
@@ -639,20 +648,28 @@ interface Transcriber {
 	*/
 	getResult(organizationId: string, clientReference: string): Promise<TranscriptionResult | undefined>;
 	/**
-	* Deletes the vendor's copy (audio, transcript and metadata) of one send, and cancels it when it
-	* is still pending. Returns `existed: true` when a copy was there. Idempotent: deleting again, or
-	* a reference never sent, resolves with `existed: false`. It must work with the client reference
-	* alone, including for a send whose vendor id the caller never stored (a crash between the vendor
-	* accepting it and the caller recording its id), which is why {@link Transcriber.list} exists.
-	* Resolves only when the vendor confirmed the deletion. O(1).
+	* Deletes the vendor's copy (audio, transcript and metadata) of the send with this reference,
+	* every copy that carries it, and returns `existed: true` when at least one was found and
+	* removed (or cancelled). Idempotent: deleting again, or a reference never sent, resolves with
+	* `existed: false`. It works with the client reference alone, including for a send whose vendor
+	* id the caller never stored (a crash between the vendor accepting it and the caller recording
+	* its id), which is why {@link Transcriber.list} exists. A send still processing is cancelled,
+	* or waited for a bounded time; if the vendor can do neither within that time the call throws
+	* `transcriber.unavailable` (retryable) and the caller retries: a purge is not done until
+	* `delete` has resolved for every reference. It resolves only when the vendor confirmed the
+	* deletion. **The caller must stop new submits for a Call before it lists and deletes**, or a
+	* send made in between survives. O(1).
 	*/
 	delete(organizationId: string, clientReference: string): Promise<{
 		existed: boolean;
 	}>;
 	/**
-	* Lists the Organization's sends by reference prefix, in reference order, one page of at most
-	* 1000. A purge lists `<callId>:` and deletes each, so a send the caller has no record of is
-	* still removed. Work proportional to the Organization's size: call it from a queued job.
+	* Lists the Organization's sends by reference prefix, **for background jobs only**: it may scan
+	* the vendor's account, so it is slow and never on a request path. The order is stable (by
+	* reference) and the cursor is opaque, valid only for the same Organization and prefix. A page
+	* may be shorter than `limit`, even empty, and still have a `nextCursor`: follow the cursor until
+	* it is absent. A purge lists `<callId>:` and deletes each entry, so a send the caller has no
+	* record of is still removed. Work proportional to the Organization's size.
 	*/
 	list(organizationId: string, options?: TranscriptionListOptions): Promise<TranscriptionPage>;
 }
@@ -666,6 +683,8 @@ interface TranscriberSubject {
 		b: string;
 		aExtended: string;
 	};
+	/** Milliseconds between reads while waiting for a result; default 0 (the stand-in answers at once). */
+	pollIntervalMs?: number;
 	/** Removes what the subject created, including every vendor copy. */
 	close(): Promise<void>;
 }

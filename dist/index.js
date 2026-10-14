@@ -6,15 +6,6 @@ import {
   redactFields,
   prepareFields,
   shouldReportError2,
-  TRANSCRIBER_ERROR_CODES2,
-  TranscriberError2,
-  MAX_CLIENT_REFERENCE_LENGTH2,
-  MAX_AUDIO_URL_LENGTH2,
-  MAX_SPEAKERS2,
-  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIPT_TURNS2,
-  MAX_TURN_TEXT2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -24,7 +15,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-tewbpdfn.js";
+} from "./shared/chunk-sf8f3fp3.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -49,6 +40,24 @@ import {
   STREAM_IDLE_TIMEOUT_MS2
 } from "./shared/chunk-60y8a3sa.js";
 import {
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIPT_TURNS2,
+  MAX_TURN_TEXT2,
+  MAX_TRANSCRIPT_RESPONSE_BYTES2,
+  MAX_AUDIO_MS2,
+  MAX_TRANSCRIPT_CHARS2,
+  MAX_SPEAKER_LABEL2,
+  MAX_CHANNELS2,
+  TRANSCRIPTION_FAILURES2,
+  checkTranscriptionResult2
+} from "./shared/chunk-mv441zb4.js";
+import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
   MAX_VISIBILITY_SECONDS2,
@@ -57,6 +66,9 @@ import {
   assertBatchCount2,
   systemSleep2
 } from "./shared/chunk-dpkegc79.js";
+import {
+  waitForTranscription2
+} from "./shared/chunk-ybwrkc2f.js";
 import {
   AppError2,
   isAppError2,
@@ -1602,34 +1614,6 @@ function createErrorReporter(options) {
   }
   return reporter;
 }
-// src/transcribe/wait.ts
-var defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function waitForTranscription(transcriber, organizationId, clientReference, options = {}) {
-  const maxAttempts = options.maxAttempts ?? 60;
-  const intervalMs = options.intervalMs ?? 5000;
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 1000) {
-    throw new TypeError("maxAttempts must be a whole number from 1 to 1000");
-  }
-  if (!Number.isFinite(intervalMs) || intervalMs < 0 || intervalMs > 60000) {
-    throw new TypeError("intervalMs must be a number from 0 to 60000");
-  }
-  const sleep = options.sleep ?? defaultSleep;
-  const random = options.random ?? Math.random;
-  let last;
-  for (let attempt = 1;attempt <= maxAttempts; attempt++) {
-    if (options.signal?.aborted) {
-      return last ?? { status: "pending" };
-    }
-    last = await transcriber.getResult(organizationId, clientReference);
-    if (last === undefined || last.status !== "pending") {
-      return last;
-    }
-    if (attempt < maxAttempts) {
-      await sleep(Math.round(intervalMs * (0.5 + random())));
-    }
-  }
-  return last;
-}
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
@@ -1655,8 +1639,10 @@ export {
   InternalCallError,
   MAX_ATTRIBUTES2 as MAX_ATTRIBUTES,
   MAX_ATTRIBUTE_STRING2 as MAX_ATTRIBUTE_STRING,
+  MAX_AUDIO_MS2 as MAX_AUDIO_MS,
   MAX_AUDIO_URL_LENGTH2 as MAX_AUDIO_URL_LENGTH,
   MAX_BATCH_SIZE2 as MAX_BATCH_SIZE,
+  MAX_CHANNELS2 as MAX_CHANNELS,
   MAX_CLIENT_REFERENCE_LENGTH2 as MAX_CLIENT_REFERENCE_LENGTH,
   MAX_DELETE_BATCH2 as MAX_DELETE_BATCH,
   MAX_DIMENSIONS2 as MAX_DIMENSIONS,
@@ -1668,10 +1654,13 @@ export {
   MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
   MAX_OBJECT_BYTES_LIMIT2 as MAX_OBJECT_BYTES_LIMIT,
   MAX_SPEAKERS2 as MAX_SPEAKERS,
+  MAX_SPEAKER_LABEL2 as MAX_SPEAKER_LABEL,
   MAX_STREAM_BYTES_LIMIT2 as MAX_STREAM_BYTES_LIMIT,
   MAX_TOKEN_LENGTH,
   MAX_TOP_K2 as MAX_TOP_K,
   MAX_TRANSCRIBER_LIST_LIMIT2 as MAX_TRANSCRIBER_LIST_LIMIT,
+  MAX_TRANSCRIPT_CHARS2 as MAX_TRANSCRIPT_CHARS,
+  MAX_TRANSCRIPT_RESPONSE_BYTES2 as MAX_TRANSCRIPT_RESPONSE_BYTES,
   MAX_TRANSCRIPT_TURNS2 as MAX_TRANSCRIPT_TURNS,
   MAX_TURN_TEXT2 as MAX_TURN_TEXT,
   MAX_UPSERT_BATCH2 as MAX_UPSERT_BATCH,
@@ -1685,6 +1674,7 @@ export {
   STREAM_IDLE_TIMEOUT_MS2 as STREAM_IDLE_TIMEOUT_MS,
   StorageError2 as StorageError,
   TRANSCRIBER_ERROR_CODES2 as TRANSCRIBER_ERROR_CODES,
+  TRANSCRIPTION_FAILURES2 as TRANSCRIPTION_FAILURES,
   TokenVerificationError,
   TranscriberError2 as TranscriberError,
   VECTOR_ERROR_CODES2 as VECTOR_ERROR_CODES,
@@ -1693,6 +1683,7 @@ export {
   assertBatchCount2 as assertBatchCount,
   assertReceiveOptions2 as assertReceiveOptions,
   assertVisibility2 as assertVisibility,
+  checkTranscriptionResult2 as checkTranscriptionResult,
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
@@ -1717,5 +1708,5 @@ export {
   systemClock2 as systemClock,
   systemSleep2 as systemSleep,
   toErrorBody2 as toErrorBody,
-  waitForTranscription
+  waitForTranscription2 as waitForTranscription
 };

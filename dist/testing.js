@@ -2,13 +2,6 @@ import {
   scrubText2,
   prepareFields,
   shouldReportError2,
-  TRANSCRIBER_ERROR_CODES2,
-  TranscriberError2,
-  MAX_CLIENT_REFERENCE_LENGTH2,
-  MAX_AUDIO_URL_LENGTH2,
-  MAX_SPEAKERS2,
-  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIBER_LIST_LIMIT2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -17,7 +10,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-tewbpdfn.js";
+} from "./shared/chunk-sf8f3fp3.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -40,6 +33,16 @@ import {
   encodeCursor,
   createStorageValidator
 } from "./shared/chunk-9sd8894z.js";
+import {
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  checkTranscriptionResult2
+} from "./shared/chunk-mv441zb4.js";
 import {
   assertReceiveOptions2,
   assertVisibility2,
@@ -529,11 +532,8 @@ function createTranscriberValidator(options) {
     return value;
   };
   const audioKey = (value) => {
-    if (value === undefined) {
-      return;
-    }
     if (typeof value !== "string" || !AUDIO_KEY.test(value)) {
-      throw bad('the audio key is 1 to 256 letters, digits, ".", "_", ":", "/" or "-"');
+      throw bad('an audio key is required: 1 to 256 letters, digits, ".", "_", ":", "/" or "-"');
     }
     return value;
   };
@@ -629,6 +629,7 @@ function defaultOutcome(request) {
   };
 }
 function checkOutcome(outcome) {
+  checkTranscriptionResult2(outcome.result);
   const reads = outcome.pendingReads ?? 1;
   if (!Number.isInteger(reads) || reads < 0 || reads > 1000) {
     throw new TypeError("pendingReads must be a whole number from 0 to 1000");

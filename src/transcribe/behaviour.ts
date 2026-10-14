@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import type { TranscribeRequest, Transcriber } from './port'
+import type { TranscribeRequest, Transcriber, TranscriptionResult } from './port'
+import { checkTranscriptionResult } from './result'
+import { waitForTranscription } from './wait'
 
 /** What the behaviour suite needs from an adapter under test. */
 export interface TranscriberSubject {
@@ -7,6 +9,8 @@ export interface TranscriberSubject {
   transcriber: Transcriber
   /** Three Organization ids the transcriber accepts: B is unrelated, and `aExtended` starts with `a`. */
   organizations: { a: string; b: string; aExtended: string }
+  /** Milliseconds between reads while waiting for a result; default 0 (the stand-in answers at once). */
+  pollIntervalMs?: number
   /** Removes what the subject created, including every vendor copy. */
   close(): Promise<void>
 }
@@ -40,9 +44,19 @@ export function transcriberBehaviour(
     ): TranscribeRequest => ({
       clientReference: reference,
       audio: { url: `https://audio.example.test/${reference}.mp3?sig=abc` },
+      audioKey: `rec/${reference}:abc`,
       speakers: 'diarize',
       ...extra,
     })
+    /** Waits (bounded) for a final result; a send that never finishes fails the test. */
+    async function finalResult(s: TranscriberSubject, org: string, reference: string) {
+      const result = await waitForTranscription(s.transcriber, org, reference, {
+        maxAttempts: 120,
+        intervalMs: s.pollIntervalMs ?? 0,
+      })
+      expect(result?.status === 'done' || result?.status === 'failed').toBe(true)
+      return result as TranscriptionResult
+    }
     const references = async (s: TranscriberSubject, org: string, prefix?: string) => {
       const found: string[] = []
       let cursor: string | undefined
@@ -114,36 +128,28 @@ export function transcriberBehaviour(
       expect(await references(s, a)).toEqual(['call_1:1'])
     })
 
-    test('a result is pending, done with ordered turns, or failed with a listed reason', async () => {
+    test('a result is pending at first or final, and a final one passes the shared result check', async () => {
       const s = await subject()
       const { a } = s.organizations
-      await s.transcriber.submit(a, send('call_1:1'))
-      const reasons = [
-        'audio_unreachable',
-        'audio_invalid',
-        'no_speech',
-        'too_long',
-        'vendor_failed',
-        'timed_out',
-      ]
+      await s.transcriber.submit(a, send('call_1:1', { maxSpeakers: 2 }))
 
-      const result = await s.transcriber.getResult(a, 'call_1:1')
+      const first = await s.transcriber.getResult(a, 'call_1:1')
+      expect(['pending', 'done', 'failed']).toContain(first?.status as string)
+      const final = await finalResult(s, a, 'call_1:1')
 
-      expect(['pending', 'done', 'failed']).toContain(result?.status as string)
-      if (result?.status === 'done') {
-        expect(result.durationMs).toBeGreaterThanOrEqual(0)
-        let previous = 0
-        for (const turn of result.turns) {
-          expect(typeof turn.speaker).toBe('string')
-          expect(turn.endMs).toBeGreaterThanOrEqual(turn.startMs)
-          expect(turn.startMs).toBeGreaterThanOrEqual(previous)
-          expect(typeof turn.text).toBe('string')
-          previous = turn.startMs
-        }
-      }
-      if (result?.status === 'failed') {
-        expect(reasons).toContain(result.reason)
-      }
+      // Throws on a turn out of order, a bad time, a speaker over the cap or an unlisted reason.
+      checkTranscriptionResult(final, { speakers: 'diarize', maxSpeakers: 2 })
+      expect(checkTranscriptionResult(await s.transcriber.getResult(a, 'call_1:1'))).toEqual(final)
+    })
+
+    test('a split-channels result carries the channel of every turn', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+      await s.transcriber.submit(a, send('call_1:2', { speakers: 'split_channels' }))
+
+      const final = await finalResult(s, a, 'call_1:2')
+
+      checkTranscriptionResult(final, { speakers: 'split_channels' })
     })
 
     test('a send that was never made, or was deleted, has no result', async () => {
@@ -195,6 +201,37 @@ export function transcriberBehaviour(
       expect(first.items).toHaveLength(2)
       expect(first.nextCursor).toBeDefined()
       expect(['pending', 'done', 'failed']).toContain(first.items[0]?.status as string)
+      // A page may be short, so follow the cursor until it ends: nothing repeats and nothing is lost.
+      const seen: string[] = first.items.map((item) => item.clientReference)
+      let cursor = first.nextCursor
+      for (let pages = 0; cursor !== undefined && pages < 20; pages++) {
+        const next = await s.transcriber.list(a, { prefix: 'call_1:', limit: 2, cursor })
+        seen.push(...next.items.map((item) => item.clientReference))
+        cursor = next.nextCursor
+      }
+      expect(seen).toEqual(['call_1:1', 'call_1:2', 'call_1:3'])
+    })
+
+    test('concurrent submits of one reference create it once', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+
+      const answers = await Promise.all(
+        Array.from({ length: 8 }, () => s.transcriber.submit(a, send('call_1:1')))
+      )
+
+      expect(answers.filter((answer) => answer.created)).toHaveLength(1)
+      expect(await references(s, a)).toEqual(['call_1:1'])
+    })
+
+    test('a prefix that ends with the separator does not match a longer id', async () => {
+      const s = await subject()
+      const { a } = s.organizations
+      for (const reference of ['call_1:1', 'call_10:1']) {
+        await s.transcriber.submit(a, send(reference))
+      }
+
+      expect(await references(s, a, 'call_1:')).toEqual(['call_1:1'])
     })
 
     test('a purge by prefix removes sends the caller kept no record of', async () => {
@@ -244,12 +281,14 @@ export function transcriberBehaviour(
       ['no audio', { audio: undefined as unknown as { url: string } }],
       ['a URL that is not a URL', { audio: { url: 'not a url' } }],
       ['a file URL', { audio: { url: 'file:///etc/passwd' } }],
+      ['a URL with only a user name', { audio: { url: 'https://user@example.test/a' } }],
       ['a URL with user information', { audio: { url: 'https://user:pw@example.test/a' } }],
       [
         'a URL over 4096 characters',
         { audio: { url: `https://example.test/${'a'.repeat(4100)}` } },
       ],
       ['an unknown speaker mode', { speakers: 'both' as unknown as 'diarize' }],
+      ['no audio key', { audioKey: undefined as unknown as string }],
       ['an audio key with a space', { audioKey: 'rec 1' }],
       ['an audio key over 256 characters', { audioKey: 'a'.repeat(257) }],
       ['a speaker cap of 0', { maxSpeakers: 0 }],

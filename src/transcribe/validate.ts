@@ -26,7 +26,7 @@ export interface CheckedRequest {
   audioUrl: string
   speakers: 'split_channels' | 'diarize'
   maxSpeakers: number | undefined
-  audioKey: string | undefined
+  audioKey: string
   callbackUrl: string | undefined
 }
 
@@ -93,12 +93,9 @@ export function createTranscriberValidator(options: {
     }
     return value
   }
-  const audioKey = (value: unknown): string | undefined => {
-    if (value === undefined) {
-      return undefined
-    }
+  const audioKey = (value: unknown): string => {
     if (typeof value !== 'string' || !AUDIO_KEY.test(value)) {
-      throw bad('the audio key is 1 to 256 letters, digits, ".", "_", ":", "/" or "-"')
+      throw bad('an audio key is required: 1 to 256 letters, digits, ".", "_", ":", "/" or "-"')
     }
     return value
   }

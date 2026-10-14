@@ -9,6 +9,7 @@ import type {
   TranscriptionResult,
   TranscriptTurn,
 } from './port'
+import { checkTranscriptionResult } from './result'
 import {
   type CheckedRequest,
   createTranscriberValidator,
@@ -101,6 +102,8 @@ function defaultOutcome(request: CheckedRequest): ScriptedOutcome {
 }
 
 function checkOutcome(outcome: ScriptedOutcome): ScriptedOutcome {
+  // A scripted result must be one a real vendor could legitimately return.
+  checkTranscriptionResult(outcome.result)
   const reads = outcome.pendingReads ?? 1
   if (!Number.isInteger(reads) || reads < 0 || reads > 1000) {
     throw new TypeError('pendingReads must be a whole number from 0 to 1000')

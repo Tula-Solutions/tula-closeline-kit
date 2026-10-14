@@ -9,6 +9,7 @@ const B = `org_${'b'.repeat(32)}`
 const send = (reference: string, extra: Partial<TranscribeRequest> = {}): TranscribeRequest => ({
   clientReference: reference,
   audio: { url: `https://audio.example.test/${reference}?sig=abc` },
+  audioKey: `rec/${reference}:abc`,
   speakers: 'diarize',
   ...extra,
 })
@@ -148,6 +149,27 @@ describe('the memory transcriber', () => {
   })
 })
 
+describe('scripted outcomes', () => {
+  test('an outcome that fails the result check is refused when scripted', () => {
+    const transcriber = createMemoryTranscriber()
+
+    expect(() =>
+      transcriber.script(A, 'c:1', {
+        result: {
+          status: 'done',
+          durationMs: 10,
+          turns: [{ speaker: 'A', startMs: 5, endMs: 1, text: 'x' }],
+        },
+      })
+    ).toThrow()
+    expect(() =>
+      transcriber.script(A, 'c:1', {
+        result: { status: 'failed', reason: 'because' as unknown as 'no_speech' },
+      })
+    ).toThrow()
+  })
+})
+
 describe('plain http URLs', () => {
   const http = 'http://audio.example.test/a?sig=SECRETSIG'
 
@@ -247,7 +269,7 @@ describe('waitForTranscription', () => {
     })
   })
 
-  test('refuses settings out of range and stops when the signal fires', async () => {
+  test('refuses settings out of range', async () => {
     const transcriber = createMemoryTranscriber()
     await transcriber.submit(A, send('c:1'))
 
@@ -257,12 +279,32 @@ describe('waitForTranscription', () => {
     await expect(waitForTranscription(transcriber, A, 'c:1', { intervalMs: -1 })).rejects.toThrow(
       TypeError
     )
-    const controller = new AbortController()
-    controller.abort()
-    expect(
-      await waitForTranscription(transcriber, A, 'c:1', { signal: controller.signal })
-    ).toEqual({
-      status: 'pending',
+  })
+
+  test('an abort before the first read, or during a pause, rejects with AbortError and is not "out of attempts"', async () => {
+    const transcriber = createMemoryTranscriber()
+    transcriber.script(A, 'c:1', {
+      pendingReads: 1000,
+      result: { status: 'done', durationMs: 5, turns: [] },
     })
+    await transcriber.submit(A, send('c:1'))
+    const before = new AbortController()
+    before.abort()
+
+    await expect(
+      waitForTranscription(transcriber, A, 'c:1', { signal: before.signal })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    // The default pause is abortable: a one-minute pause ends when the signal fires.
+    const during = new AbortController()
+    const waiting = waitForTranscription(transcriber, A, 'c:1', {
+      intervalMs: 60_000,
+      signal: during.signal,
+    })
+    setTimeout(() => during.abort(), 5)
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' })
+    // Running out of attempts is a result, not an error.
+    expect(
+      await waitForTranscription(transcriber, A, 'c:1', { maxAttempts: 2, intervalMs: 0 })
+    ).toEqual({ status: 'pending' })
   })
 })

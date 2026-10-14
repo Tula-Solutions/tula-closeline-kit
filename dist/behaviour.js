@@ -1,6 +1,12 @@
 import {
   MAX_MESSAGE_BYTES2
 } from "./shared/chunk-mjkmsg3r.js";
+import {
+  checkTranscriptionResult2
+} from "./shared/chunk-mv441zb4.js";
+import {
+  waitForTranscription2
+} from "./shared/chunk-ybwrkc2f.js";
 
 // src/queue/behaviour.ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -870,9 +876,18 @@ function transcriberBehaviour(name, make, skip = false) {
     const send = (reference, extra = {}) => ({
       clientReference: reference,
       audio: { url: `https://audio.example.test/${reference}.mp3?sig=abc` },
+      audioKey: `rec/${reference}:abc`,
       speakers: "diarize",
       ...extra
     });
+    async function finalResult(s, org, reference) {
+      const result = await waitForTranscription2(s.transcriber, org, reference, {
+        maxAttempts: 120,
+        intervalMs: s.pollIntervalMs ?? 0
+      });
+      expect4(result?.status === "done" || result?.status === "failed").toBe(true);
+      return result;
+    }
     const references = async (s, org, prefix) => {
       const found = [];
       let cursor;
@@ -924,34 +939,22 @@ function transcriberBehaviour(name, make, skip = false) {
       expect4(again.created).toBe(false);
       expect4(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test4("a result is pending, done with ordered turns, or failed with a listed reason", async () => {
+    test4("a result is pending at first or final, and a final one passes the shared result check", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      await s.transcriber.submit(a, send("call_1:1"));
-      const reasons = [
-        "audio_unreachable",
-        "audio_invalid",
-        "no_speech",
-        "too_long",
-        "vendor_failed",
-        "timed_out"
-      ];
-      const result = await s.transcriber.getResult(a, "call_1:1");
-      expect4(["pending", "done", "failed"]).toContain(result?.status);
-      if (result?.status === "done") {
-        expect4(result.durationMs).toBeGreaterThanOrEqual(0);
-        let previous = 0;
-        for (const turn of result.turns) {
-          expect4(typeof turn.speaker).toBe("string");
-          expect4(turn.endMs).toBeGreaterThanOrEqual(turn.startMs);
-          expect4(turn.startMs).toBeGreaterThanOrEqual(previous);
-          expect4(typeof turn.text).toBe("string");
-          previous = turn.startMs;
-        }
-      }
-      if (result?.status === "failed") {
-        expect4(reasons).toContain(result.reason);
-      }
+      await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2 }));
+      const first = await s.transcriber.getResult(a, "call_1:1");
+      expect4(["pending", "done", "failed"]).toContain(first?.status);
+      const final = await finalResult(s, a, "call_1:1");
+      checkTranscriptionResult2(final, { speakers: "diarize", maxSpeakers: 2 });
+      expect4(checkTranscriptionResult2(await s.transcriber.getResult(a, "call_1:1"))).toEqual(final);
+    });
+    test4("a split-channels result carries the channel of every turn", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:2", { speakers: "split_channels" }));
+      const final = await finalResult(s, a, "call_1:2");
+      checkTranscriptionResult2(final, { speakers: "split_channels" });
     });
     test4("a send that was never made, or was deleted, has no result", async () => {
       const s = await subject();
@@ -995,6 +998,29 @@ function transcriberBehaviour(name, make, skip = false) {
       expect4(first.items).toHaveLength(2);
       expect4(first.nextCursor).toBeDefined();
       expect4(["pending", "done", "failed"]).toContain(first.items[0]?.status);
+      const seen = first.items.map((item) => item.clientReference);
+      let cursor = first.nextCursor;
+      for (let pages = 0;cursor !== undefined && pages < 20; pages++) {
+        const next = await s.transcriber.list(a, { prefix: "call_1:", limit: 2, cursor });
+        seen.push(...next.items.map((item) => item.clientReference));
+        cursor = next.nextCursor;
+      }
+      expect4(seen).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
+    });
+    test4("concurrent submits of one reference create it once", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const answers = await Promise.all(Array.from({ length: 8 }, () => s.transcriber.submit(a, send("call_1:1"))));
+      expect4(answers.filter((answer) => answer.created)).toHaveLength(1);
+      expect4(await references(s, a)).toEqual(["call_1:1"]);
+    });
+    test4("a prefix that ends with the separator does not match a longer id", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      for (const reference of ["call_1:1", "call_10:1"]) {
+        await s.transcriber.submit(a, send(reference));
+      }
+      expect4(await references(s, a, "call_1:")).toEqual(["call_1:1"]);
     });
     test4("a purge by prefix removes sends the caller kept no record of", async () => {
       const s = await subject();
@@ -1034,12 +1060,14 @@ function transcriberBehaviour(name, make, skip = false) {
       ["no audio", { audio: undefined }],
       ["a URL that is not a URL", { audio: { url: "not a url" } }],
       ["a file URL", { audio: { url: "file:///etc/passwd" } }],
+      ["a URL with only a user name", { audio: { url: "https://user@example.test/a" } }],
       ["a URL with user information", { audio: { url: "https://user:pw@example.test/a" } }],
       [
         "a URL over 4096 characters",
         { audio: { url: `https://example.test/${"a".repeat(4100)}` } }
       ],
       ["an unknown speaker mode", { speakers: "both" }],
+      ["no audio key", { audioKey: undefined }],
       ["an audio key with a space", { audioKey: "rec 1" }],
       ["an audio key over 256 characters", { audioKey: "a".repeat(257) }],
       ["a speaker cap of 0", { maxSpeakers: 0 }],

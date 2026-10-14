@@ -721,9 +721,11 @@ multipart uploads 1 day after initiation** (`AbortIncompleteMultipartUpload` wit
 ticket's `INCOMPLETE_UPLOAD_PARTS_TTL_HOURS` should be 24). The memory adapter, for tests, holds the object. An object written this way may be larger
 than `maxObjectBytes`; `get` then refuses it (`object_too_large`), so read it with `getStream`,
 which opens the object and returns its info and a web stream (`undefined` if there is none), not
-limited by `maxObjectBytes`; read or cancel the body so the connection is released. Not yet run
-against S3Mock or real S3: the multipart path is covered by a stub client in
-`src/storage/aws-stream.test.ts`.
+limited by `maxObjectBytes`; read or cancel the body so the connection is released. The multipart path is covered by a stub client that reassembles and checks the parts
+(`src/storage/aws-stream.test.ts`, with non-repeating bytes, parts completing out of order and a
+slow part) and by a 12 MiB test against S3Mock in `src/storage/aws.integration.ts`, which runs in
+CI with the compose stack; it has not been run by the author of this change (no Docker daemon was
+available), so CI is its first run.
 
 **Failures and retries.** Errors are `StorageError` with codes `storage.invalid_request`,
 `object_too_large`, `rejected` (a retry cannot fix it: access denied, no such bucket, missing
@@ -789,7 +791,7 @@ the stand-in (`createMemoryTranscriber`) from `tula-closeline-kit/testing`; the 
 (`transcriberBehaviour`) from `tula-closeline-kit/testing/behaviour`, which a real adapter must pass.
 
 ```ts
-submit(organizationId, { clientReference, audio: { url }, audioKey?, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
+submit(organizationId, { clientReference, audio: { url }, audioKey, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
 getResult(organizationId, clientReference): Promise<{ status: 'pending' } | { status: 'done'; durationMs; turns } | { status: 'failed'; reason } | undefined>
 delete(organizationId, clientReference): Promise<{ existed: boolean }> // idempotent; needs no vendor id
 list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items: { clientReference; status }[]; nextCursor? }>
@@ -802,7 +804,9 @@ waitForTranscription(transcriber, organizationId, clientReference, { maxAttempts
 presigned GET of the object store valid for minutes. The reasons: the service never buffers or
 re-streams 500 MB, it is what ADR 0018 says ("sent to the vendor by a short-lived presigned URL"),
 and AssemblyAI takes an `audio_url`. The URL can carry credentials in its query string, so it is
-never logged, never put in an error and never held in a result; user information
+never logged, never put in an error and never held in a result. The service builds `audio.url`
+(and `callbackUrl`) from its own object store; **neither is ever taken from a user**, or the
+vendor becomes a way to fetch any URL. User information
 (`user:pw@host`) is refused. The kit has no presigning yet: the service produces the URL from the
 S3 client until a later ticket adds it to `ObjectStore`.
 
@@ -812,7 +816,9 @@ idempotent by `(organizationId, clientReference)`: the same request again return
 `created: false` and sends nothing, so a worker that crashed can send again; the same reference
 with a different mode, speaker cap or `audioKey` is `transcriber.conflict`. The audio URL is
 **not** part of a send's identity, because it is short-lived and the retry presigns a new one;
-`audioKey` (optional, such as `<objectKey>:<sha256>`) is what names the audio itself. `speakers` is
+`audioKey` (**required**, such as `<objectKey>:<sha256>`, validated; a send without one is
+`transcriber.invalid_request`) is what names the audio itself, so a resend that changes the audio is
+a conflict and one that only changes the URL is not. `speakers` is
 `split_channels` (a stereo Recording, each channel a speaker, the turn carries its `channel`) or
 `diarize` (mono, the vendor separates speakers; `maxSpeakers` 1 to 10 caps them and is refused with
 `split_channels`). `callbackUrl` is an optional hint for a vendor webhook; a result is always
@@ -824,11 +830,33 @@ readable by `getResult`, so nothing requires a webhook.
 `too_long`, `vendor_failed`, `timed_out`. `getResult` is `undefined` for a reference with no send.
 Turn text and speaker labels are untrusted data and are never logged.
 
-**Deleting without an id.** `delete` takes only the client reference and resolves when the vendor
-confirmed the deletion, returning whether a copy existed. A purge also calls `list` with a
-reference prefix (`<callId>:`) and deletes each entry, which removes a copy even when the worker
-died after the vendor accepted the send and before it stored anything. The stand-in can simulate
-that (`acceptThenFailNext()`).
+**Deleting without an id.** `delete` takes only the client reference, removes **every copy**
+carrying it, and resolves when the vendor confirmed the deletion, returning whether a copy was
+found (`existed`). A send still processing is cancelled or waited for a bounded time; if the vendor
+can do neither in that time, `delete` throws `transcriber.unavailable` (retryable), and a purge is
+not done until it has resolved for every reference. A purge also calls `list` with a reference
+prefix and deletes each entry, which removes a copy even when the worker died after the vendor
+accepted the send and before it stored anything. **`list` is for background jobs only**: it may
+scan the vendor's account; its order is stable and its cursor opaque; a page may be short, even
+empty, and still carry a `nextCursor`, so follow the cursor to the end. **End a prefix with the
+separator** (`call_1:`; `call_1` also matches `call_10:`). **Stop new submits for a Call before
+listing and deleting its sends**, or one made in between survives. Concurrent submits of one
+reference create it at most once. The stand-in can simulate the crash (`acceptThenFailNext()`).
+
+**Vendor output is untrusted.** A real adapter reads at most `MAX_TRANSCRIPT_RESPONSE_BYTES` (8
+MiB) of a response before parsing and runs every result through `checkTranscriptionResult`
+(exported from the root), which refuses with `transcriber.bad_response`: a duration that is not
+whole milliseconds or is over 12 hours, more than 50,000 turns or 4 million characters, a speaker
+label over 64 characters, non-integer or negative times, an end before the start or after the
+audio, turns out of order, text over 20,000 characters, more distinct speakers than `maxSpeakers`
+(else 10), a channel on a diarized result or a missing channel on a split-channels one, and an
+unlisted failure reason. The stand-in's `script` applies it too, so a test cannot script a result
+a real vendor could not give.
+
+**Waiting.** `waitForTranscription` makes at most `maxAttempts` reads (60) with a jittered pause
+(5 s). It returns the final result, `{ status: 'pending' }` when the attempts ran out (reschedule),
+or `undefined` for a missing send. Its pauses and reads stop when `signal` fires, and an abort
+rejects with the signal's reason (an `AbortError`), never with `pending`.
 
 **Errors and adapter duties.** `transcriber.invalid_request`, `conflict`, `rejected`,
 `unavailable` (the only retryable one) and `bad_response`. Every vendor call of a real adapter has
@@ -843,11 +871,14 @@ makes calls fail, `acceptThenFailNext()` accepts a send and then throws `unavail
 `copies(org?)` lists what the stand-in still holds (reference, its own id, status; never the URL or
 the text), which is how a test proves a purge left no copy.
 
-**Open questions the real adapter must answer** (ADR 0018, "before real audio"): does AssemblyAI
-accept a caller-chosen reference or support lookup by one (its transcript has no such field in
-the documentation read so far; without it the adapter must keep the reference-to-vendor-id
-mapping itself, and `delete` of a send whose id was never stored is only possible if the vendor can
-list or filter by something the adapter set); can a stereo file be transcribed per channel with its
+**A blocker for the real adapter, unverified:** whether AssemblyAI lets the caller give a reference
+of its own or look a transcript up by one. Its transcript object has no such field in the
+documentation read so far, and nothing here has been checked against the vendor. If it does not,
+the adapter owns a **mapping store** (a table of `(organizationId, clientReference)` to vendor id,
+written before the vendor call so it survives a crash), and `delete` and `list` run on that
+mapping plus the vendor's own list. That is a design of its own.
+
+**Other open questions** (ADR 0018, "before real audio"): can a stereo file be transcribed per channel with its
 own speaker label, and what that bills (ADR 0018: per channel); the EU endpoint for the EU Region;
 how soon after a delete the vendor's copy is gone and whether it says so. None of this is
 verified here.
