@@ -179,6 +179,8 @@ interface S3ObjectStoreOptions {
 	deadlineMs?: number;
 	/** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
 	maxAttempts?: number;
+	/** How long a streamed get may wait for the next bytes, in ms, 10 to 600000; default 30000. */
+	streamIdleTimeoutMs?: number;
 	/** Size of one part of a streamed put in bytes, 5 MiB to 64 MiB; default 8 MiB. */
 	partBytes?: number;
 	/** Parts of one streamed put uploading at once, 1 to 8; default 2. */

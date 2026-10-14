@@ -82,7 +82,7 @@ function discardBody(body) {
     }
   } catch {}
 }
-function guardBody(source, raw) {
+function guardBody(source, raw, idleMs) {
   const reader = source.getReader();
   let released = false;
   const release = () => {
@@ -98,7 +98,7 @@ function guardBody(source, raw) {
         const step = await Promise.race([
           reader.read(),
           new Promise((_resolve, reject) => {
-            timer = setTimeout(() => reject(new Error("the body stalled")), STREAM_IDLE_TIMEOUT_MS2);
+            timer = setTimeout(() => reject(new Error("the body stalled")), idleMs);
           })
         ]);
         if (step.done) {
@@ -157,6 +157,10 @@ function createS3ObjectStore(options) {
   }
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new TypeError("maxAttempts must be a whole number from 1 to 10");
+  }
+  const streamIdleMs = options.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS2;
+  if (!Number.isInteger(streamIdleMs) || streamIdleMs < 10 || streamIdleMs > 600000) {
+    throw new TypeError("streamIdleTimeoutMs must be a whole number from 10 to 600000");
   }
   const partBytes = options.partBytes ?? S3_DEFAULT_PART_BYTES;
   const partConcurrency = options.partConcurrency ?? S3_DEFAULT_PART_CONCURRENCY;
@@ -374,7 +378,10 @@ function createS3ObjectStore(options) {
           throw new StorageError2(STORAGE_ERROR_CODES2.badResponse, "the store returned no body");
         }
         const source = output.Body.transformToWebStream();
-        const stream = { ...described, body: guardBody(source, output.Body) };
+        const stream = {
+          ...described,
+          body: guardBody(source, output.Body, streamIdleMs)
+        };
         return stream;
       } catch (error) {
         discardBody(output.Body);

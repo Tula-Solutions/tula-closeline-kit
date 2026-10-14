@@ -77,6 +77,8 @@ export interface S3ObjectStoreOptions {
   deadlineMs?: number
   /** Attempts per call, the first included, with the SDK's jittered exponential back-off; default 3. */
   maxAttempts?: number
+  /** How long a streamed get may wait for the next bytes, in ms, 10 to 600000; default 30000. */
+  streamIdleTimeoutMs?: number
   /** Size of one part of a streamed put in bytes, 5 MiB to 64 MiB; default 8 MiB. */
   partBytes?: number
   /** Parts of one streamed put uploading at once, 1 to 8; default 2. */
@@ -145,7 +147,11 @@ function discardBody(body: unknown): void {
  * `storage.unavailable` instead of a raw socket error, and so that `cancel` destroys the
  * underlying connection.
  */
-function guardBody(source: ReadableStream<Uint8Array>, raw: unknown): ReadableStream<Uint8Array> {
+function guardBody(
+  source: ReadableStream<Uint8Array>,
+  raw: unknown,
+  idleMs: number
+): ReadableStream<Uint8Array> {
   const reader = source.getReader()
   let released = false
   const release = () => {
@@ -161,7 +167,7 @@ function guardBody(source: ReadableStream<Uint8Array>, raw: unknown): ReadableSt
         const step = await Promise.race([
           reader.read(),
           new Promise<never>((_resolve, reject) => {
-            timer = setTimeout(() => reject(new Error('the body stalled')), STREAM_IDLE_TIMEOUT_MS)
+            timer = setTimeout(() => reject(new Error('the body stalled')), idleMs)
           }),
         ])
         if (step.done) {
@@ -273,6 +279,10 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
   }
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new TypeError('maxAttempts must be a whole number from 1 to 10')
+  }
+  const streamIdleMs = options.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS
+  if (!Number.isInteger(streamIdleMs) || streamIdleMs < 10 || streamIdleMs > 600_000) {
+    throw new TypeError('streamIdleTimeoutMs must be a whole number from 10 to 600000')
   }
   const partBytes = options.partBytes ?? S3_DEFAULT_PART_BYTES
   const partConcurrency = options.partConcurrency ?? S3_DEFAULT_PART_CONCURRENCY
@@ -546,7 +556,10 @@ export function createS3ObjectStore(options: S3ObjectStoreOptions): ObjectStore 
           throw new StorageError(STORAGE_ERROR_CODES.badResponse, 'the store returned no body')
         }
         const source = output.Body.transformToWebStream() as ReadableStream<Uint8Array>
-        const stream: ObjectStream = { ...described, body: guardBody(source, output.Body) }
+        const stream: ObjectStream = {
+          ...described,
+          body: guardBody(source, output.Body, streamIdleMs),
+        }
         return stream
       } catch (error) {
         discardBody(output.Body)

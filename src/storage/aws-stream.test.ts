@@ -468,6 +468,26 @@ describe('S3 streamed get', () => {
     expect(destroyed).toBeGreaterThan(0)
   })
 
+  test('a body that stalls ends as storage.unavailable and the connection is destroyed', async () => {
+    let destroyed = 0
+    const stalled = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => undefined) })
+    const store = adapter(
+      {
+        send: async () =>
+          object(stalled, () => {
+            destroyed += 1
+          }),
+      },
+      { streamIdleTimeoutMs: 40 }
+    )
+    const got = await store.getStream(ORG, 'k')
+
+    await expect(got?.body.getReader().read()).rejects.toMatchObject({
+      code: 'storage.unavailable',
+    })
+    expect(destroyed).toBe(1)
+  })
+
   test('cancel destroys the underlying body', async () => {
     let destroyed = 0
     let cancelled = 0
