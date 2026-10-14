@@ -6,6 +6,15 @@ import {
   redactFields,
   prepareFields,
   shouldReportError2,
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIPT_TURNS2,
+  MAX_TURN_TEXT2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -15,7 +24,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-sf8f3fp3.js";
+} from "./shared/chunk-tewbpdfn.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -35,8 +44,10 @@ import {
   MAX_OBJECT_BYTES_LIMIT2,
   DEFAULT_LIST_LIMIT2,
   MAX_LIST_LIMIT2,
-  DEFAULT_CONTENT_TYPE2
-} from "./shared/chunk-r2rshw7g.js";
+  DEFAULT_CONTENT_TYPE2,
+  MAX_STREAM_BYTES_LIMIT2,
+  STREAM_IDLE_TIMEOUT_MS2
+} from "./shared/chunk-60y8a3sa.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -1591,6 +1602,34 @@ function createErrorReporter(options) {
   }
   return reporter;
 }
+// src/transcribe/wait.ts
+var defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitForTranscription(transcriber, organizationId, clientReference, options = {}) {
+  const maxAttempts = options.maxAttempts ?? 60;
+  const intervalMs = options.intervalMs ?? 5000;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 1000) {
+    throw new TypeError("maxAttempts must be a whole number from 1 to 1000");
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs < 0 || intervalMs > 60000) {
+    throw new TypeError("intervalMs must be a number from 0 to 60000");
+  }
+  const sleep = options.sleep ?? defaultSleep;
+  const random = options.random ?? Math.random;
+  let last;
+  for (let attempt = 1;attempt <= maxAttempts; attempt++) {
+    if (options.signal?.aborted) {
+      return last ?? { status: "pending" };
+    }
+    last = await transcriber.getResult(organizationId, clientReference);
+    if (last === undefined || last.status !== "pending") {
+      return last;
+    }
+    if (attempt < maxAttempts) {
+      await sleep(Math.round(intervalMs * (0.5 + random())));
+    }
+  }
+  return last;
+}
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
@@ -1599,6 +1638,7 @@ export {
   DEFAULT_CONTENT_TYPE2 as DEFAULT_CONTENT_TYPE,
   DEFAULT_LIST_LIMIT2 as DEFAULT_LIST_LIMIT,
   DEFAULT_MAX_OBJECT_BYTES2 as DEFAULT_MAX_OBJECT_BYTES,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2 as DEFAULT_TRANSCRIBER_LIST_LIMIT,
   ENVIRONMENTS,
   INTERNAL_CALL_FAILURES,
   INTERNAL_DEFAULT_IDLE_TIMEOUT_MS,
@@ -1615,7 +1655,9 @@ export {
   InternalCallError,
   MAX_ATTRIBUTES2 as MAX_ATTRIBUTES,
   MAX_ATTRIBUTE_STRING2 as MAX_ATTRIBUTE_STRING,
+  MAX_AUDIO_URL_LENGTH2 as MAX_AUDIO_URL_LENGTH,
   MAX_BATCH_SIZE2 as MAX_BATCH_SIZE,
+  MAX_CLIENT_REFERENCE_LENGTH2 as MAX_CLIENT_REFERENCE_LENGTH,
   MAX_DELETE_BATCH2 as MAX_DELETE_BATCH,
   MAX_DIMENSIONS2 as MAX_DIMENSIONS,
   MAX_JWKS_BYTES,
@@ -1625,8 +1667,13 @@ export {
   MAX_LIST_LIMIT2 as MAX_LIST_LIMIT,
   MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
   MAX_OBJECT_BYTES_LIMIT2 as MAX_OBJECT_BYTES_LIMIT,
+  MAX_SPEAKERS2 as MAX_SPEAKERS,
+  MAX_STREAM_BYTES_LIMIT2 as MAX_STREAM_BYTES_LIMIT,
   MAX_TOKEN_LENGTH,
   MAX_TOP_K2 as MAX_TOP_K,
+  MAX_TRANSCRIBER_LIST_LIMIT2 as MAX_TRANSCRIBER_LIST_LIMIT,
+  MAX_TRANSCRIPT_TURNS2 as MAX_TRANSCRIPT_TURNS,
+  MAX_TURN_TEXT2 as MAX_TURN_TEXT,
   MAX_UPSERT_BATCH2 as MAX_UPSERT_BATCH,
   MAX_VECTOR_ID_LENGTH2 as MAX_VECTOR_ID_LENGTH,
   MAX_VISIBILITY_SECONDS2 as MAX_VISIBILITY_SECONDS,
@@ -1635,8 +1682,11 @@ export {
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
   STORAGE_ERROR_CODES2 as STORAGE_ERROR_CODES,
+  STREAM_IDLE_TIMEOUT_MS2 as STREAM_IDLE_TIMEOUT_MS,
   StorageError2 as StorageError,
+  TRANSCRIBER_ERROR_CODES2 as TRANSCRIBER_ERROR_CODES,
   TokenVerificationError,
+  TranscriberError2 as TranscriberError,
   VECTOR_ERROR_CODES2 as VECTOR_ERROR_CODES,
   VectorError2 as VectorError,
   accessTokenClaimsSchema,
@@ -1666,5 +1716,6 @@ export {
   shouldReportError2 as shouldReportError,
   systemClock2 as systemClock,
   systemSleep2 as systemSleep,
-  toErrorBody2 as toErrorBody
+  toErrorBody2 as toErrorBody,
+  waitForTranscription
 };

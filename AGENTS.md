@@ -72,6 +72,12 @@ Other scripts are in `package.json`.
   hit the text budget) and 200 fields of 100 Errors with 30,000 character texts, each with a mean, median and best-batch p95 budget about five times what it
   measures.
 
+- `ObjectStore.putStream` (`src/storage/`) carries every Recording upload (500 MB, ADR 0018). Time
+  O(object size), memory O(part size): the S3 adapter holds about four parts of 8 MiB whatever the
+  size, and aborts the multipart upload on any failure. Budget in `bench/storage-stream.bench.ts`:
+  500 MiB through with at most 64 MiB of heap and buffer growth (measured about 25 MiB) in under
+  5 s (measured about 0.6 s).
+
 ## Issues
 
 All tickets live in the hub: `gh issue list -R Tula-Solutions/tula-closeline --label repo:kit`.

@@ -362,6 +362,7 @@ function processedStoreBehaviour(name, make) {
 }
 // src/storage/behaviour.ts
 import { afterEach as afterEach3, describe as describe3, expect as expect3, test as test3 } from "bun:test";
+import { createHash } from "node:crypto";
 function sameMediaType(x, y) {
   if (x === undefined) {
     return false;
@@ -742,15 +743,346 @@ x-injected: 1`],
       (first?.body)[1] = 0;
       expect3(text((await s.store.get(a, "k"))?.body ?? new Uint8Array)).toBe("keep");
     });
+    describe3("streaming", () => {
+      const sha = (data) => createHash("sha256").update(data).digest("hex");
+      async function* chunksOf(data, size = 7) {
+        for (let at = 0;at < data.byteLength; at += size) {
+          yield data.subarray(at, at + size);
+        }
+      }
+      async function readAll(stream) {
+        const parts = [];
+        for await (const part of stream) {
+          parts.push(part);
+        }
+        const out = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
+        let at = 0;
+        for (const part of parts) {
+          out.set(part, at);
+          at += part.byteLength;
+        }
+        return out;
+      }
+      test3("a streamed object reads back the same, with its size and SHA-256", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const data = Uint8Array.from({ length: 1000 }, (_, i) => i % 251);
+        const result = await s.store.putStream(a, "rec/one.bin", chunksOf(data), {
+          maxBytes: 5000,
+          contentType: "audio/mpeg"
+        });
+        expect3(result).toEqual({ size: 1000, sha256: sha(data) });
+        const got = await s.store.get(a, "rec/one.bin");
+        expect3(Array.from(got?.body ?? [])).toEqual(Array.from(data));
+        expect3(got?.contentType).toBe("audio/mpeg");
+        const streamed = await s.store.getStream(a, "rec/one.bin");
+        expect3(streamed?.size).toBe(1000);
+        expect3(Array.from(await readAll(streamed.body))).toEqual(Array.from(data));
+      });
+      test3("a web stream and an empty stream are accepted", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const web = new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes("hel"));
+            controller.enqueue(bytes("lo"));
+            controller.close();
+          }
+        });
+        expect3((await s.store.putStream(a, "web", web, { maxBytes: 10 })).size).toBe(5);
+        expect3(text((await s.store.get(a, "web"))?.body ?? new Uint8Array)).toBe("hello");
+        const empty = await s.store.putStream(a, "empty", chunksOf(new Uint8Array), {
+          maxBytes: 10
+        });
+        expect3(empty).toEqual({ size: 0, sha256: sha(new Uint8Array) });
+        expect3((await s.store.head(a, "empty"))?.size).toBe(0);
+      });
+      test3("a stream over maxBytes is refused, leaves nothing readable and keeps an older object", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await s.store.put(a, "old", bytes("old"));
+        await expect3(s.store.putStream(a, "new", chunksOf(new Uint8Array(100)), { maxBytes: 99 })).rejects.toMatchObject({ code: "storage.object_too_large" });
+        await expect3(s.store.putStream(a, "old", chunksOf(new Uint8Array(100)), { maxBytes: 99 })).rejects.toMatchObject({ code: "storage.object_too_large" });
+        expect3(await s.store.head(a, "new")).toBeUndefined();
+        expect3(text((await s.store.get(a, "old"))?.body ?? new Uint8Array)).toBe("old");
+        expect3((await s.store.putStream(a, "exact", chunksOf(new Uint8Array(99)), { maxBytes: 99 })).size).toBe(99);
+      });
+      test3("a stream that fails midway leaves nothing readable", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        async function* broken() {
+          yield bytes("some");
+          throw new Error("the client went away");
+        }
+        await expect3(s.store.putStream(a, "half", broken(), { maxBytes: 100 })).rejects.toMatchObject({ code: "storage.invalid_request" });
+        expect3(await s.store.head(a, "half")).toBeUndefined();
+      });
+      test3("an aborted signal stops the write and leaves nothing readable", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const controller = new AbortController;
+        async function* slow() {
+          yield bytes("first");
+          controller.abort();
+          yield bytes("second");
+        }
+        await expect3(s.store.putStream(a, "aborted", slow(), { maxBytes: 100, signal: controller.signal })).rejects.toMatchObject({ code: "storage.unavailable" });
+        expect3(await s.store.head(a, "aborted")).toBeUndefined();
+      });
+      test3.each([[0], [-1], [1.5], [Number.NaN], [2 ** 31 + 1], ["5"]])("maxBytes %p is refused", async (maxBytes) => {
+        const s = await subject();
+        const { a } = s.organizations;
+        await expect3(s.store.putStream(a, "k", chunksOf(bytes("x")), { maxBytes })).rejects.toMatchObject({ code: "storage.invalid_request" });
+      });
+      test3("a body that is not a stream, a bad key and a bad Organization are refused", async () => {
+        const s = await subject();
+        const { a } = s.organizations;
+        const options = { maxBytes: 10 };
+        await expect3(s.store.putStream(a, "k", "text", options)).rejects.toMatchObject({ code: "storage.invalid_request" });
+        await expect3(s.store.putStream(a, "../k", chunksOf(bytes("x")), options)).rejects.toMatchObject({ code: "storage.invalid_request" });
+        await expect3(s.store.putStream("bad/org", "k", chunksOf(bytes("x")), options)).rejects.toMatchObject({ code: "storage.invalid_request" });
+      });
+      test3("a second Organization cannot read the first one's streamed object", async () => {
+        const s = await subject();
+        const { a, b } = s.organizations;
+        await s.store.putStream(a, "rec", chunksOf(bytes("private")), { maxBytes: 100 });
+        expect3(await s.store.getStream(b, "rec")).toBeUndefined();
+        expect3(await s.store.getStream(a, "missing")).toBeUndefined();
+      });
+    });
+  });
+}
+// src/transcribe/behaviour.ts
+import { afterEach as afterEach4, describe as describe4, expect as expect4, test as test4 } from "bun:test";
+function transcriberBehaviour(name, make, skip = false) {
+  const run = skip ? describe4.skip : describe4;
+  run(`Transcriber behaviour: ${name}`, () => {
+    const open = [];
+    afterEach4(async () => {
+      await Promise.all(open.splice(0).map((subject) => subject.close()));
+    });
+    async function subject() {
+      const made = await make();
+      open.push(made);
+      return made;
+    }
+    const invalid = { code: "transcriber.invalid_request" };
+    const send = (reference, extra = {}) => ({
+      clientReference: reference,
+      audio: { url: `https://audio.example.test/${reference}.mp3?sig=abc` },
+      speakers: "diarize",
+      ...extra
+    });
+    const references = async (s, org, prefix) => {
+      const found = [];
+      let cursor;
+      for (let page = 0;page < 50; page++) {
+        const got = await s.transcriber.list(org, {
+          limit: 2,
+          ...prefix === undefined ? {} : { prefix },
+          ...cursor === undefined ? {} : { cursor }
+        });
+        found.push(...got.items.map((item) => item.clientReference));
+        cursor = got.nextCursor;
+        if (cursor === undefined) {
+          break;
+        }
+      }
+      return found;
+    };
+    test4("a send is created once and repeating it creates nothing", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      expect4(await s.transcriber.submit(a, send("call_1:1"))).toEqual({
+        clientReference: "call_1:1",
+        created: true
+      });
+      expect4(await s.transcriber.submit(a, send("call_1:1"))).toEqual({
+        clientReference: "call_1:1",
+        created: false
+      });
+      expect4(await references(s, a)).toEqual(["call_1:1"]);
+    });
+    test4("the same reference with different audio, mode or speaker cap is a conflict", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2 }));
+      const conflict = { code: "transcriber.conflict" };
+      await expect4(s.transcriber.submit(a, send("call_1:1", { audio: { url: "https://other.example.test/x" }, maxSpeakers: 2 }))).rejects.toMatchObject(conflict);
+      await expect4(s.transcriber.submit(a, send("call_1:1", { speakers: "split_channels" }))).rejects.toMatchObject(conflict);
+      await expect4(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 3 }))).rejects.toMatchObject(conflict);
+      expect4(await references(s, a)).toEqual(["call_1:1"]);
+    });
+    test4("a result is pending, done with ordered turns, or failed with a listed reason", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1"));
+      const reasons = [
+        "audio_unreachable",
+        "audio_invalid",
+        "no_speech",
+        "too_long",
+        "vendor_failed",
+        "timed_out"
+      ];
+      const result = await s.transcriber.getResult(a, "call_1:1");
+      expect4(["pending", "done", "failed"]).toContain(result?.status);
+      if (result?.status === "done") {
+        expect4(result.durationMs).toBeGreaterThanOrEqual(0);
+        let previous = 0;
+        for (const turn of result.turns) {
+          expect4(typeof turn.speaker).toBe("string");
+          expect4(turn.endMs).toBeGreaterThanOrEqual(turn.startMs);
+          expect4(turn.startMs).toBeGreaterThanOrEqual(previous);
+          expect4(typeof turn.text).toBe("string");
+          previous = turn.startMs;
+        }
+      }
+      if (result?.status === "failed") {
+        expect4(reasons).toContain(result.reason);
+      }
+    });
+    test4("a send that was never made, or was deleted, has no result", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      expect4(await s.transcriber.getResult(a, "nope")).toBeUndefined();
+      await s.transcriber.submit(a, send("call_1:1"));
+      await s.transcriber.delete(a, "call_1:1");
+      expect4(await s.transcriber.getResult(a, "call_1:1")).toBeUndefined();
+    });
+    test4("delete reports whether a copy existed and can be repeated", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1"));
+      expect4(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: true });
+      expect4(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: false });
+      expect4(await s.transcriber.delete(a, "never_sent:1")).toEqual({ existed: false });
+      expect4(await references(s, a)).toEqual([]);
+    });
+    test4("a deleted reference can be sent again as a new send", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1"));
+      await s.transcriber.delete(a, "call_1:1");
+      expect4((await s.transcriber.submit(a, send("call_1:1"))).created).toBe(true);
+    });
+    test4("list finds sends by reference prefix, in order, in pages", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      for (const reference of ["call_2:1", "call_1:2", "call_1:1", "call_1:3", "other"]) {
+        await s.transcriber.submit(a, send(reference));
+      }
+      expect4(await references(s, a, "call_1:")).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
+      expect4(await references(s, a)).toEqual([
+        "call_1:1",
+        "call_1:2",
+        "call_1:3",
+        "call_2:1",
+        "other"
+      ]);
+      const first = await s.transcriber.list(a, { prefix: "call_1:", limit: 2 });
+      expect4(first.items).toHaveLength(2);
+      expect4(first.nextCursor).toBeDefined();
+      expect4(["pending", "done", "failed"]).toContain(first.items[0]?.status);
+    });
+    test4("a purge by prefix removes sends the caller kept no record of", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      for (const reference of ["call_1:1", "call_1:2", "call_9:1"]) {
+        await s.transcriber.submit(a, send(reference));
+      }
+      for (const reference of await references(s, a, "call_1:")) {
+        await s.transcriber.delete(a, reference);
+      }
+      expect4(await references(s, a)).toEqual(["call_9:1"]);
+    });
+    test4("a second Organization cannot read, delete or list the first one's sends, and may reuse a reference", async () => {
+      const s = await subject();
+      const { a, b } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1"));
+      expect4(await s.transcriber.getResult(b, "call_1:1")).toBeUndefined();
+      expect4(await s.transcriber.delete(b, "call_1:1")).toEqual({ existed: false });
+      expect4(await references(s, b)).toEqual([]);
+      expect4((await s.transcriber.submit(b, send("call_1:1", { speakers: "split_channels" }))).created).toBe(true);
+      expect4(await references(s, a)).toEqual(["call_1:1"]);
+      await s.transcriber.delete(b, "call_1:1");
+      expect4(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
+    });
+    test4("an Organization whose id starts with another id is a different Organization", async () => {
+      const s = await subject();
+      const { a, aExtended } = s.organizations;
+      await s.transcriber.submit(a, send("call_1:1"));
+      expect4(await references(s, aExtended)).toEqual([]);
+      expect4(await s.transcriber.getResult(aExtended, "call_1:1")).toBeUndefined();
+    });
+    test4.each([
+      ["an empty reference", { clientReference: "" }],
+      ["a reference with a space", { clientReference: "call 1" }],
+      ["a reference with a slash", { clientReference: "org/call" }],
+      ["a reference over 128 characters", { clientReference: "a".repeat(129) }],
+      ["no audio", { audio: undefined }],
+      ["a URL that is not a URL", { audio: { url: "not a url" } }],
+      ["a file URL", { audio: { url: "file:///etc/passwd" } }],
+      ["a URL with user information", { audio: { url: "https://user:pw@example.test/a" } }],
+      [
+        "a URL over 4096 characters",
+        { audio: { url: `https://example.test/${"a".repeat(4100)}` } }
+      ],
+      ["an unknown speaker mode", { speakers: "both" }],
+      ["a speaker cap of 0", { maxSpeakers: 0 }],
+      ["a speaker cap of 11", { maxSpeakers: 11 }],
+      ["a fractional speaker cap", { maxSpeakers: 1.5 }],
+      [
+        "a speaker cap with split channels",
+        { speakers: "split_channels", maxSpeakers: 2 }
+      ],
+      ["a callback that is not a URL", { callbackUrl: "nope" }]
+    ])("a send with %s is refused and nothing is made", async (_label, change) => {
+      const s = await subject();
+      const { a } = s.organizations;
+      await expect4(s.transcriber.submit(a, { ...send("call_1:1"), ...change })).rejects.toMatchObject(invalid);
+      expect4(await references(s, a)).toEqual([]);
+    });
+    test4("the refusal of a bad send never repeats the audio URL", async () => {
+      const s = await subject();
+      const { a } = s.organizations;
+      const secret = "https://user:SECRETPASSWORD@example.test/a?sig=SECRETSIG";
+      try {
+        await s.transcriber.submit(a, { ...send("call_1:1"), audio: { url: secret } });
+        throw new Error("the send was accepted");
+      } catch (error) {
+        expect4(JSON.stringify(error)).not.toContain("SECRET");
+        expect4(String(error.message)).not.toContain("SECRET");
+      }
+    });
+    test4.each([
+      ["a bad Organization id", "bad/org", "call_1:1"],
+      ["a bad reference", undefined, "bad ref"]
+    ])("reads and deletes with %s are refused", async (_label, org, reference) => {
+      const s = await subject();
+      const id = org ?? s.organizations.a;
+      await expect4(s.transcriber.getResult(id, reference)).rejects.toMatchObject(invalid);
+      await expect4(s.transcriber.delete(id, reference)).rejects.toMatchObject(invalid);
+    });
+    test4.each([
+      [{ limit: 0 }],
+      [{ limit: 1001 }],
+      [{ limit: 1.5 }],
+      [{ prefix: "bad prefix" }],
+      [{ cursor: "!!!" }]
+    ])("list options %p are refused", async (options) => {
+      const s = await subject();
+      await expect4(s.transcriber.list(s.organizations.a, options)).rejects.toMatchObject(invalid);
+    });
   });
 }
 // src/vector/behaviour.ts
-import { afterEach as afterEach4, describe as describe4, expect as expect4, test as test4 } from "bun:test";
+import { afterEach as afterEach5, describe as describe5, expect as expect5, test as test5 } from "bun:test";
 function vectorStoreBehaviour(name, make, skip = false) {
-  const run = skip ? describe4.skip : describe4;
+  const run = skip ? describe5.skip : describe5;
   run(`VectorStore behaviour: ${name}`, () => {
     const open = [];
-    afterEach4(async () => {
+    afterEach5(async () => {
       await Promise.all(open.splice(0).map((subject) => subject.close()));
     });
     async function subject() {
@@ -773,64 +1105,64 @@ function vectorStoreBehaviour(name, make, skip = false) {
         { id: "z", vector: vec(s, 0, 0, 1) }
       ]);
     }
-    test4("a search returns the closest vectors first, with cosine scores and attributes", async () => {
+    test5("a search returns the closest vectors first, with cosine scores and attributes", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const hits = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 4 });
-      expect4(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
-      expect4(hits[0]?.score).toBeCloseTo(1, 4);
-      expect4(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
-      expect4(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
-      expect4(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
+      expect5(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
+      expect5(hits[0]?.score).toBeCloseTo(1, 4);
+      expect5(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
+      expect5(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+      expect5(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
     });
-    test4("a score does not depend on the length of either vector", async () => {
+    test5("a score does not depend on the length of either vector", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "long", vector: vec(s, 50, 0, 0) }]);
       const [hit] = await s.store.search(a, { vector: vec(s, 0.001, 0, 0), topK: 1 });
-      expect4(hit?.id).toBe("long");
-      expect4(hit?.score).toBeCloseTo(1, 4);
+      expect5(hit?.id).toBe("long");
+      expect5(hit?.score).toBeCloseTo(1, 4);
     });
-    test4("topK bounds the results", async () => {
+    test5("topK bounds the results", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
-      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
-      expect4(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
+      expect5(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
+      expect5(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
+      expect5(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
     });
-    test4.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
+    test5.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
       const s = await subject();
-      await expect4(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
+      await expect5(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
     });
-    test4("a filter keeps vectors whose attributes equal every entry", async () => {
+    test5("a filter keeps vectors whose attributes equal every entry", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const search = async (filter) => ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10, filter })).sort();
-      expect4(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
-      expect4(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
-      expect4(await search({ final: true })).toEqual(["xy"]);
-      expect4(await search({ page: 1 })).toEqual(["x", "xy"]);
-      expect4(await search({ document_id: "nope" })).toEqual([]);
-      expect4(await search({ page: "1" })).toEqual([]);
+      expect5(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
+      expect5(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
+      expect5(await search({ final: true })).toEqual(["xy"]);
+      expect5(await search({ page: 1 })).toEqual(["x", "xy"]);
+      expect5(await search({ document_id: "nope" })).toEqual([]);
+      expect5(await search({ page: "1" })).toEqual([]);
     });
-    test4("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
+    test5("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const code = { code: "vector.dimension_mismatch" };
       const short = Array.from({ length: s.store.dimensions - 1 }, () => 1);
       const long = Array.from({ length: s.store.dimensions + 1 }, () => 1);
-      await expect4(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
-      await expect4(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
-      await expect4(s.store.upsert(a, [
+      await expect5(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
+      await expect5(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
+      await expect5(s.store.upsert(a, [
         { id: "fine", vector: vec(s, 1) },
         { id: "short", vector: short }
       ])).rejects.toMatchObject(code);
-      expect4(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      expect5(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test4.each([
+    test5.each([
       ["NaN", (n) => Array.from({ length: n }, (_, i) => i === 0 ? Number.NaN : 1)],
       [
         "Infinity",
@@ -849,10 +1181,10 @@ function vectorStoreBehaviour(name, make, skip = false) {
       const s = await subject();
       const { a } = s.organizations;
       const vector = build(s.store.dimensions);
-      await expect4(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
-      await expect4(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
+      await expect5(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
     });
-    test4.each([
+    test5.each([
       ["an empty id", ""],
       ["a slash", "a/b"],
       ["a leading dot", ".x"],
@@ -861,24 +1193,24 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("an id with %s is refused", async (_label, id) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect4(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect4(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect5(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
     });
-    test4("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
+    test5("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect4(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
       const many = Array.from({ length: 501 }, (_, i) => ({ id: `v${i}`, vector: vec(s, 1) }));
-      await expect4(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
-      await expect4(s.store.upsert(a, [
+      await expect5(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(a, [
         { id: "same", vector: vec(s, 1) },
         { id: "same", vector: vec(s, 0, 1) }
       ])).rejects.toMatchObject(invalid);
-      await expect4(s.store.delete(a, [])).rejects.toMatchObject(invalid);
-      await expect4(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
-      expect4(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      await expect5(s.store.delete(a, [])).rejects.toMatchObject(invalid);
+      await expect5(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
+      expect5(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test4.each([
+    test5.each([
       ["the reserved name id", { id: "x" }],
       ["the reserved name vector", { vector: "x" }],
       ["a name starting with a dollar sign", { $dist: "x" }],
@@ -895,11 +1227,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("attributes with %s are refused", async (_label, attributes) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect4(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
-      await expect4(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
-      await expect4(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
+      await expect5(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
+      await expect5(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
     });
-    test4("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
+    test5("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes: { n: 1 } }]);
@@ -907,72 +1239,72 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.upsert(a, replacement);
       await s.store.upsert(a, replacement);
       const hits = await s.store.search(a, { vector: vec(s, 0, 1), topK: 10 });
-      expect4(ids(hits)).toEqual(["v"]);
-      expect4(hits[0]?.score).toBeCloseTo(1, 4);
-      expect4(hits[0]?.attributes).toEqual({ n: 2 });
+      expect5(ids(hits)).toEqual(["v"]);
+      expect5(hits[0]?.score).toBeCloseTo(1, 4);
+      expect5(hits[0]?.attributes).toEqual({ n: 2 });
     });
-    describe4("setAttributes", () => {
+    describe5("setAttributes", () => {
       const query = (s) => ({ vector: vec(s, 1, 1, 0), topK: 10 });
-      test4("merges the attributes, leaves the others and the vector as they were", async () => {
+      test5("merges the attributes, leaves the others and the vector as they were", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const before = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "xy"], { outcome: "won", seq: 2 });
         const after = await s.store.search(a, query(s));
-        expect4(missing).toEqual([]);
-        expect4(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
+        expect5(missing).toEqual([]);
+        expect5(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
         const byId = Object.fromEntries(after.map((hit) => [hit.id, hit.attributes]));
-        expect4(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
-        expect4(byId.xy).toEqual({
+        expect5(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
+        expect5(byId.xy).toEqual({
           document_id: "doc_2",
           page: 1,
           final: true,
           outcome: "won",
           seq: 2
         });
-        expect4(byId.y).toEqual({ document_id: "doc_1", page: 2 });
-        expect4(byId.z).toEqual({});
+        expect5(byId.y).toEqual({ document_id: "doc_1", page: 2 });
+        expect5(byId.z).toEqual({});
       });
-      test4("overwrites a value that exists and keeps the rest", async () => {
+      test5("overwrites a value that exists and keeps the rest", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { page: 9 });
         const hit = (await s.store.search(a, query(s))).find((item) => item.id === "x");
-        expect4(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
+        expect5(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
       });
-      test4("reports ids it did not find, in order, and does not create them", async () => {
+      test5("reports ids it did not find, in order, and does not create them", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const missing = await s.store.setAttributes(a, ["nope", "x", "gone"], { outcome: "lost" });
-        expect4(missing).toEqual(["nope", "gone"]);
+        expect5(missing).toEqual(["nope", "gone"]);
         const all = await s.store.search(a, { vector: vec(s, 1), topK: 100 });
-        expect4(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
-        expect4(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
+        expect5(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
+        expect5(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
       });
-      test4("an Organization with no vectors reports every id and creates nothing", async () => {
+      test5("an Organization with no vectors reports every id and creates nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
-        expect4(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
-        expect4(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+        expect5(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
+        expect5(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
       });
-      test4("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
+      test5("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const many = ["x", ...Array.from({ length: 500 }, (_, i) => `v${i}`)];
-        await expect4(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
-        await expect4(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect4(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect4(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
         const atMax = Array.from({ length: 500 }, (_, i) => `v${i}`);
-        expect4(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
+        expect5(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect4(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect5(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test4("a second Organization's vectors with the same ids are untouched", async () => {
+      test5("a second Organization's vectors with the same ids are untouched", async () => {
         const s = await subject();
         const { a, b } = s.organizations;
         await seed(s, a);
@@ -983,35 +1315,35 @@ function vectorStoreBehaviour(name, make, skip = false) {
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect4(other).toEqual([]);
+        expect5(other).toEqual([]);
         const mine = await s.store.search(a, {
           vector: vec(s, 1),
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect4(ids(mine).sort()).toEqual(["x", "y"]);
+        expect5(ids(mine).sort()).toEqual(["x", "y"]);
       });
-      test4("repeating the call changes nothing", async () => {
+      test5("repeating the call changes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
         const once = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
-        expect4(missing).toEqual(["nope"]);
-        expect4(await s.store.search(a, query(s))).toEqual(once);
+        expect5(missing).toEqual(["nope"]);
+        expect5(await s.store.search(a, query(s))).toEqual(once);
       });
-      test4("a filter on the changed attribute sees the new value and not the old", async () => {
+      test5("a filter on the changed attribute sees the new value and not the old", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { outcome: "open" });
         await s.store.setAttributes(a, ["x"], { outcome: "won" });
         const search = (outcome) => s.store.search(a, { vector: vec(s, 1), topK: 10, filter: { outcome } });
-        expect4(ids(await search("won"))).toEqual(["x"]);
-        expect4(await search("open")).toEqual([]);
+        expect5(ids(await search("won"))).toEqual(["x"]);
+        expect5(await search("open")).toEqual([]);
       });
-      test4.each([
+      test5.each([
         ["no entries", {}],
         ["the reserved name id", { id: "x" }],
         ["the reserved name vector", { vector: "x" }],
@@ -1028,11 +1360,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
-        await expect4(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect4(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect5(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test4("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
+      test5("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.store.upsert(a, [
@@ -1043,47 +1375,47 @@ function vectorStoreBehaviour(name, make, skip = false) {
           },
           { id: "room", vector: vec(s, 0, 1), attributes: { k0: 1 } }
         ]);
-        await expect4(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
         const room = (await s.store.search(a, { vector: vec(s, 0, 1), topK: 2 })).find((hit) => hit.id === "room");
-        expect4(room?.attributes).toEqual({ k0: 1 });
-        expect4(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
+        expect5(room?.attributes).toEqual({ k0: 1 });
+        expect5(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
       });
-      test4("an invalid Organization id is refused", async () => {
+      test5("an invalid Organization id is refused", async () => {
         const s = await subject();
-        await expect4(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect5(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
       });
     });
-    test4("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
+    test5("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       await s.store.delete(a, ["x", "missing"]);
       await s.store.delete(a, ["x", "missing"]);
-      expect4(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect5(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "y",
         "z"
       ]);
     });
-    test4("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
+    test5("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      await expect4(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
+      await expect5(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "never" });
-      expect4(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect5(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "z"
       ]);
     });
-    test4("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
+    test5("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await seed(s, a);
-      expect4(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
-      expect4(await s.store.search(b, {
+      expect5(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
+      expect5(await s.store.search(b, {
         vector: vec(s, 1, 0, 0),
         topK: 100,
         filter: { document_id: "doc_1" }
@@ -1094,34 +1426,34 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.delete(b, ["y", "xy"]);
       await s.store.deleteByFilter(b, { document_id: "doc_1" });
       const mine = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect4(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
-      expect4(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
+      expect5(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
+      expect5(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
         document_id: "doc_1",
         page: 1
       });
       const theirs = await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect4(ids(theirs)).toEqual(["x"]);
-      expect4(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
+      expect5(ids(theirs)).toEqual(["x"]);
+      expect5(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
     });
-    test4("an Organization whose id starts with another id is a different Organization", async () => {
+    test5("an Organization whose id starts with another id is a different Organization", async () => {
       const s = await subject();
       const { a, aExtended } = s.organizations;
       await s.store.upsert(a, [{ id: "one", vector: vec(s, 1) }]);
       await s.store.upsert(aExtended, [{ id: "two", vector: vec(s, 1) }]);
-      expect4(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
-      expect4(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect5(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
+      expect5(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
       await s.store.delete(a, ["two"]);
       await s.store.deleteByFilter(a, { n: 1 });
-      expect4(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect5(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
     });
-    test4("an id of exactly 64 characters is accepted", async () => {
+    test5("an id of exactly 64 characters is accepted", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const id = "x".repeat(64);
       await s.store.upsert(a, [{ id, vector: vec(s, 1) }]);
-      expect4(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
+      expect5(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
     });
-    test4("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
+    test5("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
       const s = await subject();
       const { a, b, aExtended } = s.organizations;
       await seed(s, a);
@@ -1130,23 +1462,23 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.deleteAll(a);
       await s.store.deleteAll(a);
       await s.store.deleteAll(`${a.slice(0, -1)}9`);
-      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
-      expect4(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect4(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect5(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect5(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect5(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
       await s.store.upsert(a, [{ id: "again", vector: vec(s, 1) }]);
-      expect4(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
+      expect5(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
     });
-    test4("warming an Organization changes nothing and works with or without data", async () => {
+    test5("warming an Organization changes nothing and works with or without data", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await s.store.warm(b);
       await seed(s, a);
       await s.store.warm(a);
       await s.store.warm(a);
-      expect4(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect4(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect5(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect5(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
     });
-    test4.each([
+    test5.each([
       ["empty", ""],
       ["a path", "org/../x"],
       ["a separator", "x/y"],
@@ -1155,12 +1487,12 @@ function vectorStoreBehaviour(name, make, skip = false) {
       ["too long", "x".repeat(65)]
     ])("an Organization id that is %s is refused by every operation", async (_label, id) => {
       const s = await subject();
-      await expect4(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect4(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
-      await expect4(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
-      await expect4(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
-      await expect4(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
-      await expect4(s.store.warm(id)).rejects.toMatchObject(invalid);
+      await expect5(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect5(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
+      await expect5(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
+      await expect5(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
+      await expect5(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
+      await expect5(s.store.warm(id)).rejects.toMatchObject(invalid);
     });
   });
 }
@@ -1168,5 +1500,6 @@ export {
   objectStoreBehaviour,
   processedStoreBehaviour,
   queueBehaviour,
+  transcriberBehaviour,
   vectorStoreBehaviour
 };

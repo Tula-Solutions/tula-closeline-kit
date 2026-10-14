@@ -1043,6 +1043,44 @@ function shouldReportError2(error) {
   }
 }
 
+// src/transcribe/errors.ts
+var TRANSCRIBER_ERROR_CODES2 = {
+  invalidRequest: "transcriber.invalid_request",
+  conflict: "transcriber.conflict",
+  rejected: "transcriber.rejected",
+  unavailable: "transcriber.unavailable",
+  badResponse: "transcriber.bad_response"
+};
+var STATUS = {
+  "transcriber.invalid_request": 400,
+  "transcriber.conflict": 409,
+  "transcriber.rejected": 500,
+  "transcriber.unavailable": 503,
+  "transcriber.bad_response": 502
+};
+
+class TranscriberError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "TranscriberError";
+  }
+}
+
+// src/transcribe/port.ts
+var MAX_CLIENT_REFERENCE_LENGTH2 = 128;
+var MAX_AUDIO_URL_LENGTH2 = 4096;
+var MAX_SPEAKERS2 = 10;
+var DEFAULT_TRANSCRIBER_LIST_LIMIT2 = 100;
+var MAX_TRANSCRIBER_LIST_LIMIT2 = 1000;
+var MAX_TRANSCRIPT_TURNS2 = 50000;
+var MAX_TURN_TEXT2 = 20000;
+
 // src/vector/errors.ts
 var VECTOR_ERROR_CODES2 = {
   invalidRequest: "vector.invalid_request",
@@ -1051,7 +1089,7 @@ var VECTOR_ERROR_CODES2 = {
   unavailable: "vector.unavailable",
   badResponse: "vector.bad_response"
 };
-var STATUS = {
+var STATUS2 = {
   "vector.invalid_request": 400,
   "vector.dimension_mismatch": 422,
   "vector.rejected": 500,
@@ -1063,7 +1101,7 @@ class VectorError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1081,4 +1119,4 @@ var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

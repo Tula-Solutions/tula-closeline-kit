@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import type { ObjectStore } from './port'
 
 /** What the behaviour suite needs from an adapter under test. */
@@ -449,6 +450,155 @@ export function objectStoreBehaviour(
       const first = await s.store.get(a, 'k')
       ;(first?.body as Uint8Array)[1] = 0
       expect(text((await s.store.get(a, 'k'))?.body ?? new Uint8Array())).toBe('keep')
+    })
+
+    describe('streaming', () => {
+      const sha = (data: Uint8Array) => createHash('sha256').update(data).digest('hex')
+      async function* chunksOf(data: Uint8Array, size = 7): AsyncGenerator<Uint8Array> {
+        for (let at = 0; at < data.byteLength; at += size) {
+          yield data.subarray(at, at + size)
+        }
+      }
+      async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+        const parts: Uint8Array[] = []
+        for await (const part of stream) {
+          parts.push(part)
+        }
+        const out = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0))
+        let at = 0
+        for (const part of parts) {
+          out.set(part, at)
+          at += part.byteLength
+        }
+        return out
+      }
+
+      test('a streamed object reads back the same, with its size and SHA-256', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const data = Uint8Array.from({ length: 1000 }, (_, i) => i % 251)
+
+        const result = await s.store.putStream(a, 'rec/one.bin', chunksOf(data), {
+          maxBytes: 5000,
+          contentType: 'audio/mpeg',
+        })
+
+        expect(result).toEqual({ size: 1000, sha256: sha(data) })
+        const got = await s.store.get(a, 'rec/one.bin')
+        expect(Array.from(got?.body ?? [])).toEqual(Array.from(data))
+        expect(got?.contentType).toBe('audio/mpeg')
+        const streamed = await s.store.getStream(a, 'rec/one.bin')
+        expect(streamed?.size).toBe(1000)
+        expect(
+          Array.from(await readAll((streamed as { body: ReadableStream<Uint8Array> }).body))
+        ).toEqual(Array.from(data))
+      })
+
+      test('a web stream and an empty stream are accepted', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const web = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes('hel'))
+            controller.enqueue(bytes('lo'))
+            controller.close()
+          },
+        })
+
+        expect((await s.store.putStream(a, 'web', web, { maxBytes: 10 })).size).toBe(5)
+        expect(text((await s.store.get(a, 'web'))?.body ?? new Uint8Array())).toBe('hello')
+        const empty = await s.store.putStream(a, 'empty', chunksOf(new Uint8Array()), {
+          maxBytes: 10,
+        })
+        expect(empty).toEqual({ size: 0, sha256: sha(new Uint8Array()) })
+        expect((await s.store.head(a, 'empty'))?.size).toBe(0)
+      })
+
+      test('a stream over maxBytes is refused, leaves nothing readable and keeps an older object', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        await s.store.put(a, 'old', bytes('old'))
+
+        await expect(
+          s.store.putStream(a, 'new', chunksOf(new Uint8Array(100)), { maxBytes: 99 })
+        ).rejects.toMatchObject({ code: 'storage.object_too_large' })
+        await expect(
+          s.store.putStream(a, 'old', chunksOf(new Uint8Array(100)), { maxBytes: 99 })
+        ).rejects.toMatchObject({ code: 'storage.object_too_large' })
+
+        expect(await s.store.head(a, 'new')).toBeUndefined()
+        expect(text((await s.store.get(a, 'old'))?.body ?? new Uint8Array())).toBe('old')
+        expect(
+          (await s.store.putStream(a, 'exact', chunksOf(new Uint8Array(99)), { maxBytes: 99 })).size
+        ).toBe(99)
+      })
+
+      test('a stream that fails midway leaves nothing readable', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        async function* broken(): AsyncGenerator<Uint8Array> {
+          yield bytes('some')
+          throw new Error('the client went away')
+        }
+
+        await expect(
+          s.store.putStream(a, 'half', broken(), { maxBytes: 100 })
+        ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        expect(await s.store.head(a, 'half')).toBeUndefined()
+      })
+
+      test('an aborted signal stops the write and leaves nothing readable', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const controller = new AbortController()
+        async function* slow(): AsyncGenerator<Uint8Array> {
+          yield bytes('first')
+          controller.abort()
+          yield bytes('second')
+        }
+
+        await expect(
+          s.store.putStream(a, 'aborted', slow(), { maxBytes: 100, signal: controller.signal })
+        ).rejects.toMatchObject({ code: 'storage.unavailable' })
+        expect(await s.store.head(a, 'aborted')).toBeUndefined()
+      })
+
+      test.each([[0], [-1], [1.5], [Number.NaN], [2 ** 31 + 1], ['5']])(
+        'maxBytes %p is refused',
+        async (maxBytes) => {
+          const s = await subject()
+          const { a } = s.organizations
+
+          await expect(
+            s.store.putStream(a, 'k', chunksOf(bytes('x')), { maxBytes: maxBytes as number })
+          ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        }
+      )
+
+      test('a body that is not a stream, a bad key and a bad Organization are refused', async () => {
+        const s = await subject()
+        const { a } = s.organizations
+        const options = { maxBytes: 10 }
+
+        await expect(
+          s.store.putStream(a, 'k', 'text' as unknown as AsyncIterable<Uint8Array>, options)
+        ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        await expect(
+          s.store.putStream(a, '../k', chunksOf(bytes('x')), options)
+        ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+        await expect(
+          s.store.putStream('bad/org', 'k', chunksOf(bytes('x')), options)
+        ).rejects.toMatchObject({ code: 'storage.invalid_request' })
+      })
+
+      test("a second Organization cannot read the first one's streamed object", async () => {
+        const s = await subject()
+        const { a, b } = s.organizations
+        await s.store.putStream(a, 'rec', chunksOf(bytes('private')), { maxBytes: 100 })
+
+        expect(await s.store.getStream(b, 'rec')).toBeUndefined()
+        expect(await s.store.getStream(a, 'missing')).toBeUndefined()
+      })
     })
   })
 }

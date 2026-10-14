@@ -673,6 +673,8 @@ get(organizationId, key): Promise<StoredObject | undefined>
 head(organizationId, key): Promise<ObjectInfo | undefined>
 delete(organizationId, key): Promise<void> // resolves when it is gone, also when it never existed
 list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items; nextCursor? }>
+putStream(organizationId, key, body: ByteStream, { maxBytes, contentType?, signal?, idleTimeoutMs? }): Promise<{ size; sha256 }> // added in 0.10.0
+getStream(organizationId, key): Promise<ObjectStream | undefined> // added in 0.10.0
 ```
 
 **Organization scope.** Every call takes the Organization id first. The id must pass the contract's
@@ -692,9 +694,31 @@ the parameters (S3Mock turns `text/plain; charset=utf-8` into `text/plain;charse
 returns it as stored, and a type without parameters always comes back byte for byte). Never compare
 a content type as a raw string, and never use a stored content type to decide behaviour or to
 serve an object; check the bytes yourself. An object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most): bodies are
-held in memory, so there is no streaming. A larger object is `storage.object_too_large` on `put`
+held in memory, so `put` and `get` take no more. A larger object is `storage.object_too_large` on `put`
 and on `get` (the S3 adapter checks the announced length before it reads, and closes the response
 so the connection is released).
+
+**Streaming (`putStream`, `getStream`, 0.10.0).** For objects too large to hold, such as a 500 MB
+Recording (ADR 0018). `body` is a web `ReadableStream` or any async iterable of `Uint8Array`;
+`maxBytes` (required, 1 byte to 2 GiB) is enforced while streaming, so a longer stream is
+`storage.object_too_large` as soon as the byte after the limit arrives and the rest is never read.
+It returns `{ size, sha256 }` (SHA-256 as lower-case hex, computed on the way through; ADR 0018's
+duplicate rule needs it, and `put` returns none). A stream that exceeds the limit, fails, stalls for
+`idleTimeoutMs` (30 s) or is aborted by `signal` leaves **nothing readable** under the key and an
+object already there as it was; a source that throws is `storage.invalid_request`, a stall or an
+abort `storage.unavailable`. The S3 adapter sends a body of one part or less as one PutObject and
+anything larger as a multipart upload in parts of 8 MiB (`partBytes`, 5 to 64 MiB), two at a time
+(`partConcurrency`, 1 to 8), so memory is about four parts whatever the size (`bench/storage-stream.bench.ts`
+puts 500 MiB through with about 25 MiB of growth, budget 64 MiB). On any failure the adapter waits for
+the parts in flight and aborts the multipart upload. A process that dies mid-upload leaves parts
+the adapter cannot clean: **the bucket must carry a lifecycle rule that aborts incomplete multipart
+uploads** (`INCOMPLETE_UPLOAD_PARTS_TTL_HOURS` of the playbook ticket; an infra setting, not a kit
+one). The memory adapter, for tests, holds the object. An object written this way may be larger
+than `maxObjectBytes`; `get` then refuses it (`object_too_large`), so read it with `getStream`,
+which opens the object and returns its info and a web stream (`undefined` if there is none), not
+limited by `maxObjectBytes`; read or cancel the body so the connection is released. Not yet run
+against S3Mock or real S3: the multipart path is covered by a stub client in
+`src/storage/aws-stream.test.ts`.
 
 **Failures and retries.** Errors are `StorageError` with codes `storage.invalid_request`,
 `object_too_large`, `rejected` (a retry cannot fix it: access denied, no such bucket, missing
@@ -749,6 +773,76 @@ await objects.put(organizationId, `documents/${documentId}/original.pdf`, bytes,
 ```
 
 The dev stack already starts S3Mock with a `closeline-dev` bucket (hub `compose.dev.yaml`).
+
+## Transcription (`Transcriber`)
+
+Batch speech-to-text with speaker separation (ADR 0010, 0018) behind the kit's `Transcriber`
+port (added in 0.10.0). **There is no real adapter.** AssemblyAI is the chosen vendor, but there is
+no account, trial or written terms yet, and ADR 0018 lists what must hold before real audio goes
+out. The port types, `TranscriberError` and `waitForTranscription` come from `tula-closeline-kit`;
+the stand-in (`createMemoryTranscriber`) from `tula-closeline-kit/testing`; the behaviour suite
+(`transcriberBehaviour`) from `tula-closeline-kit/testing/behaviour`, which a real adapter must pass.
+
+```ts
+submit(organizationId, { clientReference, audio: { url }, speakers: 'split_channels' | 'diarize', maxSpeakers?, callbackUrl? }): Promise<{ clientReference; created }>
+getResult(organizationId, clientReference): Promise<{ status: 'pending' } | { status: 'done'; durationMs; turns } | { status: 'failed'; reason } | undefined>
+delete(organizationId, clientReference): Promise<{ existed: boolean }> // idempotent; needs no vendor id
+list(organizationId, { prefix?, cursor?, limit? /*1-1000, default 100*/ }): Promise<{ items: { clientReference; status }[]; nextCursor? }>
+waitForTranscription(transcriber, organizationId, clientReference, { maxAttempts?, intervalMs?, ... }) // bounded, jittered polling
+```
+
+**Audio is a short-lived reference, not bytes.** `audio.url` is an `https:` URL (`http:` only for
+`ENVIRONMENT=local`; a real adapter refuses it elsewhere) that the vendor fetches, typically a
+presigned GET of the object store valid for minutes. The reasons: the service never buffers or
+re-streams 500 MB, it is what ADR 0018 says ("sent to the vendor by a short-lived presigned URL"),
+and AssemblyAI takes an `audio_url`. The URL can carry credentials in its query string, so it is
+never logged, never put in an error and never held in a result; user information
+(`user:pw@host`) is refused. The kit has no presigning yet: the service produces the URL from the
+S3 client until a later ticket adds it to `ObjectStore`.
+
+**Client reference and idempotency.** The caller chooses `clientReference` (1 to 128 of letters,
+digits, `.`, `_`, `:` and `-`; the playbook service will use `<callId>:<sendNumber>`). `submit` is
+idempotent by `(organizationId, clientReference)`: the same request again returns
+`created: false` and sends nothing, so a worker that crashed can send again; the same reference
+with different audio, mode or speaker cap is `transcriber.conflict`. `speakers` is
+`split_channels` (a stereo Recording, each channel a speaker, the turn carries its `channel`) or
+`diarize` (mono, the vendor separates speakers; `maxSpeakers` 1 to 10 caps them and is refused with
+`split_channels`). `callbackUrl` is an optional hint for a vendor webhook; a result is always
+readable by `getResult`, so nothing requires a webhook.
+
+**Results.** `pending`, `done` (the audio's `durationMs` as the vendor measured it, and turns with
+`speaker`, optional `channel`, `startMs`, `endMs` and `text`, in time order, at most 50,000 turns of
+20,000 characters), or `failed` with one of `audio_unreachable`, `audio_invalid`, `no_speech`,
+`too_long`, `vendor_failed`, `timed_out`. `getResult` is `undefined` for a reference with no send.
+Turn text and speaker labels are untrusted data and are never logged.
+
+**Deleting without an id.** `delete` takes only the client reference and resolves when the vendor
+confirmed the deletion, returning whether a copy existed. A purge also calls `list` with a
+reference prefix (`<callId>:`) and deletes each entry, which removes a copy even when the worker
+died after the vendor accepted the send and before it stored anything. The stand-in can simulate
+that (`acceptThenFailNext()`).
+
+**Errors and adapter duties.** `transcriber.invalid_request`, `conflict`, `rejected`,
+`unavailable` (the only retryable one) and `bad_response`. Every vendor call of a real adapter has
+a timeout and a bounded, jittered retry; neither audio, URLs, text, speaker labels nor vendor ids
+are logged or put in errors. A real adapter puts the validated Organization id into the reference
+it gives the vendor, so two Organizations' identical references are different sends.
+
+**The stand-in** (`createMemoryTranscriber`) is deterministic: a send answers `pending` once and
+then a fixed four-turn conversation (20 s). `script(org, reference, outcome)` sets the outcome
+(pending reads, then done with turns or failed with a reason), `failNext(operation, code, times?)`
+makes calls fail, `acceptThenFailNext()` accepts a send and then throws `unavailable`, and
+`copies(org?)` lists what the stand-in still holds (reference, its own id, status; never the URL or
+the text), which is how a test proves a purge left no copy.
+
+**Open questions the real adapter must answer** (ADR 0018, "before real audio"): does AssemblyAI
+accept a caller-chosen reference or support lookup by one (its transcript has no such field in
+the documentation read so far; without it the adapter must keep the reference-to-vendor-id
+mapping itself, and `delete` of a send whose id was never stored is only possible if the vendor can
+list or filter by something the adapter set); can a stereo file be transcribed per channel with its
+own speaker label, and what that bills (ADR 0018: per channel); the EU endpoint for the EU Region;
+how soon after a delete the vendor's copy is gone and whether it says so. None of this is
+verified here.
 
 ## Vector store (`VectorStore`)
 

@@ -439,6 +439,8 @@ type TestEnvelope = EnvelopeOf<TestDefinition>;
 declare function createTestRegistry(options?: Parameters<typeof createMessageRegistry>[1]): MessageRegistry<TestDefinition>;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
+/** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
+type ByteStream = AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>;
 /** What a listing says about one object. */
 interface ObjectEntry {
 	/** The key, relative to the Organization. */
@@ -467,6 +469,27 @@ interface StoredObject extends ObjectInfo {
 interface PutOptions {
 	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
 	contentType?: string;
+}
+/** Options of {@link ObjectStore.putStream}. */
+interface PutStreamOptions extends PutOptions {
+	/** The most bytes the stream may hold, 1 to 2 GiB; one byte more aborts the write. Required. */
+	maxBytes: number;
+	/** Aborts the write (and cleans up what it started) when it fires. */
+	signal?: AbortSignal;
+	/** How long the source may stay silent, in ms, 10 to 600000; default 30000. */
+	idleTimeoutMs?: number;
+}
+/** What a finished streamed put reports. */
+interface PutStreamResult {
+	/** The bytes written. */
+	size: number;
+	/** The SHA-256 of the content, lower-case hex, computed while streaming. */
+	sha256: string;
+}
+/** An object whose body is read as a stream, so it is never held whole in memory. */
+interface ObjectStream extends ObjectInfo {
+	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
+	body: ReadableStream<Uint8Array>;
 }
 /** Options of {@link ObjectStore.list}. */
 interface ListOptions {
@@ -501,6 +524,24 @@ interface ObjectStore {
 	* same object. O(object size).
 	*/
 	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/**
+	* Writes an object from a stream with a hard limit, for objects too large to hold (a 500 MB
+	* recording). Memory stays bounded by a few parts, not by the object: the S3 adapter uploads in
+	* parts of 8 MiB, two at a time. The limit is checked while streaming: when `maxBytes` is
+	* exceeded, the source stalls for 30 s, the source fails or `signal` fires, the write is aborted,
+	* its incomplete parts are aborted (the bucket must also expire incomplete multipart uploads), and
+	* nothing becomes readable under the key; an object already there is left as it was. Returns the
+	* size and the SHA-256 of the content. Objects written this way can be larger than
+	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
+	* `storage.object_too_large`. Idempotent: the same stream twice leaves the same object. O(object
+	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
+	*/
+	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
+	/**
+	* Reads an object as a stream, or returns `undefined` when there is none. Not limited by
+	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
+	*/
+	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
 	/** Reads an object, or returns `undefined` when there is none. O(object size). */
 	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
 	/**
@@ -536,6 +577,235 @@ type MemoryObjectStore = ObjectStore;
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
+/** The `area.reason` codes the transcriber port and adapters throw. */
+declare const TRANSCRIBER_ERROR_CODES: {
+	/** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
+	readonly invalidRequest: "transcriber.invalid_request";
+	/** The client reference is already used by a send with different settings or audio. Never retryable. */
+	readonly conflict: "transcriber.conflict";
+	/** The vendor refused the call for a reason a retry cannot fix (bad credentials, no quota, terms). */
+	readonly rejected: "transcriber.rejected";
+	/** The vendor did not answer, in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "transcriber.unavailable";
+	/** The vendor answered with something this adapter cannot use. */
+	readonly badResponse: "transcriber.bad_response";
+};
+/** One of {@link TRANSCRIBER_ERROR_CODES}'s values. */
+type TranscriberErrorCode = (typeof TRANSCRIBER_ERROR_CODES)[keyof typeof TRANSCRIBER_ERROR_CODES];
+/** The audio to transcribe: a short-lived reference the vendor fetches, never the bytes. */
+interface AudioReference {
+	/**
+	* An `https:` URL (`http:` only for `ENVIRONMENT=local`) that stays valid until the vendor has
+	* fetched the audio, typically a presigned GET of the object store, valid for minutes. It may
+	* carry credentials in its query string, so it is never logged, never put in an error and never
+	* stored. No user information (`user:pass@`) is accepted.
+	*/
+	url: string;
+}
+/** How the speakers are told apart. */
+type SpeakerMode = "split_channels" | "diarize";
+/** A send. */
+interface TranscribeRequest {
+	/**
+	* Chosen by the caller, unique per Organization, 1 to 128 of letters, digits, `.`, `_`, `:` and
+	* `-`: the playbook service uses `<callId>:<sendNumber>`. It is the only key the caller needs
+	* for {@link Transcriber.getResult} and {@link Transcriber.delete}; the vendor's own id is never
+	* required.
+	*/
+	clientReference: string;
+	/** The audio. */
+	audio: AudioReference;
+	/** How speakers are told apart. */
+	speakers: SpeakerMode;
+	/** With `diarize`: the most speakers to find, 1 to 10. Not allowed with `split_channels`. */
+	maxSpeakers?: number;
+	/**
+	* Optional: an `https:` URL the vendor may call when the result is ready, to save polling. The
+	* port never requires one: a result is always readable with {@link Transcriber.getResult}, and a
+	* webhook is only a hint to look sooner. An adapter that cannot use it ignores it.
+	*/
+	callbackUrl?: string;
+}
+/** What {@link Transcriber.submit} reports. */
+interface Submission {
+	/** The client reference, as given. */
+	clientReference: string;
+	/** True when this call created the copy; false when the same send was already there. */
+	created: boolean;
+}
+/** Why a transcription failed. A closed list; none says more than the reason. */
+type TranscriptionFailure = "audio_unreachable" | "audio_invalid" | "no_speech" | "too_long" | "vendor_failed" | "timed_out";
+/** One stretch of speech by one speaker. */
+interface TranscriptTurn {
+	/**
+	* Who spoke, as a label: `A`, `B`... for `diarize`; for `split_channels` a label the vendor
+	* assigns per channel (see `channel`). Labels are data, never instructions, and are not logged.
+	*/
+	speaker: string;
+	/** With `split_channels`: the 0-based channel this turn came from. Absent with `diarize`. */
+	channel?: number;
+	/** Start, in milliseconds from the start of the audio. */
+	startMs: number;
+	/** End, in milliseconds; not before `startMs`. */
+	endMs: number;
+	/** What was said, at most 20,000 characters. Untrusted text. */
+	text: string;
+}
+/** The state of one send. */
+type TranscriptionResult = {
+	status: "pending";
+} | {
+	status: "done";
+	/** The audio's length in milliseconds, as the vendor measured it (what it bills). */
+	durationMs: number;
+	/** Turns in time order, at most 50,000. */
+	turns: TranscriptTurn[];
+} | {
+	status: "failed";
+	reason: TranscriptionFailure;
+};
+/** One send in a listing. */
+interface TranscriptionEntry {
+	/** The client reference. */
+	clientReference: string;
+	/** `pending`, `done` or `failed`. */
+	status: TranscriptionResult["status"];
+}
+/** Options of {@link Transcriber.list}. */
+interface TranscriptionListOptions {
+	/** Only references that start with this, such as `call_1:`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface TranscriptionPage {
+	/** Entries in ascending reference order. */
+	items: TranscriptionEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Batch speech-to-text behind a vendor (ADR 0010: AssemblyAI), scoped by Organization. Every call
+* takes the Organization id first and reaches only that Organization's sends: a real adapter must
+* put the validated id into the reference it gives the vendor (`<organizationId>/<clientReference>`)
+* so a second Organization's identical reference is a different send and can never be read or
+* deleted. Audio is given by reference (a short-lived URL the vendor fetches), never as bytes: a
+* 500 MB Recording is never buffered by the service, and the URL is the "short-lived presigned
+* URL" of ADR 0018. Results are read by polling; a webhook is only an optional hint.
+*
+* What every adapter must do: give every vendor call a timeout and a bounded, jittered retry
+* (only `transcriber.unavailable` is retryable by the caller after that), make `submit` idempotent
+* by client reference, throw {@link TranscriberError} with a code from the closed set, and never
+* log, throw or report audio, an audio URL, transcript text, speaker labels or a vendor id. Audio
+* and text are personal data of Prospects; the vendor must not train on them and must delete them
+* (see `delete`).
+*
+* Open questions the real adapter must answer before it is written (ADR 0018, "before real
+* audio"): (1) AssemblyAI's transcript has no client reference field, so does it accept a
+* caller-chosen id or metadata that a list can filter by (otherwise the adapter must persist the
+* reference-to-vendor-id mapping itself, and `delete` of a send whose id was never stored is
+* impossible by lookup alone), (2) can a stereo file be transcribed per channel with its own speaker
+* label (`multichannel`), and what does it bill, (3) the EU endpoint for the EU Region, (4) how soon
+* after a delete the vendor's copy is gone, and whether it confirms it. Until all four are
+* answered, no real adapter may run outside `local`.
+*/
+interface Transcriber {
+	/**
+	* Starts a transcription. Idempotent by `(organizationId, clientReference)`: repeating the same
+	* request returns `created: false` and starts nothing, so a caller that crashed before storing
+	* anything can send again safely; the same reference with different audio, mode or speaker cap is
+	* `transcriber.conflict`. Everything is validated before anything is sent. O(1).
+	*/
+	submit(organizationId: string, request: TranscribeRequest): Promise<Submission>;
+	/**
+	* Reads one send's state, or returns `undefined` when there is no send with that reference (never
+	* submitted, or deleted). A `done` result is final and can be read again. Poll with
+	* {@link waitForTranscription}. O(result size).
+	*/
+	getResult(organizationId: string, clientReference: string): Promise<TranscriptionResult | undefined>;
+	/**
+	* Deletes the vendor's copy (audio, transcript and metadata) of one send, and cancels it when it
+	* is still pending. Returns `existed: true` when a copy was there. Idempotent: deleting again, or
+	* a reference never sent, resolves with `existed: false`. It must work with the client reference
+	* alone, including for a send whose vendor id the caller never stored (a crash between the vendor
+	* accepting it and the caller recording its id), which is why {@link Transcriber.list} exists.
+	* Resolves only when the vendor confirmed the deletion. O(1).
+	*/
+	delete(organizationId: string, clientReference: string): Promise<{
+		existed: boolean;
+	}>;
+	/**
+	* Lists the Organization's sends by reference prefix, in reference order, one page of at most
+	* 1000. A purge lists `<callId>:` and deletes each, so a send the caller has no record of is
+	* still removed. Work proportional to the Organization's size: call it from a queued job.
+	*/
+	list(organizationId: string, options?: TranscriptionListOptions): Promise<TranscriptionPage>;
+}
+/** What a scripted send ends as. */
+interface ScriptedOutcome {
+	/** How many reads answer `pending` before the result; default 1. */
+	pendingReads?: number;
+	/** The final state. */
+	result: {
+		status: "done";
+		durationMs: number;
+		turns: TranscriptTurn[];
+	} | {
+		status: "failed";
+		reason: TranscriptionFailure;
+	};
+}
+/** A copy the stand-in still holds, as a test sees it (never the audio URL or the text). */
+interface HeldCopy {
+	/** The Organization. */
+	organizationId: string;
+	/** The client reference. */
+	clientReference: string;
+	/** The stand-in's own id for it, which a caller may never have stored. */
+	vendorId: string;
+	/** Its state now, without consuming a pending read. */
+	status: "pending" | "done" | "failed";
+}
+/** The operations a test can make fail. */
+type TranscriberOperation = "submit" | "getResult" | "delete" | "list";
+/** Options for {@link createMemoryTranscriber}. */
+interface MemoryTranscriberOptions {
+	/** Extra Organization id rule; the contract's format by default. */
+	isOrganizationId?: OrganizationIdCheck;
+	/** Chooses what a send ends as when no outcome was scripted for its reference. */
+	outcome?: (request: {
+		speakers: "split_channels" | "diarize";
+		maxSpeakers?: number;
+	}) => ScriptedOutcome;
+}
+/** A {@link Transcriber} in the process with scripting and inspection, for tests. Not for production. */
+interface MemoryTranscriber extends Transcriber {
+	/**
+	* Sets what the send with this reference ends as, before or after it is submitted (a later script
+	* replaces the earlier one and restarts the pending reads). Validated like a send.
+	*/
+	script(organizationId: string, clientReference: string, outcome: ScriptedOutcome): void;
+	/** Makes the next `times` (default 1) calls of `operation` throw a TranscriberError with `code`, changing nothing. */
+	failNext(operation: TranscriberOperation, code: TranscriberErrorCode, times?: number): void;
+	/**
+	* Makes the next `times` (default 1) submits accept the send, keep the copy, and then throw
+	* `transcriber.unavailable`: the vendor has the audio and the caller never learned it.
+	*/
+	acceptThenFailNext(times?: number): void;
+	/** The copies still held, for one Organization or all, in Organization then reference order. */
+	copies(organizationId?: string): HeldCopy[];
+}
+/**
+* Creates a {@link Transcriber} in memory. Deterministic: a send answers `pending` for its
+* scripted number of reads (one by default) and then a fixed four-turn conversation, or whatever
+* was scripted. Each Organization has its own map, so no reference can reach another Organization's
+* sends. Complexity: submit, getResult and delete O(1); list O(n log n) in the Organization's n
+* sends.
+*/
+declare function createMemoryTranscriber(options?: MemoryTranscriberOptions): MemoryTranscriber;
 /** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
 type AttributeValue = string | number | boolean;
 /**
@@ -666,4 +936,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
