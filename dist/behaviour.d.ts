@@ -619,8 +619,10 @@ interface Transcriber {
 	/**
 	* Starts a transcription. Idempotent by `(organizationId, clientReference)`: repeating the same
 	* request returns `created: false` and starts nothing, so a caller that crashed before storing
-	* anything can send again safely; the same reference with different audio, mode or speaker cap is
-	* `transcriber.conflict`. Everything is validated before anything is sent. O(1).
+	* anything can send again safely; the same reference with a different mode, speaker cap or
+	* `audioKey` is `transcriber.conflict`. The audio URL is not compared (a retry presigns a new
+	* one), so without an `audioKey` the audio itself is not checked. An adapter validates with the
+	* shared checks and its `ENVIRONMENT`: plain `http:` URLs only in `local`. Everything is validated before anything is sent. O(1).
 	*/
 	submit(organizationId: string, request: TranscribeRequest): Promise<Submission>;
 	/**

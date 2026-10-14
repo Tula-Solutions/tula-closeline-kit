@@ -4,7 +4,7 @@ import { AppError } from '../errors'
 export const TRANSCRIBER_ERROR_CODES = {
   /** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
   invalidRequest: 'transcriber.invalid_request',
-  /** The client reference is already used by a send with different settings or audio. Never retryable. */
+  /** The client reference is already used by a send with a different mode, speaker cap or audio key. Never retryable. */
   conflict: 'transcriber.conflict',
   /** The vendor refused the call for a reason a retry cannot fix (bad credentials, no quota, terms). */
   rejected: 'transcriber.rejected',
