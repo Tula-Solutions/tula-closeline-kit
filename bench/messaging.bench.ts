@@ -38,8 +38,9 @@ const BUDGETS = {
   // p95 0.04013 ms, which failed the earlier 0.04 ms tail budget. These are about five times the CI
   // numbers, so a noisy runner passes and an accidental quadratic or per-call copy still fails.
   send: { meanMs: 0.15, medianMs: 0.12, tailMs: 0.2 },
-  // Measured: mean 0.0053, median 0.0041, best-of-5 p95 0.0061 ms.
-  webhook: { meanMs: 0.023, medianMs: 0.018, tailMs: 0.025 },
+  // Measured locally: mean 0.0053, median 0.0041, best-of-5 p95 0.0061 ms. Like send, sized at about
+  // five times a CI runner, which is about four times slower than local.
+  webhook: { meanMs: 0.11, medianMs: 0.08, tailMs: 0.12 },
   // Measured: mean 0.00029, median 0.00025, best-of-5 p95 0.00029 ms; the budget is a 0.02 ms floor.
   intent: { meanMs: 0.02, medianMs: 0.02, tailMs: 0.02 },
 } satisfies Record<string, Budget>
