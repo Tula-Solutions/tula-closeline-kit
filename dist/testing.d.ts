@@ -72,6 +72,61 @@ interface MemoryErrorReporter extends ErrorReporter {
 }
 /** Creates an ErrorReporter that records reported errors in memory instead of sending them. */
 declare function createMemoryErrorReporter(): MemoryErrorReporter;
+import { z as z2 } from "zod";
+/** The shape of one audit entry; unknown fields are refused. */
+declare const auditEntrySchema: z2.ZodObject<{
+	actor: z2.ZodObject<{
+		kind: z2.ZodEnum<{
+			agent: "agent";
+			api_key: "api_key";
+			member: "member";
+			system: "system";
+		}>;
+		id: z2.ZodOptional<z2.ZodString>;
+	}, z2.core.$strict>;
+	action: z2.ZodString;
+	subject: z2.ZodObject<{
+		type: z2.ZodString;
+		id: z2.ZodString;
+	}, z2.core.$strict>;
+	instructionVersion: z2.ZodOptional<z2.ZodNumber>;
+	requestId: z2.ZodOptional<z2.ZodString>;
+	occurredAt: z2.ZodOptional<z2.ZodISODateTime>;
+	metadata: z2.ZodOptional<z2.ZodRecord<z2.ZodString, z2.ZodUnion<readonly [z2.ZodString, z2.ZodNumber, z2.ZodBoolean]>>>;
+	id: z2.ZodString;
+	organizationId: z2.core.$ZodBranded<z2.ZodString, "org", "out">;
+}, z2.core.$strict>;
+/** A validated audit entry. */
+type AuditEntry = z2.output<typeof auditEntrySchema>;
+/** What a caller gives {@link AuditRecorder.record}. */
+type AuditEntryInput = z2.input<typeof auditEntrySchema>;
+/**
+* Records one audit event: who or what did what to which subject. An entry holds ids, labels and
+* an action code, never a message body, transcript, secret or address. Core consumes the events
+* (`audit.recorded`) and writes the log.
+*/
+interface AuditRecorder {
+	/**
+	* Records the entry. Idempotent per `entry.id`: recording the same id again changes nothing. Throws
+	* an AuditError: `audit.invalid_entry`, `audit.entry_too_large` or, for the queue adapter,
+	* `audit.unavailable` (retry with the same id). O(entry size), at most 4 KiB.
+	*/
+	record(entry: AuditEntryInput): Promise<void>;
+}
+/** Options for {@link createMemoryAuditRecorder}. */
+interface MemoryAuditRecorderOptions {
+	/** Time source for entries without `occurredAt`. */
+	clock?: Clock;
+	/** Receives one line per entry with ids and counts, never metadata values. */
+	logger?: Logger;
+}
+/** An {@link AuditRecorder} that keeps entries in the process, for tests. */
+interface MemoryAuditRecorder extends AuditRecorder {
+	/** Copies of the recorded entries, one per event id, in recording order. */
+	entries(): AuditEntry[];
+}
+/** Creates the in-memory recorder. The first entry for an event id is kept; later ones are ignored. */
+declare function createMemoryAuditRecorder(options?: MemoryAuditRecorderOptions): MemoryAuditRecorder;
 /** A JSON Web Key Set as published by the auth service. */
 interface Jwks {
 	keys: readonly unknown[];
@@ -495,7 +550,7 @@ interface MemoryContactGuard extends ContactGuard {
 declare function createMemoryContactGuard(): MemoryContactGuard;
 import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
 import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
-import { z as z2 } from "zod";
+import { z as z3 } from "zod";
 /**
 * The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
 * short answers) and `smart` for work that can wait longer for a better answer. An adapter maps
@@ -551,7 +606,7 @@ interface LlmRequestBase {
 	signal?: AbortSignal;
 }
 /** A request for a value shaped by a schema. */
-interface LlmCompleteRequest<S extends z2.ZodType = z2.ZodType> extends LlmRequestBase {
+interface LlmCompleteRequest<S extends z3.ZodType = z3.ZodType> extends LlmRequestBase {
 	/**
 	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
 	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
@@ -614,7 +669,7 @@ type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
 */
 interface LlmPort {
 	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
-	complete<S extends z2.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z2.output<S>>>;
+	complete<S extends z3.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z3.output<S>>>;
 	/**
 	* Streams free text. An unacceptable request throws `llm.invalid_request` or
 	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
@@ -954,13 +1009,13 @@ interface MemoryMessaging extends MessagingPort {
 * only for `sentBodies()`; no log line, report, error or inspect form holds it. Not for production.
 */
 declare function createMemoryMessaging(options: MemoryMessagingOptions): MemoryMessaging;
-import { z as z3 } from "zod";
+import { z as z4 } from "zod";
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
 type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */
 interface MessageDefinition<
 	T extends string = string,
-	P extends z3.ZodType = z3.ZodType,
+	P extends z4.ZodType = z4.ZodType,
 	S extends MessageScope = MessageScope
 > {
 	readonly type: T;
@@ -980,12 +1035,12 @@ interface PreviousVersion {
 	/** The older version number; must differ from the definition's own. */
 	version: number;
 	/** The payload schema of that version. */
-	payload: z3.ZodType;
+	payload: z4.ZodType;
 	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
 	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
+type AnyDefinition = MessageDefinition<string, z4.ZodType, MessageScope>;
 /** The fields every envelope has. */
 interface EnvelopeBase<
 	T extends string,
@@ -1010,7 +1065,7 @@ type ScopeField<S> = S extends "organization" ? {
 	organizationId?: undefined;
 };
 /** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z4.output<P>> & ScopeField<S> : never;
 /** The shape every envelope has, whatever its type. */
 interface AnyEnvelope {
 	id: string;
@@ -1024,7 +1079,7 @@ interface AnyEnvelope {
 /** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
 type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
 	type: T;
-	payload: z3.input<P>;
+	payload: z4.input<P>;
 	traceId: string;
 	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
 	id?: string;
@@ -1073,7 +1128,7 @@ interface MessageRegistryOptions {
 	* The shape of an Organization id, checked for `organization` messages on the way in and out.
 	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
 	*/
-	organizationIdSchema?: z3.ZodType<string>;
+	organizationIdSchema?: z4.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -1228,7 +1283,7 @@ interface MemoryQueue<D extends AnyDefinition> extends Queue<EnvelopeOf<D>> {
 * because it scans for the visible ones (fine for tests).
 */
 declare function createMemoryQueue<const D extends AnyDefinition>(options: MemoryQueueOptions<D>): MemoryQueue<D>;
-import { z as z4 } from "zod";
+import { z as z5 } from "zod";
 /** Time that moves only when a test says so: a clock and a {@link Sleep} that share it. */
 interface VirtualTime {
 	/** The clock; pass it to the memory queue and store. */
@@ -1245,13 +1300,13 @@ interface VirtualTime {
 /** Creates {@link VirtualTime} starting at 2026-01-01T00:00:00.000Z. */
 declare function createVirtualTime(): VirtualTime;
 /** A message that belongs to an Organization, for tests and examples. */
-declare const testPing: MessageDefinition<"test.ping", z4.ZodObject<{
-	n: z4.ZodNumber;
-}, z4.core.$strip>, "organization">;
+declare const testPing: MessageDefinition<"test.ping", z5.ZodObject<{
+	n: z5.ZodNumber;
+}, z5.core.$strip>, "organization">;
 /** A message that belongs to no Organization, for tests and examples. */
-declare const testNote: MessageDefinition<"test.note", z4.ZodObject<{
-	text: z4.ZodString;
-}, z4.core.$strip>, "global">;
+declare const testNote: MessageDefinition<"test.note", z5.ZodObject<{
+	text: z5.ZodString;
+}, z5.core.$strip>, "global">;
 /** The definitions the behaviour suite uses. */
 type TestDefinition = typeof testPing | typeof testNote;
 /** An envelope of either test type. */
@@ -2640,4 +2695,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryAuditRecorder, MemoryAuditRecorderOptions, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryAuditRecorder, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

@@ -1,57 +1,12 @@
 import {
-  CalendarConnection2,
-  CALENDAR_ERROR_CODES2,
-  CalendarError2,
-  DEFAULT_CALENDAR_TIMEOUT_MS2,
-  MAX_CALENDAR_TIMEOUT_MS2,
-  MAX_BUSY_RANGE_MS2,
-  MAX_BUSY_INTERVALS2,
-  MAX_EVENT_DURATION_MS2,
-  MAX_EVENT_ATTENDEES2,
-  DEFAULT_CALENDAR_RETRY_POLICY2,
-  calendarRetryDelayMs2,
-  LLM_ERROR_CODES2,
-  LlmError2,
-  MESSAGING_ERROR_CODES2,
-  MessagingError2,
-  isReportableMessagingError2,
-  DEFAULT_MESSAGING_TIMEOUT_MS2,
-  MAX_MESSAGING_TIMEOUT_MS2,
-  MAX_MESSAGE_BODY_CHARS2,
-  MAX_TEMPLATE_VARIABLES2,
-  MAX_TEMPLATE_VARIABLE_CHARS2,
-  MAX_MESSAGING_WEBHOOK_BYTES2,
-  MESSAGING_CHANNELS2,
-  MESSAGING_PURPOSES2,
-  DEFAULT_MESSAGING_RETRY_POLICY2,
-  messagingRetryDelayMs2,
-  InboundMessage2,
-  DEFAULT_TELEPHONY_TIMEOUT_MS2,
-  MAX_TELEPHONY_TIMEOUT_MS2,
-  MAX_DISCLOSURE_TEXT_LENGTH2,
-  MAX_RING_LEGS2,
-  MAX_WEBHOOK_BODY_BYTES2,
-  TRANSCRIBER_ERROR_CODES2,
-  TranscriberError2,
-  MAX_CLIENT_REFERENCE_LENGTH2,
-  MAX_AUDIO_URL_LENGTH2,
-  MAX_SPEAKERS2,
-  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIPT_TURNS2,
-  MAX_TURN_TEXT2,
-  MAX_VENDOR_ID_LENGTH2,
-  MAX_TRANSCRIPT_RESPONSE_BYTES2,
-  MAX_AUDIO_MS2,
-  MAX_TRANSCRIPT_CHARS2,
-  MAX_SPEAKER_LABEL2,
-  MAX_CHANNELS2,
-  TRANSCRIPTION_FAILURES2,
-  checkTranscriptionResult2,
-  TTS_ERROR_CODES2,
-  TtsError2
-} from "./shared/chunk-hff6jkfx.js";
-import {
+  AUDIT_LIMITS2,
+  AUDIT_DENIED_METADATA_KEYS2,
+  auditMetadataSchema2,
+  auditActorSchema2,
+  auditSubjectSchema2,
+  auditEventPayloadSchema2,
+  auditEntrySchema2,
+  parseAuditEntry2,
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
   withCaller2,
@@ -127,7 +82,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-0f87wa1m.js";
+} from "./shared/chunk-wrcc1eww.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -138,6 +93,61 @@ import {
   INVALID_REASONS2,
   createMessageRegistry2
 } from "./shared/chunk-mjkmsg3r.js";
+import {
+  AUDIT_ERROR_CODES2,
+  AuditError2,
+  CalendarConnection2,
+  CALENDAR_ERROR_CODES2,
+  CalendarError2,
+  DEFAULT_CALENDAR_TIMEOUT_MS2,
+  MAX_CALENDAR_TIMEOUT_MS2,
+  MAX_BUSY_RANGE_MS2,
+  MAX_BUSY_INTERVALS2,
+  MAX_EVENT_DURATION_MS2,
+  MAX_EVENT_ATTENDEES2,
+  DEFAULT_CALENDAR_RETRY_POLICY2,
+  calendarRetryDelayMs2,
+  LLM_ERROR_CODES2,
+  LlmError2,
+  MESSAGING_ERROR_CODES2,
+  MessagingError2,
+  isReportableMessagingError2,
+  DEFAULT_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGE_BODY_CHARS2,
+  MAX_TEMPLATE_VARIABLES2,
+  MAX_TEMPLATE_VARIABLE_CHARS2,
+  MAX_MESSAGING_WEBHOOK_BYTES2,
+  MESSAGING_CHANNELS2,
+  MESSAGING_PURPOSES2,
+  DEFAULT_MESSAGING_RETRY_POLICY2,
+  messagingRetryDelayMs2,
+  InboundMessage2,
+  DEFAULT_TELEPHONY_TIMEOUT_MS2,
+  MAX_TELEPHONY_TIMEOUT_MS2,
+  MAX_DISCLOSURE_TEXT_LENGTH2,
+  MAX_RING_LEGS2,
+  MAX_WEBHOOK_BODY_BYTES2,
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIPT_TURNS2,
+  MAX_TURN_TEXT2,
+  MAX_VENDOR_ID_LENGTH2,
+  MAX_TRANSCRIPT_RESPONSE_BYTES2,
+  MAX_AUDIO_MS2,
+  MAX_TRANSCRIPT_CHARS2,
+  MAX_SPEAKER_LABEL2,
+  MAX_CHANNELS2,
+  TRANSCRIPTION_FAILURES2,
+  checkTranscriptionResult2,
+  TTS_ERROR_CODES2,
+  TtsError2
+} from "./shared/chunk-q819sn0x.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2,
@@ -170,7 +180,44 @@ import {
   isAppError2,
   toErrorBody2
 } from "./shared/chunk-tya44yhr.js";
-
+// src/audit/message.ts
+var auditRecordedMessage = defineMessage2({
+  type: "audit.recorded",
+  version: 1,
+  scope: "organization",
+  payload: auditEventPayloadSchema2
+});
+// src/audit/queue.ts
+function createQueueAuditRecorder(options) {
+  const clock = options.clock ?? systemClock2;
+  return {
+    async record(input) {
+      const { id, organizationId, ...payload } = parseAuditEntry2(input, clock);
+      const { occurredAt } = payload;
+      const envelope = {
+        id,
+        type: auditRecordedMessage.type,
+        version: auditRecordedMessage.version,
+        occurredAt,
+        organizationId,
+        traceId: payload.requestId ?? id,
+        payload
+      };
+      try {
+        await options.queue.publish(envelope);
+      } catch (cause) {
+        throw new AuditError2(AUDIT_ERROR_CODES2.unavailable, "the audit event could not be queued", {
+          cause
+        });
+      }
+      options.logger?.info("audit entry recorded", {
+        eventId: id,
+        action: payload.action,
+        metadataKeys: Object.keys(payload.metadata ?? {}).length
+      });
+    }
+  };
+}
 // src/auth/claims.ts
 import {
   organizationIdSchema,
@@ -2818,7 +2865,11 @@ function createErrorReporter(options) {
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
 export {
+  AUDIT_DENIED_METADATA_KEYS2 as AUDIT_DENIED_METADATA_KEYS,
+  AUDIT_ERROR_CODES2 as AUDIT_ERROR_CODES,
+  AUDIT_LIMITS2 as AUDIT_LIMITS,
   AppError2 as AppError,
+  AuditError2 as AuditError,
   CALENDAR_ERROR_CODES2 as CALENDAR_ERROR_CODES,
   CONTACT_GUARD_RETRY_DELAY_MS,
   CONTACT_GUARD_TIMEOUT_MS,
@@ -2951,6 +3002,12 @@ export {
   assertBatchCount2 as assertBatchCount,
   assertReceiveOptions2 as assertReceiveOptions,
   assertVisibility2 as assertVisibility,
+  auditActorSchema2 as auditActorSchema,
+  auditEntrySchema2 as auditEntrySchema,
+  auditEventPayloadSchema2 as auditEventPayloadSchema,
+  auditMetadataSchema2 as auditMetadataSchema,
+  auditRecordedMessage,
+  auditSubjectSchema2 as auditSubjectSchema,
   calendarRetryDelayMs2 as calendarRetryDelayMs,
   checkTranscriptionResult2 as checkTranscriptionResult,
   classifyMessageIntent2 as classifyMessageIntent,
@@ -2964,6 +3021,7 @@ export {
   createMemoryTwilioStore,
   createMessageRegistry2 as createMessageRegistry,
   createNoopErrorReporter,
+  createQueueAuditRecorder,
   createRemoteKeySet,
   createStaticKeySet,
   createTokenVerifier,
@@ -2981,6 +3039,7 @@ export {
   isSentryDsn,
   llmRetryDelayMs2 as llmRetryDelayMs,
   messagingRetryDelayMs2 as messagingRetryDelayMs,
+  parseAuditEntry2 as parseAuditEntry,
   reconnectDelayMs2 as reconnectDelayMs,
   requireSentryDsn,
   scrubText2 as scrubText,

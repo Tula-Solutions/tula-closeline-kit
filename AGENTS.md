@@ -69,6 +69,13 @@ Other scripts are in `package.json`.
   times the memory adapter's measured numbers: a chunk pull mean 0.0015 ms and open to first chunk
   mean 0.012 ms, each with a median and best-batch p95 budget as above.
 
+- `AuditRecorder.record` (`src/audit/`) runs on every Agent action. It validates one entry strictly
+  (O(entry size), at most 4 KiB, 20 metadata keys of at most 200 characters), serialises it once for
+  the size cap, then does O(1) work: a map insert (memory) or one envelope build and one queue
+  publish. The event id is the envelope id, so a retry is dropped by the idempotent consumer. Budgets
+  in `bench/audit.bench.ts`, about five times what it measures: memory mean 0.08 ms and queue mean
+  0.11 ms (GC pauses carry the mean), each with a median and best-batch p95 budget as above.
+
 - `MessagingPort.send` (`src/messaging/`) is on every outbound text. It validates a small request
   strictly (O(body length), at most 1,600 characters and 20 template variables), asks the Contact
   Check once, then makes one HTTP call; the memory adapter adds one sha256 and one map insert, and

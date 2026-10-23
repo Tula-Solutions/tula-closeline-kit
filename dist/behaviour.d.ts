@@ -1,3 +1,90 @@
+import { z } from "zod";
+/** A source of the current time, so code under test never reads the real clock. */
+interface Clock {
+	/** Returns the current time as a new Date each call. */
+	now(): Date;
+}
+/** The shape of one audit entry; unknown fields are refused. */
+declare const auditEntrySchema: z.ZodObject<{
+	actor: z.ZodObject<{
+		kind: z.ZodEnum<{
+			agent: "agent";
+			api_key: "api_key";
+			member: "member";
+			system: "system";
+		}>;
+		id: z.ZodOptional<z.ZodString>;
+	}, z.core.$strict>;
+	action: z.ZodString;
+	subject: z.ZodObject<{
+		type: z.ZodString;
+		id: z.ZodString;
+	}, z.core.$strict>;
+	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	requestId: z.ZodOptional<z.ZodString>;
+	occurredAt: z.ZodOptional<z.ZodISODateTime>;
+	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
+	id: z.ZodString;
+	organizationId: z.core.$ZodBranded<z.ZodString, "org", "out">;
+}, z.core.$strict>;
+/** What a caller gives {@link AuditRecorder.record}. */
+type AuditEntryInput = z.input<typeof auditEntrySchema>;
+/**
+* Records one audit event: who or what did what to which subject. An entry holds ids, labels and
+* an action code, never a message body, transcript, secret or address. Core consumes the events
+* (`audit.recorded`) and writes the log.
+*/
+interface AuditRecorder {
+	/**
+	* Records the entry. Idempotent per `entry.id`: recording the same id again changes nothing. Throws
+	* an AuditError: `audit.invalid_entry`, `audit.entry_too_large` or, for the queue adapter,
+	* `audit.unavailable` (retry with the same id). O(entry size), at most 4 KiB.
+	*/
+	record(entry: AuditEntryInput): Promise<void>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface AuditSubject {
+	/** The recorder under test, empty. */
+	recorder: AuditRecorder;
+	/**
+	* Every event the recorder has handed on, as `{ id, organizationId, action }`, in order. The
+	* memory adapter keeps one per event id; the queue adapter may hold duplicates with the same id
+	* (the queue delivers at least once and the consumer drops the second).
+	*/
+	delivered(): Promise<{
+		id: string;
+		organizationId: string;
+		action: string;
+	}[]>;
+	/** Everything the recorder logged, one JSON or text line per entry. */
+	logs(): string[];
+	/** Releases what the subject created. */
+	close(): Promise<void>;
+}
+/** A valid entry for the suite; `id` is the event id. */
+declare function sampleAuditEntry(id: string, overrides?: Partial<AuditEntryInput>): {
+	occurredAt?: string | undefined;
+	id: string;
+	organizationId: string;
+	actor: {
+		kind: "agent" | "api_key" | "member" | "system";
+		id?: string | undefined;
+	};
+	action: string;
+	subject: {
+		type: string;
+		id: string;
+	};
+	instructionVersion: number;
+	requestId: string;
+	metadata: Record<string, string | number | boolean>;
+};
+/**
+* The behaviour every {@link AuditRecorder} must show. Run it with {@link auditBehaviour} against
+* the memory adapter and the queue adapter; a change that passes for one and fails for the other
+* is a bug in one of them.
+*/
+declare function auditBehaviour(name: string, make: () => Promise<AuditSubject>, skip?: boolean): void;
 import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
@@ -391,7 +478,7 @@ interface ContactGuardSubject {
 declare function contactGuardBehaviour(name: string, make: () => Promise<ContactGuardSubject>): void;
 import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
 import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
-import { z as z2 } from "zod";
+import { z as z3 } from "zod";
 /**
 * The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
 * short answers) and `smart` for work that can wait longer for a better answer. An adapter maps
@@ -447,7 +534,7 @@ interface LlmRequestBase {
 	signal?: AbortSignal;
 }
 /** A request for a value shaped by a schema. */
-interface LlmCompleteRequest<S extends z2.ZodType = z2.ZodType> extends LlmRequestBase {
+interface LlmCompleteRequest<S extends z3.ZodType = z3.ZodType> extends LlmRequestBase {
 	/**
 	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
 	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
@@ -510,7 +597,7 @@ type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
 */
 interface LlmPort {
 	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
-	complete<S extends z2.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z2.output<S>>>;
+	complete<S extends z3.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z3.output<S>>>;
 	/**
 	* Streams free text. An unacceptable request throws `llm.invalid_request` or
 	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
@@ -816,18 +903,13 @@ interface MessagingSubject {
 * against the memory adapter and the Twilio adapter over a stubbed `fetch`.
 */
 declare function messagingBehaviour(name: string, make: () => Promise<MessagingSubject>, skip?: boolean): void;
-import { z as z3 } from "zod";
-/** A source of the current time, so code under test never reads the real clock. */
-interface Clock {
-	/** Returns the current time as a new Date each call. */
-	now(): Date;
-}
+import { z as z4 } from "zod";
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
 type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */
 interface MessageDefinition<
 	T extends string = string,
-	P extends z3.ZodType = z3.ZodType,
+	P extends z4.ZodType = z4.ZodType,
 	S extends MessageScope = MessageScope
 > {
 	readonly type: T;
@@ -847,12 +929,12 @@ interface PreviousVersion {
 	/** The older version number; must differ from the definition's own. */
 	version: number;
 	/** The payload schema of that version. */
-	payload: z3.ZodType;
+	payload: z4.ZodType;
 	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
 	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
+type AnyDefinition = MessageDefinition<string, z4.ZodType, MessageScope>;
 /** The fields every envelope has. */
 interface EnvelopeBase<
 	T extends string,
@@ -877,7 +959,7 @@ type ScopeField<S> = S extends "organization" ? {
 	organizationId?: undefined;
 };
 /** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z4.output<P>> & ScopeField<S> : never;
 /** The shape every envelope has, whatever its type. */
 interface AnyEnvelope {
 	id: string;
@@ -891,7 +973,7 @@ interface AnyEnvelope {
 /** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
 type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
 	type: T;
-	payload: z3.input<P>;
+	payload: z4.input<P>;
 	traceId: string;
 	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
 	id?: string;
@@ -940,7 +1022,7 @@ interface MessageRegistryOptions {
 	* The shape of an Organization id, checked for `organization` messages on the way in and out.
 	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
 	*/
-	organizationIdSchema?: z3.ZodType<string>;
+	organizationIdSchema?: z4.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -1048,15 +1130,15 @@ interface Queue<E extends AnyEnvelope = AnyEnvelope> {
 	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
 	release(receipt: Receipt): Promise<void>;
 }
-import { z as z4 } from "zod";
+import { z as z5 } from "zod";
 /** A message that belongs to an Organization, for tests and examples. */
-declare const testPing: MessageDefinition<"test.ping", z4.ZodObject<{
-	n: z4.ZodNumber;
-}, z4.core.$strip>, "organization">;
+declare const testPing: MessageDefinition<"test.ping", z5.ZodObject<{
+	n: z5.ZodNumber;
+}, z5.core.$strip>, "organization">;
 /** A message that belongs to no Organization, for tests and examples. */
-declare const testNote: MessageDefinition<"test.note", z4.ZodObject<{
-	text: z4.ZodString;
-}, z4.core.$strip>, "global">;
+declare const testNote: MessageDefinition<"test.note", z5.ZodObject<{
+	text: z5.ZodString;
+}, z5.core.$strip>, "global">;
 /** The definitions the behaviour suite uses. */
 type TestDefinition = typeof testPing | typeof testNote;
 /** An envelope of either test type. */
@@ -2353,4 +2435,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { CalendarSubject, ContactGuardSubject, HeardTurn, LlmSubject, MessagingSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, TtsSubject, VectorStoreSubject, calendarBehaviour, contactGuardBehaviour, llmBehaviour, messagingBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, ttsBehaviour, vectorStoreBehaviour };
+export { AuditSubject, CalendarSubject, ContactGuardSubject, HeardTurn, LlmSubject, MessagingSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, TtsSubject, VectorStoreSubject, auditBehaviour, calendarBehaviour, contactGuardBehaviour, llmBehaviour, messagingBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, sampleAuditEntry, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, ttsBehaviour, vectorStoreBehaviour };
