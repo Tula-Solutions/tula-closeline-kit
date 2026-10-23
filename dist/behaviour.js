@@ -1092,7 +1092,7 @@ function telephonyBehaviour(name, make, skip = false) {
         const placed = await place(s);
         expect5(placed.created).toBe(true);
         expect5(placed.providerCallId.length).toBeGreaterThan(0);
-        expect5(s.takeEvents().map((e) => e.type)).toEqual(["ringing", "answered"]);
+        expect5((await s.takeEvents()).map((e) => e.type)).toEqual(["ringing", "answered"]);
       });
       test5("the same idempotency key places exactly one call", async () => {
         const s = await subject();
@@ -1106,7 +1106,7 @@ function telephonyBehaviour(name, make, skip = false) {
         const first = await s.telephony.placeCall(request);
         const second = await s.telephony.placeCall(request);
         expect5(second).toEqual({ providerCallId: first.providerCallId, created: false });
-        expect5(s.takeEvents().filter((e) => e.type === "ringing")).toHaveLength(1);
+        expect5((await s.takeEvents()).filter((e) => e.type === "ringing")).toHaveLength(1);
       });
       test5("the same key for another number is refused", async () => {
         const s = await subject();
@@ -1142,24 +1142,24 @@ function telephonyBehaviour(name, make, skip = false) {
           ...bad
         };
         await expect5(s.telephony.placeCall(request)).rejects.toMatchObject(code("telephony.invalid_request"));
-        expect5(s.takeEvents()).toHaveLength(0);
+        expect5(await s.takeEvents()).toHaveLength(0);
       });
       test5("a Prospect who does not answer: no_answer", async () => {
         const s = await subject();
         await place(s, "no_answer");
-        const events = s.takeEvents();
+        const events = await s.takeEvents();
         expect5(events.map((e) => e.type)).toEqual(["ringing", "no_answer"]);
         expect5(events[1]).toMatchObject({ failureReason: "no_answer" });
       });
       test5("a busy Prospect: busy", async () => {
         const s = await subject();
         await place(s, "busy");
-        expect5(s.takeEvents().at(-1)).toMatchObject({ type: "busy", failureReason: "busy" });
+        expect5((await s.takeEvents()).at(-1)).toMatchObject({ type: "busy", failureReason: "busy" });
       });
       test5("a carrier failure: failed with a contract reason, and the call is over", async () => {
         const s = await subject();
         const placed = await place(s, "carrier_failure");
-        const last = s.takeEvents().at(-1);
+        const last = (await s.takeEvents()).at(-1);
         expect5(last?.type).toBe("failed");
         expect5(["carrier_dropped", "carrier_rejected", "provider_error"]).toContain(last?.failureReason);
         await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.call_ended"));
@@ -1174,7 +1174,7 @@ function telephonyBehaviour(name, make, skip = false) {
           from: line,
           to
         });
-        const text = JSON.stringify(s.takeEvents());
+        const text = JSON.stringify(await s.takeEvents());
         expect5(text).not.toContain(to);
         expect5(text).not.toContain(line);
       });
@@ -1182,7 +1182,7 @@ function telephonyBehaviour(name, make, skip = false) {
     describe5("answering an inbound call", () => {
       test5("answers it and rings the browser legs", async () => {
         const s = await subject();
-        const providerCallId = s.receiveInbound(s.organizations.a);
+        const providerCallId = await s.receiveInbound(s.organizations.a);
         const answered = await s.telephony.answerCall({
           organizationId: s.organizations.a,
           providerCallId,
@@ -1190,11 +1190,11 @@ function telephonyBehaviour(name, make, skip = false) {
           ringIdentities: [rep, otherRep]
         });
         expect5(answered).toEqual({ ringing: 2 });
-        expect5(s.takeEvents().map((e) => e.type)).toContain("answered");
+        expect5((await s.takeEvents()).map((e) => e.type)).toContain("answered");
       });
       test5("answering again changes nothing", async () => {
         const s = await subject();
-        const providerCallId = s.receiveInbound(s.organizations.a);
+        const providerCallId = await s.receiveInbound(s.organizations.a);
         const request = {
           organizationId: s.organizations.a,
           providerCallId,
@@ -1202,13 +1202,13 @@ function telephonyBehaviour(name, make, skip = false) {
           ringIdentities: [rep]
         };
         await s.telephony.answerCall(request);
-        s.takeEvents();
+        await s.takeEvents();
         expect5(await s.telephony.answerCall(request)).toEqual({ ringing: 1 });
-        expect5(s.takeEvents()).toHaveLength(0);
+        expect5(await s.takeEvents()).toHaveLength(0);
       });
       test5("another Organization cannot answer it", async () => {
         const s = await subject();
-        const providerCallId = s.receiveInbound(s.organizations.a);
+        const providerCallId = await s.receiveInbound(s.organizations.a);
         await expect5(s.telephony.answerCall({
           organizationId: s.organizations.b,
           providerCallId,
@@ -1221,7 +1221,7 @@ function telephonyBehaviour(name, make, skip = false) {
         ["a bad identity", ["mem_1"]]
       ])("%s is refused", async (_label, ringIdentities) => {
         const s = await subject();
-        const providerCallId = s.receiveInbound(s.organizations.a);
+        const providerCallId = await s.receiveInbound(s.organizations.a);
         await expect5(s.telephony.answerCall({
           organizationId: s.organizations.a,
           providerCallId,
@@ -1231,7 +1231,7 @@ function telephonyBehaviour(name, make, skip = false) {
       });
       test5("a call nobody answered cannot play the Disclosure yet", async () => {
         const s = await subject();
-        const providerCallId = s.receiveInbound(s.organizations.a);
+        const providerCallId = await s.receiveInbound(s.organizations.a);
         await expect5(s.telephony.playDisclosure({
           organizationId: s.organizations.a,
           providerCallId,
@@ -1274,7 +1274,10 @@ function telephonyBehaviour(name, make, skip = false) {
         const s = await subject();
         const placed = await place(s, "hangs_up_during_disclosure");
         await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.call_ended"));
-        expect5(s.takeEvents().at(-1)).toMatchObject({ type: "completed", endedBy: "prospect" });
+        expect5((await s.takeEvents()).at(-1)).toMatchObject({
+          type: "completed",
+          endedBy: "prospect"
+        });
         await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.call_ended"));
       });
       test5("a later wording version replaces the earlier one, including whether it names an AI", async () => {
@@ -1352,9 +1355,9 @@ function telephonyBehaviour(name, make, skip = false) {
         const s = await subject();
         const placed = await disclosed(s);
         await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
-        s.takeEvents();
-        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
-        expect5(s.takeEvents().find((e) => e.type === "completed")).toMatchObject({
+        await s.takeEvents();
+        await s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
+        expect5((await s.takeEvents()).find((e) => e.type === "completed")).toMatchObject({
           endedBy: "prospect"
         });
         await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: otherRep })).rejects.toMatchObject(code("telephony.call_ended"));
@@ -1382,7 +1385,7 @@ function telephonyBehaviour(name, make, skip = false) {
         const placed = await disclosed(s);
         const started = await s.telephony.startRecording(placed.ref);
         await s.telephony.hangUp({ ...placed.ref, by: "rep" });
-        expect5(s.takeEvents().at(-1)).toMatchObject({
+        expect5((await s.takeEvents()).at(-1)).toMatchObject({
           type: "recording_ready",
           recordingId: started.recordingId
         });
@@ -1405,7 +1408,7 @@ function telephonyBehaviour(name, make, skip = false) {
         const s = await subject();
         const placed = await disclosed(s);
         const started = await s.telephony.startRecording(placed.ref);
-        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
+        await s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
         const fetched = await s.telephony.fetchRecording({
           organizationId: placed.ref.organizationId,
           recordingId: started.recordingId
@@ -1467,11 +1470,11 @@ function telephonyBehaviour(name, make, skip = false) {
       test5("ends the call with who ended it, and again is a no-op", async () => {
         const s = await subject();
         const placed = await place(s);
-        s.takeEvents();
+        await s.takeEvents();
         await s.telephony.hangUp({ ...placed.ref, by: "rep" });
-        expect5(s.takeEvents()).toMatchObject([{ type: "completed", endedBy: "rep" }]);
+        expect5(await s.takeEvents()).toMatchObject([{ type: "completed", endedBy: "rep" }]);
         await s.telephony.hangUp(placed.ref);
-        expect5(s.takeEvents()).toHaveLength(0);
+        expect5(await s.takeEvents()).toHaveLength(0);
       });
       test5("another Organization cannot hang it up", async () => {
         const s = await subject();
@@ -1498,7 +1501,7 @@ function telephonyBehaviour(name, make, skip = false) {
       async function webhook() {
         const s = await subject();
         const placed = await place(s);
-        const event = s.takeEvents()[0];
+        const event = (await s.takeEvents())[0];
         return { s, placed, event, hook: s.signedWebhook(event) };
       }
       test5("a genuine webhook verifies", async () => {
@@ -1597,7 +1600,7 @@ function telephonyBehaviour(name, make, skip = false) {
           }, { timeoutMs: TIMEOUT })
         },
         answerCall: {
-          ready: async (s) => ({ providerCallId: s.receiveInbound(s.organizations.a) }),
+          ready: async (s) => ({ providerCallId: await s.receiveInbound(s.organizations.a) }),
           call: (s, c) => s.telephony.answerCall({
             organizationId: s.organizations.a,
             providerCallId: c.providerCallId,
@@ -1695,7 +1698,7 @@ function telephonyBehaviour(name, make, skip = false) {
         };
         s.stallNext("placeCall");
         await expect5(s.telephony.placeCall(request, { timeoutMs: TIMEOUT })).rejects.toMatchObject(code("telephony.unavailable"));
-        expect5(s.takeEvents()).toHaveLength(0);
+        expect5(await s.takeEvents()).toHaveLength(0);
         expect5((await s.telephony.placeCall(request)).created).toBe(true);
       });
       test5("a hangUp that timed out left the call up", async () => {

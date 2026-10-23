@@ -829,15 +829,15 @@ interface TelephonySubject {
 	/** Returns a number (E.164) that, when dialed, plays out as `scenario`. */
 	numberFor(scenario: ProspectScenario): string;
 	/** Makes a provider call arrive on a Line, as an inbound webhook would; returns its provider id. */
-	receiveInbound(organizationId: string): string;
+	receiveInbound(organizationId: string): string | Promise<string>;
 	/** Has the Prospect on a call hang up now. */
-	prospectHangsUp(organizationId: string, providerCallId: string): void;
+	prospectHangsUp(organizationId: string, providerCallId: string): void | Promise<void>;
 	/** Makes the next call of `operation` never get an answer from the provider. */
 	stallNext(operation: TelephonyOperation): void;
 	/** Makes the next call of `operation` fail at the provider, as `telephony.unavailable`. */
 	failNext(operation: TelephonyOperation): void;
 	/** Returns the events the provider has reported since the last call, in order. */
-	takeEvents(): TelephonyEvent[];
+	takeEvents(): TelephonyEvent[] | Promise<TelephonyEvent[]>;
 	/** The signed webhook the provider would send for `event`. */
 	signedWebhook(event: TelephonyEvent): SignedWebhook;
 	/** Removes what the subject created, including every provider call and Recording. */

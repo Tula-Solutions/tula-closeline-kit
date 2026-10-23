@@ -1,4 +1,9 @@
 import {
+  MAX_TELEPHONY_TIMEOUT_MS2,
+  MAX_DISCLOSURE_TEXT_LENGTH2,
+  MAX_RING_LEGS2
+} from "./chunk-0xwm31t3.js";
+import {
   AppError2,
   isAppError2
 } from "./chunk-tya44yhr.js";
@@ -1133,4 +1138,82 @@ var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, TELEPHONY_ERROR_CODES2, TelephonyError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+// src/telephony/validate.ts
+import {
+  callIdSchema,
+  e164PhoneSchema,
+  membershipIdSchema,
+  organizationIdSchema
+} from "tula-closeline-contract";
+var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+var CONTROL = /[\u0000-\u001f\u007f]/;
+function invalid(what) {
+  throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function checkOrganizationId(value) {
+  return organizationIdSchema.safeParse(value).success ? value : invalid("organizationId");
+}
+function checkCallId(value) {
+  return callIdSchema.safeParse(value).success ? value : invalid("callId");
+}
+function checkIdentity(value) {
+  return membershipIdSchema.safeParse(value).success ? value : invalid("identity");
+}
+function checkNumber(value, what) {
+  return e164PhoneSchema.safeParse(value).success ? value : invalid(what);
+}
+function checkProviderId(value, what) {
+  return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid(what);
+}
+function checkDisclosure(version, text, aiAssisted) {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    invalid("wordingVersion");
+  }
+  if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_DISCLOSURE_TEXT_LENGTH2 || CONTROL.test(text)) {
+    invalid("text");
+  }
+  if (typeof aiAssisted !== "boolean") {
+    invalid("aiAssisted");
+  }
+}
+function checkRingIdentities(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RING_LEGS2) {
+    invalid("ringIdentities");
+  }
+  const identities = value.map(checkIdentity);
+  return [...new Set(identities)];
+}
+function checkDestinationUrl(value, allowPlain) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
+    invalid("destinationUrl");
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return invalid("destinationUrl");
+  }
+  const secure = url.protocol === "wss:";
+  if (!(secure || allowPlain && url.protocol === "ws:") || url.username || url.password) {
+    invalid("destinationUrl");
+  }
+  return value;
+}
+function resolveTimeout(options, fallback) {
+  const value = options?.timeoutMs ?? fallback;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_TELEPHONY_TIMEOUT_MS2) {
+    invalid("timeoutMs");
+  }
+  return value;
+}
+function requireDisclosure(played, needsAi = false) {
+  if (!played) {
+    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure has not played on this call");
+  }
+  if (needsAi && !played.aiAssisted) {
+    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure did not say an AI takes part");
+  }
+  return played;
+}
+
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

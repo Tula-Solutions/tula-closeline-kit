@@ -6,6 +6,7 @@ import {
 } from 'tula-closeline-contract'
 import { TELEPHONY_ERROR_CODES, TelephonyError } from './errors'
 import {
+  type DisclosurePlayed,
   MAX_DISCLOSURE_TEXT_LENGTH,
   MAX_RING_LEGS,
   MAX_TELEPHONY_TIMEOUT_MS,
@@ -100,4 +101,28 @@ export function resolveTimeout(options: TelephonyOptions | undefined, fallback: 
     invalid('timeoutMs')
   }
   return value
+}
+
+/**
+ * The Disclosure rule of ADR 0003 for every adapter: a call whose Disclosure has not played
+ * cannot be bridged, recorded or forked (`telephony.disclosure_required`), and forking audio to
+ * an AI also needs a Disclosure that said so. Returns the played Disclosure.
+ */
+export function requireDisclosure(
+  played: DisclosurePlayed | null | undefined,
+  needsAi = false
+): DisclosurePlayed {
+  if (!played) {
+    throw new TelephonyError(
+      TELEPHONY_ERROR_CODES.disclosureRequired,
+      'The Disclosure has not played on this call'
+    )
+  }
+  if (needsAi && !played.aiAssisted) {
+    throw new TelephonyError(
+      TELEPHONY_ERROR_CODES.disclosureRequired,
+      'The Disclosure did not say an AI takes part'
+    )
+  }
+  return played
 }

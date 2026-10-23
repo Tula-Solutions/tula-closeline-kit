@@ -933,8 +933,8 @@ forks audio through the kit's `TelephonyPort` (added in 0.13.0). The port types,
 and the limits come from `tula-closeline-kit`; the memory adapter (`createMemoryTelephony`) from
 `tula-closeline-kit/testing`; the behaviour suite (`telephonyBehaviour`) from
 `tula-closeline-kit/testing/behaviour`. Ids, E.164 numbers, failure reasons and the
-`SoftphoneToken` are the voice contract's (v0.19.0). **There is no real adapter yet;** the Twilio
-adapter is a follow-up that has to pass `telephonyBehaviour`.
+`SoftphoneToken` are the voice contract's (v0.19.0). The Twilio adapter
+(`createTwilioTelephony`, added in 0.14.0) is exported from `tula-closeline-kit`; see below.
 
 ```ts
 placeCall({ organizationId, callId, idempotencyKey, from, to }, opts?): Promise<{ providerCallId; created }> // dials the Prospect; same key, one call
@@ -964,6 +964,72 @@ buffers, and returns false for a missing, empty, wrong-length or wrong signature
 Organization's call), `call_ended`, `disclosure_required`, `recording_not_ready`, `rejected`,
 `unavailable` (the only retryable one) and `bad_response`. Messages never hold a number, a
 Disclosure text or a token.
+
+### Twilio adapter (`createTwilioTelephony`)
+
+```ts
+const telephony = createTwilioTelephony({
+  accountSid, apiKeySid, apiKeySecret, // API Key credentials sign every REST call and the browser token
+  authToken, // only for verifyWebhook (X-Twilio-Signature is signed with the Auth Token)
+  twimlAppSid, // the TwiML App the Voice SDK dials through
+  region: 'ie1', // optional: Ireland. Default is the US (api.twilio.com)
+  environment, store, // see below
+})
+```
+
+- **Programmable Voice over REST + TwiML.** `placeCall` creates a call that holds on a long
+  `<Pause>`; the Disclosure, bridge (`<Dial answerOnBridge><Client>`), Recording
+  (`RecordingChannels=dual`, always two channels) and Media Streams fork (`both_tracks`) are then
+  applied to the live call. `fetchRecording` streams the two-channel WAV. Browser tokens are Voice
+  SDK access tokens (HS256 JWT with a Voice grant, signed with `jose`), minted locally with no I/O.
+- **Ireland.** `region: 'ie1'` uses the edge `dublin` and the host `api.dublin.ie1.twilio.com`;
+  `edge` can be set explicitly. Twilio API Keys and the Auth Token are per region, so use the
+  Ireland ones with it.
+- **Requests.** Each REST request has the operation's deadline as its timeout. A network error,
+  429 or 5xx is retried up to 3 attempts in all with jittered exponential backoff inside the
+  deadline; a timeout is final; a 4xx is never retried. Twilio's "call is not in progress" errors
+  map to `telephony.call_ended`, 404 to `not_found`, 401/403/other 4xx to `rejected`, and 429/5xx
+  to `unavailable`. Messages are fixed text; no number, secret, token, Disclosure text or Recording
+  URL is logged or put in an error. The adapter never logs.
+- **The store.** Twilio has no tags and the port has no store, so the adapter keeps the Organization
+  that owns each call and Recording, the played Disclosure and the placement key in a `TwilioStore`.
+  The default is in memory (fine for one process and tests); in production inject a Postgres- or
+  cache-backed store so any instance can serve any call. A call or Recording missing from the
+  store is `telephony.not_found`.
+- **Disclosure wait.** Twilio does not tell the REST caller when a `<Say>` finished. `playDisclosure`
+  waits an estimate from the text length, or the `disclosureDone` hook when the service can wait for
+  its own signal (such as a status callback). A Disclosure that cannot finish inside the timeout is
+  `unavailable` and is not played.
+- **Inbound.** `answerCall` holds the call and claims it for the Organization; the browser legs are
+  rung when `bridge` is called, not at `answerCall`.
+- **Webhooks.** `verifyWebhook` recomputes X-Twilio-Signature (HMAC-SHA1 of the URL plus the sorted
+  form parameters, or the URL with `bodySHA256` for JSON bodies), tries the URL with and without
+  the default port, and compares in constant time. Without `authToken` it refuses everything.
+
+**Live behaviour suite.** `src/telephony/twilio.behaviour.test.ts` runs `telephonyBehaviour`
+against Twilio only when `TWILIO_ACCOUNT_SID`, `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`,
+`TWILIO_AUTH_TOKEN`, `TWILIO_TWIML_APP_SID`, `TWILIO_FROM_NUMBER`, `TWILIO_TEST_CALLER_NUMBER` and
+`TWILIO_TEST_NUMBER_{ANSWERS,NO_ANSWER,BUSY,HANGS_UP,CARRIER_FAILURE}` are set (and optionally
+`TWILIO_REGION`); otherwise it is skipped and the skip names the missing variables. It places real,
+billed calls. The Line's Voice URL needs a TwiML Bin with a long `<Pause>` for the inbound cases.
+
+**Not verified without credentials.** Everything above is tested against handwritten HTTP fixtures
+only. These have not been run against Twilio: the live behaviour suite; that a call bridged to a
+Voice SDK leg yields two separate tracks. To check the last one, with credentials run the
+suite's fork case with a `wss://` listener, bridge a browser client, speak on each side, and
+confirm the stream's `inbound_track` and `outbound_track` frames each carry one party (and that the
+two recording channels are Prospect and Rep in that order); also whether Media Streams work in the
+Ireland region, and that the `I-Twilio-Idempotency-Token` header is honoured.
+
+Twilio keeps none of the per-call state, so the adapter takes a `TwilioStore` (`getCall`, `putCall`,
+atomic `claimCall`, `withCall` (a per-call critical section; a durable store holds a row lock, `SELECT ... FOR UPDATE`, until the callback settles, including its Twilio request), recordings, placements). `store` may be omitted only when `environment` is
+`local` or `dev` (memory); otherwise construction throws. A Disclosure is held back for an
+estimated speaking time (0.4 s a word, or 90 ms a character for unspaced scripts, plus margins)
+unless a `disclosureDone` hook confirms it. Limits: `answerCall` binds a never-registered inbound
+call to the first Organization that names it, atomically, but cannot itself prove that Organization
+owns the dialled number, so the voice service must resolve that before calling; Reps are rung at
+`bridge`, not at `answerCall`. `playDisclosure` marks the Disclosure started and sends it inside `withCall`, so a retried `answerCall` hold can never land after it. Also unverified: that a browser `connect({params})` cannot override
+the `organizationId` the grant sets (the voice service should not trust that parameter alone).
 
 **Scripting the memory adapter.** `script(number, ...)` makes the Prospect answer, not answer
 (`no_answer`), be busy, hang up (during the Disclosure or after the bridge) or the carrier fail.

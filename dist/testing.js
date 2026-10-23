@@ -6,6 +6,17 @@ import {
   shouldReportError2,
   TELEPHONY_ERROR_CODES2,
   TelephonyError2,
+  invalid,
+  checkOrganizationId,
+  checkCallId,
+  checkIdentity,
+  checkNumber,
+  checkProviderId,
+  checkDisclosure,
+  checkRingIdentities,
+  checkDestinationUrl,
+  resolveTimeout,
+  requireDisclosure,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -14,7 +25,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-a56avm11.js";
+} from "./shared/chunk-jaw5xnf7.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -39,9 +50,6 @@ import {
 } from "./shared/chunk-d77yh0fk.js";
 import {
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
-  MAX_TELEPHONY_TIMEOUT_MS2,
-  MAX_DISCLOSURE_TEXT_LENGTH2,
-  MAX_RING_LEGS2,
   MAX_WEBHOOK_BODY_BYTES2,
   TRANSCRIBER_ERROR_CODES2,
   TranscriberError2,
@@ -607,77 +615,6 @@ ${expires}`).digest("hex");
 }
 // src/telephony/memory.ts
 import { createHmac as createHmac2, randomBytes as randomBytes2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
-
-// src/telephony/validate.ts
-import {
-  callIdSchema,
-  e164PhoneSchema,
-  membershipIdSchema,
-  organizationIdSchema
-} from "tula-closeline-contract";
-var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-var CONTROL = /[\u0000-\u001f\u007f]/;
-function invalid(what) {
-  throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function checkOrganizationId(value) {
-  return organizationIdSchema.safeParse(value).success ? value : invalid("organizationId");
-}
-function checkCallId(value) {
-  return callIdSchema.safeParse(value).success ? value : invalid("callId");
-}
-function checkIdentity(value) {
-  return membershipIdSchema.safeParse(value).success ? value : invalid("identity");
-}
-function checkNumber(value, what) {
-  return e164PhoneSchema.safeParse(value).success ? value : invalid(what);
-}
-function checkProviderId(value, what) {
-  return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid(what);
-}
-function checkDisclosure(version, text, aiAssisted) {
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    invalid("wordingVersion");
-  }
-  if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_DISCLOSURE_TEXT_LENGTH2 || CONTROL.test(text)) {
-    invalid("text");
-  }
-  if (typeof aiAssisted !== "boolean") {
-    invalid("aiAssisted");
-  }
-}
-function checkRingIdentities(value) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RING_LEGS2) {
-    invalid("ringIdentities");
-  }
-  const identities = value.map(checkIdentity);
-  return [...new Set(identities)];
-}
-function checkDestinationUrl(value, allowPlain) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
-    invalid("destinationUrl");
-  }
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    return invalid("destinationUrl");
-  }
-  const secure = url.protocol === "wss:";
-  if (!(secure || allowPlain && url.protocol === "ws:") || url.username || url.password) {
-    invalid("destinationUrl");
-  }
-  return value;
-}
-function resolveTimeout(options, fallback) {
-  const value = options?.timeoutMs ?? fallback;
-  if (!Number.isInteger(value) || value < 1 || value > MAX_TELEPHONY_TIMEOUT_MS2) {
-    invalid("timeoutMs");
-  }
-  return value;
-}
-
-// src/telephony/memory.ts
 var DEFAULT_SECRET = "memory-webhook-secret";
 var DEFAULT_TTL_SECONDS = 900;
 var FAKE_AUDIO = new TextEncoder().encode("RIFF....WAVEmemory-recording");
@@ -763,11 +700,8 @@ function createMemoryTelephony(options = {}) {
       invalid("call: it has not been answered, so it");
     }
   }
-  function needDisclosure(call) {
-    if (call.disclosure === null) {
-      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure has not played on this call");
-    }
-    return call.disclosure;
+  function needDisclosure(call, needsAi = false) {
+    return requireDisclosure(call.disclosure, needsAi);
   }
   function checkRef(request) {
     checkOrganizationId(request.organizationId);
@@ -935,10 +869,7 @@ function createMemoryTelephony(options = {}) {
           return { streamId: call.streamId, tracks: ["rep", "prospect"] };
         }
         live(call);
-        const disclosure = needDisclosure(call);
-        if (!disclosure.aiAssisted) {
-          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure did not say an AI takes part");
-        }
+        needDisclosure(call, true);
         call.streamId = nextId("memstream-");
         record("forkTracks", call.providerCallId);
         return { streamId: call.streamId, tracks: ["rep", "prospect"] };
