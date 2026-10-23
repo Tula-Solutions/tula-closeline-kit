@@ -4,6 +4,13 @@ import {
   scrubText2,
   prepareFields,
   shouldReportError2,
+  STREAMING_TRANSCRIBE_ERROR_CODES2,
+  StreamingTranscribeError2,
+  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_AUDIO_CHUNK_BYTES2,
+  DEFAULT_RECONNECT_POLICY2,
+  reconnectDelayMs2,
   TELEPHONY_ERROR_CODES2,
   TelephonyError2,
   invalid,
@@ -25,7 +32,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-jaw5xnf7.js";
+} from "./shared/chunk-hpv6bet7.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -612,6 +619,283 @@ ${expires}`).digest("hex");
     }
   };
   return store;
+}
+// src/streaming-transcribe/validate.ts
+import { callIdSchema, organizationIdSchema } from "tula-closeline-contract";
+var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
+var SAMPLE_RATES = [8000, 16000, 24000, 48000];
+var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
+var TRACKS = ["rep", "prospect"];
+function invalid2(what) {
+  throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function checkOpenRequest(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid2("request");
+  }
+  if (!organizationIdSchema.safeParse(request.organizationId).success) {
+    invalid2("organizationId");
+  }
+  if (!callIdSchema.safeParse(request.callId).success) {
+    invalid2("callId");
+  }
+  if (!TRACKS.includes(request.track)) {
+    invalid2("track");
+  }
+  if (!ENCODINGS.includes(request.encoding)) {
+    invalid2("encoding");
+  }
+  if (!SAMPLE_RATES.includes(request.sampleRate)) {
+    invalid2("sampleRate");
+  }
+  if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
+    invalid2("language");
+  }
+  if (typeof request.onEvent !== "function") {
+    invalid2("onEvent");
+  }
+  return resolveReconnectPolicy(request.reconnect);
+}
+function resolveReconnectPolicy(policy) {
+  const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
+  if (!integerIn(maxAttempts, 0, 10)) {
+    invalid2("reconnect.maxAttempts");
+  }
+  if (!integerIn(baseDelayMs, 1, 60000)) {
+    invalid2("reconnect.baseDelayMs");
+  }
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
+    invalid2("reconnect.maxDelayMs");
+  }
+  return { maxAttempts, baseDelayMs, maxDelayMs };
+}
+function resolveTimeout2(options) {
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
+  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid2("timeoutMs");
+}
+function checkChunk(chunk) {
+  if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
+    return invalid2("chunk");
+  }
+  return chunk;
+}
+
+// src/streaming-transcribe/memory.ts
+var WORD_MS = 200;
+function wordsOf(text, startMs) {
+  return text.split(" ").filter((word) => word.length > 0).map((word, index) => ({
+    text: word,
+    startMs: startMs + index * WORD_MS,
+    endMs: startMs + (index + 1) * WORD_MS
+  }));
+}
+function checkScript(turns) {
+  if (!Array.isArray(turns) || turns.length > 1000) {
+    invalid2("turns");
+  }
+  let previous = 0;
+  for (const turn of turns) {
+    const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
+    if (count < 1 || count > 200) {
+      invalid2("turn text");
+    }
+    if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
+      invalid2("afterBytes");
+    }
+    if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
+      invalid2("interims");
+    }
+    previous = turn.afterBytes;
+  }
+  return [...turns];
+}
+function createMemoryStreamingTranscribe(options = {}) {
+  const sleep = options.sleep ?? systemSleep2;
+  const random = options.random ?? Math.random;
+  const scripts = new Map;
+  const live = new Set;
+  const all = new Map;
+  const openFailures = [];
+  let reconnectFailures = 0;
+  let counter = 0;
+  const scriptKey = (organizationId, callId, track) => `${organizationId}|${callId}|${track}`;
+  function emit(stream, event) {
+    try {
+      stream.request.onEvent(event);
+    } catch {
+      options.logger?.warn("A stream listener threw", { streamId: stream.view.streamId });
+    }
+  }
+  function turnEvent(stream, isFinal, endOfTurn, text) {
+    stream.sequence += 1;
+    const words = wordsOf(text, stream.lastWordEndMs);
+    emit(stream, {
+      type: "turn",
+      turnId: `turn-${stream.turnCounter}`,
+      sequence: stream.sequence,
+      isFinal,
+      endOfTurn,
+      text,
+      words
+    });
+    if (isFinal) {
+      stream.lastWordEndMs = words.at(-1)?.endMs ?? stream.lastWordEndMs;
+    }
+  }
+  function pump(stream) {
+    const script = stream.script;
+    while (script !== undefined && stream.view.state === "open" && script.next < script.turns.length) {
+      const turn = script.turns[script.next];
+      if (turn === undefined || stream.view.audioBytes < turn.afterBytes) {
+        return;
+      }
+      script.next += 1;
+      const words = turn.text.split(" ").filter((word) => word.length > 0);
+      const interims = turn.interims ?? Math.min(2, words.length - 1);
+      for (let i = 1;i <= interims; i++) {
+        const take = Math.max(1, Math.floor(words.length * i / (interims + 1)));
+        turnEvent(stream, false, false, words.slice(0, take).join(" "));
+      }
+      const endOfTurn = turn.endOfTurn ?? true;
+      turnEvent(stream, true, endOfTurn, words.join(" "));
+      if (endOfTurn) {
+        stream.turnCounter += 1;
+      }
+    }
+  }
+  function finish(stream, state) {
+    stream.view.state = state;
+    live.delete(stream.key);
+    stream.abort.abort();
+  }
+  function fail(stream, attempts) {
+    finish(stream, "failed");
+    emit(stream, {
+      type: "failed",
+      code: STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable,
+      attempts
+    });
+    options.logger?.error("A stream could not be restored", {
+      streamId: stream.view.streamId,
+      track: stream.view.track,
+      attempts
+    });
+    options.reporter?.capture(new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The stream could not be restored", { details: { attempts, track: stream.view.track } }), {
+      organizationId: stream.view.organizationId,
+      tags: { feature: "streaming-transcribe", track: stream.view.track }
+    });
+  }
+  async function reconnect(stream) {
+    stream.view.state = "reconnecting";
+    for (let attempt = 1;attempt <= stream.policy.maxAttempts; attempt++) {
+      const delayMs = reconnectDelayMs2(attempt, stream.policy, random);
+      emit(stream, { type: "reconnecting", attempt, delayMs });
+      options.logger?.warn("A stream is reconnecting", {
+        streamId: stream.view.streamId,
+        attempt,
+        delayMs
+      });
+      await sleep(delayMs, stream.abort.signal);
+      if (stream.view.state !== "reconnecting") {
+        return;
+      }
+      if (reconnectFailures > 0) {
+        reconnectFailures -= 1;
+        continue;
+      }
+      stream.view.state = "open";
+      stream.view.reconnects += 1;
+      emit(stream, { type: "reconnected", attempts: attempt });
+      pump(stream);
+      return;
+    }
+    fail(stream, stream.policy.maxAttempts);
+  }
+  const port = {
+    async open(request, opts) {
+      const policy = checkOpenRequest(request);
+      resolveTimeout2(opts);
+      const code = openFailures.shift();
+      if (code !== undefined) {
+        throw new StreamingTranscribeError2(code, "The vendor failed");
+      }
+      const key = scriptKey(request.organizationId, request.callId, request.track);
+      if (live.has(key)) {
+        throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.conflict, "A stream for this Call and track is already open");
+      }
+      counter += 1;
+      const streamId = `memstream-${counter.toString(16).padStart(8, "0")}`;
+      const stream = {
+        view: {
+          streamId,
+          organizationId: request.organizationId,
+          callId: request.callId,
+          track: request.track,
+          state: "open",
+          audioBytes: 0,
+          reconnects: 0
+        },
+        key,
+        request,
+        policy,
+        script: scripts.get(key),
+        abort: new AbortController,
+        sequence: 0,
+        turnCounter: 1,
+        lastWordEndMs: 0
+      };
+      live.add(key);
+      all.set(streamId, stream);
+      const handle = {
+        streamId,
+        sendAudio(chunk) {
+          const bytes = checkChunk(chunk);
+          if (stream.view.state === "closed" || stream.view.state === "failed") {
+            throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.closed, "The stream has ended");
+          }
+          stream.view.audioBytes += bytes.length;
+          pump(stream);
+        },
+        async close() {
+          if (stream.view.state === "closed" || stream.view.state === "failed") {
+            return;
+          }
+          finish(stream, "closed");
+          emit(stream, { type: "closed" });
+        }
+      };
+      return handle;
+    },
+    script(organizationId, callId, track, turns) {
+      scripts.set(scriptKey(organizationId, callId, track), {
+        turns: checkScript(turns),
+        next: 0
+      });
+    },
+    async dropConnection(streamId) {
+      const stream = all.get(streamId);
+      if (stream?.view.state === "open") {
+        await reconnect(stream);
+      }
+    },
+    failReconnects(times = 1) {
+      reconnectFailures += times;
+    },
+    failNextOpen(code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        openFailures.push(code);
+      }
+    },
+    streams() {
+      return [...all.values()].map((stream) => ({ ...stream.view }));
+    }
+  };
+  return port;
 }
 // src/telephony/memory.ts
 import { createHmac as createHmac2, randomBytes as randomBytes2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
@@ -1607,6 +1891,7 @@ export {
   createMemoryLogger,
   createMemoryObjectStore,
   createMemoryQueue,
+  createMemoryStreamingTranscribe,
   createMemoryTelephony,
   createMemoryTranscriber,
   createMemoryVectorStore,

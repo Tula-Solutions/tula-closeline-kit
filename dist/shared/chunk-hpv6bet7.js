@@ -1065,6 +1065,53 @@ function shouldReportError2(error) {
   }
 }
 
+// src/streaming-transcribe/errors.ts
+var STREAMING_TRANSCRIBE_ERROR_CODES2 = {
+  invalidRequest: "streaming_transcribe.invalid_request",
+  conflict: "streaming_transcribe.conflict",
+  closed: "streaming_transcribe.closed",
+  rejected: "streaming_transcribe.rejected",
+  unavailable: "streaming_transcribe.unavailable",
+  badResponse: "streaming_transcribe.bad_response"
+};
+var STATUS = {
+  "streaming_transcribe.invalid_request": 400,
+  "streaming_transcribe.conflict": 409,
+  "streaming_transcribe.closed": 409,
+  "streaming_transcribe.rejected": 502,
+  "streaming_transcribe.unavailable": 503,
+  "streaming_transcribe.bad_response": 502
+};
+
+class StreamingTranscribeError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "StreamingTranscribeError";
+  }
+}
+
+// src/streaming-transcribe/port.ts
+var DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2 = 1e4;
+var MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2 = 60000;
+var MAX_AUDIO_CHUNK_BYTES2 = 65536;
+var MAX_REPLAY_AUDIO_BYTES2 = 524288;
+var MAX_WORDS_PER_TURN2 = 2000;
+var DEFAULT_RECONNECT_POLICY2 = {
+  maxAttempts: 5,
+  baseDelayMs: 250,
+  maxDelayMs: 5000
+};
+function reconnectDelayMs2(attempt, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
+}
+
 // src/telephony/errors.ts
 var TELEPHONY_ERROR_CODES2 = {
   invalidRequest: "telephony.invalid_request",
@@ -1076,7 +1123,7 @@ var TELEPHONY_ERROR_CODES2 = {
   unavailable: "telephony.unavailable",
   badResponse: "telephony.bad_response"
 };
-var STATUS = {
+var STATUS2 = {
   "telephony.invalid_request": 400,
   "telephony.not_found": 404,
   "telephony.call_ended": 409,
@@ -1091,7 +1138,7 @@ class TelephonyError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1108,7 +1155,7 @@ var VECTOR_ERROR_CODES2 = {
   unavailable: "vector.unavailable",
   badResponse: "vector.bad_response"
 };
-var STATUS2 = {
+var STATUS3 = {
   "vector.invalid_request": 400,
   "vector.dimension_mismatch": 422,
   "vector.rejected": 500,
@@ -1120,7 +1167,7 @@ class VectorError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS2[code],
+      status: STATUS3[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1216,4 +1263,4 @@ function requireDisclosure(played, needsAi = false) {
   return played;
 }
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
