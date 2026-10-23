@@ -780,15 +780,17 @@ function createMemoryStreamingTranscribe(options = {}) {
       code: STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable,
       attempts
     });
-    options.logger?.error("A stream could not be restored", {
-      streamId: stream.view.streamId,
-      track: stream.view.track,
-      attempts
-    });
-    options.reporter?.capture(new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The stream could not be restored", { details: { attempts, track: stream.view.track } }), {
-      organizationId: stream.view.organizationId,
-      tags: { feature: "streaming-transcribe", track: stream.view.track }
-    });
+    try {
+      options.logger?.error("A stream could not be restored", {
+        streamId: stream.view.streamId,
+        track: stream.view.track,
+        attempts
+      });
+      options.reporter?.capture(new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The stream could not be restored", { details: { attempts, track: stream.view.track } }), {
+        organizationId: stream.view.organizationId,
+        tags: { feature: "streaming-transcribe", track: stream.view.track }
+      });
+    } catch {}
   }
   async function reconnect(stream) {
     stream.view.state = "reconnecting";

@@ -225,22 +225,26 @@ export function createMemoryStreamingTranscribe(
       code: STREAMING_TRANSCRIBE_ERROR_CODES.unavailable,
       attempts,
     })
-    options.logger?.error('A stream could not be restored', {
-      streamId: stream.view.streamId,
-      track: stream.view.track,
-      attempts,
-    })
-    options.reporter?.capture(
-      new StreamingTranscribeError(
-        STREAMING_TRANSCRIBE_ERROR_CODES.unavailable,
-        'The stream could not be restored',
-        { details: { attempts, track: stream.view.track } }
-      ),
-      {
-        organizationId: stream.view.organizationId,
-        tags: { feature: 'streaming-transcribe', track: stream.view.track },
-      }
-    )
+    try {
+      options.logger?.error('A stream could not be restored', {
+        streamId: stream.view.streamId,
+        track: stream.view.track,
+        attempts,
+      })
+      options.reporter?.capture(
+        new StreamingTranscribeError(
+          STREAMING_TRANSCRIBE_ERROR_CODES.unavailable,
+          'The stream could not be restored',
+          { details: { attempts, track: stream.view.track } }
+        ),
+        {
+          organizationId: stream.view.organizationId,
+          tags: { feature: 'streaming-transcribe', track: stream.view.track },
+        }
+      )
+    } catch {
+      // Reporting must never turn an event into an exception.
+    }
   }
 
   async function reconnect(stream: Stream) {

@@ -116,4 +116,23 @@ describe('createMemoryStreamingTranscribe', () => {
       ])
     ).toThrow(expect.objectContaining({ code: STREAMING_TRANSCRIBE_ERROR_CODES.invalidRequest }))
   })
+
+  test('a reporter or logger that throws does not make a failed stream throw', async () => {
+    const boom = () => {
+      throw new Error('boom')
+    }
+    const events: StreamEvent[] = []
+    const memory = createMemoryStreamingTranscribe({
+      sleep: async () => undefined,
+      reporter: { capture: boom, flush: boom, close: boom },
+    })
+    const stream = await memory.open({
+      ...request,
+      reconnect: { maxAttempts: 1 },
+      onEvent: (e) => events.push(e),
+    })
+    memory.failReconnects(5)
+    await memory.dropConnection(stream.streamId)
+    expect(events.at(-1)?.type).toBe('failed')
+  })
 })
