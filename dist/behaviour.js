@@ -3,18 +3,18 @@ import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
   CalendarError2,
-  MAX_BUSY_RANGE_MS2,
   MESSAGING_ERROR_CODES2,
   MessagingError2,
   InboundMessage2,
+  MAX_BUSY_RANGE_MS2,
   MAX_WEBHOOK_BODY_BYTES2,
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-jkpcd738.js";
+} from "./shared/chunk-y4v94n67.js";
 import {
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";
@@ -357,7 +357,8 @@ function calendarBehaviour(name, make, skip = false) {
       const del = (requestId, eventId = made.eventId) => s.port.deleteEvent({ organizationId: c.organizationId, connection: c, eventId, requestId }, opts);
       expect2(await del("del-1")).toEqual({ deleted: true });
       expect2(await busy(s, c)).toEqual([]);
-      expect2(await del("del-1")).toEqual({ deleted: true });
+      expect2(await del("del-1")).toEqual({ deleted: s.remembersDeletes !== false });
+      expect2(await busy(s, c)).toEqual([]);
       expect2(await del("del-2")).toEqual({ deleted: false });
       expect2(await del("del-3", "never-existed")).toEqual({ deleted: false });
     });
@@ -517,7 +518,7 @@ function calendarBehaviour(name, make, skip = false) {
       s.revokeAtProvider(c);
       const before = s.vendorRequests();
       expect2(await codeOf(busy(s, c))).toBe(CALENDAR_ERROR_CODES2.revoked);
-      expect2(s.vendorRequests() - before).toBeLessThanOrEqual(1);
+      expect2(s.vendorRequests() - before).toBeLessThanOrEqual(2);
     });
     test2("the timeout aborts the vendor request and fails with calendar.timeout", async () => {
       const s = await subject();

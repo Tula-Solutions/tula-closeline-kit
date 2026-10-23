@@ -1017,7 +1017,7 @@ await stream.close()                   // release the stream; later use fails wi
 ## Calendar (`CalendarPort`)
 
 `CalendarPort` (0.17.0) is how core reads a Rep's busy times and writes Bookings to their calendar.
-It is vendor-neutral; Google Calendar and Microsoft Graph adapters come later. The port, the
+It is vendor-neutral; the Google Calendar adapter is below and a Microsoft Graph one comes later. The port, the
 `CalendarConnection` and `CalendarError` come from `tula-closeline-kit`; the memory adapter
 (`createMemoryCalendar`) from `tula-closeline-kit/testing`; `calendarBehaviour` from
 `tula-closeline-kit/testing/behaviour`.
@@ -1049,6 +1049,22 @@ await calendar.revoke({ organizationId, connection })
   `calendar.rejected`, `calendar.unavailable` (the only retryable one), `calendar.timeout`,
   `calendar.aborted`. `unavailable` and `rejected` also go to the ErrorReporter, metadata only.
 - Tokens, grants, titles, notes and attendee addresses are never logged, reported or put in an error.
+- `createGoogleCalendar({ clientId, clientSecret, calendarId? })` (0.24.0) is the Google Calendar
+  adapter, on the REST API with OAuth 2.0. Ask for `GOOGLE_CALENDAR_SCOPES` and no more
+  (`calendar.freebusy` and `calendar.events`, with `access_type=offline` and PKCE) in the consent
+  URL. The stored credential is the Rep's refresh token; access tokens are cached in process for
+  under an hour and refreshed on expiry or a 401. A refresh Google refuses with `invalid_grant` is
+  `calendar.revoked`. A network error, 429, 5xx and a rate-limit 403 are `calendar.unavailable`
+  (retried); other 4xx are `calendar.rejected`. `createEvent` sends an event id derived from the
+  connection and request id and a content fingerprint, so a repeat or a retry after a lost
+  response is `created: false` and a different event under the same id is `invalid_request`;
+  `updateEvent` is idempotent the same way for the last request id only (a late replay of an older update is applied again). Google keeps no record
+  of a delete's request id, so a replay of a delete that worked answers `deleted: false` (the
+  event is gone either way). Attendees are mailed (`sendUpdates=all`). `joinUrl` is absent while
+  Google is still making the Meet link. `bun run test:integration` runs it against a test account
+  when `GOOGLE_CALENDAR_TEST_CLIENT_ID`, `_CLIENT_SECRET` and `_REFRESH_TOKEN` are set, and says
+  SKIPPED otherwise. The Google Cloud consent screen needs Google's verification before real
+  Reps can connect.
 - Tests use `createMemoryCalendar()` (`allowGrant`, `addBusy`, `failNext`, `loseNextResponse`,
   `hangNext`, `revokeAtProvider`, `events`, `requests`); an adapter passes `calendarBehaviour`. An
   adapter reuses `startCalendarDeadline` and `withCalendarRetry` (`src/calendar/deadline.ts`) and the
