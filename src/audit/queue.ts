@@ -25,8 +25,8 @@ export function createQueueAuditRecorder(options: QueueAuditRecorderOptions): Au
   const clock = options.clock ?? systemClock
   return {
     async record(input) {
-      const { id, organizationId, ...payload } = parseAuditEntry(input)
-      const occurredAt = payload.occurredAt ?? clock.now().toISOString()
+      const { id, organizationId, ...payload } = parseAuditEntry(input, clock)
+      const { occurredAt } = payload
       const envelope: AuditRecordedEnvelope = {
         id,
         type: auditRecordedMessage.type,
@@ -34,7 +34,7 @@ export function createQueueAuditRecorder(options: QueueAuditRecorderOptions): Au
         occurredAt,
         organizationId,
         traceId: payload.requestId ?? id,
-        payload: { ...payload, occurredAt },
+        payload,
       }
       try {
         await options.queue.publish(envelope)

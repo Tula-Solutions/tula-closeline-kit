@@ -82,7 +82,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-mnvbt65g.js";
+} from "./shared/chunk-hpgsqwv7.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -92,7 +92,7 @@ import {
   defineMessage2,
   INVALID_REASONS2,
   createMessageRegistry2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   AUDIT_ERROR_CODES2,
   AuditError2,
@@ -171,7 +171,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-h070fpj8.js";
+} from "./shared/chunk-xfecgbam.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";
@@ -192,8 +192,8 @@ function createQueueAuditRecorder(options) {
   const clock = options.clock ?? systemClock2;
   return {
     async record(input) {
-      const { id, organizationId, ...payload } = parseAuditEntry2(input);
-      const occurredAt = payload.occurredAt ?? clock.now().toISOString();
+      const { id, organizationId, ...payload } = parseAuditEntry2(input, clock);
+      const { occurredAt } = payload;
       const envelope = {
         id,
         type: auditRecordedMessage.type,
@@ -201,7 +201,7 @@ function createQueueAuditRecorder(options) {
         occurredAt,
         organizationId,
         traceId: payload.requestId ?? id,
-        payload: { ...payload, occurredAt }
+        payload
       };
       try {
         await options.queue.publish(envelope);

@@ -1,4 +1,18 @@
 import { z } from "zod";
+/** A source of the current time, so code under test never reads the real clock. */
+interface Clock {
+	/** Returns the current time as a new Date each call. */
+	now(): Date;
+}
+/** A clock that can be moved forward by hand. */
+interface FixedClock extends Clock {
+	/** Moves the clock forward by a duration such as `500ms`, `30s`, `10m`, `2h` or `1d`. */
+	advance(duration: string): void;
+}
+/** The real clock, for production wiring. */
+declare const systemClock: Clock;
+/** Creates a clock frozen at `start` that only moves when `advance` is called. */
+declare function createFixedClock(start: Date | string): FixedClock;
 /** The bounds on an audit entry. */
 declare const AUDIT_LIMITS: {
 	/** Most keys in `metadata`. */
@@ -76,10 +90,13 @@ type AuditEntry = z.output<typeof auditEntrySchema>;
 /** What a caller gives {@link AuditRecorder.record}. */
 type AuditEntryInput = z.input<typeof auditEntrySchema>;
 /**
-* Validates an entry and checks its serialised size. Throws an AuditError `audit.invalid_entry`
+* Validates an entry, fills `occurredAt` from the clock when absent, and checks the serialised
+* size of the result (so the cap holds for what is stored). Throws an AuditError `audit.invalid_entry`
 * or `audit.entry_too_large`; neither holds a value from the entry. O(entry size).
 */
-declare function parseAuditEntry(input: unknown): AuditEntry;
+declare function parseAuditEntry(input: unknown, clock?: Clock): AuditEntry & {
+	occurredAt: string;
+};
 /** Everything needed to build an AppError. */
 interface AppErrorInit {
 	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
@@ -135,20 +152,6 @@ declare class AuditError extends AppError {
 	});
 }
 import { z as z2 } from "zod";
-/** A source of the current time, so code under test never reads the real clock. */
-interface Clock {
-	/** Returns the current time as a new Date each call. */
-	now(): Date;
-}
-/** A clock that can be moved forward by hand. */
-interface FixedClock extends Clock {
-	/** Moves the clock forward by a duration such as `500ms`, `30s`, `10m`, `2h` or `1d`. */
-	advance(duration: string): void;
-}
-/** The real clock, for production wiring. */
-declare const systemClock: Clock;
-/** Creates a clock frozen at `start` that only moves when `advance` is called. */
-declare function createFixedClock(start: Date | string): FixedClock;
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */

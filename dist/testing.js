@@ -64,7 +64,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-mnvbt65g.js";
+} from "./shared/chunk-hpgsqwv7.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -103,7 +103,7 @@ import {
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2
@@ -122,7 +122,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-h070fpj8.js";
+} from "./shared/chunk-xfecgbam.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -166,11 +166,11 @@ function createMemoryAuditRecorder(options = {}) {
   const stored = new Map;
   return {
     async record(input) {
-      const entry = parseAuditEntry2(input);
+      const entry = parseAuditEntry2(input, clock);
       const key = `${entry.organizationId}\x00${entry.id}`;
       const duplicate = stored.has(key);
       if (!duplicate) {
-        stored.set(key, structuredClone({ ...entry, occurredAt: entry.occurredAt ?? clock.now().toISOString() }));
+        stored.set(key, structuredClone(entry));
       }
       options.logger?.info("audit entry recorded", {
         eventId: entry.id,

@@ -1,5 +1,6 @@
 import { organizationIdSchema } from 'tula-closeline-contract'
 import { z } from 'zod'
+import { type Clock, systemClock } from '../clock'
 import { AUDIT_ERROR_CODES, AuditError } from './errors'
 
 /** The bounds on an audit entry. */
@@ -27,9 +28,19 @@ export const AUDIT_DENIED_METADATA_KEYS = [
 
 const DENIED = new Set<string>(AUDIT_DENIED_METADATA_KEYS)
 
-/** True when the key, compared without case and without punctuation, is a denied name. */
+/**
+ * True when the key is a denied name, or has a denied word as one of its parts: the key is split
+ * at punctuation and at lower-to-upper case changes, so `messageBody` and `auth_token` are refused
+ * and `context` is not.
+ */
 function isDeniedKey(key: string): boolean {
-  return DENIED.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''))
+  if (DENIED.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+    return true
+  }
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .some((part) => DENIED.has(part.toLowerCase()))
 }
 
 const label = z.string().regex(/^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/)
@@ -100,21 +111,26 @@ function issuesOf(error: z.ZodError): string[] {
 }
 
 /**
- * Validates an entry and checks its serialised size. Throws an AuditError `audit.invalid_entry`
+ * Validates an entry, fills `occurredAt` from the clock when absent, and checks the serialised
+ * size of the result (so the cap holds for what is stored). Throws an AuditError `audit.invalid_entry`
  * or `audit.entry_too_large`; neither holds a value from the entry. O(entry size).
  */
-export function parseAuditEntry(input: unknown): AuditEntry {
+export function parseAuditEntry(
+  input: unknown,
+  clock: Clock = systemClock
+): AuditEntry & { occurredAt: string } {
   const parsed = auditEntrySchema.safeParse(input)
   if (!parsed.success) {
     throw new AuditError(AUDIT_ERROR_CODES.invalidEntry, 'the audit entry is not valid', {
       details: { issues: issuesOf(parsed.error) },
     })
   }
-  const bytes = new TextEncoder().encode(JSON.stringify(parsed.data)).length
+  const entry = { ...parsed.data, occurredAt: parsed.data.occurredAt ?? clock.now().toISOString() }
+  const bytes = new TextEncoder().encode(JSON.stringify(entry)).length
   if (bytes > AUDIT_LIMITS.maxEntryBytes) {
     throw new AuditError(AUDIT_ERROR_CODES.entryTooLarge, 'the audit entry is too large', {
       details: { bytes, maxBytes: AUDIT_LIMITS.maxEntryBytes },
     })
   }
-  return parsed.data
+  return entry
 }

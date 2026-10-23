@@ -1,4 +1,9 @@
 import { z } from "zod";
+/** A source of the current time, so code under test never reads the real clock. */
+interface Clock {
+	/** Returns the current time as a new Date each call. */
+	now(): Date;
+}
 /** The shape of one audit entry; unknown fields are refused. */
 declare const auditEntrySchema: z.ZodObject<{
 	actor: z.ZodObject<{
@@ -899,11 +904,6 @@ interface MessagingSubject {
 */
 declare function messagingBehaviour(name: string, make: () => Promise<MessagingSubject>, skip?: boolean): void;
 import { z as z4 } from "zod";
-/** A source of the current time, so code under test never reads the real clock. */
-interface Clock {
-	/** Returns the current time as a new Date each call. */
-	now(): Date;
-}
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
 type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */

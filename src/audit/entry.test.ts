@@ -120,3 +120,44 @@ describe('memory recorder', () => {
     expect(recorder.entries()[0]?.metadata).toEqual({ a: 1 })
   })
 })
+
+describe('review findings', () => {
+  test('a key that holds a denied word as a part is refused', () => {
+    for (const key of [
+      'messageBody',
+      'emailAddress',
+      'authToken',
+      'transcript_text',
+      'user-password',
+    ]) {
+      expect(() =>
+        parseAuditEntry(sampleAuditEntry('evt_1', { metadata: { [key]: 'x' } }))
+      ).toThrow(AuditError)
+    }
+    for (const key of ['context', 'attempt', 'channel']) {
+      expect(() =>
+        parseAuditEntry(sampleAuditEntry('evt_1', { metadata: { [key]: 'x' } }))
+      ).not.toThrow()
+    }
+  })
+
+  test('the size cap counts the timestamp the recorder adds', () => {
+    const size = (e: unknown) => new TextEncoder().encode(JSON.stringify(e)).length
+    const clock = createFixedClock('2026-01-01T00:00:00.000Z')
+    const metadata: Record<string, string> = {}
+    for (let i = 0; i < 17; i++) {
+      metadata[`key_${i}`] = 'a'.repeat(200)
+    }
+    metadata.extra = 'e'.repeat(100)
+    // one more key, padded so the entry without a timestamp is 10 bytes under the cap
+    const without = size(sampleAuditEntry('evt_1', { metadata: { ...metadata, last: '' } }))
+    metadata.last = 'z'.repeat(AUDIT_LIMITS.maxEntryBytes - 10 - without)
+    const entry = sampleAuditEntry('evt_1', { metadata })
+    expect(metadata.last.length).toBeLessThanOrEqual(200)
+    expect(size(entry)).toBe(AUDIT_LIMITS.maxEntryBytes - 10)
+    expect(() => parseAuditEntry(entry, clock)).toThrow(AuditError)
+    expect(() => parseAuditEntry({ ...entry, occurredAt: '2026-01-01T00:00:00.000Z' })).toThrow(
+      AuditError
+    )
+  })
+})

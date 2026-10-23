@@ -25,14 +25,11 @@ export function createMemoryAuditRecorder(
   const stored = new Map<string, AuditEntry>()
   return {
     async record(input) {
-      const entry = parseAuditEntry(input)
+      const entry = parseAuditEntry(input, clock)
       const key = `${entry.organizationId}\u0000${entry.id}`
       const duplicate = stored.has(key)
       if (!duplicate) {
-        stored.set(
-          key,
-          structuredClone({ ...entry, occurredAt: entry.occurredAt ?? clock.now().toISOString() })
-        )
+        stored.set(key, structuredClone(entry))
       }
       options.logger?.info('audit entry recorded', {
         eventId: entry.id,
