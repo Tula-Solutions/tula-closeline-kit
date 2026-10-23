@@ -187,6 +187,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { formatId } from "tula-closeline-contract";
 var testUserId = (n = 1) => formatId("usr", n.toString(16).padStart(32, "0"));
 var testOrganizationId = (n = 1) => formatId("org", n.toString(16).padStart(32, "0"));
+var testApiKeyId = (n = 1) => formatId("akey", n.toString(16).padStart(32, "0"));
 async function createTestKeyPair(kid = "test-key-1") {
   const { publicKey, privateKey } = await generateKeyPair("EdDSA", { crv: "Ed25519" });
   const jwk = await exportJWK(publicKey);
@@ -228,6 +229,19 @@ async function mintTestToken(options) {
   const jwt = new SignJWT(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));
   jwt.setProtectedHeader(Object.fromEntries(Object.entries(header).filter(([, value]) => value !== undefined)));
   return jwt.sign(options.keyPair.privateKey);
+}
+async function mintTestApiKeyToken(options) {
+  const { apiKeyId, scopes, claims, ...rest } = options;
+  return mintTestToken({
+    ...rest,
+    claims: {
+      sub: apiKeyId ?? testApiKeyId(1),
+      act: "api_key",
+      scp: scopes ?? ["prospects:read"],
+      role: undefined,
+      ...claims
+    }
+  });
 }
 // src/calendar/deadline.ts
 function startCalendarDeadline(timeoutMs, caller) {
@@ -3475,7 +3489,9 @@ export {
   createTestKeyPair,
   createTestRegistry,
   createVirtualTime,
+  mintTestApiKeyToken,
   mintTestToken,
+  testApiKeyId,
   testNote,
   testOrganizationId,
   testPing,

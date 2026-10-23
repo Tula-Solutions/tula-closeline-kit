@@ -220,6 +220,9 @@ function createQueueAuditRecorder(options) {
 }
 // src/auth/claims.ts
 import {
+  API_KEY_SCOPES,
+  apiKeyIdSchema,
+  apiKeyScopeSchema,
   organizationIdSchema,
   regionSchema,
   roleSchema,
@@ -228,10 +231,22 @@ import {
 import { z } from "zod";
 var MAX_TOKEN_LENGTH = 4096;
 var accessTokenClaimsSchema = z.object({
+  act: z.undefined().optional(),
   sub: userIdSchema,
   org: organizationIdSchema,
   role: roleSchema,
   region: regionSchema,
+  iat: z.number().finite(),
+  exp: z.number().finite()
+});
+var API_KEY_ACTOR = "api_key";
+var apiKeyTokenClaimsSchema = z.object({
+  act: z.literal(API_KEY_ACTOR),
+  sub: apiKeyIdSchema,
+  org: organizationIdSchema,
+  role: z.undefined().optional(),
+  region: regionSchema,
+  scp: z.array(apiKeyScopeSchema).min(1).max(API_KEY_SCOPES.length),
   iat: z.number().finite(),
   exp: z.number().finite()
 });
@@ -521,6 +536,49 @@ function createRemoteKeySet(options) {
     }
   };
 }
+// src/auth/scope.ts
+import { COMPOSED_HANDLER } from "hono/utils/constants";
+import { apiKeyScopeSchema as apiKeyScopeSchema2 } from "tula-closeline-contract";
+var SCOPE_GUARD = Symbol("tula-closeline-kit.requireScope");
+function isScopeGuard(handler) {
+  if (typeof handler !== "function") {
+    return false;
+  }
+  const marked = handler;
+  return marked[SCOPE_GUARD] === true || isScopeGuard(marked[COMPOSED_HANDLER]);
+}
+function forbidden() {
+  return new AppError2({
+    code: "auth.forbidden",
+    status: 403,
+    message: "You are not allowed to do this."
+  });
+}
+function requireScope(scope) {
+  if (!apiKeyScopeSchema2.safeParse(scope).success) {
+    throw new TypeError("requireScope needs a scope from the contract");
+  }
+  const guard = async (c, next) => {
+    const actor = c.get("actor");
+    if (actor === "member") {
+      return next();
+    }
+    if (actor === "api_key") {
+      if (c.get("scopes")?.includes(scope) === true) {
+        return next();
+      }
+      throw forbidden();
+    }
+    throw new AppError2({
+      code: "auth.unauthenticated",
+      status: 401,
+      message: "Authentication is required."
+    });
+  };
+  Object.defineProperty(guard, SCOPE_GUARD, { value: true });
+  return guard;
+}
+
 // src/auth/middleware.ts
 var BEARER = /^Bearer ([^\s]+)$/i;
 function unauthenticated() {
@@ -591,6 +649,25 @@ function createAuthMiddleware(options) {
     } catch (error) {
       throw toAppError(error, logger, logError);
     }
+    if (verified.actor === "api_key") {
+      if (!c.req.matchedRoutes.some((route) => isScopeGuard(route.handler))) {
+        logger?.warn("request rejected", { reason: "forbidden" });
+        throw new AppError2({
+          code: "auth.forbidden",
+          status: 403,
+          message: "You are not allowed to do this."
+        });
+      }
+      const scoped = c;
+      scoped.set("actor", "api_key");
+      scoped.set("organizationId", verified.organizationId);
+      scoped.set("region", verified.region);
+      scoped.set("apiKeyId", verified.apiKeyId);
+      scoped.set("scopes", verified.scopes);
+      await next();
+      return;
+    }
+    c.set("actor", "member");
     c.set("organizationId", verified.organizationId);
     c.set("userId", verified.userId);
     c.set("role", verified.role);
@@ -615,6 +692,9 @@ function createTokenVerifier(options) {
   }
   if (!Number.isFinite(toleranceSeconds) || toleranceSeconds < 0 || toleranceSeconds > MAX_CLOCK_TOLERANCE_SECONDS) {
     throw new TypeError(`clockToleranceSeconds must be 0 to ${MAX_CLOCK_TOLERANCE_SECONDS}`);
+  }
+  function isCoherent(iat, exp, now) {
+    return iat <= now.getTime() / 1000 + toleranceSeconds && exp > iat;
   }
   function readKid(token) {
     let header;
@@ -661,15 +741,33 @@ function createTokenVerifier(options) {
       } catch (error) {
         return reject(error instanceof joseErrors.JWTExpired ? "expired" : "invalid");
       }
+      const actor = payload.act;
+      if (actor !== undefined && actor !== API_KEY_ACTOR) {
+        return reject();
+      }
+      if (actor === API_KEY_ACTOR) {
+        const claims = apiKeyTokenClaimsSchema.safeParse(payload);
+        if (!claims.success || !isCoherent(claims.data.iat, claims.data.exp, now)) {
+          return reject();
+        }
+        const { sub, org, region, scp, iat, exp } = claims.data;
+        return {
+          actor: "api_key",
+          apiKeyId: sub,
+          scopes: [...new Set(scp)],
+          organizationId: org,
+          region,
+          issuedAt: new Date(iat * 1000),
+          expiresAt: new Date(exp * 1000)
+        };
+      }
       const claims = accessTokenClaimsSchema.safeParse(payload);
-      if (!claims.success) {
+      if (!claims.success || !isCoherent(claims.data.iat, claims.data.exp, now)) {
         return reject();
       }
       const { sub, org, role, region, iat, exp } = claims.data;
-      if (iat > now.getTime() / 1000 + toleranceSeconds || exp <= iat) {
-        return reject();
-      }
       return {
+        actor: "member",
         userId: sub,
         organizationId: org,
         role,
@@ -2865,6 +2963,7 @@ function createErrorReporter(options) {
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
 export {
+  API_KEY_ACTOR,
   AUDIT_DENIED_METADATA_KEYS2 as AUDIT_DENIED_METADATA_KEYS,
   AUDIT_ERROR_CODES2 as AUDIT_ERROR_CODES,
   AUDIT_LIMITS2 as AUDIT_LIMITS,
@@ -2999,6 +3098,7 @@ export {
   VECTOR_ERROR_CODES2 as VECTOR_ERROR_CODES,
   VectorError2 as VectorError,
   accessTokenClaimsSchema,
+  apiKeyTokenClaimsSchema,
   assertBatchCount2 as assertBatchCount,
   assertReceiveOptions2 as assertReceiveOptions,
   assertVisibility2 as assertVisibility,
@@ -3036,11 +3136,13 @@ export {
   isAppError2 as isAppError,
   isContactGuardRequest2 as isContactGuardRequest,
   isReportableMessagingError2 as isReportableMessagingError,
+  isScopeGuard,
   isSentryDsn,
   llmRetryDelayMs2 as llmRetryDelayMs,
   messagingRetryDelayMs2 as messagingRetryDelayMs,
   parseAuditEntry2 as parseAuditEntry,
   reconnectDelayMs2 as reconnectDelayMs,
+  requireScope,
   requireSentryDsn,
   scrubText2 as scrubText,
   sentryDsnSchema,

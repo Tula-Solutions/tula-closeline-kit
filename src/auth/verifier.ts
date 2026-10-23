@@ -1,6 +1,12 @@
 import { decodeProtectedHeader, errors as joseErrors, jwtVerify } from 'jose'
 import type { Clock } from '../clock'
-import { accessTokenClaimsSchema, MAX_TOKEN_LENGTH, type VerifiedToken } from './claims'
+import {
+  API_KEY_ACTOR,
+  accessTokenClaimsSchema,
+  apiKeyTokenClaimsSchema,
+  MAX_TOKEN_LENGTH,
+  type VerifiedIdentity,
+} from './claims'
 import { type TokenRejection, TokenVerificationError } from './errors'
 import type { KeySet } from './keys'
 
@@ -31,7 +37,7 @@ export interface TokenVerifier {
    * Returns the identity in a valid token, or throws a TokenVerificationError: `expired` or
    * `invalid` for the token, `unavailable` when the signing keys could not be loaded.
    */
-  verify(token: string): Promise<VerifiedToken>
+  verify(token: string): Promise<VerifiedIdentity>
 }
 
 function reject(reason: TokenRejection = 'invalid'): never {
@@ -54,6 +60,12 @@ export function createTokenVerifier(options: TokenVerifierOptions): TokenVerifie
     toleranceSeconds > MAX_CLOCK_TOLERANCE_SECONDS
   ) {
     throw new TypeError(`clockToleranceSeconds must be 0 to ${MAX_CLOCK_TOLERANCE_SECONDS}`)
+  }
+
+  // jose does not look at `iat`: a token claiming to be from the future, or to expire before it
+  // began, was not minted by a clock we trust.
+  function isCoherent(iat: number, exp: number, now: Date): boolean {
+    return iat <= now.getTime() / 1000 + toleranceSeconds && exp > iat
   }
 
   function readKid(token: string): string {
@@ -106,17 +118,34 @@ export function createTokenVerifier(options: TokenVerifierOptions): TokenVerifie
       } catch (error) {
         return reject(error instanceof joseErrors.JWTExpired ? 'expired' : 'invalid')
       }
+      const actor = (payload as { act?: unknown }).act
+      // Only a member (no `act`) and an API key are known; any other actor is not ours to trust.
+      if (actor !== undefined && actor !== API_KEY_ACTOR) {
+        return reject()
+      }
+      if (actor === API_KEY_ACTOR) {
+        const claims = apiKeyTokenClaimsSchema.safeParse(payload)
+        if (!claims.success || !isCoherent(claims.data.iat, claims.data.exp, now)) {
+          return reject()
+        }
+        const { sub, org, region, scp, iat, exp } = claims.data
+        return {
+          actor: 'api_key',
+          apiKeyId: sub,
+          scopes: [...new Set(scp)],
+          organizationId: org,
+          region,
+          issuedAt: new Date(iat * 1000),
+          expiresAt: new Date(exp * 1000),
+        }
+      }
       const claims = accessTokenClaimsSchema.safeParse(payload)
-      if (!claims.success) {
+      if (!claims.success || !isCoherent(claims.data.iat, claims.data.exp, now)) {
         return reject()
       }
       const { sub, org, role, region, iat, exp } = claims.data
-      // jose does not look at `iat`: a token claiming to be from the future, or to expire before
-      // it began, was not minted by a clock we trust.
-      if (iat > now.getTime() / 1000 + toleranceSeconds || exp <= iat) {
-        return reject()
-      }
       return {
+        actor: 'member',
         userId: sub,
         organizationId: org,
         role,
