@@ -1345,6 +1345,572 @@ function createGoogleCalendar(options) {
     }
   };
 }
+// src/calendar/outlook.ts
+import { createHash as createHash2, randomUUID as randomUUID2 } from "node:crypto";
+var OUTLOOK_CALENDAR_SCOPES = ["offline_access", "Calendars.ReadWrite"];
+var LOGIN = "https://login.microsoftonline.com";
+var GRAPH = "https://graph.microsoft.com/v1.0";
+var MAX_RESPONSE_BYTES2 = 2097152;
+var DEFAULT_ATTEMPT_TIMEOUT_MS2 = 5000;
+var TOKEN_MARGIN_MS2 = 60000;
+var MAX_CACHED_TOKENS2 = 1024;
+var MAX_REVOKED = 1e4;
+var CREATED_SKEW_MS = 5000;
+var PAGE_SIZE = 200;
+var MAX_PAGES = 50;
+var PROPERTY_NAMESPACE = "{d4b6f1c2-7a3e-4c58-9a1b-3e5f8c2d6a47}";
+var THROTTLE_CODES = new Set([
+  "TooManyRequests",
+  "ApplicationThrottled",
+  "ErrorServerBusy",
+  "ErrorTimeoutExceeded",
+  "MailboxConcurrency",
+  "activityLimitReached"
+]);
+var BUSY_STATES = new Set(["busy", "tentative", "oof", "unknown"]);
+function unavailable3(phase, status) {
+  return new CalendarError2(CALENDAR_ERROR_CODES2.unavailable, "The calendar provider is unavailable", { details: { phase, ...status === undefined ? {} : { status } } });
+}
+function rejected2(reason, status) {
+  return new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The calendar provider refused the request", { details: { reason, ...status === undefined ? {} : { status } } });
+}
+function revoked2() {
+  return new CalendarError2(CALENDAR_ERROR_CODES2.revoked, "The calendar connection was revoked");
+}
+function isObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+async function readBounded3(response) {
+  const body = response.body;
+  if (body === null) {
+    return "";
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder;
+  let total = 0;
+  let text = "";
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES2) {
+      await reader.cancel().catch(() => {
+        return;
+      });
+      throw rejected2("too_large");
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+function parseJson2(text) {
+  try {
+    const value = JSON.parse(text);
+    return isObject2(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function sha256Hex(...parts) {
+  return createHash2("sha256").update(parts.join("\x00")).digest("hex");
+}
+function iso2(ms) {
+  return new Date(ms).toISOString();
+}
+function graphTime(ms) {
+  return { dateTime: iso2(ms).slice(0, -1), timeZone: "UTC" };
+}
+function readTime(value) {
+  if (!isObject2(value) || typeof value.dateTime !== "string") {
+    return Number.NaN;
+  }
+  const zone = value.timeZone;
+  if (typeof zone === "string" && zone.toUpperCase() !== "UTC") {
+    return Number.NaN;
+  }
+  const text = value.dateTime;
+  return Date.parse(/(?:Z|[+-]\d\d:\d\d)$/.test(text) ? text : `${text}Z`);
+}
+function graphCode(json) {
+  const error = json?.error;
+  const code = isObject2(error) ? error.code : undefined;
+  return typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined;
+}
+function propertyId(name) {
+  return `String ${PROPERTY_NAMESPACE} Name ${name}`;
+}
+function property(json, name) {
+  const list = json?.singleValueExtendedProperties;
+  if (!Array.isArray(list)) {
+    return;
+  }
+  const id = propertyId(name);
+  for (const item of list) {
+    if (isObject2(item) && item.id === id && typeof item.value === "string") {
+      return item.value;
+    }
+  }
+  return;
+}
+function eventRef2(json, status) {
+  const id = json?.id;
+  const startMs = readTime(json?.start);
+  const endMs = readTime(json?.end);
+  if (typeof id !== "string" || id.length < 1 || id.length > 256 || Number.isNaN(startMs) || Number.isNaN(endMs)) {
+    throw rejected2("shape", status);
+  }
+  const meeting = json?.onlineMeeting;
+  const link = isObject2(meeting) ? meeting.joinUrl : undefined;
+  const joinUrl = typeof link === "string" && link.startsWith("https://") ? link : undefined;
+  return {
+    eventId: id,
+    start: iso2(startMs),
+    end: iso2(endMs),
+    ...joinUrl === undefined ? {} : { joinUrl }
+  };
+}
+function attendeesBody2(attendees) {
+  return attendees.map((a) => ({
+    emailAddress: { address: a.email, ...a.name === undefined ? {} : { name: a.name } },
+    type: "required"
+  }));
+}
+function createOutlookCalendar(options) {
+  if (typeof options.clientId !== "string" || options.clientId.length < 1) {
+    throw new TypeError("clientId is required");
+  }
+  if (typeof options.clientSecret !== "string" || options.clientSecret.length < 1) {
+    throw new TypeError("clientSecret is required");
+  }
+  const tenant = options.tenant ?? "common";
+  if (typeof tenant !== "string" || !/^[A-Za-z0-9.-]{1,128}$/.test(tenant)) {
+    throw new TypeError("tenant is not acceptable");
+  }
+  const calendarId = options.calendarId;
+  if (calendarId !== undefined && (typeof calendarId !== "string" || calendarId.length < 1 || calendarId.length > 512)) {
+    throw new TypeError("calendarId is not acceptable");
+  }
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS2;
+  if (!Number.isInteger(attemptTimeoutMs) || attemptTimeoutMs < 1 || attemptTimeoutMs > 60000) {
+    throw new TypeError("attemptTimeoutMs must be 1 to 60000");
+  }
+  const { clientId, clientSecret } = options;
+  const clock = options.clock ?? systemClock2;
+  const sleep = options.sleep ?? systemSleep2;
+  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const tokenUrl = `${LOGIN}/${tenant}/oauth2/v2.0/token`;
+  const calendarUrl = calendarId === undefined ? `${GRAPH}/me/calendar` : `${GRAPH}/me/calendars/${encodeURIComponent(calendarId)}`;
+  const scope = OUTLOOK_CALENDAR_SCOPES.join(" ");
+  const tokens = new Map;
+  const revokedHere = new Set;
+  function tokenKey(credential) {
+    return sha256Hex(credential);
+  }
+  function remember(credential, accessToken, expiresInSeconds) {
+    const key = tokenKey(credential);
+    tokens.delete(key);
+    tokens.set(key, {
+      accessToken,
+      expiresAtMs: clock.now().getTime() + expiresInSeconds * 1000 - TOKEN_MARGIN_MS2
+    });
+    if (tokens.size > MAX_CACHED_TOKENS2) {
+      const oldest = tokens.keys().next().value;
+      if (oldest !== undefined) {
+        tokens.delete(oldest);
+      }
+    }
+  }
+  async function http(url, init, overall) {
+    const own = new AbortController;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      own.abort();
+    }, attemptTimeoutMs);
+    timer.unref?.();
+    const signal = AbortSignal.any([overall, own.signal]);
+    try {
+      const response = await raceAbort(doFetch(url, { ...init, redirect: "manual", signal }), signal);
+      const text = await raceAbort(readBounded3(response), signal);
+      return { status: response.status, json: parseJson2(text) };
+    } catch (error) {
+      if (error instanceof CalendarError2) {
+        throw error;
+      }
+      if (error instanceof AttemptAborted && !timedOut) {
+        throw error;
+      }
+      throw unavailable3(timedOut ? "attempt_timeout" : "network");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function tokenRequest(form, overall) {
+    return http(tokenUrl, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope,
+        ...form
+      }).toString()
+    }, overall);
+  }
+  function tokenAnswer(answer, grantGone) {
+    if (answer.status === 429 || answer.status >= 500) {
+      throw unavailable3("token", answer.status);
+    }
+    if ((answer.status === 400 || answer.status === 401) && (answer.json?.error === "invalid_grant" || answer.json?.error === "interaction_required")) {
+      throw grantGone();
+    }
+    if (answer.status !== 200) {
+      throw rejected2("token", answer.status);
+    }
+    const accessToken = answer.json?.access_token;
+    const expiresIn = answer.json?.expires_in;
+    if (typeof accessToken !== "string" || accessToken.length < 1) {
+      throw rejected2("token_shape", answer.status);
+    }
+    const granted = answer.json?.scope;
+    if (typeof granted === "string") {
+      const have = new Set(granted.toLowerCase().split(" "));
+      if (!have.has("calendars.readwrite") && !have.has("https://graph.microsoft.com/calendars.readwrite")) {
+        throw rejected2("scope", answer.status);
+      }
+    }
+    const seconds = typeof expiresIn === "number" && Number.isFinite(expiresIn) ? Math.min(Math.max(expiresIn, 0), 86400) : 3600;
+    return { accessToken, seconds, refreshToken: answer.json?.refresh_token };
+  }
+  async function accessToken(credential, overall) {
+    const cached = tokens.get(tokenKey(credential));
+    if (cached !== undefined && cached.expiresAtMs > clock.now().getTime()) {
+      return cached.accessToken;
+    }
+    const answer = await tokenRequest({ grant_type: "refresh_token", refresh_token: credential }, overall);
+    const read = tokenAnswer(answer, revoked2);
+    remember(credential, read.accessToken, read.seconds);
+    return read.accessToken;
+  }
+  async function api(connection, method, url, body, overall) {
+    const credential = connection.unsafeCredential();
+    if (revokedHere.has(tokenKey(credential))) {
+      throw revoked2();
+    }
+    for (let pass = 0;; pass++) {
+      const token = await accessToken(credential, overall);
+      const answer = await http(url, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/json",
+          prefer: 'outlook.timezone="UTC"',
+          ...body === undefined ? {} : { "content-type": "application/json" }
+        },
+        ...body === undefined ? {} : { body: JSON.stringify(body) }
+      }, overall);
+      if (answer.status === 401 && pass === 0) {
+        tokens.delete(tokenKey(credential));
+        continue;
+      }
+      if (answer.status === 401) {
+        throw revoked2();
+      }
+      return answer;
+    }
+  }
+  function failure(answer, notFound = rejected2("not_found", 404)) {
+    const { status } = answer;
+    if (status === 404 || status === 410) {
+      return notFound;
+    }
+    if (status === 429 || status >= 500) {
+      return unavailable3("http", status);
+    }
+    const code = graphCode(answer.json);
+    if (code !== undefined && THROTTLE_CODES.has(code)) {
+      return unavailable3("rate_limit", status);
+    }
+    return rejected2(code ?? "http", status);
+  }
+  function report(error, organizationId) {
+    if (!(error instanceof CalendarError2) || error.code !== CALENDAR_ERROR_CODES2.unavailable && error.code !== CALENDAR_ERROR_CODES2.rejected) {
+      return;
+    }
+    try {
+      options.reporter?.capture(error, { organizationId, tags: { feature: "calendar" } });
+    } catch {}
+  }
+  async function call(kind, organizationId, callOptions, attempt, retries = true) {
+    const checked = checkOptions(callOptions);
+    const deadline = startCalendarDeadline(checked.timeoutMs, checked.signal);
+    try {
+      return await withCalendarRetry(async () => {
+        try {
+          return await attempt(deadline.signal);
+        } catch (error) {
+          if (error instanceof AttemptAborted) {
+            deadline.check();
+            throw unavailable3("attempt_timeout");
+          }
+          throw error;
+        }
+      }, {
+        policy: retries ? checked.retry : { ...checked.retry, maxRetries: 0 },
+        deadline,
+        sleep,
+        ...options.random === undefined ? {} : { random: options.random },
+        onRetry: (retry, delayMs) => options.logger?.warn("A calendar call is retrying", {
+          feature: "calendar",
+          kind,
+          retry,
+          delayMs
+        })
+      });
+    } catch (error) {
+      report(error, organizationId);
+      throw error;
+    } finally {
+      deadline.stop();
+    }
+  }
+  function eventUrl(eventId, query = "") {
+    return `${GRAPH}/me/events/${encodeURIComponent(eventId)}${query}`;
+  }
+  function expand(names) {
+    const filter = names.map((n) => `id eq '${propertyId(n)}'`).join(" or ");
+    return `$expand=${encodeURIComponent(`singleValueExtendedProperties($filter=${filter})`)}`;
+  }
+  async function readEvent(connection, eventId, names, overall, missing) {
+    const answer = await api(connection, "GET", eventUrl(eventId, `?${expand(names)}`), undefined, overall);
+    if (answer.status !== 200) {
+      throw failure(answer, missing);
+    }
+    if (answer.json?.isCancelled === true) {
+      throw missing;
+    }
+    return answer.json ?? {};
+  }
+  function fingerprint(value) {
+    return sha256Hex(JSON.stringify(value));
+  }
+  return {
+    async connect(request, callOptions) {
+      checkOrganizationId(request?.organizationId);
+      const grant = checkGrant(request.grant);
+      return call("connect", request.organizationId, callOptions, async (overall) => {
+        if (grant.kind === "refresh_token") {
+          const answer = await tokenRequest({ grant_type: "refresh_token", refresh_token: grant.refreshToken }, overall);
+          const read = tokenAnswer(answer, () => rejected2("invalid_grant", answer.status));
+          remember(grant.refreshToken, read.accessToken, read.seconds);
+          return grant.refreshToken;
+        }
+        const answer = await tokenRequest({
+          grant_type: "authorization_code",
+          code: grant.code,
+          redirect_uri: grant.redirectUri,
+          ...grant.codeVerifier === undefined ? {} : { code_verifier: grant.codeVerifier }
+        }, overall);
+        const read = tokenAnswer(answer, () => rejected2("invalid_grant", answer.status));
+        if (typeof read.refreshToken !== "string" || read.refreshToken.length < 1) {
+          throw rejected2("no_refresh_token", answer.status);
+        }
+        remember(read.refreshToken, read.accessToken, read.seconds);
+        return read.refreshToken;
+      }, false).then((credential) => new CalendarConnection2({
+        organizationId: request.organizationId,
+        provider: "microsoft",
+        connectionId: `ocal_${randomUUID2()}`,
+        credential
+      }));
+    },
+    async busy(request, callOptions) {
+      const connection = checkBase(request);
+      const { fromMs, toMs } = checkRange(request.from, request.to);
+      return call("busy", request.organizationId, callOptions, async (overall) => {
+        const blocks = [];
+        let url = `${calendarUrl}/calendarView?startDateTime=${encodeURIComponent(iso2(fromMs))}` + `&endDateTime=${encodeURIComponent(iso2(toMs))}&$select=start,end,showAs,isCancelled&$top=${PAGE_SIZE}`;
+        for (let page = 0;url !== undefined; page++) {
+          if (page >= MAX_PAGES) {
+            throw tooMany();
+          }
+          const answer = await api(connection, "GET", url, undefined, overall);
+          if (answer.status !== 200) {
+            throw failure(answer, rejected2("calendar_not_found", answer.status));
+          }
+          const items = answer.json?.value;
+          if (!Array.isArray(items)) {
+            throw rejected2("shape", answer.status);
+          }
+          for (const item of items) {
+            if (!isObject2(item)) {
+              throw rejected2("shape", answer.status);
+            }
+            const start = readTime(item.start);
+            const end = readTime(item.end);
+            if (Number.isNaN(start) || Number.isNaN(end)) {
+              throw rejected2("shape", answer.status);
+            }
+            const state = typeof item.showAs === "string" ? item.showAs.toLowerCase() : "busy";
+            if (item.isCancelled === true || !BUSY_STATES.has(state)) {
+              continue;
+            }
+            const clipped = { startMs: Math.max(start, fromMs), endMs: Math.min(end, toMs) };
+            if (clipped.startMs < clipped.endMs) {
+              blocks.push(clipped);
+            }
+          }
+          const next = answer.json?.["@odata.nextLink"];
+          if (next === undefined) {
+            url = undefined;
+          } else if (typeof next === "string" && next.startsWith(`${GRAPH}/`)) {
+            url = next;
+          } else {
+            throw rejected2("next_link", answer.status);
+          }
+        }
+        blocks.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+        const merged = [];
+        for (const block of blocks) {
+          const last = merged.at(-1);
+          if (last !== undefined && block.startMs <= last.endMs) {
+            last.endMs = Math.max(last.endMs, block.endMs);
+          } else {
+            merged.push({ ...block });
+          }
+        }
+        if (merged.length > MAX_BUSY_INTERVALS2) {
+          throw tooMany();
+        }
+        return merged.map((b) => ({ start: iso2(b.startMs), end: iso2(b.endMs) }));
+      });
+    },
+    async createEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const requestId = checkRequestId(request.requestId);
+      const { event, startMs, endMs } = checkEvent(request.event);
+      const video = event.conferencing === "video";
+      const key = sha256Hex(connection.connectionId, requestId);
+      const fp = fingerprint({
+        title: event.title,
+        startMs,
+        endMs,
+        description: event.description ?? null,
+        location: event.location ?? null,
+        attendees: event.attendees ?? [],
+        video
+      });
+      const body = {
+        transactionId: key,
+        subject: event.title,
+        start: graphTime(startMs),
+        end: graphTime(endMs),
+        ...event.description === undefined ? {} : { body: { contentType: "text", content: event.description } },
+        ...event.location === undefined ? {} : { location: { displayName: event.location } },
+        ...event.attendees === undefined ? {} : { attendees: attendeesBody2(event.attendees) },
+        ...video ? { isOnlineMeeting: true, onlineMeetingProvider: "teamsForBusiness" } : {},
+        singleValueExtendedProperties: [{ id: propertyId("kitFp"), value: fp }]
+      };
+      return call("create", request.organizationId, callOptions, async (overall) => {
+        const startedAt = clock.now().getTime();
+        const answer = await api(connection, "POST", `${calendarUrl}/events`, body, overall);
+        if (answer.status !== 201 && answer.status !== 200) {
+          throw failure(answer);
+        }
+        const ref = eventRef2(answer.json, answer.status);
+        const madeAt = Date.parse(String(answer.json?.createdDateTime));
+        if (Number.isNaN(madeAt) || madeAt >= startedAt - CREATED_SKEW_MS) {
+          return { ...ref, created: true };
+        }
+        const notFound = rejected2("event_deleted");
+        const existing = await readEvent(connection, ref.eventId, ["kitFp"], overall, notFound);
+        if (property(existing, "kitFp") !== fp) {
+          invalid("requestId");
+        }
+        return { ...ref, created: false };
+      });
+    },
+    async updateEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const eventId = checkEventId(request.eventId);
+      const requestId = checkRequestId(request.requestId);
+      const changes = checkChanges(request.changes);
+      const requestHash = sha256Hex(requestId).slice(0, 32);
+      const changeHash = fingerprint(changes);
+      const notFound = new CalendarError2(CALENDAR_ERROR_CODES2.notFound, "The event does not exist");
+      return call("update", request.organizationId, callOptions, async (overall) => {
+        const existing = await readEvent(connection, eventId, ["kitUpd"], overall, notFound);
+        const last = property(existing, "kitUpd");
+        if (last?.startsWith(`${requestHash}:`)) {
+          if (last !== `${requestHash}:${changeHash}`) {
+            invalid("requestId");
+          }
+          return eventRef2(existing, 200);
+        }
+        const current = eventRef2(existing, 200);
+        const startMs = changes.start === undefined ? Date.parse(current.start) : Date.parse(changes.start);
+        const endMs = changes.end === undefined ? Date.parse(current.end) : Date.parse(changes.end);
+        checkEventTimes(startMs, endMs);
+        const body = {
+          ...changes.title === undefined ? {} : { subject: changes.title },
+          ...changes.description === undefined ? {} : { body: { contentType: "text", content: changes.description } },
+          ...changes.location === undefined ? {} : { location: { displayName: changes.location } },
+          ...changes.attendees === undefined ? {} : { attendees: attendeesBody2(changes.attendees) },
+          ...changes.start === undefined ? {} : { start: graphTime(startMs) },
+          ...changes.end === undefined ? {} : { end: graphTime(endMs) },
+          singleValueExtendedProperties: [
+            { id: propertyId("kitUpd"), value: `${requestHash}:${changeHash}` }
+          ]
+        };
+        const answer = await api(connection, "PATCH", eventUrl(eventId), body, overall);
+        if (answer.status !== 200) {
+          throw failure(answer, notFound);
+        }
+        return eventRef2(answer.json, answer.status);
+      });
+    },
+    async deleteEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const eventId = checkEventId(request.eventId);
+      checkRequestId(request.requestId);
+      let attempts = 0;
+      return call("delete", request.organizationId, callOptions, async (overall) => {
+        attempts++;
+        const answer = await api(connection, "DELETE", eventUrl(eventId), undefined, overall);
+        if (answer.status === 204 || answer.status === 200) {
+          return { deleted: true };
+        }
+        if (answer.status === 404 || answer.status === 410) {
+          return { deleted: attempts > 1 };
+        }
+        throw failure(answer);
+      });
+    },
+    async revoke(request, callOptions) {
+      const connection = checkBase(request);
+      const key = tokenKey(connection.unsafeCredential());
+      await call("revoke", request.organizationId, callOptions, async () => {
+        tokens.delete(key);
+        revokedHere.delete(key);
+        revokedHere.add(key);
+        if (revokedHere.size > MAX_REVOKED) {
+          const oldest = revokedHere.values().next().value;
+          if (oldest !== undefined) {
+            revokedHere.delete(oldest);
+          }
+        }
+      });
+    }
+  };
+}
+function tooMany() {
+  return new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The calendar has too many busy intervals", { details: { reason: "too_many_intervals", max: MAX_BUSY_INTERVALS2 } });
+}
 // src/consent/http.ts
 import {
   CONSENT_ROUTES,
@@ -1456,7 +2022,7 @@ function retryAfterMs(value) {
   }
   return Number(text.trim()) * 1000;
 }
-function parseJson2(text) {
+function parseJson3(text) {
   if (text.trim() === "") {
     return;
   }
@@ -1740,7 +2306,7 @@ class Failure {
   }
 }
 function answerJson(wire) {
-  const json = parseJson2(wire.text);
+  const json = parseJson3(wire.text);
   if (json === undefined && wire.status >= 200 && wire.status < 300 && wire.text.trim() !== "") {
     throw new Failure("response_invalid", wire.status);
   }
@@ -1891,11 +2457,11 @@ function createLogger(options) {
   return wrap(options.destination ? pino(config, options.destination) : pino(config));
 }
 // src/messaging/twilio.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 import { e164PhoneSchema } from "tula-closeline-contract";
 
 // src/telephony/twilio.ts
-import { createHash as createHash2, createHmac, randomBytes } from "node:crypto";
+import { createHash as createHash3, createHmac, randomBytes } from "node:crypto";
 import { SignJWT } from "jose";
 
 // src/telephony/twilio-http.ts
@@ -1904,7 +2470,7 @@ var TWILIO_RETRY_BASE_MS = 100;
 var TWILIO_RETRY_MAX_MS = 1000;
 var TWILIO_MAX_RESPONSE_BYTES = 1048576;
 var CALL_ENDED_CODES = new Set([21220, 21221, 21222, 21224]);
-function unavailable3(reason, details) {
+function unavailable4(reason, details) {
   return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, `The provider did not answer: ${reason}`, details === undefined ? {} : { details });
 }
 function mapTwilioFailure(status, body) {
@@ -1939,7 +2505,7 @@ function guardBody(response, timer, signal, timedOut) {
   }
   const reader = source.getReader();
   const aborted = new Promise((_, reject) => {
-    const fail = () => reject(unavailable3(timedOut() ? "timed out" : "the request failed"));
+    const fail = () => reject(unavailable4(timedOut() ? "timed out" : "the request failed"));
     if (signal.aborted) {
       fail();
     } else {
@@ -2006,7 +2572,7 @@ function createTwilioHttp(options) {
     for (let attempt = 1;attempt <= maxAttempts; attempt++) {
       const remaining = request.deadline - options.now();
       if (remaining <= 0) {
-        throw last ?? unavailable3("timed out");
+        throw last ?? unavailable4("timed out");
       }
       const controller = new AbortController;
       let timedOut = false;
@@ -2049,10 +2615,10 @@ function createTwilioHttp(options) {
           throw error;
         }
         if (timedOut) {
-          throw unavailable3("timed out");
+          throw unavailable4("timed out");
         }
         if (!(error instanceof TelephonyError2)) {
-          last = unavailable3("the request failed");
+          last = unavailable4("the request failed");
         }
       } finally {
         if (!keepTimer) {
@@ -2065,7 +2631,7 @@ function createTwilioHttp(options) {
         await options.sleep(pause);
       }
     }
-    throw last ?? unavailable3("the request failed");
+    throw last ?? unavailable4("the request failed");
   }
   return {
     json: (request, opts) => send(request, "json", opts?.allow ?? []),
@@ -2078,12 +2644,12 @@ async function readJson(response, mustParse) {
   }
   let text;
   try {
-    text = await readBounded3(response);
+    text = await readBounded4(response);
   } catch (error) {
     if (error instanceof TelephonyError2) {
       throw error;
     }
-    throw unavailable3("the answer could not be read");
+    throw unavailable4("the answer could not be read");
   }
   if (text.length === 0) {
     return null;
@@ -2098,7 +2664,7 @@ async function readJson(response, mustParse) {
     return null;
   }
 }
-async function readBounded3(response) {
+async function readBounded4(response) {
   const reader = response.body?.getReader();
   if (!reader) {
     return "";
@@ -2194,7 +2760,7 @@ function hold() {
 function badResponse(what) {
   return new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, `The provider answered without a usable ${what}`);
 }
-function unavailable4() {
+function unavailable5() {
   return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, "The provider did not answer in time");
 }
 function notFound() {
@@ -2292,7 +2858,7 @@ function createTwilioTelephony(options) {
     return nowMs() + resolveTimeout(opts, defaultTimeoutMs);
   }
   function token(...parts) {
-    return createHash2("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
+    return createHash3("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
   }
   async function patchCall(providerCallId, patch) {
     await store.withCall(providerCallId, async (current) => {
@@ -2433,7 +2999,7 @@ function createTwilioTelephony(options) {
       }
       const waitMs = estimateSpeechMs(request.text);
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
-        throw unavailable4();
+        throw unavailable5();
       }
       await store.withCall(providerCallId, async (fresh) => {
         if (fresh === null) {
@@ -2450,7 +3016,7 @@ function createTwilioTelephony(options) {
         await sleep(waitMs);
       }
       if (nowMs() > deadline) {
-        throw unavailable4();
+        throw unavailable5();
       }
       if (!await callIsUp(providerCallId, deadline)) {
         throw callEnded();
@@ -2610,7 +3176,7 @@ function createTwilioTelephony(options) {
           return false;
         }
         if (hashed !== null) {
-          const actual = createHash2("sha256").update(request.body, "utf8").digest("hex");
+          const actual = createHash3("sha256").update(request.body, "utf8").digest("hex");
           if (!sameText(actual, hashed.toLowerCase())) {
             return false;
           }
@@ -2659,13 +3225,13 @@ function createTwilioTelephony(options) {
 var ACCOUNT_SID = /^AC[0-9a-fA-F]{32}$/;
 var SERVICE_SID = /^MG[0-9a-fA-F]{32}$/;
 var MESSAGE_SID = /^(SM|MM)[0-9a-fA-F]{32}$/;
-var MAX_RESPONSE_BYTES2 = 65536;
-var DEFAULT_ATTEMPT_TIMEOUT_MS2 = 5000;
+var MAX_RESPONSE_BYTES3 = 65536;
+var DEFAULT_ATTEMPT_TIMEOUT_MS3 = 5000;
 var OPTED_OUT = 21610;
 var TEMPLATE_REQUIRED = 63016;
 var QUEUED = new Set(["queued", "accepted", "scheduled", "sending"]);
 var SENT = new Set(["sent", "delivered"]);
-function unavailable5(phase, status) {
+function unavailable6(phase, status) {
   return new MessagingError2(MESSAGING_ERROR_CODES2.unavailable, "The messaging provider is unavailable", {
     details: { phase, ...status === undefined ? {} : { status } }
   });
@@ -2673,7 +3239,7 @@ function unavailable5(phase, status) {
 function badResponse2(reason, status) {
   return new MessagingError2(MESSAGING_ERROR_CODES2.badResponse, "The messaging provider sent an unusable answer", { details: { reason, ...status === undefined ? {} : { status } } });
 }
-async function readBounded4(response) {
+async function readBounded5(response) {
   const body = response.body;
   if (body === null) {
     return "";
@@ -2688,7 +3254,7 @@ async function readBounded4(response) {
       break;
     }
     total += value.byteLength;
-    if (total > MAX_RESPONSE_BYTES2) {
+    if (total > MAX_RESPONSE_BYTES3) {
       await reader.cancel().catch(() => {
         return;
       });
@@ -2698,7 +3264,7 @@ async function readBounded4(response) {
   }
   return text + decoder.decode();
 }
-function parseJson3(text) {
+function parseJson4(text) {
   try {
     const value = JSON.parse(text);
     return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -2749,7 +3315,7 @@ function createTwilioMessaging(options) {
       throw new TypeError("statusCallbackUrl must be https without credentials");
     }
   }
-  const attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS2;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS3;
   if (!Number.isInteger(attemptTimeoutMs) || attemptTimeoutMs < 1 || attemptTimeoutMs > 60000) {
     throw new TypeError("attemptTimeoutMs must be 1 to 60000");
   }
@@ -2786,7 +3352,7 @@ function createTwilioMessaging(options) {
     return params;
   }
   function idempotencyToken(request) {
-    return createHash3("sha256").update([accountSid, request.organizationId, request.idempotencyKey].join("\x00")).digest("hex");
+    return createHash4("sha256").update([accountSid, request.organizationId, request.idempotencyKey].join("\x00")).digest("hex");
   }
   async function attempt(params, token, overall) {
     const own = new AbortController;
@@ -2811,17 +3377,17 @@ function createTwilioMessaging(options) {
         body: params
       }), signal);
       const status = response.status;
-      const text = await raceAbort(readBounded4(response), signal);
+      const text = await raceAbort(readBounded5(response), signal);
       if (status === 429 || status >= 500) {
-        throw unavailable5("http", status);
+        throw unavailable6("http", status);
       }
       if (status >= 400) {
-        throw fail4xx(status, parseJson3(text));
+        throw fail4xx(status, parseJson4(text));
       }
       if (status < 200 || status >= 300) {
         throw badResponse2("status", status);
       }
-      const json = parseJson3(text);
+      const json = parseJson4(text);
       const sid = json?.sid;
       const state = json?.status;
       if (typeof sid !== "string" || !MESSAGE_SID.test(sid) || typeof state !== "string") {
@@ -2841,7 +3407,7 @@ function createTwilioMessaging(options) {
       if (error instanceof AttemptAborted && !attemptTimedOut) {
         throw error;
       }
-      throw unavailable5(attemptTimedOut ? "attempt_timeout" : "network");
+      throw unavailable6(attemptTimedOut ? "attempt_timeout" : "network");
     } finally {
       clearTimeout(timer);
     }
@@ -2872,7 +3438,7 @@ function createTwilioMessaging(options) {
           } catch (error) {
             if (error instanceof AttemptAborted) {
               deadline.check();
-              throw unavailable5("attempt_timeout");
+              throw unavailable6("attempt_timeout");
             }
             throw error;
           }
@@ -3527,7 +4093,7 @@ function createErrorReporter(options) {
   return reporter;
 }
 // src/tts/cartesia.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID3 } from "node:crypto";
 var INSPECT = Symbol.for("nodejs.util.inspect.custom");
 var UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 var VENDOR_CODE = /^[a-z0-9_]{1,64}$/;
@@ -3551,7 +4117,7 @@ var bunCartesiaSocket = (url, headers) => {
 };
 
 class Attempt {
-  contextId = randomUUID2();
+  contextId = randomUUID3();
   events = [];
   ready = false;
   ended = false;
@@ -4227,6 +4793,7 @@ export {
   MESSAGING_PURPOSES2 as MESSAGING_PURPOSES,
   MODEL_TIERS2 as MODEL_TIERS,
   MessagingError2 as MessagingError,
+  OUTLOOK_CALENDAR_SCOPES,
   PACKAGE,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
@@ -4275,6 +4842,7 @@ export {
   createMemoryTwilioStore,
   createMessageRegistry2 as createMessageRegistry,
   createNoopErrorReporter,
+  createOutlookCalendar,
   createQueueAuditRecorder,
   createRemoteKeySet,
   createStaticKeySet,
