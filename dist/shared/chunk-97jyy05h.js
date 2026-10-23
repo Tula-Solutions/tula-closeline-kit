@@ -1682,12 +1682,13 @@ function denied(code) {
     details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
   });
 }
-async function ask(guard, who, request, deadline) {
+async function requireConsent(guard, request, deadline) {
   let result;
   try {
     result = await raceAbort(Promise.resolve().then(() => guard.check({
       organizationId: request.organizationId,
-      ...who,
+      prospectId: request.prospectId,
+      phone: request.to,
       channel: request.channel,
       purpose: request.purpose
     })), deadline.signal);
@@ -1703,12 +1704,7 @@ async function ask(guard, who, request, deadline) {
   if (typeof result.checkId !== "string") {
     throw denied("consent.unavailable");
   }
-  return result.checkId;
-}
-async function requireConsent(guard, request, deadline) {
-  const consentCheckId = await ask(guard, { prospectId: request.prospectId }, request, deadline);
-  const numberConsentCheckId = await ask(guard, { phone: request.to }, request, deadline);
-  return { consentCheckId, numberConsentCheckId };
+  return { consentCheckId: result.checkId };
 }
 
 // src/messaging/validate.ts

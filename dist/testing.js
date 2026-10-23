@@ -64,7 +64,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-wrcc1eww.js";
+} from "./shared/chunk-97jyy05h.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -710,9 +710,19 @@ import {
   formatId as formatId2
 } from "tula-closeline-contract";
 var MEMORY_CALLER = "memory";
+function addressKey(target) {
+  return target.email !== undefined ? `email:${target.email}` : target.phone !== undefined ? `phone:${target.phone}` : target.linkedinUrl !== undefined ? `linkedin:${target.linkedinUrl}` : undefined;
+}
 function key(target, channel) {
-  const who = target.prospectId !== undefined ? `prospect:${target.prospectId}` : target.email !== undefined ? `email:${target.email}` : target.phone !== undefined ? `phone:${target.phone}` : `linkedin:${target.linkedinUrl}`;
+  const who = target.prospectId !== undefined ? `prospect:${target.prospectId}` : addressKey(target);
   return JSON.stringify([target.organizationId, who, channel]);
+}
+function identityKey(organizationId, prospectId) {
+  return JSON.stringify([organizationId, prospectId]);
+}
+function addressOnly(target) {
+  const { prospectId: _prospectId, ...rest } = target;
+  return rest;
 }
 var counter = 0;
 function checkId() {
@@ -722,7 +732,15 @@ function checkId() {
 function createMemoryContactGuard() {
   const presets = new Map;
   const calls = [];
+  const identities = new Map;
   let unavailable = false;
+  function register(target) {
+    const address = addressKey(target);
+    if (target.prospectId !== undefined && address !== undefined) {
+      const id = identityKey(target.organizationId, target.prospectId);
+      identities.set(id, (identities.get(id) ?? new Set).add(address));
+    }
+  }
   const guard = {
     calls,
     async check(request) {
@@ -733,18 +751,33 @@ function createMemoryContactGuard() {
       if (unavailable) {
         return CONTACT_UNAVAILABLE2;
       }
-      return presets.get(key(request, request.channel)) ?? {
+      const missing = {
         allowed: false,
         checkId: checkId(),
         code: "consent.missing",
         suppressionReason: null
       };
+      const address = addressKey(request);
+      if (request.prospectId !== undefined && address !== undefined) {
+        const owned = identities.get(identityKey(request.organizationId, request.prospectId));
+        if (!owned?.has(address)) {
+          return missing;
+        }
+        const suppressed = presets.get(key({ ...addressOnly(request) }, request.channel));
+        if (suppressed !== undefined && !suppressed.allowed) {
+          return suppressed;
+        }
+        return presets.get(key({ organizationId: request.organizationId, prospectId: request.prospectId }, request.channel)) ?? missing;
+      }
+      return presets.get(key(request, request.channel)) ?? missing;
     },
     allow(target, channel, basis = "consent_granted") {
+      register(target);
       presets.set(key(target, channel), { allowed: true, checkId: checkId(), basis });
       return guard;
     },
     deny(target, channel, code = "consent.missing", suppressionReason) {
+      register(target);
       const reason = code === "consent.suppressed" ? suppressionReason ?? "manual" : null;
       presets.set(key(target, channel), {
         allowed: false,
@@ -1231,7 +1264,7 @@ function createMemoryMessaging(options) {
       const checked = checkSendRequest(request);
       const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal);
       try {
-        const { consentCheckId, numberConsentCheckId } = await requireConsent(options.guard, checked, deadline);
+        const { consentCheckId } = await requireConsent(options.guard, checked, deadline);
         const fingerprint = createHash("sha256").update(JSON.stringify([
           checked.prospectId,
           checked.channel,
@@ -1272,7 +1305,7 @@ function createMemoryMessaging(options) {
             });
             return {
               consentCheckId,
-              numberConsentCheckId,
+              numberConsentCheckId: consentCheckId,
               providerMessageId: answer.providerMessageId,
               channel: checked.channel,
               status: "queued",

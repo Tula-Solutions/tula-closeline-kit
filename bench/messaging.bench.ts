@@ -42,9 +42,7 @@ const BUDGETS = {
 } satisfies Record<string, Budget>
 
 const guard = createMemoryContactGuard()
-guard.allow({ organizationId: ORG, prospectId: PROSPECT }, 'sms')
-guard.allow({ organizationId: ORG, phone: '+14155550142' }, 'sms')
-guard.allow({ organizationId: ORG, phone: '+14155550199' }, 'sms')
+guard.allow({ organizationId: ORG, prospectId: PROSPECT, phone: '+14155550142' }, 'sms')
 const messaging = createMemoryMessaging({ guard })
 const inbound = messaging.inbound({
   from: '+14155550142',

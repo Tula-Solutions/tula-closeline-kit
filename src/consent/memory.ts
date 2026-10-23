@@ -17,7 +17,11 @@ type Basis = Extract<ContactCheckResult, { allowed: true }>['basis']
 /** The caller name the memory guard checks requests under. */
 const MEMORY_CALLER = 'memory'
 
-/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
+/**
+ * Who a preset is about: an Organization and a Prospect id, an address, or a Prospect id with one
+ * of its addresses. The last form also records the address as one of the Prospect's identities;
+ * consent is kept on the Prospect and a suppression on the address alone.
+ */
 export type ContactTarget = Pick<
   ContactGuardRequest,
   'organizationId' | 'prospectId' | 'email' | 'phone' | 'linkedinUrl'
@@ -46,16 +50,28 @@ export interface MemoryContactGuard extends ContactGuard {
   reset(): void
 }
 
+function addressKey(target: ContactTarget): string | undefined {
+  return target.email !== undefined
+    ? `email:${target.email}`
+    : target.phone !== undefined
+      ? `phone:${target.phone}`
+      : target.linkedinUrl !== undefined
+        ? `linkedin:${target.linkedinUrl}`
+        : undefined
+}
+
 function key(target: ContactTarget, channel: string): string {
-  const who =
-    target.prospectId !== undefined
-      ? `prospect:${target.prospectId}`
-      : target.email !== undefined
-        ? `email:${target.email}`
-        : target.phone !== undefined
-          ? `phone:${target.phone}`
-          : `linkedin:${target.linkedinUrl}`
+  const who = target.prospectId !== undefined ? `prospect:${target.prospectId}` : addressKey(target)
   return JSON.stringify([target.organizationId, who, channel])
+}
+
+function identityKey(organizationId: string, prospectId: string): string {
+  return JSON.stringify([organizationId, prospectId])
+}
+
+function addressOnly(target: ContactTarget): ContactTarget {
+  const { prospectId: _prospectId, ...rest } = target
+  return rest
 }
 
 let counter = 0
@@ -72,7 +88,17 @@ function checkId() {
 export function createMemoryContactGuard(): MemoryContactGuard {
   const presets = new Map<string, ContactGuardResult>()
   const calls: ContactGuardRequest[] = []
+  // A Prospect's stored identities: `[organization, prospect]` to the address keys it owns.
+  const identities = new Map<string, Set<string>>()
   let unavailable = false
+
+  function register(target: ContactTarget): void {
+    const address = addressKey(target)
+    if (target.prospectId !== undefined && address !== undefined) {
+      const id = identityKey(target.organizationId, target.prospectId)
+      identities.set(id, (identities.get(id) ?? new Set()).add(address))
+    }
+  }
 
   const guard: MemoryContactGuard = {
     calls,
@@ -84,20 +110,42 @@ export function createMemoryContactGuard(): MemoryContactGuard {
       if (unavailable) {
         return CONTACT_UNAVAILABLE
       }
-      return (
-        presets.get(key(request, request.channel)) ?? {
-          allowed: false,
-          checkId: checkId(),
-          code: 'consent.missing',
-          suppressionReason: null,
+      const missing: ContactGuardResult = {
+        allowed: false,
+        checkId: checkId(),
+        code: 'consent.missing',
+        suppressionReason: null,
+      }
+      const address = addressKey(request)
+      if (request.prospectId !== undefined && address !== undefined) {
+        // A Prospect with an address: the address must be one of its identities, suppression is
+        // read on the address, and consent from the Prospect's own ledger.
+        const owned = identities.get(identityKey(request.organizationId, request.prospectId))
+        if (!owned?.has(address)) {
+          return missing
         }
-      )
+        const suppressed = presets.get(key({ ...addressOnly(request) }, request.channel))
+        if (suppressed !== undefined && !suppressed.allowed) {
+          return suppressed
+        }
+        return (
+          presets.get(
+            key(
+              { organizationId: request.organizationId, prospectId: request.prospectId },
+              request.channel
+            )
+          ) ?? missing
+        )
+      }
+      return presets.get(key(request, request.channel)) ?? missing
     },
     allow(target, channel, basis = 'consent_granted') {
+      register(target)
       presets.set(key(target, channel), { allowed: true, checkId: checkId(), basis })
       return guard
     },
     deny(target, channel, code = 'consent.missing', suppressionReason) {
+      register(target)
       const reason = code === 'consent.suppressed' ? (suppressionReason ?? 'manual') : null
       presets.set(key(target, channel), {
         allowed: false,

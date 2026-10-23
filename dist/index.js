@@ -82,7 +82,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-wrcc1eww.js";
+} from "./shared/chunk-97jyy05h.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -2200,7 +2200,7 @@ function createTwilioMessaging(options) {
       const text = body.toString();
       const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal);
       try {
-        const { consentCheckId, numberConsentCheckId } = await requireConsent(guard, checked, deadline);
+        const { consentCheckId } = await requireConsent(guard, checked, deadline);
         const answer = await withMessagingRetry(async () => {
           try {
             return await attempt(text, token, deadline.signal);
@@ -2225,7 +2225,7 @@ function createTwilioMessaging(options) {
         });
         return {
           consentCheckId,
-          numberConsentCheckId,
+          numberConsentCheckId: consentCheckId,
           providerMessageId: answer.providerMessageId,
           channel: checked.channel,
           status: answer.status,

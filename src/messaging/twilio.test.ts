@@ -37,8 +37,7 @@ function req(over: Partial<SendMessageRequest> = {}): SendMessageRequest {
 }
 
 function allowed(h: ReturnType<typeof twilioHarness>, channel: 'sms' | 'whatsapp' = 'sms') {
-  h.guard.allow({ organizationId: org, prospectId: prospect }, channel)
-  h.guard.allow({ organizationId: org, phone: RECIPIENT }, channel)
+  h.guard.allow({ organizationId: org, prospectId: prospect, phone: RECIPIENT }, channel)
 }
 
 async function fails(run: () => Promise<unknown>): Promise<MessagingError> {

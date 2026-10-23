@@ -220,7 +220,7 @@ describe('the HTTP ContactGuard fails closed', () => {
   test('an invalid request is denied before any call', async () => {
     const core = stand(() => Response.json({}))
     const { guard } = build(core.url)
-    expect(await guard.check({ ...request, prospectId })).toEqual(UNAVAILABLE)
+    expect(await guard.check({ ...request, phone: '+14155550142' })).toEqual(UNAVAILABLE)
     expect(core.seen).toHaveLength(0)
     guard.close()
   })

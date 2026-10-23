@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { inspect } from 'node:util'
-import type { OrganizationId, ProspectId } from 'tula-closeline-contract'
+import { formatId, type OrganizationId, type ProspectId } from 'tula-closeline-contract'
 import type { MemoryContactGuard } from '../consent/memory'
 import type { MemoryErrorReporter } from '../reporting/testing'
 import { MESSAGING_ERROR_CODES, MessagingError } from './errors'
@@ -119,8 +119,7 @@ export function messagingBehaviour(
     }
 
     function allow(s: MessagingSubject, channel: MessagingChannel, org = s.organizations.a): void {
-      s.guard.allow({ organizationId: org, prospectId: s.prospect }, channel)
-      s.guard.allow({ organizationId: org, phone: s.recipient }, channel)
+      s.guard.allow({ organizationId: org, prospectId: s.prospect, phone: s.recipient }, channel)
     }
 
     let counter = 0
@@ -149,17 +148,11 @@ export function messagingBehaviour(
       expect(sent.status).toBe('queued')
       expect(sent.idempotencyKey).toBe('order-1')
       expect(s.vendorCalls()).toBe(1)
-      expect(sent.numberConsentCheckId).toMatch(/^chk_/)
-      expect(sent.numberConsentCheckId).not.toBe(sent.consentCheckId)
+      expect(sent.numberConsentCheckId).toBe(sent.consentCheckId)
       expect(s.guard.calls).toEqual([
         {
           organizationId: s.organizations.a,
           prospectId: s.prospect,
-          channel: 'sms',
-          purpose: 'agent_initiated',
-        },
-        {
-          organizationId: s.organizations.a,
           phone: s.recipient,
           channel: 'sms',
           purpose: 'agent_initiated',
@@ -199,7 +192,11 @@ export function messagingBehaviour(
     for (const denial of ['consent.missing', 'consent.withdrawn', 'consent.suppressed'] as const) {
       test(`a denial with ${denial} fails with messaging.consent_denied and never reaches the vendor`, async () => {
         const s = await subject()
-        s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect }, 'sms', denial)
+        s.guard.deny(
+          { organizationId: s.organizations.a, prospectId: s.prospect, phone: s.recipient },
+          'sms',
+          denial
+        )
         const error = await errorOf(() => s.port.send(request(s)))
         expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
         expect(error?.details).toEqual({ code: denial })
@@ -226,24 +223,57 @@ export function messagingBehaviour(
       expect(s.vendorCalls()).toBe(0)
     })
 
-    for (const code of ['consent.missing', 'consent.withdrawn', 'consent.suppressed'] as const) {
-      test(`a number denied with ${code} blocks the send though the Prospect is allowed`, async () => {
-        const s = await subject()
-        allow(s, 'sms')
-        s.guard.deny({ organizationId: s.organizations.a, phone: s.recipient }, 'sms', code)
-        const error = await errorOf(() => s.port.send(request(s)))
-        expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
-        expect(error?.details).toEqual({ code })
-        expect(s.vendorCalls()).toBe(0)
-      })
-    }
+    test('a suppressed number blocks the send though the Prospect is allowed and not suppressed', async () => {
+      const s = await subject()
+      allow(s, 'sms')
+      s.guard.deny(
+        { organizationId: s.organizations.a, phone: s.recipient },
+        'sms',
+        'consent.suppressed'
+      )
+      const error = await errorOf(() => s.port.send(request(s)))
+      expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
+      expect(error?.details).toEqual({ code: 'consent.suppressed' })
+      expect(s.vendorCalls()).toBe(0)
+    })
 
-    test('a number nobody preset is denied though the Prospect is allowed', async () => {
+    test("a send to another Prospect's number is refused as missing", async () => {
+      const s = await subject()
+      const otherProspect = formatId('prs', '2'.repeat(32)) as ProspectId
+      const otherNumber = '+14155550177'
+      allow(s, 'sms')
+      s.guard.allow(
+        { organizationId: s.organizations.a, prospectId: otherProspect, phone: otherNumber },
+        'sms'
+      )
+      const error = await errorOf(() => s.port.send(request(s, { to: otherNumber })))
+      expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
+      expect(error?.details).toEqual({ code: 'consent.missing' })
+      expect(s.vendorCalls()).toBe(0)
+    })
+
+    test('a number that is no identity of the Prospect is refused though the Prospect has consent', async () => {
       const s = await subject()
       s.guard.allow({ organizationId: s.organizations.a, prospectId: s.prospect }, 'sms')
       const error = await errorOf(() => s.port.send(request(s)))
       expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
+      expect(error?.details).toEqual({ code: 'consent.missing' })
       expect(s.vendorCalls()).toBe(0)
+    })
+
+    test('exactly one Contact Check is made per send, naming the Prospect and the number', async () => {
+      const s = await subject()
+      allow(s, 'sms')
+      await s.port.send(request(s))
+      expect(s.guard.calls).toHaveLength(1)
+      expect(s.guard.calls[0]).toMatchObject({ prospectId: s.prospect, phone: s.recipient })
+      s.guard.deny(
+        { organizationId: s.organizations.a, prospectId: s.prospect },
+        'sms',
+        'consent.withdrawn'
+      )
+      await codeOf(() => s.port.send(request(s)))
+      expect(s.guard.calls).toHaveLength(2)
     })
 
     test('a Contact Check that never answers fails with messaging.timeout at the deadline', async () => {
@@ -287,7 +317,7 @@ export function messagingBehaviour(
         'consent.withdrawn'
       )
       expect(await codeOf(() => s.port.send(request(s)))).toBe(MESSAGING_ERROR_CODES.consentDenied)
-      expect(s.guard.calls.length).toBe(4)
+      expect(s.guard.calls.length).toBe(3)
       expect(s.vendorCalls()).toBe(1)
     })
 

@@ -657,6 +657,46 @@ function contactGuardBehaviour(name, make) {
       const result = await s.guard.check({ ...email, channel: "email", purpose: "agent_initiated" });
       expect3(result.allowed).toBe(true);
     });
+    describe3("a Prospect with one of its own addresses", () => {
+      const phone = "+14155550142";
+      const own = { organizationId: org, prospectId, phone };
+      const combined = { ...own, channel: "sms", purpose: "agent_initiated" };
+      test3("is allowed when the address is the Prospect's and the Prospect consented", async () => {
+        const s = await subject();
+        s.allow(own, "sms");
+        expect3((await s.guard.check(combined)).allowed).toBe(true);
+        expect3(s.reached()).toEqual([combined]);
+      });
+      test3("is denied as missing for another Prospect's address", async () => {
+        const s = await subject();
+        s.allow(own, "sms");
+        const result = await s.guard.check({ ...combined, phone: "+14155550177" });
+        expect3(result).toMatchObject({ allowed: false, code: "consent.missing" });
+      });
+      test3("is denied as missing when the Prospect has no such identity", async () => {
+        const s = await subject();
+        s.allow({ organizationId: org, prospectId }, "sms");
+        const result = await s.guard.check(combined);
+        expect3(result).toMatchObject({ allowed: false, code: "consent.missing" });
+      });
+      test3("is denied as suppressed when the address is suppressed, though the Prospect is not", async () => {
+        const s = await subject();
+        s.allow(own, "sms");
+        s.deny({ organizationId: org, phone }, "sms", "consent.suppressed", "unsubscribe");
+        const result = await s.guard.check(combined);
+        expect3(result).toMatchObject({
+          allowed: false,
+          code: "consent.suppressed",
+          suppressionReason: "unsubscribe"
+        });
+      });
+      test3("is denied in a second Organization", async () => {
+        const s = await subject();
+        s.allow(own, "sms");
+        const result = await s.guard.check({ ...combined, organizationId: otherOrg });
+        expect3(result.allowed).toBe(false);
+      });
+    });
     test3("the channel and purpose reach the check", async () => {
       const s = await subject();
       await s.guard.check({ ...request, channel: "whatsapp", purpose: "reply" });
@@ -680,10 +720,14 @@ function contactGuardBehaviour(name, make) {
         suppressionReason: null
       });
     });
-    test3("a request naming two targets is denied as unavailable and asks nothing", async () => {
+    test3("a request naming two addresses is denied as unavailable and asks nothing", async () => {
       const s = await subject();
       s.allow(target, "sms");
-      const result = await s.guard.check({ ...request, email: "pat@example.com" });
+      const result = await s.guard.check({
+        ...request,
+        email: "pat@example.com",
+        phone: "+14155550142"
+      });
       expect3(result).toMatchObject({ allowed: false, code: "consent.unavailable" });
       expect3(s.reached()).toHaveLength(0);
     });
@@ -972,6 +1016,7 @@ function llmBehaviour(name, make, skip = false) {
 // src/messaging/behaviour.ts
 import { afterEach as afterEach5, describe as describe5, expect as expect5, test as test5 } from "bun:test";
 import { inspect as inspect2 } from "node:util";
+import { formatId as formatId2 } from "tula-closeline-contract";
 var SECRET_TEXT = "zebra confidential pricing";
 var retry = { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 2 };
 var TEMPLATE = `HX${"0123456789abcdef".repeat(2)}`;
@@ -1002,8 +1047,7 @@ function messagingBehaviour(name, make, skip = false) {
       return next;
     }
     function allow(s, channel, org = s.organizations.a) {
-      s.guard.allow({ organizationId: org, prospectId: s.prospect }, channel);
-      s.guard.allow({ organizationId: org, phone: s.recipient }, channel);
+      s.guard.allow({ organizationId: org, prospectId: s.prospect, phone: s.recipient }, channel);
     }
     let counter = 0;
     function request(s, overrides = {}) {
@@ -1030,17 +1074,11 @@ function messagingBehaviour(name, make, skip = false) {
       expect5(sent.status).toBe("queued");
       expect5(sent.idempotencyKey).toBe("order-1");
       expect5(s.vendorCalls()).toBe(1);
-      expect5(sent.numberConsentCheckId).toMatch(/^chk_/);
-      expect5(sent.numberConsentCheckId).not.toBe(sent.consentCheckId);
+      expect5(sent.numberConsentCheckId).toBe(sent.consentCheckId);
       expect5(s.guard.calls).toEqual([
         {
           organizationId: s.organizations.a,
           prospectId: s.prospect,
-          channel: "sms",
-          purpose: "agent_initiated"
-        },
-        {
-          organizationId: s.organizations.a,
           phone: s.recipient,
           channel: "sms",
           purpose: "agent_initiated"
@@ -1073,7 +1111,7 @@ function messagingBehaviour(name, make, skip = false) {
     for (const denial of ["consent.missing", "consent.withdrawn", "consent.suppressed"]) {
       test5(`a denial with ${denial} fails with messaging.consent_denied and never reaches the vendor`, async () => {
         const s = await subject();
-        s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms", denial);
+        s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect, phone: s.recipient }, "sms", denial);
         const error = await errorOf(() => s.port.send(request(s)));
         expect5(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
         expect5(error?.details).toEqual({ code: denial });
@@ -1097,23 +1135,43 @@ function messagingBehaviour(name, make, skip = false) {
       expect5(error?.details).toEqual({ code: "consent.unavailable" });
       expect5(s.vendorCalls()).toBe(0);
     });
-    for (const code of ["consent.missing", "consent.withdrawn", "consent.suppressed"]) {
-      test5(`a number denied with ${code} blocks the send though the Prospect is allowed`, async () => {
-        const s = await subject();
-        allow(s, "sms");
-        s.guard.deny({ organizationId: s.organizations.a, phone: s.recipient }, "sms", code);
-        const error = await errorOf(() => s.port.send(request(s)));
-        expect5(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
-        expect5(error?.details).toEqual({ code });
-        expect5(s.vendorCalls()).toBe(0);
-      });
-    }
-    test5("a number nobody preset is denied though the Prospect is allowed", async () => {
+    test5("a suppressed number blocks the send though the Prospect is allowed and not suppressed", async () => {
+      const s = await subject();
+      allow(s, "sms");
+      s.guard.deny({ organizationId: s.organizations.a, phone: s.recipient }, "sms", "consent.suppressed");
+      const error = await errorOf(() => s.port.send(request(s)));
+      expect5(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
+      expect5(error?.details).toEqual({ code: "consent.suppressed" });
+      expect5(s.vendorCalls()).toBe(0);
+    });
+    test5("a send to another Prospect's number is refused as missing", async () => {
+      const s = await subject();
+      const otherProspect = formatId2("prs", "2".repeat(32));
+      const otherNumber = "+14155550177";
+      allow(s, "sms");
+      s.guard.allow({ organizationId: s.organizations.a, prospectId: otherProspect, phone: otherNumber }, "sms");
+      const error = await errorOf(() => s.port.send(request(s, { to: otherNumber })));
+      expect5(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
+      expect5(error?.details).toEqual({ code: "consent.missing" });
+      expect5(s.vendorCalls()).toBe(0);
+    });
+    test5("a number that is no identity of the Prospect is refused though the Prospect has consent", async () => {
       const s = await subject();
       s.guard.allow({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms");
       const error = await errorOf(() => s.port.send(request(s)));
       expect5(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
+      expect5(error?.details).toEqual({ code: "consent.missing" });
       expect5(s.vendorCalls()).toBe(0);
+    });
+    test5("exactly one Contact Check is made per send, naming the Prospect and the number", async () => {
+      const s = await subject();
+      allow(s, "sms");
+      await s.port.send(request(s));
+      expect5(s.guard.calls).toHaveLength(1);
+      expect5(s.guard.calls[0]).toMatchObject({ prospectId: s.prospect, phone: s.recipient });
+      s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms", "consent.withdrawn");
+      await codeOf(() => s.port.send(request(s)));
+      expect5(s.guard.calls).toHaveLength(2);
     });
     test5("a Contact Check that never answers fails with messaging.timeout at the deadline", async () => {
       const s = await subject();
@@ -1144,7 +1202,7 @@ function messagingBehaviour(name, make, skip = false) {
       expect5(await codeOf(() => s.port.send(request(s, { channel: "whatsapp", content: { kind: "template", templateId: TEMPLATE } })))).toBe(MESSAGING_ERROR_CODES2.consentDenied);
       s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms", "consent.withdrawn");
       expect5(await codeOf(() => s.port.send(request(s)))).toBe(MESSAGING_ERROR_CODES2.consentDenied);
-      expect5(s.guard.calls.length).toBe(4);
+      expect5(s.guard.calls.length).toBe(3);
       expect5(s.vendorCalls()).toBe(1);
     });
     test5("consent in one Organization does not let a second Organization send", async () => {
