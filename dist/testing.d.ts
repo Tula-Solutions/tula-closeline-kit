@@ -873,7 +873,8 @@ interface TelephonyPort {
 	/**
 	* Plays the Disclosure into a connected call and resolves when it has finished playing. Nobody
 	* else hears the call meanwhile. A call the Prospect has left is `telephony.call_ended`. Idempotent
-	* per wording version: a Disclosure that has already played is reported again, not replayed.
+	* per wording version: a Disclosure that has already played is reported again, not replayed. A
+	* later version plays again and replaces the earlier one, including its `aiAssisted`.
 	*/
 	playDisclosure(request: PlayDisclosureRequest, options?: TelephonyOptions): Promise<DisclosurePlayed>;
 	/**
@@ -916,8 +917,9 @@ interface TelephonyPort {
 	*/
 	verifyWebhook(request: WebhookRequest): boolean;
 	/**
-	* Mints a short-lived token the browser registers the Softphone with. It carries only the Rep's
-	* identity and the Organization, expires at `expiresAt`, and is a credential: never logged or
+	* Mints a short-lived token the browser registers the Softphone with. It is issued for the Rep's
+	* identity in the Organization (a real adapter binds both at the provider; the token text need
+	* not show them), expires at `expiresAt`, and is a credential: never logged or
 	* stored.
 	*/
 	mintBrowserToken(request: BrowserTokenRequest, options?: TelephonyOptions): Promise<SoftphoneToken>;

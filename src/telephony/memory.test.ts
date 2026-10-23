@@ -107,6 +107,13 @@ describe('memory telephony', () => {
     expect(() => createMemoryTelephony({ webhookSecret: 'short' })).toThrow(TypeError)
   })
 
+  test.each([[0], [Number.NaN], [60_001]])(
+    'a defaultTimeoutMs of %p is refused at construction',
+    (ms) => {
+      expect(() => createMemoryTelephony({ defaultTimeoutMs: ms })).toThrow(TypeError)
+    }
+  )
+
   test('a ws: destination is accepted only in local', async () => {
     const local = createMemoryTelephony({ environment: 'local' })
     const prod = createMemoryTelephony({ environment: 'prod' })

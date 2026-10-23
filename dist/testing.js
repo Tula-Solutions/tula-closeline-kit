@@ -697,6 +697,11 @@ function createMemoryTelephony(options = {}) {
     throw new TypeError("createMemoryTelephony needs a webhookSecret of at least 16 characters");
   }
   const defaultTimeout = options.defaultTimeoutMs ?? DEFAULT_TELEPHONY_TIMEOUT_MS2;
+  try {
+    resolveTimeout(undefined, defaultTimeout);
+  } catch {
+    throw new TypeError("createMemoryTelephony needs a defaultTimeoutMs from 1 to 60000");
+  }
   const audio = options.recordingAudio ?? FAKE_AUDIO;
   const calls = new Map;
   const recordings = new Map;
@@ -873,7 +878,7 @@ function createMemoryTelephony(options = {}) {
         }
         const played = {
           wordingVersion: request.wordingVersion,
-          aiAssisted: request.aiAssisted || (call.disclosure?.aiAssisted ?? false),
+          aiAssisted: request.aiAssisted,
           playedAt: clock.now().toISOString()
         };
         call.disclosure = played;

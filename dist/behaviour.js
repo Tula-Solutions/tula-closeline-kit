@@ -1277,6 +1277,19 @@ function telephonyBehaviour(name, make, skip = false) {
         expect5(s.takeEvents().at(-1)).toMatchObject({ type: "completed", endedBy: "prospect" });
         await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.call_ended"));
       });
+      test5("a later wording version replaces the earlier one, including whether it names an AI", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await s.telephony.playDisclosure({ ...placed.ref, ...wording, aiAssisted: true });
+        const second = await s.telephony.playDisclosure({
+          ...placed.ref,
+          ...wording,
+          wordingVersion: 2,
+          aiAssisted: false
+        });
+        expect5(second).toMatchObject({ wordingVersion: 2, aiAssisted: false });
+        await expect5(s.telephony.forkTracks({ ...placed.ref, destinationUrl: "wss://copilot.example.test/s" })).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
       test5("another Organization cannot play it on this call", async () => {
         const s = await subject();
         const placed = await place(s);

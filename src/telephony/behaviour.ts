@@ -323,6 +323,22 @@ export function telephonyBehaviour(
         )
       })
 
+      test('a later wording version replaces the earlier one, including whether it names an AI', async () => {
+        const s = await subject()
+        const placed = await place(s)
+        await s.telephony.playDisclosure({ ...placed.ref, ...wording, aiAssisted: true })
+        const second = await s.telephony.playDisclosure({
+          ...placed.ref,
+          ...wording,
+          wordingVersion: 2,
+          aiAssisted: false,
+        })
+        expect(second).toMatchObject({ wordingVersion: 2, aiAssisted: false })
+        await expect(
+          s.telephony.forkTracks({ ...placed.ref, destinationUrl: 'wss://copilot.example.test/s' })
+        ).rejects.toMatchObject(code('telephony.disclosure_required'))
+      })
+
       test('another Organization cannot play it on this call', async () => {
         const s = await subject()
         const placed = await place(s)
