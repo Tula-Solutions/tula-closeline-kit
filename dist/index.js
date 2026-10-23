@@ -1964,7 +1964,21 @@ function createMemoryTwilioStore() {
   const calls = new Map;
   const recordings = new Map;
   const placements = new Map;
+  const chains = new Map;
   return {
+    withCall: async (id, fn) => {
+      const previous = chains.get(id) ?? Promise.resolve();
+      const run = async () => fn(calls.get(id) ?? null);
+      const next = previous.then(run, run);
+      chains.set(id, next);
+      try {
+        return await next;
+      } finally {
+        if (chains.get(id) === next) {
+          chains.delete(id);
+        }
+      }
+    },
     getCall: async (id) => calls.get(id) ?? null,
     putCall: async (id, record) => {
       calls.set(id, record);
@@ -2142,25 +2156,13 @@ function createTwilioTelephony(options) {
   function token(...parts) {
     return createHash("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
   }
-  const patching = new Map;
   async function patchCall(providerCallId, patch) {
-    const run = async () => {
-      const current = await store.getCall(providerCallId);
+    await store.withCall(providerCallId, async (current) => {
       if (current === null) {
         throw notFound();
       }
       await store.putCall(providerCallId, { ...current, ...patch });
-    };
-    const previous = patching.get(providerCallId) ?? Promise.resolve();
-    const next = previous.then(run, run);
-    patching.set(providerCallId, next);
-    try {
-      await next;
-    } finally {
-      if (patching.get(providerCallId) === next) {
-        patching.delete(providerCallId);
-      }
-    }
+    });
   }
   async function ownedCall(organizationId, providerCallId) {
     const record = await store.getCall(providerCallId);
@@ -2252,7 +2254,11 @@ function createTwilioTelephony(options) {
           throw notFound();
         }
         if (known.direction === "inbound" && known.callId === callId && known.disclosure === null && known.disclosureStarted !== true) {
-          await updateCall(providerCallId, { Twiml: hold() }, deadline);
+          await store.withCall(providerCallId, async (fresh) => {
+            if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
+              await updateCall(providerCallId, { Twiml: hold() }, deadline);
+            }
+          });
         }
         return { ringing: known.ringIdentities.length };
       }
@@ -2288,10 +2294,15 @@ function createTwilioTelephony(options) {
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
         throw unavailable3();
       }
-      await patchCall(providerCallId, { disclosureStarted: true });
-      await updateCall(providerCallId, {
-        Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
-      }, deadline);
+      await store.withCall(providerCallId, async (fresh) => {
+        if (fresh === null) {
+          throw notFound();
+        }
+        await store.putCall(providerCallId, { ...fresh, disclosureStarted: true });
+        await updateCall(providerCallId, {
+          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
+        }, deadline);
+      });
       if (options.disclosureDone) {
         await options.disclosureDone({ organizationId, providerCallId, deadline });
       } else {

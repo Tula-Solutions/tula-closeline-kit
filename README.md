@@ -1022,13 +1022,13 @@ two recording channels are Prospect and Rep in that order); also whether Media S
 Ireland region, and that the `I-Twilio-Idempotency-Token` header is honoured.
 
 Twilio keeps none of the per-call state, so the adapter takes a `TwilioStore` (`getCall`, `putCall`,
-atomic `claimCall`, recordings, placements). `store` may be omitted only when `environment` is
+atomic `claimCall`, `withCall` (a per-call critical section; a durable store holds a row lock, `SELECT ... FOR UPDATE`, until the callback settles, including its Twilio request), recordings, placements). `store` may be omitted only when `environment` is
 `local` or `dev` (memory); otherwise construction throws. A Disclosure is held back for an
 estimated speaking time (0.4 s a word, or 90 ms a character for unspaced scripts, plus margins)
 unless a `disclosureDone` hook confirms it. Limits: `answerCall` binds a never-registered inbound
 call to the first Organization that names it, atomically, but cannot itself prove that Organization
 owns the dialled number, so the voice service must resolve that before calling; Reps are rung at
-`bridge`, not at `answerCall`. Also unverified: that a browser `connect({params})` cannot override
+`bridge`, not at `answerCall`. `playDisclosure` marks the Disclosure started and sends it inside `withCall`, so a retried `answerCall` hold can never land after it. Also unverified: that a browser `connect({params})` cannot override
 the `organizationId` the grant sets (the voice service should not trust that parameter alone).
 
 **Scripting the memory adapter.** `script(number, ...)` makes the Prospect answer, not answer

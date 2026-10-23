@@ -53,7 +53,10 @@ function json(status: number, body: unknown): Response {
 }
 
 /** A handwritten Twilio: answers by method and path, and records every request. */
-function harness(handler: (seen: Seen) => Reply | undefined, extra: Partial<TwilioOptions> = {}) {
+function harness(
+  handler: (seen: Seen) => Reply | undefined | Promise<Reply | undefined>,
+  extra: Partial<TwilioOptions> = {}
+) {
   const seen: Seen[] = []
   const sleeps: number[] = []
   const options: TwilioOptions = {
@@ -77,7 +80,7 @@ function harness(handler: (seen: Seen) => Reply | undefined, extra: Partial<Twil
         form: new URLSearchParams(typeof init.body === 'string' ? init.body : ''),
       }
       seen.push(record)
-      const reply = handler(record)
+      const reply = await handler(record)
       if (reply === 'hang') {
         return new Promise<Response>((_, reject) => {
           init.signal?.addEventListener('abort', () => reject(new Error('aborted')))
@@ -1102,5 +1105,39 @@ describe('twilio telephony: answerCall retry', () => {
       callId: callIdSchema.parse(`call_${'d'.repeat(32)}`),
     })
     expect(inbound.seen.filter(isHold)).toHaveLength(held)
+  })
+
+  test('a hold gated in flight can never land after the Disclosure Say', async () => {
+    let gated = false
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const landed: string[] = []
+    const h = harness(async (s) => {
+      const twiml = s.form.get('Twiml')
+      if (isHold(s) && twiml) {
+        const kind = twiml.includes('<Say') ? 'say' : 'hold'
+        if (kind === 'hold' && gated) {
+          await gate
+        }
+        landed.push(kind)
+      }
+      return happy(s)
+    })
+    await h.telephony.answerCall(request)
+    landed.length = 0
+    gated = true
+    const retry = h.telephony.answerCall(request)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const playing = h.telephony.playDisclosure({
+      organizationId: org,
+      providerCallId: CALL_SID,
+      ...wording,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    release()
+    await Promise.all([retry, playing])
+    expect(landed.at(-1)).toBe('say')
   })
 })

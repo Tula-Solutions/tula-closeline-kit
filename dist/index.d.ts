@@ -1497,6 +1497,13 @@ interface TwilioStore {
 	/** Creates or replaces the record of a provider call. */
 	putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>;
 	/**
+	* Runs `fn` with the current record (null when there is none) while no other `withCall` for the
+	* same call runs, until `fn` settles, including any Twilio request it makes. Inside `fn` use
+	* `getCall`/`putCall`, never `withCall` again for that call. A durable store holds a row lock
+	* (`SELECT ... FOR UPDATE`) for the duration; the memory store chains promises per call.
+	*/
+	withCall<T>(providerCallId: string, fn: (record: TwilioCallRecord | null) => Promise<T>): Promise<T>;
+	/**
 	* Atomically creates the record when none exists and returns the record that now stands, which
 	* is the caller's own when it won and the earlier one when it lost.
 	*/

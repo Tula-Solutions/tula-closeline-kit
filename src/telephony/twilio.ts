@@ -101,6 +101,16 @@ export interface TwilioStore {
   /** Creates or replaces the record of a provider call. */
   putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>
   /**
+   * Runs `fn` with the current record (null when there is none) while no other `withCall` for the
+   * same call runs, until `fn` settles, including any Twilio request it makes. Inside `fn` use
+   * `getCall`/`putCall`, never `withCall` again for that call. A durable store holds a row lock
+   * (`SELECT ... FOR UPDATE`) for the duration; the memory store chains promises per call.
+   */
+  withCall<T>(
+    providerCallId: string,
+    fn: (record: TwilioCallRecord | null) => Promise<T>
+  ): Promise<T>
+  /**
    * Atomically creates the record when none exists and returns the record that now stands, which
    * is the caller's own when it won and the earlier one when it lost.
    */
@@ -120,7 +130,21 @@ export function createMemoryTwilioStore(): TwilioStore {
   const calls = new Map<string, TwilioCallRecord>()
   const recordings = new Map<string, string>()
   const placements = new Map<string, TwilioPlacement>()
+  const chains = new Map<string, Promise<unknown>>()
   return {
+    withCall: async (id, fn) => {
+      const previous = chains.get(id) ?? Promise.resolve()
+      const run = async () => fn(calls.get(id) ?? null)
+      const next = previous.then(run, run)
+      chains.set(id, next)
+      try {
+        return await next
+      } finally {
+        if (chains.get(id) === next) {
+          chains.delete(id)
+        }
+      }
+    },
     getCall: async (id) => calls.get(id) ?? null,
     putCall: async (id, record) => {
       calls.set(id, record)
@@ -429,33 +453,20 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       .digest('hex')
   }
 
-  const patching = new Map<string, Promise<unknown>>()
   /**
-   * Writes only the changed fields onto the freshest record, one patch at a time per call in this
-   * process, so concurrent steps keep each other's ids. Across instances a durable store should
-   * make the read and write one transaction.
+   * Writes only the changed fields onto the freshest record, inside the call's critical section,
+   * so concurrent steps keep each other's ids.
    */
   async function patchCall(
     providerCallId: string,
     patch: Partial<TwilioCallRecord>
   ): Promise<void> {
-    const run = async () => {
-      const current = await store.getCall(providerCallId)
+    await store.withCall(providerCallId, async (current) => {
       if (current === null) {
         throw notFound()
       }
       await store.putCall(providerCallId, { ...current, ...patch })
-    }
-    const previous = patching.get(providerCallId) ?? Promise.resolve()
-    const next = previous.then(run, run)
-    patching.set(providerCallId, next)
-    try {
-      await next
-    } finally {
-      if (patching.get(providerCallId) === next) {
-        patching.delete(providerCallId)
-      }
-    }
+    })
   }
 
   async function ownedCall(
@@ -570,7 +581,13 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
           known.disclosure === null &&
           known.disclosureStarted !== true
         ) {
-          await updateCall(providerCallId, { Twiml: hold() }, deadline)
+          // Inside the call's critical section the record is read again, so a Disclosure that
+          // started meanwhile is never talked over by this hold.
+          await store.withCall(providerCallId, async (fresh) => {
+            if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
+              await updateCall(providerCallId, { Twiml: hold() }, deadline)
+            }
+          })
         }
         return { ringing: known.ringIdentities.length }
       }
@@ -614,14 +631,21 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
         throw unavailable()
       }
-      await patchCall(providerCallId, { disclosureStarted: true })
-      await updateCall(
-        providerCallId,
-        {
-          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`,
-        },
-        deadline
-      )
+      // Marking the start and sending the Say are one critical section, so a hold that is in
+      // flight finishes before the Say, and none can follow it.
+      await store.withCall(providerCallId, async (fresh) => {
+        if (fresh === null) {
+          throw notFound()
+        }
+        await store.putCall(providerCallId, { ...fresh, disclosureStarted: true })
+        await updateCall(
+          providerCallId,
+          {
+            Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`,
+          },
+          deadline
+        )
+      })
       if (options.disclosureDone) {
         await options.disclosureDone({ organizationId, providerCallId, deadline })
       } else {
