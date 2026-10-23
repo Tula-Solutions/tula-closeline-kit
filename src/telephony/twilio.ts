@@ -469,6 +469,18 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
     })
   }
 
+  /**
+   * Holds the caller inside the call's critical section, after reading the record again, so a
+   * Disclosure that has started is never talked over by a hold that was already on its way.
+   */
+  async function holdUnlessDisclosing(providerCallId: string, deadline: number): Promise<void> {
+    await store.withCall(providerCallId, async (fresh) => {
+      if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
+        await updateCall(providerCallId, { Twiml: hold() }, deadline)
+      }
+    })
+  }
+
   async function ownedCall(
     organizationId: string,
     providerCallId: string
@@ -583,11 +595,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         ) {
           // Inside the call's critical section the record is read again, so a Disclosure that
           // started meanwhile is never talked over by this hold.
-          await store.withCall(providerCallId, async (fresh) => {
-            if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
-              await updateCall(providerCallId, { Twiml: hold() }, deadline)
-            }
-          })
+          await holdUnlessDisclosing(providerCallId, deadline)
         }
         return { ringing: known.ringIdentities.length }
       }
@@ -611,7 +619,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       if (claimed.organizationId !== organizationId) {
         throw notFound()
       }
-      await updateCall(providerCallId, { Twiml: hold() }, deadline)
+      await holdUnlessDisclosing(providerCallId, deadline)
       return { ringing: claimed.ringIdentities.length }
     },
 

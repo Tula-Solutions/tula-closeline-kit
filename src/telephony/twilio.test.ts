@@ -1140,4 +1140,34 @@ describe('twilio telephony: answerCall retry', () => {
     await Promise.all([retry, playing])
     expect(landed.at(-1)).toBe('say')
   })
+
+  test('the first answerCall hold, in flight, can never land after the Disclosure Say', async () => {
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const landed: string[] = []
+    const h = harness(async (s) => {
+      const twiml = s.form.get('Twiml')
+      if (isHold(s) && twiml) {
+        const kind = twiml.includes('<Say') ? 'say' : 'hold'
+        if (kind === 'hold') {
+          await gate
+        }
+        landed.push(kind)
+      }
+      return happy(s)
+    })
+    const first = h.telephony.answerCall(request)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const playing = h.telephony.playDisclosure({
+      organizationId: org,
+      providerCallId: CALL_SID,
+      ...wording,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    release()
+    await Promise.all([first, playing])
+    expect(landed.at(-1)).toBe('say')
+  })
 })
