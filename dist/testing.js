@@ -2,18 +2,6 @@ import {
   parseAuditEntry2,
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
-  DEFAULT_LLM_TIMEOUT_MS2,
-  MAX_LLM_TIMEOUT_MS2,
-  DEFAULT_LLM_MAX_INPUT_TOKENS2,
-  MAX_LLM_MAX_INPUT_TOKENS2,
-  DEFAULT_LLM_MAX_OUTPUT_TOKENS2,
-  MAX_LLM_MAX_OUTPUT_TOKENS2,
-  MAX_LLM_MESSAGES2,
-  MODEL_TIERS2,
-  ESTIMATED_CHARS_PER_TOKEN2,
-  estimateTokens2,
-  DEFAULT_LLM_RETRY_POLICY2,
-  llmRetryDelayMs2,
   scrubText2,
   prepareFields,
   signTwilioRequest2,
@@ -64,7 +52,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-97jyy05h.js";
+} from "./shared/chunk-ewk7hvaq.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -77,8 +65,6 @@ import {
   MAX_EVENT_ATTENDEES2,
   DEFAULT_CALENDAR_RETRY_POLICY2,
   calendarRetryDelayMs2,
-  LLM_ERROR_CODES2,
-  LlmError2,
   MessagingError2,
   isReportableMessagingError2,
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
@@ -94,7 +80,15 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-q819sn0x.js";
+} from "./shared/chunk-jkpcd738.js";
+import {
+  startDeadline,
+  withLlmRetry,
+  invalid3,
+  checkRequest,
+  checkCompleteRequest,
+  parseModelOutput
+} from "./shared/chunk-rj1qezzq.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -118,11 +112,21 @@ import {
   createStorageValidator
 } from "./shared/chunk-d77yh0fk.js";
 import {
-  systemSleep2,
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-h070fpj8.js";
+} from "./shared/chunk-3n6tvg2s.js";
+import {
+  ESTIMATED_CHARS_PER_TOKEN2,
+  estimateTokens2
+} from "./shared/chunk-g61vs8b5.js";
+import {
+  systemSleep2
+} from "./shared/chunk-hybwyj31.js";
+import {
+  LLM_ERROR_CODES2,
+  LlmError2
+} from "./shared/chunk-hk4f87am.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -298,7 +302,7 @@ async function withCalendarRetry(attempt, options) {
 // src/calendar/validate.ts
 import { organizationIdSchema } from "tula-closeline-contract";
 import { z } from "zod";
-function invalid3(what) {
+function invalid4(what) {
   throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn(value, min, max) {
@@ -306,27 +310,27 @@ function integerIn(value, min, max) {
 }
 function checkOptions(options) {
   if (options !== undefined && (typeof options !== "object" || options === null)) {
-    invalid3("options");
+    invalid4("options");
   }
   const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
   if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
-    invalid3("timeoutMs");
+    invalid4("timeoutMs");
   }
   if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
-    invalid3("signal");
+    invalid4("signal");
   }
   const policy = options?.retry;
   const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
   if (!integerIn(maxRetries, 0, 5)) {
-    invalid3("retry.maxRetries");
+    invalid4("retry.maxRetries");
   }
   if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid3("retry.baseDelayMs");
+    invalid4("retry.baseDelayMs");
   }
   if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid3("retry.maxDelayMs");
+    invalid4("retry.maxDelayMs");
   }
   return {
     timeoutMs,
@@ -338,7 +342,7 @@ function parse(schema, value, what) {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
     const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
-    return invalid3(path ? `${what}.${path}` : what);
+    return invalid4(path ? `${what}.${path}` : what);
   }
   return parsed.data;
 }
@@ -380,18 +384,18 @@ var grantSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("refresh_token"), refreshToken: z.string().min(1).max(4096) })
 ]);
 function checkOrganizationId2(value) {
-  return organizationIdSchema.safeParse(value).success ? value : invalid3("organizationId");
+  return organizationIdSchema.safeParse(value).success ? value : invalid4("organizationId");
 }
 function checkBase(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid3("request");
+    return invalid4("request");
   }
   checkOrganizationId2(request.organizationId);
   if (!(request.connection instanceof CalendarConnection2)) {
-    return invalid3("connection");
+    return invalid4("connection");
   }
   if (request.connection.organizationId !== request.organizationId) {
-    return invalid3("connection");
+    return invalid4("connection");
   }
   return request.connection;
 }
@@ -408,13 +412,13 @@ function checkRange(from, to) {
   const fromMs = Date.parse(parse(instant, from, "from"));
   const toMs = Date.parse(parse(instant, to, "to"));
   if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
-    invalid3("range");
+    invalid4("range");
   }
   return { fromMs, toMs };
 }
 function checkEventTimes(startMs, endMs) {
   if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
-    invalid3("event.times");
+    invalid4("event.times");
   }
 }
 function checkEvent(value) {
@@ -459,7 +463,7 @@ function createMemoryCalendar(options = {}) {
   function account(connection) {
     const found = accounts.get(connection.connectionId);
     if (found === undefined || found.organizationId !== connection.organizationId) {
-      invalid3("connection");
+      invalid4("connection");
     }
     return found;
   }
@@ -529,7 +533,7 @@ function createMemoryCalendar(options = {}) {
     const seen = replays.get(key);
     if (seen !== undefined) {
       if (seen.fingerprint !== fingerprint) {
-        invalid3("requestId");
+        invalid4("requestId");
       }
       return { result: seen.result, first: false };
     }
@@ -813,170 +817,6 @@ function createMemoryContactGuard() {
   };
   return guard;
 }
-// src/llm/deadline.ts
-function startDeadline(timeoutMs, caller) {
-  const controller = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const onCaller = () => controller.abort();
-  if (caller?.aborted) {
-    controller.abort();
-  }
-  caller?.addEventListener("abort", onCaller, { once: true });
-  return {
-    signal: controller.signal,
-    check() {
-      if (timedOut) {
-        throw new LlmError2(LLM_ERROR_CODES2.timeout, "The call took too long", {
-          details: { timeoutMs }
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new LlmError2(LLM_ERROR_CODES2.aborted, "The call was cancelled");
-      }
-    },
-    cancel() {
-      controller.abort();
-    },
-    stop() {
-      clearTimeout(timer);
-      caller?.removeEventListener("abort", onCaller);
-    }
-  };
-}
-function isRetryableLlmError(error) {
-  return error instanceof LlmError2 && error.code === LLM_ERROR_CODES2.unavailable;
-}
-async function withLlmRetry(attempt, options) {
-  const sleep = options.sleep ?? systemSleep2;
-  for (let n = 1;; n++) {
-    options.deadline.check();
-    try {
-      return await attempt(n);
-    } catch (error) {
-      options.deadline.check();
-      if (!isRetryableLlmError(error) || n > options.policy.maxRetries) {
-        throw error;
-      }
-      const delayMs = llmRetryDelayMs2(n, options.policy, options.random);
-      options.onRetry?.(n, delayMs);
-      await sleep(delayMs, options.deadline.signal);
-    }
-  }
-}
-
-// src/llm/validate.ts
-import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
-import { z as z2 } from "zod";
-var SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-function invalid4(what) {
-  throw new LlmError2(LLM_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function integerIn2(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function resolveRetryPolicy(policy) {
-  const maxRetries = policy?.maxRetries ?? DEFAULT_LLM_RETRY_POLICY2.maxRetries;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn2(maxRetries, 0, 5)) {
-    invalid4("retry.maxRetries");
-  }
-  if (!integerIn2(baseDelayMs, 1, 60000)) {
-    invalid4("retry.baseDelayMs");
-  }
-  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
-    invalid4("retry.maxDelayMs");
-  }
-  return { maxRetries, baseDelayMs, maxDelayMs };
-}
-function checkRequest(request) {
-  if (typeof request !== "object" || request === null) {
-    return invalid4("request");
-  }
-  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
-    invalid4("organizationId");
-  }
-  if (!MODEL_TIERS2.includes(request.tier)) {
-    invalid4("tier");
-  }
-  if (request.system !== undefined && typeof request.system !== "string") {
-    invalid4("system");
-  }
-  const messages = request.messages;
-  if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_LLM_MESSAGES2) {
-    invalid4("messages");
-  }
-  for (const message of messages) {
-    const m = message;
-    if (typeof m !== "object" || m === null || m.role !== "user" && m.role !== "assistant" || typeof m.content !== "string" || m.content.length < 1) {
-      invalid4("messages");
-    }
-  }
-  if (messages.at(-1)?.role !== "user") {
-    invalid4("messages");
-  }
-  const timeoutMs = request.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS2;
-  if (!integerIn2(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
-    invalid4("timeoutMs");
-  }
-  const maxInputTokens = request.maxInputTokens ?? DEFAULT_LLM_MAX_INPUT_TOKENS2;
-  if (!integerIn2(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
-    invalid4("maxInputTokens");
-  }
-  const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS2;
-  if (!integerIn2(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
-    invalid4("maxOutputTokens");
-  }
-  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid4("signal");
-  }
-  const retry = resolveRetryPolicy(request.retry);
-  const inputTokens = estimateTokens2(request.system ?? "") + messages.reduce((sum, m) => sum + estimateTokens2(m.content), 0);
-  if (inputTokens > maxInputTokens) {
-    throw new LlmError2(LLM_ERROR_CODES2.inputTooLarge, "The prompt is over the input token budget", {
-      details: { maxInputTokens }
-    });
-  }
-  return { timeoutMs, maxInputTokens, maxOutputTokens, retry, inputTokens };
-}
-function checkCompleteRequest(request) {
-  const checked = checkRequest(request);
-  if (!(request.schema instanceof z2.ZodType)) {
-    invalid4("schema");
-  }
-  if (typeof request.schemaName !== "string" || !SCHEMA_NAME.test(request.schemaName)) {
-    invalid4("schemaName");
-  }
-  let jsonSchema;
-  try {
-    jsonSchema = z2.toJSONSchema(request.schema, { io: "input" });
-  } catch {
-    return invalid4("schema");
-  }
-  return { checked, jsonSchema };
-}
-function parseModelOutput(schema, text) {
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new LlmError2(LLM_ERROR_CODES2.invalidOutput, "The model did not answer in JSON", {
-      details: { reason: "not_json" }
-    });
-  }
-  const parsed = schema.safeParse(json);
-  if (!parsed.success) {
-    throw new LlmError2(LLM_ERROR_CODES2.invalidOutput, "The model answer does not fit the schema", {
-      details: { reason: "schema", issues: parsed.error.issues.length }
-    });
-  }
-  return parsed.data;
-}
-
 // src/llm/memory.ts
 function createMemoryLlm(options = {}) {
   const sleep = options.sleep ?? systemSleep2;
@@ -1127,10 +967,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid4("reply text");
+        invalid3("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid4("reply chunks");
+        invalid3("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -1514,7 +1354,7 @@ function createMemoryQueue(options) {
   };
 }
 // src/queue/testing.ts
-import { z as z3 } from "zod";
+import { z as z2 } from "zod";
 var SETTLE_ROUNDS = 8;
 function createVirtualTime() {
   const clock = createFixedClock2("2026-01-01T00:00:00.000Z");
@@ -1567,17 +1407,17 @@ var testPing = defineMessage2({
   type: "test.ping",
   version: 1,
   scope: "organization",
-  payload: z3.object({ n: z3.number().int() })
+  payload: z2.object({ n: z2.number().int() })
 });
 var testNote = defineMessage2({
   type: "test.note",
   version: 1,
   scope: "global",
-  payload: z3.object({ text: z3.string() })
+  payload: z2.object({ text: z2.string() })
 });
 function createTestRegistry(options = {}) {
   return createMessageRegistry2([testPing, testNote], {
-    organizationIdSchema: z3.string().min(1).max(64),
+    organizationIdSchema: z2.string().min(1).max(64),
     ...options
   });
 }
@@ -1745,7 +1585,7 @@ ${expires}`).digest("hex");
   return store;
 }
 // src/streaming-transcribe/validate.ts
-import { callIdSchema, organizationIdSchema as organizationIdSchema3 } from "tula-closeline-contract";
+import { callIdSchema, organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
 var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
@@ -1753,14 +1593,14 @@ var TRACKS = ["rep", "prospect"];
 function invalid5(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn3(value, min, max) {
+function integerIn2(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function checkOpenRequest(request) {
   if (typeof request !== "object" || request === null) {
     return invalid5("request");
   }
-  if (!organizationIdSchema3.safeParse(request.organizationId).success) {
+  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
     invalid5("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
@@ -1787,20 +1627,20 @@ function resolveReconnectPolicy(policy) {
   const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
-  if (!integerIn3(maxAttempts, 0, 10)) {
+  if (!integerIn2(maxAttempts, 0, 10)) {
     invalid5("reconnect.maxAttempts");
   }
-  if (!integerIn3(baseDelayMs, 1, 60000)) {
+  if (!integerIn2(baseDelayMs, 1, 60000)) {
     invalid5("reconnect.baseDelayMs");
   }
-  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
+  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
     invalid5("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn3(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
+  return integerIn2(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
@@ -2813,14 +2653,14 @@ async function withTtsRetry(attempt, options) {
 }
 
 // src/tts/validate.ts
-import { organizationIdSchema as organizationIdSchema4 } from "tula-closeline-contract";
+import { organizationIdSchema as organizationIdSchema3 } from "tula-closeline-contract";
 var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
 var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
 var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
 function invalid6(what) {
   throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn4(value, min, max) {
+function integerIn3(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function resolveTtsRetryPolicy(policy) {
@@ -2830,13 +2670,13 @@ function resolveTtsRetryPolicy(policy) {
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn4(maxRetries, 0, 5)) {
+  if (!integerIn3(maxRetries, 0, 5)) {
     invalid6("retry.maxRetries");
   }
-  if (!integerIn4(baseDelayMs, 1, 60000)) {
+  if (!integerIn3(baseDelayMs, 1, 60000)) {
     invalid6("retry.baseDelayMs");
   }
-  if (!integerIn4(maxDelayMs, baseDelayMs, 60000)) {
+  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
     invalid6("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
@@ -2845,7 +2685,7 @@ function checkOpenRequest2(request) {
   if (typeof request !== "object" || request === null) {
     return invalid6("request");
   }
-  if (!organizationIdSchema4.safeParse(request.organizationId).success) {
+  if (!organizationIdSchema3.safeParse(request.organizationId).success) {
     invalid6("organizationId");
   }
   if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
@@ -2858,15 +2698,15 @@ function checkOpenRequest2(request) {
     invalid6("sampleRate");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
-  if (!integerIn4(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
+  if (!integerIn3(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
     invalid6("timeoutMs");
   }
   const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
-  if (!integerIn4(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
+  if (!integerIn3(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
     invalid6("firstChunkTimeoutMs");
   }
   const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
-  if (!integerIn4(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
+  if (!integerIn3(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
     invalid6("maxTextChars");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
