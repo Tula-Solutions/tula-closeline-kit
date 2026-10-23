@@ -23,7 +23,7 @@ import {
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-5cxd570z.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2
@@ -58,7 +58,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-xfecgbam.js";
+} from "./shared/chunk-h070fpj8.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
