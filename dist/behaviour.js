@@ -2,8 +2,9 @@ import {
   MAX_MESSAGE_BYTES2
 } from "./shared/chunk-mjkmsg3r.js";
 import {
+  MAX_WEBHOOK_BODY_BYTES2,
   checkTranscriptionResult2
-} from "./shared/chunk-5yzgse6v.js";
+} from "./shared/chunk-0xwm31t3.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";
@@ -1040,13 +1041,671 @@ x-injected: 1`],
     });
   });
 }
-// src/transcribe/behaviour.ts
+// src/telephony/behaviour.ts
 import { afterEach as afterEach5, describe as describe5, expect as expect5, test as test5 } from "bun:test";
-function transcriberBehaviour(name, make, skip = false) {
+import {
+  callIdSchema,
+  membershipIdSchema,
+  softphoneTokenSchema
+} from "tula-closeline-contract";
+function telephonyBehaviour(name, make, skip = false) {
   const run = skip ? describe5.skip : describe5;
-  run(`Transcriber behaviour: ${name}`, () => {
+  run(`Telephony behaviour: ${name}`, () => {
     const open = [];
     afterEach5(async () => {
+      await Promise.all(open.splice(0).map((subject) => subject.close()));
+    });
+    async function subject() {
+      const made = await make();
+      open.push(made);
+      return made;
+    }
+    const callId = callIdSchema.parse(`call_${"c".repeat(32)}`);
+    const rep = membershipIdSchema.parse(`mem_${"1".repeat(32)}`);
+    const otherRep = membershipIdSchema.parse(`mem_${"2".repeat(32)}`);
+    const line = "+14155550100";
+    const wording = { wordingVersion: 1, text: "This call is recorded.", aiAssisted: false };
+    let keyCounter = 0;
+    const key = () => `key-${++keyCounter}-${Math.random().toString(36).slice(2)}`;
+    async function place(s, scenario = "answers") {
+      const placed = await s.telephony.placeCall({
+        organizationId: s.organizations.a,
+        callId,
+        idempotencyKey: key(),
+        from: line,
+        to: s.numberFor(scenario)
+      });
+      return {
+        ...placed,
+        ref: { organizationId: s.organizations.a, providerCallId: placed.providerCallId }
+      };
+    }
+    async function disclosed(s, aiAssisted = false) {
+      const placed = await place(s);
+      await s.telephony.playDisclosure({ ...placed.ref, ...wording, aiAssisted });
+      return placed;
+    }
+    const code = (value) => ({ code: value });
+    describe5("placing a call", () => {
+      test5("a Prospect who answers: the call rings, then is answered", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        expect5(placed.created).toBe(true);
+        expect5(placed.providerCallId.length).toBeGreaterThan(0);
+        expect5(s.takeEvents().map((e) => e.type)).toEqual(["ringing", "answered"]);
+      });
+      test5("the same idempotency key places exactly one call", async () => {
+        const s = await subject();
+        const request = {
+          organizationId: s.organizations.a,
+          callId,
+          idempotencyKey: key(),
+          from: line,
+          to: s.numberFor("answers")
+        };
+        const first = await s.telephony.placeCall(request);
+        const second = await s.telephony.placeCall(request);
+        expect5(second).toEqual({ providerCallId: first.providerCallId, created: false });
+        expect5(s.takeEvents().filter((e) => e.type === "ringing")).toHaveLength(1);
+      });
+      test5("the same key for another number is refused", async () => {
+        const s = await subject();
+        const idempotencyKey = key();
+        const base = { organizationId: s.organizations.a, callId, idempotencyKey, from: line };
+        await s.telephony.placeCall({ ...base, to: s.numberFor("answers") });
+        await expect5(s.telephony.placeCall({ ...base, to: s.numberFor("busy") })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+      test5("the same key in another Organization is a different call", async () => {
+        const s = await subject();
+        const base = { callId, idempotencyKey: key(), from: line, to: s.numberFor("answers") };
+        const a = await s.telephony.placeCall({ ...base, organizationId: s.organizations.a });
+        const b = await s.telephony.placeCall({ ...base, organizationId: s.organizations.b });
+        expect5(b.created).toBe(true);
+        expect5(b.providerCallId).not.toBe(a.providerCallId);
+      });
+      test5.each([
+        ["to", { to: "4155550100" }],
+        ["to", { to: "+0123" }],
+        ["from", { from: "not a number" }],
+        ["idempotencyKey", { idempotencyKey: "" }],
+        ["idempotencyKey", { idempotencyKey: "has space" }],
+        ["callId", { callId: "call_1" }],
+        ["organizationId", { organizationId: "org_1" }]
+      ])("a bad %s is refused before the provider is asked", async (_field, bad) => {
+        const s = await subject();
+        const request = {
+          organizationId: s.organizations.a,
+          callId,
+          idempotencyKey: key(),
+          from: line,
+          to: s.numberFor("answers"),
+          ...bad
+        };
+        await expect5(s.telephony.placeCall(request)).rejects.toMatchObject(code("telephony.invalid_request"));
+        expect5(s.takeEvents()).toHaveLength(0);
+      });
+      test5("a Prospect who does not answer: no_answer", async () => {
+        const s = await subject();
+        await place(s, "no_answer");
+        const events = s.takeEvents();
+        expect5(events.map((e) => e.type)).toEqual(["ringing", "no_answer"]);
+        expect5(events[1]).toMatchObject({ failureReason: "no_answer" });
+      });
+      test5("a busy Prospect: busy", async () => {
+        const s = await subject();
+        await place(s, "busy");
+        expect5(s.takeEvents().at(-1)).toMatchObject({ type: "busy", failureReason: "busy" });
+      });
+      test5("a carrier failure: failed with a contract reason, and the call is over", async () => {
+        const s = await subject();
+        const placed = await place(s, "carrier_failure");
+        const last = s.takeEvents().at(-1);
+        expect5(last?.type).toBe("failed");
+        expect5(["carrier_dropped", "carrier_rejected", "provider_error"]).toContain(last?.failureReason);
+        await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.call_ended"));
+      });
+      test5("events carry no number and no text", async () => {
+        const s = await subject();
+        const to = s.numberFor("answers");
+        await s.telephony.placeCall({
+          organizationId: s.organizations.a,
+          callId,
+          idempotencyKey: key(),
+          from: line,
+          to
+        });
+        const text = JSON.stringify(s.takeEvents());
+        expect5(text).not.toContain(to);
+        expect5(text).not.toContain(line);
+      });
+    });
+    describe5("answering an inbound call", () => {
+      test5("answers it and rings the browser legs", async () => {
+        const s = await subject();
+        const providerCallId = s.receiveInbound(s.organizations.a);
+        const answered = await s.telephony.answerCall({
+          organizationId: s.organizations.a,
+          providerCallId,
+          callId,
+          ringIdentities: [rep, otherRep]
+        });
+        expect5(answered).toEqual({ ringing: 2 });
+        expect5(s.takeEvents().map((e) => e.type)).toContain("answered");
+      });
+      test5("answering again changes nothing", async () => {
+        const s = await subject();
+        const providerCallId = s.receiveInbound(s.organizations.a);
+        const request = {
+          organizationId: s.organizations.a,
+          providerCallId,
+          callId,
+          ringIdentities: [rep]
+        };
+        await s.telephony.answerCall(request);
+        s.takeEvents();
+        expect5(await s.telephony.answerCall(request)).toEqual({ ringing: 1 });
+        expect5(s.takeEvents()).toHaveLength(0);
+      });
+      test5("another Organization cannot answer it", async () => {
+        const s = await subject();
+        const providerCallId = s.receiveInbound(s.organizations.a);
+        await expect5(s.telephony.answerCall({
+          organizationId: s.organizations.b,
+          providerCallId,
+          callId,
+          ringIdentities: [rep]
+        })).rejects.toMatchObject(code("telephony.not_found"));
+      });
+      test5.each([
+        ["no legs", []],
+        ["a bad identity", ["mem_1"]]
+      ])("%s is refused", async (_label, ringIdentities) => {
+        const s = await subject();
+        const providerCallId = s.receiveInbound(s.organizations.a);
+        await expect5(s.telephony.answerCall({
+          organizationId: s.organizations.a,
+          providerCallId,
+          callId,
+          ringIdentities
+        })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+      test5("a call nobody answered cannot play the Disclosure yet", async () => {
+        const s = await subject();
+        const providerCallId = s.receiveInbound(s.organizations.a);
+        await expect5(s.telephony.playDisclosure({
+          organizationId: s.organizations.a,
+          providerCallId,
+          ...wording
+        })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+    });
+    describe5("the Disclosure", () => {
+      test5("plays, and reports its wording version, whether it names an AI, and when", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        const played = await s.telephony.playDisclosure({
+          ...placed.ref,
+          ...wording,
+          aiAssisted: true
+        });
+        expect5(played).toMatchObject({ wordingVersion: 1, aiAssisted: true });
+        expect5(Number.isNaN(Date.parse(played.playedAt))).toBe(false);
+      });
+      test5("playing the same version again reports it and does not replay it", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        const first = await s.telephony.playDisclosure({ ...placed.ref, ...wording });
+        const again = await s.telephony.playDisclosure({ ...placed.ref, ...wording });
+        expect5(again).toEqual(first);
+      });
+      test5.each([
+        ["an empty text", { text: "   " }],
+        ["a control character", { text: "bad\x00text" }],
+        ["a text over 1000 characters", { text: "x".repeat(1001) }],
+        ["version 0", { wordingVersion: 0 }],
+        ["a fractional version", { wordingVersion: 1.5 }],
+        ["no aiAssisted flag", { aiAssisted: undefined }]
+      ])("%s is refused", async (_label, bad) => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording, ...bad })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+      test5("a Prospect who hangs up during it: call_ended, nothing is bridged", async () => {
+        const s = await subject();
+        const placed = await place(s, "hangs_up_during_disclosure");
+        await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.call_ended"));
+        expect5(s.takeEvents().at(-1)).toMatchObject({ type: "completed", endedBy: "prospect" });
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.call_ended"));
+      });
+      test5("another Organization cannot play it on this call", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.playDisclosure({
+          organizationId: s.organizations.b,
+          providerCallId: placed.providerCallId,
+          ...wording
+        })).rejects.toMatchObject(code("telephony.not_found"));
+      });
+    });
+    describe5("nothing happens before the Disclosure", () => {
+      test5("bridging a Rep is refused", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
+      test5("recording is refused", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.startRecording(placed.ref)).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
+      test5("forking the tracks is refused", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.forkTracks({ ...placed.ref, destinationUrl: "wss://copilot.example.test/s" })).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
+      test5("forking the tracks needs a Disclosure that named an AI", async () => {
+        const s = await subject();
+        const placed = await disclosed(s, false);
+        await expect5(s.telephony.forkTracks({ ...placed.ref, destinationUrl: "wss://copilot.example.test/s" })).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
+      test5("a failed Disclosure leaves the call unbridged and unrecorded", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        s.failNext("playDisclosure");
+        await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.unavailable"));
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.disclosure_required"));
+        await expect5(s.telephony.startRecording(placed.ref)).rejects.toMatchObject(code("telephony.disclosure_required"));
+      });
+    });
+    describe5("bridging", () => {
+      test5("joins a Rep after the Disclosure, and again is a no-op", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
+        await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
+      });
+      test5("moves the call to another Rep", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
+        await s.telephony.bridge({ ...placed.ref, repIdentity: otherRep });
+      });
+      test5("a bad identity is refused", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: "mem_1" })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+      test5("a Prospect who hangs up after the Rep is bridged ends the call", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
+        s.takeEvents();
+        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
+        expect5(s.takeEvents().find((e) => e.type === "completed")).toMatchObject({
+          endedBy: "prospect"
+        });
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: otherRep })).rejects.toMatchObject(code("telephony.call_ended"));
+      });
+    });
+    describe5("recording", () => {
+      test5("is dual-channel and starting it again returns the first Recording", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const first = await s.telephony.startRecording(placed.ref);
+        expect5(first.channels).toBe(2);
+        expect5(await s.telephony.startRecording(placed.ref)).toEqual(first);
+      });
+      test5("cannot be fetched while the call is up", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const started = await s.telephony.startRecording(placed.ref);
+        await expect5(s.telephony.fetchRecording({
+          organizationId: placed.ref.organizationId,
+          recordingId: started.recordingId
+        })).rejects.toMatchObject(code("telephony.recording_not_ready"));
+      });
+      test5("can be fetched after the call: two channels, a type and bytes", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const started = await s.telephony.startRecording(placed.ref);
+        await s.telephony.hangUp({ ...placed.ref, by: "rep" });
+        expect5(s.takeEvents().at(-1)).toMatchObject({
+          type: "recording_ready",
+          recordingId: started.recordingId
+        });
+        const fetched = await s.telephony.fetchRecording({
+          organizationId: placed.ref.organizationId,
+          recordingId: started.recordingId
+        });
+        expect5(fetched.channels).toBe(2);
+        expect5(fetched.contentType).toMatch(/^audio\//);
+        let bytes = 0;
+        for await (const chunk of fetched.body) {
+          bytes += chunk.length;
+        }
+        expect5(bytes).toBeGreaterThan(0);
+        if (fetched.sizeBytes !== null) {
+          expect5(fetched.sizeBytes).toBe(bytes);
+        }
+      });
+      test5("a recording started before the call ended can be fetched when the Prospect hangs up", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const started = await s.telephony.startRecording(placed.ref);
+        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId);
+        const fetched = await s.telephony.fetchRecording({
+          organizationId: placed.ref.organizationId,
+          recordingId: started.recordingId
+        });
+        await fetched.body[Symbol.asyncIterator]?.().return?.();
+        expect5(fetched.channels).toBe(2);
+      });
+      test5("deleting removes the provider copy; deleting again and an unknown id say it did not exist", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const started = await s.telephony.startRecording(placed.ref);
+        await s.telephony.hangUp(placed.ref);
+        const ref = { organizationId: placed.ref.organizationId, recordingId: started.recordingId };
+        expect5(await s.telephony.deleteRecording(ref)).toEqual({ existed: true });
+        expect5(await s.telephony.deleteRecording(ref)).toEqual({ existed: false });
+        expect5(await s.telephony.deleteRecording({ ...ref, recordingId: "never-issued" })).toEqual({
+          existed: false
+        });
+        await expect5(s.telephony.fetchRecording(ref)).rejects.toMatchObject(code("telephony.not_found"));
+      });
+      test5("another Organization can neither fetch nor delete it", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        const started = await s.telephony.startRecording(placed.ref);
+        await s.telephony.hangUp(placed.ref);
+        const theirs = { organizationId: s.organizations.b, recordingId: started.recordingId };
+        await expect5(s.telephony.fetchRecording(theirs)).rejects.toMatchObject(code("telephony.not_found"));
+        expect5(await s.telephony.deleteRecording(theirs)).toEqual({ existed: false });
+        const mine = { organizationId: s.organizations.a, recordingId: started.recordingId };
+        const fetched = await s.telephony.fetchRecording(mine);
+        expect5(fetched.channels).toBe(2);
+      });
+      test5("a bad recording id is refused", async () => {
+        const s = await subject();
+        await expect5(s.telephony.fetchRecording({ organizationId: s.organizations.a, recordingId: "../x" })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+    });
+    describe5("forking the tracks", () => {
+      test5("sends the Rep and the Prospect apart once an AI-naming Disclosure played; again returns the first", async () => {
+        const s = await subject();
+        const placed = await disclosed(s, true);
+        const request = { ...placed.ref, destinationUrl: "wss://copilot.example.test/s" };
+        const first = await s.telephony.forkTracks(request);
+        expect5(first.tracks).toEqual(["rep", "prospect"]);
+        expect5(await s.telephony.forkTracks(request)).toEqual(first);
+      });
+      test5.each([
+        ["a plain http URL", "http://copilot.example.test/s"],
+        ["a URL with credentials", "wss://user:pw@copilot.example.test/s"],
+        ["not a URL", "copilot"],
+        ["an empty string", ""]
+      ])("%s is refused", async (_label, destinationUrl) => {
+        const s = await subject();
+        const placed = await disclosed(s, true);
+        await expect5(s.telephony.forkTracks({ ...placed.ref, destinationUrl })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+    });
+    describe5("hanging up", () => {
+      test5("ends the call with who ended it, and again is a no-op", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        s.takeEvents();
+        await s.telephony.hangUp({ ...placed.ref, by: "rep" });
+        expect5(s.takeEvents()).toMatchObject([{ type: "completed", endedBy: "rep" }]);
+        await s.telephony.hangUp(placed.ref);
+        expect5(s.takeEvents()).toHaveLength(0);
+      });
+      test5("another Organization cannot hang it up", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await expect5(s.telephony.hangUp({
+          organizationId: s.organizations.b,
+          providerCallId: placed.providerCallId
+        })).rejects.toMatchObject(code("telephony.not_found"));
+      });
+      test5("an unknown call is not found", async () => {
+        const s = await subject();
+        await expect5(s.telephony.hangUp({ organizationId: s.organizations.a, providerCallId: "unknown" })).rejects.toMatchObject(code("telephony.not_found"));
+      });
+      test5("nothing can be played, bridged, recorded or forked on an ended call", async () => {
+        const s = await subject();
+        const placed = await place(s);
+        await s.telephony.hangUp(placed.ref);
+        await expect5(s.telephony.playDisclosure({ ...placed.ref, ...wording })).rejects.toMatchObject(code("telephony.call_ended"));
+        await expect5(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(code("telephony.call_ended"));
+        await expect5(s.telephony.startRecording(placed.ref)).rejects.toMatchObject(code("telephony.call_ended"));
+      });
+    });
+    describe5("verifying a webhook", () => {
+      async function webhook() {
+        const s = await subject();
+        const placed = await place(s);
+        const event = s.takeEvents()[0];
+        return { s, placed, event, hook: s.signedWebhook(event) };
+      }
+      test5("a genuine webhook verifies", async () => {
+        const { s, hook } = await webhook();
+        expect5(s.telephony.verifyWebhook(hook)).toBe(true);
+      });
+      test5("a wrong signature of the right length is refused", async () => {
+        const { s, hook } = await webhook();
+        const flipped = (hook.signature[0] === "A" ? "B" : "A") + hook.signature.slice(1);
+        expect5(flipped).toHaveLength(hook.signature.length);
+        expect5(s.telephony.verifyWebhook({ ...hook, signature: flipped })).toBe(false);
+      });
+      test5("a signature of the wrong length is refused", async () => {
+        const { s, hook } = await webhook();
+        expect5(s.telephony.verifyWebhook({ ...hook, signature: hook.signature.slice(0, -1) })).toBe(false);
+        expect5(s.telephony.verifyWebhook({ ...hook, signature: `${hook.signature}A` })).toBe(false);
+        expect5(s.telephony.verifyWebhook({ ...hook, signature: "x" })).toBe(false);
+      });
+      test5.each([
+        ["undefined", undefined],
+        ["null", null],
+        ["empty", ""]
+      ])("a %s signature is refused", async (_label, signature) => {
+        const { s, hook } = await webhook();
+        expect5(s.telephony.verifyWebhook({ ...hook, signature })).toBe(false);
+      });
+      test5("a signature that fits another body or another URL is refused", async () => {
+        const { s, hook } = await webhook();
+        expect5(s.telephony.verifyWebhook({ ...hook, body: `${hook.body} ` })).toBe(false);
+        expect5(s.telephony.verifyWebhook({ ...hook, url: `${hook.url}?x=1` })).toBe(false);
+      });
+      test5("a body over the limit is refused without throwing", async () => {
+        const { s, hook } = await webhook();
+        const body = "x".repeat(MAX_WEBHOOK_BODY_BYTES2 + 1);
+        expect5(s.telephony.verifyWebhook({ ...hook, body })).toBe(false);
+      });
+      test5("garbage in any field is refused, never thrown", async () => {
+        const { s } = await webhook();
+        for (const bad of [null, undefined, 1, "x", {}, { url: 1, body: 2, signature: 3 }]) {
+          expect5(s.telephony.verifyWebhook(bad)).toBe(false);
+        }
+      });
+    });
+    describe5("the browser token", () => {
+      test5("is a SoftphoneToken for the Rep that expires within the hour", async () => {
+        const s = await subject();
+        const before = Date.now();
+        const token = await s.telephony.mintBrowserToken({
+          organizationId: s.organizations.a,
+          identity: rep,
+          ttlSeconds: 120
+        });
+        expect5(softphoneTokenSchema.safeParse(token).success).toBe(true);
+        expect5(token).toMatchObject({ identity: rep, ttlSeconds: 120 });
+        expect5(Date.parse(token.expiresAt)).toBeGreaterThan(before);
+        expect5(Date.parse(token.expiresAt)).toBeLessThanOrEqual(Date.now() + 120000 + 1000);
+      });
+      test5("defaults to a short life and each token is different", async () => {
+        const s = await subject();
+        const request = { organizationId: s.organizations.a, identity: rep };
+        const one = await s.telephony.mintBrowserToken(request);
+        const two = await s.telephony.mintBrowserToken(request);
+        expect5(one.ttlSeconds).toBeGreaterThanOrEqual(60);
+        expect5(one.ttlSeconds).toBeLessThanOrEqual(3600);
+        expect5(one.token).not.toBe(two.token);
+      });
+      test5.each([[59], [3601], [1.5], [Number.NaN]])("a life of %p seconds is refused", async (ttl) => {
+        const s = await subject();
+        await expect5(s.telephony.mintBrowserToken({
+          organizationId: s.organizations.a,
+          identity: rep,
+          ttlSeconds: ttl
+        })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+      test5("the token does not hold the Organization id or the Rep id in clear", async () => {
+        const s = await subject();
+        const token = await s.telephony.mintBrowserToken({
+          organizationId: s.organizations.a,
+          identity: rep
+        });
+        expect5(token.token).not.toContain(s.organizations.a);
+        expect5(token.token).not.toContain(rep);
+      });
+    });
+    describe5("timeouts and a failing provider", () => {
+      const TIMEOUT = 30;
+      const steps = {
+        placeCall: {
+          ready: async () => ({}),
+          call: (s, _c) => s.telephony.placeCall({
+            organizationId: s.organizations.a,
+            callId,
+            idempotencyKey: key(),
+            from: line,
+            to: s.numberFor("answers")
+          }, { timeoutMs: TIMEOUT })
+        },
+        answerCall: {
+          ready: async (s) => ({ providerCallId: s.receiveInbound(s.organizations.a) }),
+          call: (s, c) => s.telephony.answerCall({
+            organizationId: s.organizations.a,
+            providerCallId: c.providerCallId,
+            callId,
+            ringIdentities: [rep]
+          }, { timeoutMs: TIMEOUT })
+        },
+        playDisclosure: {
+          ready: async (s) => ({ providerCallId: (await place(s)).providerCallId }),
+          call: (s, c) => s.telephony.playDisclosure({
+            organizationId: s.organizations.a,
+            providerCallId: c.providerCallId,
+            ...wording
+          }, { timeoutMs: TIMEOUT })
+        },
+        bridge: {
+          ready: async (s) => ({ providerCallId: (await disclosed(s)).providerCallId }),
+          call: (s, c) => s.telephony.bridge({
+            organizationId: s.organizations.a,
+            providerCallId: c.providerCallId,
+            repIdentity: rep
+          }, { timeoutMs: TIMEOUT })
+        },
+        startRecording: {
+          ready: async (s) => ({ providerCallId: (await disclosed(s)).providerCallId }),
+          call: (s, c) => s.telephony.startRecording({ organizationId: s.organizations.a, providerCallId: c.providerCallId }, { timeoutMs: TIMEOUT })
+        },
+        forkTracks: {
+          ready: async (s) => ({ providerCallId: (await disclosed(s, true)).providerCallId }),
+          call: (s, c) => s.telephony.forkTracks({
+            organizationId: s.organizations.a,
+            providerCallId: c.providerCallId,
+            destinationUrl: "wss://copilot.example.test/s"
+          }, { timeoutMs: TIMEOUT })
+        },
+        hangUp: {
+          ready: async (s) => ({ providerCallId: (await place(s)).providerCallId }),
+          call: (s, c) => s.telephony.hangUp({ organizationId: s.organizations.a, providerCallId: c.providerCallId }, { timeoutMs: TIMEOUT })
+        },
+        fetchRecording: {
+          ready: async (s) => {
+            const placed = await disclosed(s);
+            const started = await s.telephony.startRecording(placed.ref);
+            await s.telephony.hangUp(placed.ref);
+            return { recordingId: started.recordingId };
+          },
+          call: (s, c) => s.telephony.fetchRecording({ organizationId: s.organizations.a, recordingId: c.recordingId }, { timeoutMs: TIMEOUT })
+        },
+        deleteRecording: {
+          ready: async (s) => {
+            const placed = await disclosed(s);
+            const started = await s.telephony.startRecording(placed.ref);
+            await s.telephony.hangUp(placed.ref);
+            return { recordingId: started.recordingId };
+          },
+          call: (s, c) => s.telephony.deleteRecording({ organizationId: s.organizations.a, recordingId: c.recordingId }, { timeoutMs: TIMEOUT })
+        },
+        mintBrowserToken: {
+          ready: async () => ({}),
+          call: (s) => s.telephony.mintBrowserToken({ organizationId: s.organizations.a, identity: rep }, { timeoutMs: TIMEOUT })
+        }
+      };
+      const operations = Object.keys(steps);
+      test5.each(operations)("%s gives up when the provider does not answer in time", async (operation) => {
+        const s = await subject();
+        const ctx = await steps[operation].ready(s);
+        s.stallNext(operation);
+        const started = Date.now();
+        await expect5(steps[operation].call(s, ctx)).rejects.toMatchObject(code("telephony.unavailable"));
+        const elapsed = Date.now() - started;
+        expect5(elapsed).toBeGreaterThanOrEqual(TIMEOUT - 10);
+        expect5(elapsed).toBeLessThan(5000);
+      });
+      test5.each(operations)("%s reports a failing provider as unavailable", async (operation) => {
+        const s = await subject();
+        const ctx = await steps[operation].ready(s);
+        s.failNext(operation);
+        await expect5(steps[operation].call(s, ctx)).rejects.toMatchObject(code("telephony.unavailable"));
+      });
+      test5.each(operations)("%s works again once the provider recovers", async (operation) => {
+        const s = await subject();
+        const ctx = await steps[operation].ready(s);
+        s.failNext(operation);
+        await expect5(steps[operation].call(s, ctx)).rejects.toBeDefined();
+        await steps[operation].call(s, ctx);
+      });
+      test5("a placeCall that timed out placed nothing: the same key places the call", async () => {
+        const s = await subject();
+        const request = {
+          organizationId: s.organizations.a,
+          callId,
+          idempotencyKey: key(),
+          from: line,
+          to: s.numberFor("answers")
+        };
+        s.stallNext("placeCall");
+        await expect5(s.telephony.placeCall(request, { timeoutMs: TIMEOUT })).rejects.toMatchObject(code("telephony.unavailable"));
+        expect5(s.takeEvents()).toHaveLength(0);
+        expect5((await s.telephony.placeCall(request)).created).toBe(true);
+      });
+      test5("a hangUp that timed out left the call up", async () => {
+        const s = await subject();
+        const placed = await disclosed(s);
+        s.stallNext("hangUp");
+        await expect5(s.telephony.hangUp(placed.ref, { timeoutMs: TIMEOUT })).rejects.toBeDefined();
+        await s.telephony.bridge({ ...placed.ref, repIdentity: rep });
+      });
+      test5.each([[0], [-1], [1.5], [60001], [Number.NaN]])("a timeout of %p ms is refused", async (timeoutMs) => {
+        const s = await subject();
+        await expect5(s.telephony.mintBrowserToken({ organizationId: s.organizations.a, identity: rep }, { timeoutMs })).rejects.toMatchObject(code("telephony.invalid_request"));
+      });
+    });
+  });
+}
+// src/transcribe/behaviour.ts
+import { afterEach as afterEach6, describe as describe6, expect as expect6, test as test6 } from "bun:test";
+function transcriberBehaviour(name, make, skip = false) {
+  const run = skip ? describe6.skip : describe6;
+  run(`Transcriber behaviour: ${name}`, () => {
+    const open = [];
+    afterEach6(async () => {
       await Promise.all(open.splice(0).map((subject) => subject.close()));
     });
     async function subject() {
@@ -1067,7 +1726,7 @@ function transcriberBehaviour(name, make, skip = false) {
         maxAttempts: 120,
         intervalMs: s.pollIntervalMs ?? 0
       });
-      expect5(result?.status === "done" || result?.status === "failed").toBe(true);
+      expect6(result?.status === "done" || result?.status === "failed").toBe(true);
       return result;
     }
     async function finalResultWith(s, org, reference, vendorId) {
@@ -1076,7 +1735,7 @@ function transcriberBehaviour(name, make, skip = false) {
         intervalMs: s.pollIntervalMs ?? 0,
         vendorId
       });
-      expect5(result?.status === "done" || result?.status === "failed").toBe(true);
+      expect6(result?.status === "done" || result?.status === "failed").toBe(true);
       return result;
     }
     const references = async (s, org, prefix) => {
@@ -1096,26 +1755,26 @@ function transcriberBehaviour(name, make, skip = false) {
       }
       return found;
     };
-    test5("a send is created once and repeating it creates nothing", async () => {
+    test6("a send is created once and repeating it creates nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const first = await s.transcriber.submit(a, send("call_1:1"));
       const again = await s.transcriber.submit(a, send("call_1:1"));
-      expect5(first).toMatchObject({ clientReference: "call_1:1", created: true });
-      expect5(again).toMatchObject({ clientReference: "call_1:1", created: false });
-      expect5(await references(s, a)).toEqual(["call_1:1"]);
+      expect6(first).toMatchObject({ clientReference: "call_1:1", created: true });
+      expect6(again).toMatchObject({ clientReference: "call_1:1", created: false });
+      expect6(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test5("the same reference with another mode, speaker cap or audio key is a conflict", async () => {
+    test6("the same reference with another mode, speaker cap or audio key is a conflict", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2, audioKey: "rec/1:abc" }));
       const conflict = { code: "transcriber.conflict" };
-      await expect5(s.transcriber.submit(a, send("call_1:1", { speakers: "split_channels", audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
-      await expect5(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 3, audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
-      await expect5(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2, audioKey: "rec/2:def" }))).rejects.toMatchObject(conflict);
-      expect5(await references(s, a)).toEqual(["call_1:1"]);
+      await expect6(s.transcriber.submit(a, send("call_1:1", { speakers: "split_channels", audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
+      await expect6(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 3, audioKey: "rec/1:abc" }))).rejects.toMatchObject(conflict);
+      await expect6(s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2, audioKey: "rec/2:def" }))).rejects.toMatchObject(conflict);
+      expect6(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test5("a retry with a freshly presigned URL is the same send, not a conflict", async () => {
+    test6("a retry with a freshly presigned URL is the same send, not a conflict", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1", { audioKey: "rec/1:abc" }));
@@ -1123,58 +1782,58 @@ function transcriberBehaviour(name, make, skip = false) {
         audio: { url: "https://audio.example.test/call_1.mp3?sig=NEWSIGNATURE&expires=2" },
         audioKey: "rec/1:abc"
       }));
-      expect5(again.created).toBe(false);
-      expect5(await references(s, a)).toEqual(["call_1:1"]);
+      expect6(again.created).toBe(false);
+      expect6(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test5("a result is pending at first or final, and a final one passes the shared result check", async () => {
+    test6("a result is pending at first or final, and a final one passes the shared result check", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1", { maxSpeakers: 2 }));
       const first = await s.transcriber.getResult(a, "call_1:1");
-      expect5(["pending", "done", "failed"]).toContain(first?.status);
+      expect6(["pending", "done", "failed"]).toContain(first?.status);
       const final = await finalResult(s, a, "call_1:1");
       checkTranscriptionResult2(final, { speakers: "diarize", maxSpeakers: 2 });
-      expect5(checkTranscriptionResult2(await s.transcriber.getResult(a, "call_1:1"))).toEqual(final);
+      expect6(checkTranscriptionResult2(await s.transcriber.getResult(a, "call_1:1"))).toEqual(final);
     });
-    test5("a split-channels result carries the channel of every turn", async () => {
+    test6("a split-channels result carries the channel of every turn", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:2", { speakers: "split_channels" }));
       const final = await finalResult(s, a, "call_1:2");
       checkTranscriptionResult2(final, { speakers: "split_channels" });
     });
-    test5("a send that was never made, or was deleted, has no result", async () => {
+    test6("a send that was never made, or was deleted, has no result", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      expect5(await s.transcriber.getResult(a, "nope")).toBeUndefined();
+      expect6(await s.transcriber.getResult(a, "nope")).toBeUndefined();
       await s.transcriber.submit(a, send("call_1:1"));
       await s.transcriber.delete(a, "call_1:1");
-      expect5(await s.transcriber.getResult(a, "call_1:1")).toBeUndefined();
+      expect6(await s.transcriber.getResult(a, "call_1:1")).toBeUndefined();
     });
-    test5("delete reports whether a copy existed and can be repeated", async () => {
+    test6("delete reports whether a copy existed and can be repeated", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1"));
-      expect5(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: true });
-      expect5(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: false });
-      expect5(await s.transcriber.delete(a, "never_sent:1")).toEqual({ existed: false });
-      expect5(await references(s, a)).toEqual([]);
+      expect6(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: true });
+      expect6(await s.transcriber.delete(a, "call_1:1")).toEqual({ existed: false });
+      expect6(await s.transcriber.delete(a, "never_sent:1")).toEqual({ existed: false });
+      expect6(await references(s, a)).toEqual([]);
     });
-    test5("a deleted reference can be sent again as a new send", async () => {
+    test6("a deleted reference can be sent again as a new send", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1"));
       await s.transcriber.delete(a, "call_1:1");
-      expect5((await s.transcriber.submit(a, send("call_1:1"))).created).toBe(true);
+      expect6((await s.transcriber.submit(a, send("call_1:1"))).created).toBe(true);
     });
-    test5("list finds sends by reference prefix, in order, in pages", async () => {
+    test6("list finds sends by reference prefix, in order, in pages", async () => {
       const s = await subject();
       const { a } = s.organizations;
       for (const reference of ["call_2:1", "call_1:2", "call_1:1", "call_1:3", "other"]) {
         await s.transcriber.submit(a, send(reference));
       }
-      expect5(await references(s, a, "call_1:")).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
-      expect5(await references(s, a)).toEqual([
+      expect6(await references(s, a, "call_1:")).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
+      expect6(await references(s, a)).toEqual([
         "call_1:1",
         "call_1:2",
         "call_1:3",
@@ -1182,9 +1841,9 @@ function transcriberBehaviour(name, make, skip = false) {
         "other"
       ]);
       const first = await s.transcriber.list(a, { prefix: "call_1:", limit: 2 });
-      expect5(first.items).toHaveLength(2);
-      expect5(first.nextCursor).toBeDefined();
-      expect5(["pending", "done", "failed"]).toContain(first.items[0]?.status);
+      expect6(first.items).toHaveLength(2);
+      expect6(first.nextCursor).toBeDefined();
+      expect6(["pending", "done", "failed"]).toContain(first.items[0]?.status);
       const seen = first.items.map((item) => item.clientReference);
       let cursor = first.nextCursor;
       for (let pages = 0;cursor !== undefined && pages < 20; pages++) {
@@ -1192,79 +1851,79 @@ function transcriberBehaviour(name, make, skip = false) {
         seen.push(...next.items.map((item) => item.clientReference));
         cursor = next.nextCursor;
       }
-      expect5(seen).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
+      expect6(seen).toEqual(["call_1:1", "call_1:2", "call_1:3"]);
     });
-    describe5("the vendor id", () => {
-      test5("submit returns an opaque bounded id, the same one when the send is repeated", async () => {
+    describe6("the vendor id", () => {
+      test6("submit returns an opaque bounded id, the same one when the send is repeated", async () => {
         const s = await subject();
         const { a } = s.organizations;
         const first = await s.transcriber.submit(a, send("call_1:1"));
         const again = await s.transcriber.submit(a, send("call_1:1"));
-        expect5(first.vendorId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
-        expect5(again.vendorId).toBe(first.vendorId);
+        expect6(first.vendorId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+        expect6(again.vendorId).toBe(first.vendorId);
       });
-      test5("list carries the id of each send", async () => {
+      test6("list carries the id of each send", async () => {
         const s = await subject();
         const { a } = s.organizations;
         const one = await s.transcriber.submit(a, send("call_1:1"));
         const two = await s.transcriber.submit(a, send("call_1:2"));
         const page = await s.transcriber.list(a, { prefix: "call_1:" });
         const ids = new Map(page.items.map((item) => [item.clientReference, item.vendorId]));
-        expect5(ids.get("call_1:1")).toBe(one.vendorId);
-        expect5(ids.get("call_1:2")).toBe(two.vendorId);
+        expect6(ids.get("call_1:1")).toBe(one.vendorId);
+        expect6(ids.get("call_1:2")).toBe(two.vendorId);
       });
-      test5("a read and a delete with the right id work as they do by reference alone", async () => {
+      test6("a read and a delete with the right id work as they do by reference alone", async () => {
         const s = await subject();
         const { a } = s.organizations;
         const { vendorId } = await s.transcriber.submit(a, send("call_1:1"));
         const result = await finalResultWith(s, a, "call_1:1", vendorId);
-        expect5(result.status === "done" || result.status === "failed").toBe(true);
-        expect5(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: true });
-        expect5(await s.transcriber.getResult(a, "call_1:1", { vendorId })).toBeUndefined();
-        expect5(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: false });
+        expect6(result.status === "done" || result.status === "failed").toBe(true);
+        expect6(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: true });
+        expect6(await s.transcriber.getResult(a, "call_1:1", { vendorId })).toBeUndefined();
+        expect6(await s.transcriber.delete(a, "call_1:1", { vendorId })).toEqual({ existed: false });
       });
-      test5("an id that names another reference's send is ignored: the call is about the reference", async () => {
+      test6("an id that names another reference's send is ignored: the call is about the reference", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.transcriber.submit(a, send("call_1:1"));
         const other = await s.transcriber.submit(a, send("call_1:2"));
-        expect5(await s.transcriber.getResult(a, "call_1:1", { vendorId: other.vendorId })).toBeDefined();
-        expect5(await s.transcriber.delete(a, "call_1:1", { vendorId: other.vendorId })).toEqual({
+        expect6(await s.transcriber.getResult(a, "call_1:1", { vendorId: other.vendorId })).toBeDefined();
+        expect6(await s.transcriber.delete(a, "call_1:1", { vendorId: other.vendorId })).toEqual({
           existed: true
         });
-        expect5(await references(s, a)).toEqual(["call_1:2"]);
-        expect5(await s.transcriber.getResult(a, "call_1:9", { vendorId: other.vendorId })).toBeUndefined();
-        expect5(await s.transcriber.delete(a, "call_1:9", { vendorId: other.vendorId })).toEqual({
+        expect6(await references(s, a)).toEqual(["call_1:2"]);
+        expect6(await s.transcriber.getResult(a, "call_1:9", { vendorId: other.vendorId })).toBeUndefined();
+        expect6(await s.transcriber.delete(a, "call_1:9", { vendorId: other.vendorId })).toEqual({
           existed: false
         });
-        expect5(await references(s, a)).toEqual(["call_1:2"]);
+        expect6(await references(s, a)).toEqual(["call_1:2"]);
       });
-      test5("an id from another Organization is ignored and never reaches that Organization's send", async () => {
+      test6("an id from another Organization is ignored and never reaches that Organization's send", async () => {
         const s = await subject();
         const { a, b } = s.organizations;
         const mine = await s.transcriber.submit(a, send("call_1:1"));
         await s.transcriber.submit(b, send("call_1:1", { speakers: "split_channels" }));
-        expect5(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
+        expect6(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
           existed: true
         });
-        expect5(await references(s, a)).toEqual(["call_1:1"]);
-        expect5(await references(s, b)).toEqual([]);
-        expect5(await s.transcriber.getResult(b, "call_1:1", { vendorId: mine.vendorId })).toBeUndefined();
-        expect5(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
+        expect6(await references(s, a)).toEqual(["call_1:1"]);
+        expect6(await references(s, b)).toEqual([]);
+        expect6(await s.transcriber.getResult(b, "call_1:1", { vendorId: mine.vendorId })).toBeUndefined();
+        expect6(await s.transcriber.delete(b, "call_1:1", { vendorId: mine.vendorId })).toEqual({
           existed: false
         });
-        expect5(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
+        expect6(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
       });
-      test5("an id the vendor does not know falls back to the reference", async () => {
+      test6("an id the vendor does not know falls back to the reference", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.transcriber.submit(a, send("call_1:1"));
-        expect5(await s.transcriber.getResult(a, "call_1:1", { vendorId: "unknown-id-1" })).toBeDefined();
-        expect5(await s.transcriber.delete(a, "call_1:1", { vendorId: "unknown-id-1" })).toEqual({
+        expect6(await s.transcriber.getResult(a, "call_1:1", { vendorId: "unknown-id-1" })).toBeDefined();
+        expect6(await s.transcriber.delete(a, "call_1:1", { vendorId: "unknown-id-1" })).toEqual({
           existed: true
         });
       });
-      test5.each([
+      test6.each([
         ["empty", ""],
         ["with a space", "a b"],
         ["with a slash", "a/b"],
@@ -1274,34 +1933,34 @@ function transcriberBehaviour(name, make, skip = false) {
         const s = await subject();
         const { a } = s.organizations;
         await s.transcriber.submit(a, send("call_1:1"));
-        await expect5(s.transcriber.getResult(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
-        await expect5(s.transcriber.delete(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
-        expect5(await references(s, a)).toEqual(["call_1:1"]);
+        await expect6(s.transcriber.getResult(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
+        await expect6(s.transcriber.delete(a, "call_1:1", { vendorId })).rejects.toMatchObject(invalid);
+        expect6(await references(s, a)).toEqual(["call_1:1"]);
       });
-      test5("a hint with the id of a deleted job is ignored and acts on the resubmitted one", async () => {
+      test6("a hint with the id of a deleted job is ignored and acts on the resubmitted one", async () => {
         const s = await subject();
         const { a } = s.organizations;
         const old = await s.transcriber.submit(a, send("call_1:1"));
         await s.transcriber.delete(a, "call_1:1");
         const fresh = await s.transcriber.submit(a, send("call_1:1"));
-        expect5(fresh.created).toBe(true);
-        expect5(await s.transcriber.getResult(a, "call_1:1", { vendorId: old.vendorId })).toBeDefined();
-        expect5(await s.transcriber.delete(a, "call_1:1", { vendorId: old.vendorId })).toEqual({
+        expect6(fresh.created).toBe(true);
+        expect6(await s.transcriber.getResult(a, "call_1:1", { vendorId: old.vendorId })).toBeDefined();
+        expect6(await s.transcriber.delete(a, "call_1:1", { vendorId: old.vendorId })).toEqual({
           existed: true
         });
-        expect5(await references(s, a)).toEqual([]);
+        expect6(await references(s, a)).toEqual([]);
       });
-      test5("a send submitted through one instance is listed and deleted through another", async () => {
+      test6("a send submitted through one instance is listed and deleted through another", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.transcriber.submit(a, send("call_1:1"));
         const other = await s.reopen();
         const found = await other.list(a, { prefix: "call_1:" });
-        expect5(found.items.map((item) => item.clientReference)).toEqual(["call_1:1"]);
-        expect5(await other.delete(a, "call_1:1")).toEqual({ existed: true });
-        expect5(await references(s, a)).toEqual([]);
+        expect6(found.items.map((item) => item.clientReference)).toEqual(["call_1:1"]);
+        expect6(await other.delete(a, "call_1:1")).toEqual({ existed: true });
+        expect6(await references(s, a)).toEqual([]);
       });
-      test5("a send whose id was never kept is found by listing for its reference and deleted without it", async () => {
+      test6("a send whose id was never kept is found by listing for its reference and deleted without it", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.transcriber.submit(a, send("call_1:1"));
@@ -1309,28 +1968,28 @@ function transcriberBehaviour(name, make, skip = false) {
         await s.transcriber.submit(a, send("call_9:1"));
         const found = await s.transcriber.list(a, { prefix: "call_1:" });
         for (const entry of found.items) {
-          expect5(entry.vendorId).toBeDefined();
-          expect5(await s.transcriber.delete(a, entry.clientReference)).toEqual({ existed: true });
+          expect6(entry.vendorId).toBeDefined();
+          expect6(await s.transcriber.delete(a, entry.clientReference)).toEqual({ existed: true });
         }
-        expect5(await references(s, a)).toEqual(["call_9:1"]);
+        expect6(await references(s, a)).toEqual(["call_9:1"]);
       });
     });
-    test5("concurrent submits of one reference create it once", async () => {
+    test6("concurrent submits of one reference create it once", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const answers = await Promise.all(Array.from({ length: 8 }, () => s.transcriber.submit(a, send("call_1:1"))));
-      expect5(answers.filter((answer) => answer.created)).toHaveLength(1);
-      expect5(await references(s, a)).toEqual(["call_1:1"]);
+      expect6(answers.filter((answer) => answer.created)).toHaveLength(1);
+      expect6(await references(s, a)).toEqual(["call_1:1"]);
     });
-    test5("a prefix that ends with the separator does not match a longer id", async () => {
+    test6("a prefix that ends with the separator does not match a longer id", async () => {
       const s = await subject();
       const { a } = s.organizations;
       for (const reference of ["call_1:1", "call_10:1"]) {
         await s.transcriber.submit(a, send(reference));
       }
-      expect5(await references(s, a, "call_1:")).toEqual(["call_1:1"]);
+      expect6(await references(s, a, "call_1:")).toEqual(["call_1:1"]);
     });
-    test5("a purge by prefix removes sends the caller kept no record of", async () => {
+    test6("a purge by prefix removes sends the caller kept no record of", async () => {
       const s = await subject();
       const { a } = s.organizations;
       for (const reference of ["call_1:1", "call_1:2", "call_9:1"]) {
@@ -1339,28 +1998,28 @@ function transcriberBehaviour(name, make, skip = false) {
       for (const reference of await references(s, a, "call_1:")) {
         await s.transcriber.delete(a, reference);
       }
-      expect5(await references(s, a)).toEqual(["call_9:1"]);
+      expect6(await references(s, a)).toEqual(["call_9:1"]);
     });
-    test5("a second Organization cannot read, delete or list the first one's sends, and may reuse a reference", async () => {
+    test6("a second Organization cannot read, delete or list the first one's sends, and may reuse a reference", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1"));
-      expect5(await s.transcriber.getResult(b, "call_1:1")).toBeUndefined();
-      expect5(await s.transcriber.delete(b, "call_1:1")).toEqual({ existed: false });
-      expect5(await references(s, b)).toEqual([]);
-      expect5((await s.transcriber.submit(b, send("call_1:1", { speakers: "split_channels" }))).created).toBe(true);
-      expect5(await references(s, a)).toEqual(["call_1:1"]);
+      expect6(await s.transcriber.getResult(b, "call_1:1")).toBeUndefined();
+      expect6(await s.transcriber.delete(b, "call_1:1")).toEqual({ existed: false });
+      expect6(await references(s, b)).toEqual([]);
+      expect6((await s.transcriber.submit(b, send("call_1:1", { speakers: "split_channels" }))).created).toBe(true);
+      expect6(await references(s, a)).toEqual(["call_1:1"]);
       await s.transcriber.delete(b, "call_1:1");
-      expect5(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
+      expect6(await s.transcriber.getResult(a, "call_1:1")).toBeDefined();
     });
-    test5("an Organization whose id starts with another id is a different Organization", async () => {
+    test6("an Organization whose id starts with another id is a different Organization", async () => {
       const s = await subject();
       const { a, aExtended } = s.organizations;
       await s.transcriber.submit(a, send("call_1:1"));
-      expect5(await references(s, aExtended)).toEqual([]);
-      expect5(await s.transcriber.getResult(aExtended, "call_1:1")).toBeUndefined();
+      expect6(await references(s, aExtended)).toEqual([]);
+      expect6(await s.transcriber.getResult(aExtended, "call_1:1")).toBeUndefined();
     });
-    test5.each([
+    test6.each([
       ["an empty reference", { clientReference: "" }],
       ["a reference with a space", { clientReference: "call 1" }],
       ["a reference with a slash", { clientReference: "org/call" }],
@@ -1389,10 +2048,10 @@ function transcriberBehaviour(name, make, skip = false) {
     ])("a send with %s is refused and nothing is made", async (_label, change) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect5(s.transcriber.submit(a, { ...send("call_1:1"), ...change })).rejects.toMatchObject(invalid);
-      expect5(await references(s, a)).toEqual([]);
+      await expect6(s.transcriber.submit(a, { ...send("call_1:1"), ...change })).rejects.toMatchObject(invalid);
+      expect6(await references(s, a)).toEqual([]);
     });
-    test5("the refusal of a bad send never repeats the audio URL", async () => {
+    test6("the refusal of a bad send never repeats the audio URL", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const secret = "https://user:SECRETPASSWORD@example.test/a?sig=SECRETSIG";
@@ -1400,20 +2059,20 @@ function transcriberBehaviour(name, make, skip = false) {
         await s.transcriber.submit(a, { ...send("call_1:1"), audio: { url: secret } });
         throw new Error("the send was accepted");
       } catch (error) {
-        expect5(JSON.stringify(error)).not.toContain("SECRET");
-        expect5(String(error.message)).not.toContain("SECRET");
+        expect6(JSON.stringify(error)).not.toContain("SECRET");
+        expect6(String(error.message)).not.toContain("SECRET");
       }
     });
-    test5.each([
+    test6.each([
       ["a bad Organization id", "bad/org", "call_1:1"],
       ["a bad reference", undefined, "bad ref"]
     ])("reads and deletes with %s are refused", async (_label, org, reference) => {
       const s = await subject();
       const id = org ?? s.organizations.a;
-      await expect5(s.transcriber.getResult(id, reference)).rejects.toMatchObject(invalid);
-      await expect5(s.transcriber.delete(id, reference)).rejects.toMatchObject(invalid);
+      await expect6(s.transcriber.getResult(id, reference)).rejects.toMatchObject(invalid);
+      await expect6(s.transcriber.delete(id, reference)).rejects.toMatchObject(invalid);
     });
-    test5.each([
+    test6.each([
       [{ limit: 0 }],
       [{ limit: 1001 }],
       [{ limit: 1.5 }],
@@ -1421,17 +2080,17 @@ function transcriberBehaviour(name, make, skip = false) {
       [{ cursor: "!!!" }]
     ])("list options %p are refused", async (options) => {
       const s = await subject();
-      await expect5(s.transcriber.list(s.organizations.a, options)).rejects.toMatchObject(invalid);
+      await expect6(s.transcriber.list(s.organizations.a, options)).rejects.toMatchObject(invalid);
     });
   });
 }
 // src/vector/behaviour.ts
-import { afterEach as afterEach6, describe as describe6, expect as expect6, test as test6 } from "bun:test";
+import { afterEach as afterEach7, describe as describe7, expect as expect7, test as test7 } from "bun:test";
 function vectorStoreBehaviour(name, make, skip = false) {
-  const run = skip ? describe6.skip : describe6;
+  const run = skip ? describe7.skip : describe7;
   run(`VectorStore behaviour: ${name}`, () => {
     const open = [];
-    afterEach6(async () => {
+    afterEach7(async () => {
       await Promise.all(open.splice(0).map((subject) => subject.close()));
     });
     async function subject() {
@@ -1454,64 +2113,64 @@ function vectorStoreBehaviour(name, make, skip = false) {
         { id: "z", vector: vec(s, 0, 0, 1) }
       ]);
     }
-    test6("a search returns the closest vectors first, with cosine scores and attributes", async () => {
+    test7("a search returns the closest vectors first, with cosine scores and attributes", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const hits = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 4 });
-      expect6(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
-      expect6(hits[0]?.score).toBeCloseTo(1, 4);
-      expect6(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
-      expect6(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
-      expect6(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
+      expect7(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
+      expect7(hits[0]?.score).toBeCloseTo(1, 4);
+      expect7(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
+      expect7(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+      expect7(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
     });
-    test6("a score does not depend on the length of either vector", async () => {
+    test7("a score does not depend on the length of either vector", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "long", vector: vec(s, 50, 0, 0) }]);
       const [hit] = await s.store.search(a, { vector: vec(s, 0.001, 0, 0), topK: 1 });
-      expect6(hit?.id).toBe("long");
-      expect6(hit?.score).toBeCloseTo(1, 4);
+      expect7(hit?.id).toBe("long");
+      expect7(hit?.score).toBeCloseTo(1, 4);
     });
-    test6("topK bounds the results", async () => {
+    test7("topK bounds the results", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      expect6(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
-      expect6(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
-      expect6(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
+      expect7(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
+      expect7(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
+      expect7(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
     });
-    test6.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
+    test7.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
       const s = await subject();
-      await expect6(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
+      await expect7(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
     });
-    test6("a filter keeps vectors whose attributes equal every entry", async () => {
+    test7("a filter keeps vectors whose attributes equal every entry", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const search = async (filter) => ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10, filter })).sort();
-      expect6(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
-      expect6(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
-      expect6(await search({ final: true })).toEqual(["xy"]);
-      expect6(await search({ page: 1 })).toEqual(["x", "xy"]);
-      expect6(await search({ document_id: "nope" })).toEqual([]);
-      expect6(await search({ page: "1" })).toEqual([]);
+      expect7(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
+      expect7(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
+      expect7(await search({ final: true })).toEqual(["xy"]);
+      expect7(await search({ page: 1 })).toEqual(["x", "xy"]);
+      expect7(await search({ document_id: "nope" })).toEqual([]);
+      expect7(await search({ page: "1" })).toEqual([]);
     });
-    test6("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
+    test7("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const code = { code: "vector.dimension_mismatch" };
       const short = Array.from({ length: s.store.dimensions - 1 }, () => 1);
       const long = Array.from({ length: s.store.dimensions + 1 }, () => 1);
-      await expect6(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
-      await expect6(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
-      await expect6(s.store.upsert(a, [
+      await expect7(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
+      await expect7(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
+      await expect7(s.store.upsert(a, [
         { id: "fine", vector: vec(s, 1) },
         { id: "short", vector: short }
       ])).rejects.toMatchObject(code);
-      expect6(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      expect7(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test6.each([
+    test7.each([
       ["NaN", (n) => Array.from({ length: n }, (_, i) => i === 0 ? Number.NaN : 1)],
       [
         "Infinity",
@@ -1530,10 +2189,10 @@ function vectorStoreBehaviour(name, make, skip = false) {
       const s = await subject();
       const { a } = s.organizations;
       const vector = build(s.store.dimensions);
-      await expect6(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
-      await expect6(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
+      await expect7(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
     });
-    test6.each([
+    test7.each([
       ["an empty id", ""],
       ["a slash", "a/b"],
       ["a leading dot", ".x"],
@@ -1542,24 +2201,24 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("an id with %s is refused", async (_label, id) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect6(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect6(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect7(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
     });
-    test6("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
+    test7("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect6(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
       const many = Array.from({ length: 501 }, (_, i) => ({ id: `v${i}`, vector: vec(s, 1) }));
-      await expect6(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
-      await expect6(s.store.upsert(a, [
+      await expect7(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(a, [
         { id: "same", vector: vec(s, 1) },
         { id: "same", vector: vec(s, 0, 1) }
       ])).rejects.toMatchObject(invalid);
-      await expect6(s.store.delete(a, [])).rejects.toMatchObject(invalid);
-      await expect6(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
-      expect6(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      await expect7(s.store.delete(a, [])).rejects.toMatchObject(invalid);
+      await expect7(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
+      expect7(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test6.each([
+    test7.each([
       ["the reserved name id", { id: "x" }],
       ["the reserved name vector", { vector: "x" }],
       ["a name starting with a dollar sign", { $dist: "x" }],
@@ -1576,11 +2235,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("attributes with %s are refused", async (_label, attributes) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect6(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
-      await expect6(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
-      await expect6(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
+      await expect7(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
+      await expect7(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
     });
-    test6("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
+    test7("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes: { n: 1 } }]);
@@ -1588,72 +2247,72 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.upsert(a, replacement);
       await s.store.upsert(a, replacement);
       const hits = await s.store.search(a, { vector: vec(s, 0, 1), topK: 10 });
-      expect6(ids(hits)).toEqual(["v"]);
-      expect6(hits[0]?.score).toBeCloseTo(1, 4);
-      expect6(hits[0]?.attributes).toEqual({ n: 2 });
+      expect7(ids(hits)).toEqual(["v"]);
+      expect7(hits[0]?.score).toBeCloseTo(1, 4);
+      expect7(hits[0]?.attributes).toEqual({ n: 2 });
     });
-    describe6("setAttributes", () => {
+    describe7("setAttributes", () => {
       const query = (s) => ({ vector: vec(s, 1, 1, 0), topK: 10 });
-      test6("merges the attributes, leaves the others and the vector as they were", async () => {
+      test7("merges the attributes, leaves the others and the vector as they were", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const before = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "xy"], { outcome: "won", seq: 2 });
         const after = await s.store.search(a, query(s));
-        expect6(missing).toEqual([]);
-        expect6(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
+        expect7(missing).toEqual([]);
+        expect7(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
         const byId = Object.fromEntries(after.map((hit) => [hit.id, hit.attributes]));
-        expect6(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
-        expect6(byId.xy).toEqual({
+        expect7(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
+        expect7(byId.xy).toEqual({
           document_id: "doc_2",
           page: 1,
           final: true,
           outcome: "won",
           seq: 2
         });
-        expect6(byId.y).toEqual({ document_id: "doc_1", page: 2 });
-        expect6(byId.z).toEqual({});
+        expect7(byId.y).toEqual({ document_id: "doc_1", page: 2 });
+        expect7(byId.z).toEqual({});
       });
-      test6("overwrites a value that exists and keeps the rest", async () => {
+      test7("overwrites a value that exists and keeps the rest", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { page: 9 });
         const hit = (await s.store.search(a, query(s))).find((item) => item.id === "x");
-        expect6(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
+        expect7(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
       });
-      test6("reports ids it did not find, in order, and does not create them", async () => {
+      test7("reports ids it did not find, in order, and does not create them", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const missing = await s.store.setAttributes(a, ["nope", "x", "gone"], { outcome: "lost" });
-        expect6(missing).toEqual(["nope", "gone"]);
+        expect7(missing).toEqual(["nope", "gone"]);
         const all = await s.store.search(a, { vector: vec(s, 1), topK: 100 });
-        expect6(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
-        expect6(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
+        expect7(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
+        expect7(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
       });
-      test6("an Organization with no vectors reports every id and creates nothing", async () => {
+      test7("an Organization with no vectors reports every id and creates nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
-        expect6(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
-        expect6(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+        expect7(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
+        expect7(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
       });
-      test6("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
+      test7("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const many = ["x", ...Array.from({ length: 500 }, (_, i) => `v${i}`)];
-        await expect6(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
-        await expect6(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect6(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect6(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
         const atMax = Array.from({ length: 500 }, (_, i) => `v${i}`);
-        expect6(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
+        expect7(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect6(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect7(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test6("a second Organization's vectors with the same ids are untouched", async () => {
+      test7("a second Organization's vectors with the same ids are untouched", async () => {
         const s = await subject();
         const { a, b } = s.organizations;
         await seed(s, a);
@@ -1664,35 +2323,35 @@ function vectorStoreBehaviour(name, make, skip = false) {
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect6(other).toEqual([]);
+        expect7(other).toEqual([]);
         const mine = await s.store.search(a, {
           vector: vec(s, 1),
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect6(ids(mine).sort()).toEqual(["x", "y"]);
+        expect7(ids(mine).sort()).toEqual(["x", "y"]);
       });
-      test6("repeating the call changes nothing", async () => {
+      test7("repeating the call changes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
         const once = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
-        expect6(missing).toEqual(["nope"]);
-        expect6(await s.store.search(a, query(s))).toEqual(once);
+        expect7(missing).toEqual(["nope"]);
+        expect7(await s.store.search(a, query(s))).toEqual(once);
       });
-      test6("a filter on the changed attribute sees the new value and not the old", async () => {
+      test7("a filter on the changed attribute sees the new value and not the old", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { outcome: "open" });
         await s.store.setAttributes(a, ["x"], { outcome: "won" });
         const search = (outcome) => s.store.search(a, { vector: vec(s, 1), topK: 10, filter: { outcome } });
-        expect6(ids(await search("won"))).toEqual(["x"]);
-        expect6(await search("open")).toEqual([]);
+        expect7(ids(await search("won"))).toEqual(["x"]);
+        expect7(await search("open")).toEqual([]);
       });
-      test6.each([
+      test7.each([
         ["no entries", {}],
         ["the reserved name id", { id: "x" }],
         ["the reserved name vector", { vector: "x" }],
@@ -1709,11 +2368,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
-        await expect6(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect6(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect7(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test6("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
+      test7("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.store.upsert(a, [
@@ -1724,47 +2383,47 @@ function vectorStoreBehaviour(name, make, skip = false) {
           },
           { id: "room", vector: vec(s, 0, 1), attributes: { k0: 1 } }
         ]);
-        await expect6(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
         const room = (await s.store.search(a, { vector: vec(s, 0, 1), topK: 2 })).find((hit) => hit.id === "room");
-        expect6(room?.attributes).toEqual({ k0: 1 });
-        expect6(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
+        expect7(room?.attributes).toEqual({ k0: 1 });
+        expect7(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
       });
-      test6("an invalid Organization id is refused", async () => {
+      test7("an invalid Organization id is refused", async () => {
         const s = await subject();
-        await expect6(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect7(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
       });
     });
-    test6("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
+    test7("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       await s.store.delete(a, ["x", "missing"]);
       await s.store.delete(a, ["x", "missing"]);
-      expect6(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect7(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "y",
         "z"
       ]);
     });
-    test6("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
+    test7("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      await expect6(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
+      await expect7(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "never" });
-      expect6(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect7(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "z"
       ]);
     });
-    test6("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
+    test7("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await seed(s, a);
-      expect6(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
-      expect6(await s.store.search(b, {
+      expect7(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
+      expect7(await s.store.search(b, {
         vector: vec(s, 1, 0, 0),
         topK: 100,
         filter: { document_id: "doc_1" }
@@ -1775,34 +2434,34 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.delete(b, ["y", "xy"]);
       await s.store.deleteByFilter(b, { document_id: "doc_1" });
       const mine = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect6(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
-      expect6(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
+      expect7(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
+      expect7(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
         document_id: "doc_1",
         page: 1
       });
       const theirs = await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect6(ids(theirs)).toEqual(["x"]);
-      expect6(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
+      expect7(ids(theirs)).toEqual(["x"]);
+      expect7(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
     });
-    test6("an Organization whose id starts with another id is a different Organization", async () => {
+    test7("an Organization whose id starts with another id is a different Organization", async () => {
       const s = await subject();
       const { a, aExtended } = s.organizations;
       await s.store.upsert(a, [{ id: "one", vector: vec(s, 1) }]);
       await s.store.upsert(aExtended, [{ id: "two", vector: vec(s, 1) }]);
-      expect6(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
-      expect6(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect7(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
+      expect7(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
       await s.store.delete(a, ["two"]);
       await s.store.deleteByFilter(a, { n: 1 });
-      expect6(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect7(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
     });
-    test6("an id of exactly 64 characters is accepted", async () => {
+    test7("an id of exactly 64 characters is accepted", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const id = "x".repeat(64);
       await s.store.upsert(a, [{ id, vector: vec(s, 1) }]);
-      expect6(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
+      expect7(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
     });
-    test6("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
+    test7("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
       const s = await subject();
       const { a, b, aExtended } = s.organizations;
       await seed(s, a);
@@ -1811,23 +2470,23 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.deleteAll(a);
       await s.store.deleteAll(a);
       await s.store.deleteAll(`${a.slice(0, -1)}9`);
-      expect6(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
-      expect6(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect6(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect7(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect7(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect7(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
       await s.store.upsert(a, [{ id: "again", vector: vec(s, 1) }]);
-      expect6(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
+      expect7(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
     });
-    test6("warming an Organization changes nothing and works with or without data", async () => {
+    test7("warming an Organization changes nothing and works with or without data", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await s.store.warm(b);
       await seed(s, a);
       await s.store.warm(a);
       await s.store.warm(a);
-      expect6(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect6(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect7(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect7(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
     });
-    test6.each([
+    test7.each([
       ["empty", ""],
       ["a path", "org/../x"],
       ["a separator", "x/y"],
@@ -1836,12 +2495,12 @@ function vectorStoreBehaviour(name, make, skip = false) {
       ["too long", "x".repeat(65)]
     ])("an Organization id that is %s is refused by every operation", async (_label, id) => {
       const s = await subject();
-      await expect6(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect6(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
-      await expect6(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
-      await expect6(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
-      await expect6(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
-      await expect6(s.store.warm(id)).rejects.toMatchObject(invalid);
+      await expect7(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect7(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
+      await expect7(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
+      await expect7(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
+      await expect7(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
+      await expect7(s.store.warm(id)).rejects.toMatchObject(invalid);
     });
   });
 }
@@ -1850,6 +2509,7 @@ export {
   objectStoreBehaviour,
   processedStoreBehaviour,
   queueBehaviour,
+  telephonyBehaviour,
   transcriberBehaviour,
   vectorStoreBehaviour
 };

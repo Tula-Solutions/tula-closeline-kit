@@ -4,6 +4,8 @@ import {
   scrubText2,
   prepareFields,
   shouldReportError2,
+  TELEPHONY_ERROR_CODES2,
+  TelephonyError2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -12,7 +14,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-qarghb8f.js";
+} from "./shared/chunk-a56avm11.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -36,6 +38,11 @@ import {
   createStorageValidator
 } from "./shared/chunk-d77yh0fk.js";
 import {
+  DEFAULT_TELEPHONY_TIMEOUT_MS2,
+  MAX_TELEPHONY_TIMEOUT_MS2,
+  MAX_DISCLOSURE_TEXT_LENGTH2,
+  MAX_RING_LEGS2,
+  MAX_WEBHOOK_BODY_BYTES2,
   TRANSCRIBER_ERROR_CODES2,
   TranscriberError2,
   MAX_CLIENT_REFERENCE_LENGTH2,
@@ -45,7 +52,7 @@ import {
   MAX_TRANSCRIBER_LIST_LIMIT2,
   MAX_VENDOR_ID_LENGTH2,
   checkTranscriptionResult2
-} from "./shared/chunk-5yzgse6v.js";
+} from "./shared/chunk-0xwm31t3.js";
 import {
   systemSleep2,
   assertReceiveOptions2,
@@ -597,6 +604,485 @@ ${expires}`).digest("hex");
     }
   };
   return store;
+}
+// src/telephony/memory.ts
+import { createHmac as createHmac2, randomBytes as randomBytes2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+
+// src/telephony/validate.ts
+import {
+  callIdSchema,
+  e164PhoneSchema,
+  membershipIdSchema,
+  organizationIdSchema
+} from "tula-closeline-contract";
+var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+var CONTROL = /[\u0000-\u001f\u007f]/;
+function invalid(what) {
+  throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function checkOrganizationId(value) {
+  return organizationIdSchema.safeParse(value).success ? value : invalid("organizationId");
+}
+function checkCallId(value) {
+  return callIdSchema.safeParse(value).success ? value : invalid("callId");
+}
+function checkIdentity(value) {
+  return membershipIdSchema.safeParse(value).success ? value : invalid("identity");
+}
+function checkNumber(value, what) {
+  return e164PhoneSchema.safeParse(value).success ? value : invalid(what);
+}
+function checkProviderId(value, what) {
+  return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid(what);
+}
+function checkDisclosure(version, text, aiAssisted) {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    invalid("wordingVersion");
+  }
+  if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_DISCLOSURE_TEXT_LENGTH2 || CONTROL.test(text)) {
+    invalid("text");
+  }
+  if (typeof aiAssisted !== "boolean") {
+    invalid("aiAssisted");
+  }
+}
+function checkRingIdentities(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RING_LEGS2) {
+    invalid("ringIdentities");
+  }
+  const identities = value.map(checkIdentity);
+  return [...new Set(identities)];
+}
+function checkDestinationUrl(value, allowPlain) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
+    invalid("destinationUrl");
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return invalid("destinationUrl");
+  }
+  const secure = url.protocol === "wss:";
+  if (!(secure || allowPlain && url.protocol === "ws:") || url.username || url.password) {
+    invalid("destinationUrl");
+  }
+  return value;
+}
+function resolveTimeout(options, fallback) {
+  const value = options?.timeoutMs ?? fallback;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_TELEPHONY_TIMEOUT_MS2) {
+    invalid("timeoutMs");
+  }
+  return value;
+}
+
+// src/telephony/memory.ts
+var DEFAULT_SECRET = "memory-webhook-secret";
+var DEFAULT_TTL_SECONDS = 900;
+var FAKE_AUDIO = new TextEncoder().encode("RIFF....WAVEmemory-recording");
+function chunked(bytes) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes.slice());
+      controller.close();
+    }
+  });
+}
+function createMemoryTelephony(options = {}) {
+  const clock = options.clock ?? systemClock2;
+  const allowPlainSocket = (options.environment ?? "local") === "local";
+  const secret = options.webhookSecret ?? DEFAULT_SECRET;
+  if (secret.length < 16) {
+    throw new TypeError("createMemoryTelephony needs a webhookSecret of at least 16 characters");
+  }
+  const defaultTimeout = options.defaultTimeoutMs ?? DEFAULT_TELEPHONY_TIMEOUT_MS2;
+  const audio = options.recordingAudio ?? FAKE_AUDIO;
+  const calls = new Map;
+  const recordings = new Map;
+  const placed = new Map;
+  const scripts = new Map;
+  const failures = new Map;
+  const stalls = new Map;
+  const events = [];
+  const operations = [];
+  let taken = 0;
+  let counter = 0;
+  const nextId = (prefix) => {
+    counter += 1;
+    return `${prefix}${counter.toString(16).padStart(8, "0")}`;
+  };
+  const sign = (url, body) => createHmac2("sha256", secret).update(url).update(`
+`).update(body).digest("base64");
+  function emit(call, type, extra = {}) {
+    events.push({
+      eventId: nextId("evt-"),
+      organizationId: call.organizationId,
+      providerCallId: call.providerCallId,
+      type,
+      at: clock.now().toISOString(),
+      ...extra
+    });
+  }
+  function finishRecording(call) {
+    const recording = call.recordingId === null ? undefined : recordings.get(call.recordingId);
+    if (recording && !recording.ready) {
+      recording.ready = true;
+      emit(call, "recording_ready", { recordingId: recording.recordingId });
+    }
+  }
+  function end(call, by) {
+    call.state = "ended";
+    call.endedBy = by;
+    emit(call, "completed", { endedBy: by });
+    finishRecording(call);
+  }
+  function fail(call, reason) {
+    call.state = "ended";
+    call.endedBy = "system";
+    emit(call, "failed", { failureReason: reason });
+    finishRecording(call);
+  }
+  function find(organizationId, providerCallId) {
+    const call = calls.get(providerCallId);
+    if (!call || call.organizationId !== organizationId) {
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.notFound, "There is no such call");
+    }
+    return call;
+  }
+  function live(call) {
+    if (call.state === "ended") {
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call has ended");
+    }
+    if (call.state === "incoming") {
+      invalid("call: it has not been answered, so it");
+    }
+  }
+  function needDisclosure(call) {
+    if (call.disclosure === null) {
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure has not played on this call");
+    }
+    return call.disclosure;
+  }
+  function checkRef(request) {
+    checkOrganizationId(request.organizationId);
+    checkProviderId(request.providerCallId, "providerCallId");
+  }
+  async function run(operation, opts, body) {
+    const timeoutMs = resolveTimeout(opts, defaultTimeout);
+    const stalled = stalls.get(operation) ?? 0;
+    if (stalled > 0) {
+      stalls.set(operation, stalled - 1);
+      await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, "The provider did not answer in time");
+    }
+    const code = failures.get(operation)?.shift();
+    if (code !== undefined) {
+      throw new TelephonyError2(code, "The provider failed");
+    }
+    return body();
+  }
+  function record(operation, providerCallId) {
+    operations.push({ operation, providerCallId });
+  }
+  const port = {
+    events,
+    operations,
+    placeCall(request, opts) {
+      return run("placeCall", opts, () => {
+        checkOrganizationId(request.organizationId);
+        checkCallId(request.callId);
+        checkProviderId(request.idempotencyKey, "idempotencyKey");
+        checkNumber(request.from, "from");
+        checkNumber(request.to, "to");
+        const key = `${request.organizationId}|${request.idempotencyKey}`;
+        const existing = placed.get(key);
+        if (existing !== undefined) {
+          const first = calls.get(existing);
+          if (first && (first.to !== request.to || first.from !== request.from)) {
+            invalid("idempotencyKey: it was used for another call, so it");
+          }
+          return { providerCallId: existing, created: false };
+        }
+        const script = scripts.get(request.to) ?? { kind: "answers" };
+        const call = {
+          organizationId: request.organizationId,
+          providerCallId: nextId("memcall-"),
+          callId: request.callId,
+          direction: "outbound",
+          state: "connected",
+          to: request.to,
+          from: request.from,
+          script,
+          disclosure: null,
+          bridgedTo: null,
+          recordingId: null,
+          streamId: null,
+          ringing: null,
+          endedBy: null
+        };
+        calls.set(call.providerCallId, call);
+        placed.set(key, call.providerCallId);
+        record("placeCall", call.providerCallId);
+        emit(call, "ringing");
+        if (script.kind === "no_answer") {
+          call.state = "ended";
+          emit(call, "no_answer", { failureReason: "no_answer" });
+        } else if (script.kind === "busy") {
+          call.state = "ended";
+          emit(call, "busy", { failureReason: "busy" });
+        } else if (script.kind === "carrier_failure" && (script.when ?? "dial") === "dial") {
+          fail(call, script.reason ?? "carrier_rejected");
+        } else {
+          emit(call, "answered");
+        }
+        return { providerCallId: call.providerCallId, created: true };
+      });
+    },
+    answerCall(request, opts) {
+      return run("answerCall", opts, () => {
+        checkRef(request);
+        checkCallId(request.callId);
+        const identities = checkRingIdentities(request.ringIdentities);
+        const call = find(request.organizationId, request.providerCallId);
+        if (call.state === "ended") {
+          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call has ended");
+        }
+        if (call.state === "incoming") {
+          call.state = "connected";
+          call.callId = request.callId;
+          call.ringing = identities.length;
+          record("answerCall", call.providerCallId);
+          emit(call, "answered");
+        }
+        return { ringing: call.ringing ?? identities.length };
+      });
+    },
+    playDisclosure(request, opts) {
+      return run("playDisclosure", opts, () => {
+        checkRef(request);
+        checkDisclosure(request.wordingVersion, request.text, request.aiAssisted);
+        const call = find(request.organizationId, request.providerCallId);
+        if (call.disclosure !== null && call.disclosure.wordingVersion === request.wordingVersion) {
+          return call.disclosure;
+        }
+        live(call);
+        if (call.script.kind === "hangs_up" && call.script.when === "during_disclosure") {
+          end(call, "prospect");
+          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The Prospect hung up");
+        }
+        const played = {
+          wordingVersion: request.wordingVersion,
+          aiAssisted: request.aiAssisted || (call.disclosure?.aiAssisted ?? false),
+          playedAt: clock.now().toISOString()
+        };
+        call.disclosure = played;
+        record("playDisclosure", call.providerCallId);
+        return played;
+      });
+    },
+    bridge(request, opts) {
+      return run("bridge", opts, () => {
+        checkRef(request);
+        checkIdentity(request.repIdentity);
+        const call = find(request.organizationId, request.providerCallId);
+        live(call);
+        needDisclosure(call);
+        if (call.bridgedTo === request.repIdentity) {
+          return;
+        }
+        call.bridgedTo = request.repIdentity;
+        record("bridge", call.providerCallId);
+        if (call.script.kind === "hangs_up" && call.script.when === "after_bridge") {
+          end(call, "prospect");
+        } else if (call.script.kind === "carrier_failure" && call.script.when === "after_bridge") {
+          fail(call, call.script.reason ?? "carrier_dropped");
+        }
+      });
+    },
+    startRecording(request, opts) {
+      return run("startRecording", opts, () => {
+        checkRef(request);
+        const call = find(request.organizationId, request.providerCallId);
+        if (call.recordingId !== null) {
+          return { recordingId: call.recordingId, channels: 2 };
+        }
+        live(call);
+        needDisclosure(call);
+        const recordingId = nextId("memrec-");
+        recordings.set(recordingId, {
+          organizationId: call.organizationId,
+          recordingId,
+          providerCallId: call.providerCallId,
+          ready: false
+        });
+        call.recordingId = recordingId;
+        record("startRecording", call.providerCallId);
+        return { recordingId, channels: 2 };
+      });
+    },
+    forkTracks(request, opts) {
+      return run("forkTracks", opts, () => {
+        checkRef(request);
+        checkDestinationUrl(request.destinationUrl, allowPlainSocket);
+        const call = find(request.organizationId, request.providerCallId);
+        if (call.streamId !== null) {
+          return { streamId: call.streamId, tracks: ["rep", "prospect"] };
+        }
+        live(call);
+        const disclosure = needDisclosure(call);
+        if (!disclosure.aiAssisted) {
+          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure did not say an AI takes part");
+        }
+        call.streamId = nextId("memstream-");
+        record("forkTracks", call.providerCallId);
+        return { streamId: call.streamId, tracks: ["rep", "prospect"] };
+      });
+    },
+    hangUp(request, opts) {
+      return run("hangUp", opts, () => {
+        checkRef(request);
+        if (request.by !== undefined && request.by !== "rep" && request.by !== "system") {
+          invalid("by");
+        }
+        const call = find(request.organizationId, request.providerCallId);
+        if (call.state === "ended") {
+          return;
+        }
+        record("hangUp", call.providerCallId);
+        end(call, request.by ?? "system");
+      });
+    },
+    fetchRecording(request, opts) {
+      return run("fetchRecording", opts, () => {
+        checkOrganizationId(request.organizationId);
+        checkProviderId(request.recordingId, "recordingId");
+        const found = recordings.get(request.recordingId);
+        if (!found || found.organizationId !== request.organizationId) {
+          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.notFound, "There is no such Recording");
+        }
+        if (!found.ready) {
+          throw new TelephonyError2(TELEPHONY_ERROR_CODES2.recordingNotReady, "The Recording is not finished");
+        }
+        record("fetchRecording", found.providerCallId);
+        return {
+          body: chunked(audio),
+          contentType: "audio/wav",
+          sizeBytes: audio.length,
+          channels: 2
+        };
+      });
+    },
+    deleteRecording(request, opts) {
+      return run("deleteRecording", opts, () => {
+        checkOrganizationId(request.organizationId);
+        checkProviderId(request.recordingId, "recordingId");
+        const found = recordings.get(request.recordingId);
+        if (!found || found.organizationId !== request.organizationId) {
+          return { existed: false };
+        }
+        recordings.delete(request.recordingId);
+        record("deleteRecording", found.providerCallId);
+        return { existed: true };
+      });
+    },
+    verifyWebhook(request) {
+      if (typeof request !== "object" || request === null || typeof request.url !== "string" || typeof request.body !== "string" || typeof request.signature !== "string" || request.signature.length === 0 || Buffer.byteLength(request.body) > MAX_WEBHOOK_BODY_BYTES2) {
+        return false;
+      }
+      const expected = Buffer.from(sign(request.url, request.body));
+      const got = Buffer.from(request.signature);
+      return got.length === expected.length && timingSafeEqual2(got, expected);
+    },
+    mintBrowserToken(request, opts) {
+      return run("mintBrowserToken", opts, () => {
+        checkOrganizationId(request.organizationId);
+        checkIdentity(request.identity);
+        const ttl = request.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+        if (!Number.isInteger(ttl) || ttl < 60 || ttl > 3600) {
+          invalid("ttlSeconds");
+        }
+        return {
+          token: `memtok.${randomBytes2(24).toString("base64url")}`,
+          identity: request.identity,
+          ttlSeconds: ttl,
+          expiresAt: new Date(clock.now().getTime() + ttl * 1000).toISOString()
+        };
+      });
+    },
+    script(number, behaviour) {
+      checkNumber(number, "number");
+      scripts.set(number, behaviour);
+    },
+    receiveInbound(organizationId, from, to) {
+      checkOrganizationId(organizationId);
+      checkNumber(from, "from");
+      checkNumber(to, "to");
+      const call = {
+        organizationId,
+        providerCallId: nextId("memcall-"),
+        callId: null,
+        direction: "inbound",
+        state: "incoming",
+        to,
+        from,
+        script: { kind: "answers" },
+        disclosure: null,
+        bridgedTo: null,
+        recordingId: null,
+        streamId: null,
+        ringing: null,
+        endedBy: null
+      };
+      calls.set(call.providerCallId, call);
+      emit(call, "ringing");
+      return call.providerCallId;
+    },
+    prospectHangsUp(organizationId, providerCallId) {
+      const call = find(organizationId, providerCallId);
+      if (call.state !== "ended") {
+        record("prospectHangsUp", providerCallId);
+        end(call, "prospect");
+      }
+    },
+    failNext(operation, code, times = 1) {
+      const queue = failures.get(operation) ?? [];
+      for (let i = 0;i < times; i++) {
+        queue.push(code);
+      }
+      failures.set(operation, queue);
+    },
+    stallNext(operation, times = 1) {
+      stalls.set(operation, (stalls.get(operation) ?? 0) + times);
+    },
+    takeEvents() {
+      const fresh = events.slice(taken);
+      taken = events.length;
+      return fresh;
+    },
+    calls(organizationId) {
+      return [...calls.values()].filter((call) => organizationId === undefined || call.organizationId === organizationId).map((call) => ({
+        organizationId: call.organizationId,
+        providerCallId: call.providerCallId,
+        callId: call.callId,
+        direction: call.direction,
+        state: call.state,
+        disclosure: call.disclosure,
+        bridgedTo: call.bridgedTo,
+        recordingId: call.recordingId,
+        streamId: call.streamId,
+        endedBy: call.endedBy
+      }));
+    },
+    webhookFor(event) {
+      const url = "https://voice.example.test/webhooks/telephony";
+      const body = JSON.stringify(event);
+      return { url, body, signature: sign(url, body) };
+    },
+    sign,
+    recordingCount: () => recordings.size
+  };
+  return port;
 }
 // src/transcribe/memory.ts
 import { createHash as createHash2 } from "node:crypto";
@@ -1185,6 +1671,7 @@ export {
   createMemoryLogger,
   createMemoryObjectStore,
   createMemoryQueue,
+  createMemoryTelephony,
   createMemoryTranscriber,
   createMemoryVectorStore,
   createTestDeps,

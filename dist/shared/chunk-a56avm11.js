@@ -1060,6 +1060,41 @@ function shouldReportError2(error) {
   }
 }
 
+// src/telephony/errors.ts
+var TELEPHONY_ERROR_CODES2 = {
+  invalidRequest: "telephony.invalid_request",
+  notFound: "telephony.not_found",
+  callEnded: "telephony.call_ended",
+  disclosureRequired: "telephony.disclosure_required",
+  recordingNotReady: "telephony.recording_not_ready",
+  rejected: "telephony.rejected",
+  unavailable: "telephony.unavailable",
+  badResponse: "telephony.bad_response"
+};
+var STATUS = {
+  "telephony.invalid_request": 400,
+  "telephony.not_found": 404,
+  "telephony.call_ended": 409,
+  "telephony.disclosure_required": 409,
+  "telephony.recording_not_ready": 409,
+  "telephony.rejected": 502,
+  "telephony.unavailable": 503,
+  "telephony.bad_response": 502
+};
+
+class TelephonyError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "TelephonyError";
+  }
+}
+
 // src/vector/errors.ts
 var VECTOR_ERROR_CODES2 = {
   invalidRequest: "vector.invalid_request",
@@ -1068,7 +1103,7 @@ var VECTOR_ERROR_CODES2 = {
   unavailable: "vector.unavailable",
   badResponse: "vector.bad_response"
 };
-var STATUS = {
+var STATUS2 = {
   "vector.invalid_request": 400,
   "vector.dimension_mismatch": 422,
   "vector.rejected": 500,
@@ -1080,7 +1115,7 @@ class VectorError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1098,4 +1133,4 @@ var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, TELEPHONY_ERROR_CODES2, TelephonyError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
