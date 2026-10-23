@@ -42,18 +42,18 @@ import {
   shouldReportError2,
   STREAMING_TRANSCRIBE_ERROR_CODES2,
   StreamingTranscribeError2,
-  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_AUDIO_CHUNK_BYTES2,
-  DEFAULT_RECONNECT_POLICY2,
   reconnectDelayMs2,
+  invalid4,
+  checkOpenRequest,
+  resolveTimeout2,
+  checkChunk,
   TtsAudioChunk2,
   MAX_TTS_AUDIO_CHUNK_BYTES2,
   startTtsDeadline,
   watchFirstChunk,
   withTtsRetry,
-  invalid4,
-  checkOpenRequest,
+  invalid5,
+  checkOpenRequest2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -62,7 +62,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-77fb749y.js";
+} from "./shared/chunk-rxcekq2t.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -87,11 +87,11 @@ import {
 import {
   startDeadline,
   withLlmRetry,
-  invalid5,
+  invalid6,
   checkRequest,
   checkCompleteRequest,
   parseModelOutput
-} from "./shared/chunk-67y2hsjp.js";
+} from "./shared/chunk-qwe4ynpn.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -100,7 +100,7 @@ import {
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2
@@ -118,7 +118,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-3n6tvg2s.js";
+} from "./shared/chunk-c3b5jbxv.js";
 import {
   ESTIMATED_CHARS_PER_TOKEN2,
   estimateTokens2
@@ -785,10 +785,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid5("reply text");
+        invalid6("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid5("reply chunks");
+        invalid6("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -1402,71 +1402,6 @@ ${expires}`).digest("hex");
   };
   return store;
 }
-// src/streaming-transcribe/validate.ts
-import { callIdSchema, organizationIdSchema } from "tula-closeline-contract";
-var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
-var SAMPLE_RATES = [8000, 16000, 24000, 48000];
-var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
-var TRACKS = ["rep", "prospect"];
-function invalid6(what) {
-  throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function integerIn(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function checkOpenRequest2(request) {
-  if (typeof request !== "object" || request === null) {
-    return invalid6("request");
-  }
-  if (!organizationIdSchema.safeParse(request.organizationId).success) {
-    invalid6("organizationId");
-  }
-  if (!callIdSchema.safeParse(request.callId).success) {
-    invalid6("callId");
-  }
-  if (!TRACKS.includes(request.track)) {
-    invalid6("track");
-  }
-  if (!ENCODINGS.includes(request.encoding)) {
-    invalid6("encoding");
-  }
-  if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid6("sampleRate");
-  }
-  if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
-    invalid6("language");
-  }
-  if (typeof request.onEvent !== "function") {
-    invalid6("onEvent");
-  }
-  return resolveReconnectPolicy(request.reconnect);
-}
-function resolveReconnectPolicy(policy) {
-  const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
-  if (!integerIn(maxAttempts, 0, 10)) {
-    invalid6("reconnect.maxAttempts");
-  }
-  if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid6("reconnect.baseDelayMs");
-  }
-  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid6("reconnect.maxDelayMs");
-  }
-  return { maxAttempts, baseDelayMs, maxDelayMs };
-}
-function resolveTimeout2(options) {
-  const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid6("timeoutMs");
-}
-function checkChunk(chunk) {
-  if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
-    return invalid6("chunk");
-  }
-  return chunk;
-}
-
 // src/streaming-transcribe/memory.ts
 var WORD_MS = 200;
 function wordsOf(text, startMs) {
@@ -1478,19 +1413,19 @@ function wordsOf(text, startMs) {
 }
 function checkScript(turns) {
   if (!Array.isArray(turns) || turns.length > 1000) {
-    invalid6("turns");
+    invalid4("turns");
   }
   let previous = 0;
   for (const turn of turns) {
     const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
     if (count < 1 || count > 200) {
-      invalid6("turn text");
+      invalid4("turn text");
     }
     if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
-      invalid6("afterBytes");
+      invalid4("afterBytes");
     }
     if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
-      invalid6("interims");
+      invalid4("interims");
     }
     previous = turn.afterBytes;
   }
@@ -1602,7 +1537,7 @@ function createMemoryStreamingTranscribe(options = {}) {
   }
   const port = {
     async open(request, opts) {
-      const policy = checkOpenRequest2(request);
+      const policy = checkOpenRequest(request);
       resolveTimeout2(opts);
       const code = openFailures.shift();
       if (code !== undefined) {
@@ -2411,7 +2346,7 @@ class MemoryTtsStream {
     this.#assertOpen();
     this.#deadline.check();
     if (typeof text !== "string") {
-      invalid4("text");
+      invalid5("text");
     }
     if (text.length === 0) {
       return;
@@ -2630,7 +2565,7 @@ function createMemoryTts(options = {}) {
   let open = 0;
   return {
     open(request) {
-      const checked = checkOpenRequest(request);
+      const checked = checkOpenRequest2(request);
       open += 1;
       let released = false;
       return new MemoryTtsStream({
@@ -2683,11 +2618,11 @@ function createMemoryTts(options = {}) {
     speak(speech) {
       const scripted = Array.isArray(speech) ? { chunks: speech } : speech;
       if (typeof scripted !== "object" || scripted === null || !Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
-        invalid4("speech chunks");
+        invalid5("speech chunks");
       }
       const failAfter = scripted.failAfterChunks;
       if (failAfter !== undefined && (!Number.isInteger(failAfter) || failAfter < 1 || failAfter > scripted.chunks.length)) {
-        invalid4("speech failAfterChunks");
+        invalid5("speech failAfterChunks");
       }
       scripts.push({ ...scripted });
     },

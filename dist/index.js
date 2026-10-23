@@ -64,6 +64,10 @@ import {
   MAX_WORDS_PER_TURN2,
   DEFAULT_RECONNECT_POLICY2,
   reconnectDelayMs2,
+  invalid4,
+  checkOpenRequest,
+  resolveTimeout2,
+  checkChunk,
   TtsAudioChunk2,
   DEFAULT_TTS_TIMEOUT_MS2,
   MAX_TTS_TIMEOUT_MS2,
@@ -77,8 +81,8 @@ import {
   startTtsDeadline,
   watchFirstChunk,
   withTtsRetry,
-  invalid4,
-  checkOpenRequest,
+  invalid5,
+  checkOpenRequest2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -88,7 +92,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-77fb749y.js";
+} from "./shared/chunk-rxcekq2t.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -98,7 +102,7 @@ import {
   defineMessage2,
   INVALID_REASONS2,
   createMessageRegistry2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   AUDIT_ERROR_CODES2,
   AuditError2,
@@ -174,7 +178,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-3n6tvg2s.js";
+} from "./shared/chunk-c3b5jbxv.js";
 import {
   DEFAULT_LLM_TIMEOUT_MS2,
   MAX_LLM_TIMEOUT_MS2,
@@ -4127,9 +4131,703 @@ function createErrorReporter(options) {
   }
   return reporter;
 }
+// src/streaming-transcribe/assemblyai.ts
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+var SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
+var REJECTED_CLOSE_CODES = [1008, 4001, 4002, 4003];
+var MAX_MESSAGE_CHARS = 1048576;
+var MAX_TRANSCRIPT_CHARS = 1e5;
+var MIN_FRAME_MS = 50;
+var MAX_FRAME_MS = 500;
+var QUICK_DEATH_MS = 1000;
+var MAX_QUICK_DEATHS = 5;
+var MAX_SOCKET_BACKLOG_BYTES = 1048576;
+var DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS = 5000;
+var DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS = 3000;
+var bunAssemblyAiSocket = (url, headers) => {
+  const ws = new WebSocket(url, { headers: { ...headers } });
+  return {
+    send(data) {
+      if (ws.bufferedAmount > MAX_SOCKET_BACKLOG_BYTES) {
+        throw new Error("The connection is not taking audio fast enough");
+      }
+      ws.send(data);
+    },
+    close: (code) => ws.close(code),
+    attach(h) {
+      ws.onopen = () => h.open();
+      ws.onmessage = (event) => h.message(event.data);
+      ws.onerror = () => h.error();
+      ws.onclose = (event) => h.close(event.code);
+    }
+  };
+};
+
+class Link {
+  sessionId = "";
+  down = false;
+  socket;
+  constructor(socket) {
+    this.socket = socket;
+  }
+  send(data) {
+    this.socket.send(data);
+  }
+  shutdown() {
+    if (this.down) {
+      return;
+    }
+    this.down = true;
+    try {
+      this.socket.close(1000);
+    } catch {}
+  }
+}
+function failure(code, message, details) {
+  return new StreamingTranscribeError2(code, message, details === undefined ? {} : { details });
+}
+function closeError(code) {
+  return REJECTED_CLOSE_CODES.includes(code) ? failure(STREAMING_TRANSCRIBE_ERROR_CODES2.rejected, "The vendor refused the stream", {
+    closeCode: code
+  }) : failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection closed", {
+    closeCode: code
+  });
+}
+function parseJson5(data) {
+  if (typeof data !== "string" || data.length > MAX_MESSAGE_CHARS) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(data);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+}
+function connectLink(config, meta, url, timeoutMs, signal, events) {
+  return new Promise((resolve, reject) => {
+    let link;
+    try {
+      link = new Link(config.socket(url, { Authorization: config.apiKey }, meta));
+    } catch {
+      reject(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection failed"));
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection timed out", {
+        phase: "connect",
+        timeoutMs
+      }));
+    }, timeoutMs);
+    const onAbort = () => finish(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The connection was abandoned"));
+    function finish(error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      if (error === undefined) {
+        resolve(link);
+      } else {
+        link.shutdown();
+        reject(error);
+      }
+    }
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    link.socket.attach({
+      open: () => {
+        return;
+      },
+      message: (data) => {
+        if (link.down) {
+          return;
+        }
+        if (settled) {
+          events.message(link, data);
+          return;
+        }
+        const m = parseJson5(data);
+        if (m?.type === "Begin") {
+          if (typeof m.id !== "string" || !SESSION_ID.test(m.id)) {
+            finish(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.badResponse, "The vendor sent a session this adapter cannot use"));
+            return;
+          }
+          link.sessionId = m.id;
+          finish();
+        } else if (typeof m?.error === "string") {
+          finish(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor sent an error"));
+        }
+      },
+      error: () => {
+        if (!settled) {
+          finish(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection failed"));
+        } else if (!link.down) {
+          link.shutdown();
+          events.lost(link, 1006);
+        }
+      },
+      close: (code) => {
+        if (!settled) {
+          finish(closeError(code));
+        } else if (!link.down) {
+          link.down = true;
+          events.lost(link, code);
+        }
+      }
+    });
+  });
+}
+function badResponse3() {
+  return failure(STREAMING_TRANSCRIBE_ERROR_CODES2.badResponse, "The vendor sent a message this adapter cannot read");
+}
+function wholeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function parseTurn(m) {
+  if (!(typeof m.turn_order === "number" && Number.isInteger(m.turn_order) && m.turn_order >= 0) || typeof m.transcript !== "string" || m.transcript.length > MAX_TRANSCRIPT_CHARS || typeof m.end_of_turn !== "boolean" || !Array.isArray(m.words) || !(m.turn_is_formatted === undefined || typeof m.turn_is_formatted === "boolean")) {
+    return;
+  }
+  const words = [];
+  for (const raw of m.words.slice(0, MAX_WORDS_PER_TURN2)) {
+    if (typeof raw !== "object" || raw === null) {
+      return;
+    }
+    const w = raw;
+    if (typeof w.text !== "string" || !wholeNumber(w.start) || !wholeNumber(w.end)) {
+      return;
+    }
+    const confidence = typeof w.confidence === "number" && w.confidence >= 0 && w.confidence <= 1 ? w.confidence : undefined;
+    words.push({ text: w.text, start: w.start, end: w.end, confidence });
+  }
+  return {
+    order: m.turn_order,
+    text: m.transcript,
+    endOfTurn: m.end_of_turn,
+    formatted: m.turn_is_formatted === true,
+    words
+  };
+}
+function concat(a, b) {
+  if (a.length === 0) {
+    return b.slice();
+  }
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+}
+
+class AssemblyAiStream {
+  streamId;
+  #host;
+  #abort = new AbortController;
+  events;
+  #state = "open";
+  #link;
+  #connectedAt = 0;
+  #quickDeaths = 0;
+  #pending = new Uint8Array(0);
+  #replay = [];
+  #replayBytes = 0;
+  #timelineBytes = 0;
+  #offsetMs = 0;
+  #turnBase = 0;
+  #lastTurnNumber = -1;
+  #endedOrder = -1;
+  #sequence = 0;
+  #finished = false;
+  #settle;
+  #closing;
+  constructor(host, streamId) {
+    this.#host = host;
+    this.streamId = streamId;
+    this.events = {
+      message: (link, data) => this.#onMessage(link, data),
+      lost: (link, code) => this.#onLost(link, code)
+    };
+  }
+  adopt(link) {
+    this.#link = link;
+    this.#connectedAt = performance.now();
+  }
+  sendAudio(chunk) {
+    const bytes = checkChunk(chunk);
+    if (this.#state === "closing" || this.#state === "closed" || this.#state === "failed") {
+      throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.closed, "The stream has ended");
+    }
+    const { bytesPerMs, frameBytes } = this.#host;
+    const minBytes = Math.ceil(MIN_FRAME_MS * bytesPerMs / frameBytes) * frameBytes;
+    const maxBytes = Math.floor(MAX_FRAME_MS * bytesPerMs / frameBytes) * frameBytes;
+    this.#pending = concat(this.#pending, bytes);
+    while (this.#pending.length >= minBytes) {
+      const take = Math.min(this.#pending.length - this.#pending.length % frameBytes, maxBytes);
+      const frame = this.#pending.slice(0, take);
+      this.#pending = this.#pending.slice(take);
+      this.#dispatch(frame);
+      if (this.#finished) {
+        return;
+      }
+    }
+  }
+  close() {
+    if (this.#closing !== undefined) {
+      return this.#closing;
+    }
+    if (this.#state === "closed" || this.#state === "failed") {
+      return Promise.resolve();
+    }
+    this.#closing = this.#doClose();
+    return this.#closing;
+  }
+  toJSON() {
+    return { streamId: this.streamId, state: this.#state };
+  }
+  toString() {
+    return `AssemblyAiStream(${this.streamId}, ${this.#state})`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+  async#doClose() {
+    if (this.#state === "reconnecting") {
+      this.#end("closed");
+      return;
+    }
+    this.#state = "closing";
+    const link = this.#link;
+    if (link !== undefined && !link.down) {
+      const settled = new Promise((resolve) => {
+        this.#settle = resolve;
+      });
+      let timer;
+      const timedOut = new Promise((resolve) => {
+        timer = setTimeout(resolve, this.#host.config.closeTimeoutMs);
+      });
+      try {
+        this.#flushTail(link);
+        link.send(JSON.stringify({ type: "ForceEndpoint" }));
+        link.send(JSON.stringify({ type: "Terminate" }));
+        await Promise.race([settled, timedOut]);
+      } catch {} finally {
+        clearTimeout(timer);
+      }
+    }
+    this.#end("closed");
+  }
+  #flushTail(link) {
+    if (this.#pending.length === 0) {
+      return;
+    }
+    const { bytesPerMs, frameBytes, request } = this.#host;
+    const minBytes = Math.ceil(MIN_FRAME_MS * bytesPerMs / frameBytes) * frameBytes;
+    const frame = new Uint8Array(Math.max(minBytes, this.#pending.length));
+    frame.fill(request.encoding === "pcm_mulaw" ? 255 : 0);
+    frame.set(this.#pending);
+    this.#pending = new Uint8Array(0);
+    this.#timelineBytes += frame.length;
+    link.send(frame);
+  }
+  #emit(event) {
+    if (this.#finished) {
+      return;
+    }
+    if (event.type === "closed" || event.type === "failed") {
+      this.#finished = true;
+    }
+    try {
+      this.#host.request.onEvent(event);
+    } catch {
+      this.#host.config.logger?.warn("A stream listener threw", { streamId: this.streamId });
+    }
+  }
+  #end(state, error, attempts = 0) {
+    if (this.#finished) {
+      return;
+    }
+    this.#state = state;
+    this.#abort.abort();
+    this.#link?.shutdown();
+    this.#pending = new Uint8Array(0);
+    this.#replay = [];
+    this.#replayBytes = 0;
+    this.#settle?.();
+    this.#host.released();
+    if (state === "closed" || error === undefined) {
+      this.#emit({ type: "closed" });
+      return;
+    }
+    this.#emit({ type: "failed", code: error.code, attempts });
+    this.#host.config.logger?.error("A stream failed", {
+      streamId: this.streamId,
+      track: this.#host.meta.track,
+      code: error.code,
+      attempts
+    });
+    this.#host.report(error);
+  }
+  #fail(error, attempts) {
+    this.#end("failed", error, attempts);
+  }
+  #dispatch(frame) {
+    this.#timelineBytes += frame.length;
+    const link = this.#link;
+    if (this.#state === "open" && link !== undefined && !link.down) {
+      try {
+        link.send(frame);
+        return;
+      } catch {}
+      this.#keep(frame);
+      link.shutdown();
+      this.#onLost(link, 1006);
+      return;
+    }
+    this.#keep(frame);
+  }
+  #keep(frame) {
+    this.#replay.push(frame.slice());
+    this.#replayBytes += frame.length;
+    while (this.#replayBytes > MAX_REPLAY_AUDIO_BYTES2 && this.#replay.length > 0) {
+      this.#replayBytes -= this.#replay.shift()?.length ?? 0;
+    }
+  }
+  #onMessage(link, data) {
+    if (link !== this.#link || this.#finished) {
+      return;
+    }
+    const m = parseJson5(data);
+    if (m === undefined) {
+      this.#fail(badResponse3(), 0);
+      return;
+    }
+    switch (m.type) {
+      case "Turn": {
+        const turn = parseTurn(m);
+        if (turn === undefined) {
+          this.#fail(badResponse3(), 0);
+          return;
+        }
+        this.#onTurn(turn);
+        return;
+      }
+      case "Termination":
+        this.#settle?.();
+        return;
+      default:
+        if (typeof m.error === "string") {
+          link.shutdown();
+          this.#onLost(link, 1011);
+        }
+    }
+  }
+  #onTurn(turn) {
+    const { formatTurns } = this.#host.config;
+    if (turn.order <= this.#endedOrder) {
+      return;
+    }
+    if (turn.endOfTurn && formatTurns && !turn.formatted) {
+      return;
+    }
+    const number = this.#turnBase + turn.order;
+    this.#lastTurnNumber = Math.max(this.#lastTurnNumber, number);
+    if (turn.endOfTurn) {
+      this.#endedOrder = turn.order;
+    }
+    if (turn.text.length === 0) {
+      return;
+    }
+    const offset = this.#offsetMs;
+    const words = turn.words.map((w) => {
+      const startMs = Math.round(w.start) + offset;
+      return {
+        text: w.text,
+        startMs,
+        endMs: Math.max(startMs, Math.round(w.end) + offset),
+        ...w.confidence === undefined ? {} : { confidence: w.confidence }
+      };
+    });
+    this.#sequence += 1;
+    const event = {
+      type: "turn",
+      turnId: `turn-${number}`,
+      sequence: this.#sequence,
+      isFinal: turn.endOfTurn,
+      endOfTurn: turn.endOfTurn,
+      text: turn.text,
+      words
+    };
+    this.#emit(event);
+  }
+  #onLost(link, code) {
+    if (link !== this.#link) {
+      return;
+    }
+    if (this.#state === "closing") {
+      this.#settle?.();
+      return;
+    }
+    if (this.#state !== "open") {
+      return;
+    }
+    if (REJECTED_CLOSE_CODES.includes(code)) {
+      this.#fail(closeError(code), 0);
+      return;
+    }
+    this.#quickDeaths = performance.now() - this.#connectedAt < QUICK_DEATH_MS ? this.#quickDeaths + 1 : 0;
+    if (this.#quickDeaths >= MAX_QUICK_DEATHS) {
+      this.#fail(failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection keeps closing as soon as it opens"), 0);
+      return;
+    }
+    this.#reconnect();
+  }
+  async#reconnect() {
+    const host = this.#host;
+    const { policy, config } = host;
+    this.#state = "reconnecting";
+    this.#link?.shutdown();
+    let last;
+    for (let attempt = 1;attempt <= policy.maxAttempts; attempt++) {
+      const delayMs = reconnectDelayMs2(attempt, policy, config.random);
+      this.#emit({ type: "reconnecting", attempt, delayMs });
+      config.logger?.warn("A stream is reconnecting", {
+        streamId: this.streamId,
+        attempt,
+        delayMs
+      });
+      await config.sleep(delayMs, this.#abort.signal);
+      if (this.#state !== "reconnecting") {
+        return;
+      }
+      let link;
+      try {
+        link = await connectLink(config, host.meta, host.url, config.connectTimeoutMs, this.#abort.signal, this.events);
+      } catch (error) {
+        if (this.#state !== "reconnecting") {
+          return;
+        }
+        last = error instanceof StreamingTranscribeError2 ? error : badResponse3();
+        if (last.code === STREAMING_TRANSCRIBE_ERROR_CODES2.rejected || last.code === STREAMING_TRANSCRIBE_ERROR_CODES2.badResponse) {
+          this.#fail(last, attempt);
+          return;
+        }
+        continue;
+      }
+      if (this.#state !== "reconnecting") {
+        link.shutdown();
+        return;
+      }
+      this.#offsetMs = Math.floor((this.#timelineBytes - this.#replayBytes) / host.bytesPerMs);
+      this.#turnBase = this.#lastTurnNumber + 1;
+      this.#endedOrder = -1;
+      this.#link = link;
+      this.#connectedAt = performance.now();
+      this.#state = "open";
+      this.#emit({ type: "reconnected", attempts: attempt });
+      this.#replayAudio(link);
+      return;
+    }
+    this.#fail(last ?? failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The stream could not be restored"), policy.maxAttempts);
+  }
+  #replayAudio(link) {
+    while (this.#replay.length > 0 && this.#state === "open" && !link.down) {
+      const frame = this.#replay[0];
+      if (frame === undefined) {
+        return;
+      }
+      try {
+        link.send(frame);
+      } catch {
+        link.shutdown();
+        this.#onLost(link, 1006);
+        return;
+      }
+      this.#replay.shift();
+      this.#replayBytes -= frame.length;
+    }
+  }
+}
+function checkNumber2(value, what, min, max, whole) {
+  if (value === undefined) {
+    return;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max || whole && !Number.isInteger(value)) {
+    invalid4(what);
+  }
+}
+function isSafeBaseUrl(base) {
+  let url;
+  try {
+    url = new URL(base);
+  } catch {
+    return false;
+  }
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return false;
+  }
+  if (url.protocol === "wss:") {
+    return true;
+  }
+  return url.protocol === "ws:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+}
+var HOSTS = {
+  us: "wss://streaming.assemblyai.com",
+  eu: "wss://streaming.eu.assemblyai.com"
+};
+function createAssemblyAiStreamingTranscribe(options) {
+  if (typeof options.apiKey !== "string" || options.apiKey.length === 0 || /[\u0000-\u001f\u007f\s]/.test(options.apiKey)) {
+    invalid4("apiKey");
+  }
+  const region = options.region ?? "us";
+  if (!Object.hasOwn(HOSTS, region)) {
+    invalid4("region");
+  }
+  const base = options.baseUrl ?? HOSTS[region];
+  if (!isSafeBaseUrl(base)) {
+    invalid4("baseUrl");
+  }
+  const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS;
+  const closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS;
+  checkNumber2(connectTimeoutMs, "connectTimeoutMs", 1, 30000, true);
+  checkNumber2(closeTimeoutMs, "closeTimeoutMs", 1, 30000, true);
+  checkNumber2(options.endOfTurnConfidenceThreshold, "endOfTurnConfidenceThreshold", 0, 1, false);
+  checkNumber2(options.minEndOfTurnSilenceMs, "minEndOfTurnSilenceMs", 0, 60000, true);
+  checkNumber2(options.maxTurnSilenceMs, "maxTurnSilenceMs", 0, 60000, true);
+  if (options.formatTurns !== undefined && typeof options.formatTurns !== "boolean") {
+    invalid4("formatTurns");
+  }
+  const formatTurns = options.formatTurns ?? false;
+  const tuning = {};
+  if (options.endOfTurnConfidenceThreshold !== undefined) {
+    tuning.end_of_turn_confidence_threshold = String(options.endOfTurnConfidenceThreshold);
+  }
+  if (options.minEndOfTurnSilenceMs !== undefined) {
+    tuning.min_end_of_turn_silence_when_confident = String(options.minEndOfTurnSilenceMs);
+  }
+  if (options.maxTurnSilenceMs !== undefined) {
+    tuning.max_turn_silence = String(options.maxTurnSilenceMs);
+  }
+  const config = {
+    apiKey: options.apiKey,
+    base: base.replace(/\/+$/, ""),
+    formatTurns,
+    query: tuning,
+    connectTimeoutMs,
+    closeTimeoutMs,
+    socket: options.socket ?? bunAssemblyAiSocket,
+    sleep: options.sleep ?? systemSleep2,
+    random: options.random ?? Math.random,
+    reporter: options.reporter,
+    logger: options.logger
+  };
+  const live = new Set;
+  function urlFor(request) {
+    const query = new URLSearchParams({
+      sample_rate: String(request.sampleRate),
+      encoding: request.encoding,
+      format_turns: String(formatTurns),
+      ...config.query
+    });
+    if (request.language !== undefined && request.language.split("-")[0] !== "en") {
+      query.set("speech_model", "universal-streaming-multilingual");
+    }
+    return `${config.base}/v3/ws?${query.toString()}`;
+  }
+  function report(request, error) {
+    if (error.code !== STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable && error.code !== STREAMING_TRANSCRIBE_ERROR_CODES2.rejected && error.code !== STREAMING_TRANSCRIBE_ERROR_CODES2.badResponse) {
+      return;
+    }
+    try {
+      config.reporter?.capture(error, {
+        organizationId: request.organizationId,
+        tags: { feature: "streaming-transcribe", track: request.track }
+      });
+    } catch {}
+  }
+  return {
+    async open(request, opts) {
+      const policy = checkOpenRequest(request);
+      const timeoutMs = resolveTimeout2(opts);
+      const key = `${request.organizationId}|${request.callId}|${request.track}`;
+      if (live.has(key)) {
+        throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.conflict, "A stream for this Call and track is already open");
+      }
+      live.add(key);
+      const meta = {
+        organizationId: request.organizationId,
+        callId: request.callId,
+        track: request.track
+      };
+      const host = {
+        config,
+        request,
+        policy,
+        url: urlFor(request),
+        meta,
+        bytesPerMs: request.sampleRate * (request.encoding === "pcm_s16le" ? 2 : 1) / 1000,
+        frameBytes: request.encoding === "pcm_s16le" ? 2 : 1,
+        released: () => {
+          live.delete(key);
+        },
+        report: (error) => report(request, error)
+      };
+      let stream;
+      const events = {
+        message: (link, data) => stream?.events.message(link, data),
+        lost: (link, code) => stream?.events.lost(link, code)
+      };
+      const deadline = performance.now() + timeoutMs;
+      const abort = new AbortController;
+      try {
+        let link;
+        let last;
+        for (let attempt = 0;attempt <= policy.maxAttempts && link === undefined; attempt++) {
+          if (attempt > 0) {
+            const delayMs = reconnectDelayMs2(attempt, policy, config.random);
+            if (performance.now() + delayMs >= deadline) {
+              break;
+            }
+            await config.sleep(delayMs, abort.signal);
+          }
+          const remaining = deadline - performance.now();
+          if (remaining <= 0) {
+            break;
+          }
+          try {
+            link = await connectLink(config, meta, host.url, Math.min(config.connectTimeoutMs, remaining), abort.signal, events);
+          } catch (error) {
+            last = error instanceof StreamingTranscribeError2 ? error : badResponse3();
+            if (last.code !== STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable) {
+              throw last;
+            }
+          }
+        }
+        if (link === undefined) {
+          throw last ?? failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor did not answer in time");
+        }
+        stream = new AssemblyAiStream(host, link.sessionId);
+        stream.adopt(link);
+        return stream;
+      } catch (error) {
+        abort.abort();
+        live.delete(key);
+        const failed = error instanceof StreamingTranscribeError2 ? error : failure(STREAMING_TRANSCRIBE_ERROR_CODES2.unavailable, "The vendor connection failed");
+        report(request, failed);
+        throw failed;
+      }
+    },
+    openStreams() {
+      return live.size;
+    }
+  };
+}
 // src/tts/cartesia.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+var INSPECT2 = Symbol.for("nodejs.util.inspect.custom");
 var UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 var VENDOR_CODE = /^[a-z0-9_]{1,64}$/;
 var MAX_BACKLOG_EVENTS = 8192;
@@ -4350,7 +5048,7 @@ class CartesiaStream {
     this.#assertOpen();
     this.#deadline.check();
     if (typeof text !== "string") {
-      invalid4("text");
+      invalid5("text");
     }
     if (text.length === 0) {
       return;
@@ -4417,7 +5115,7 @@ class CartesiaStream {
   toString() {
     return `CartesiaStream(${this.#state}, ${this.#chars} chars)`;
   }
-  [INSPECT]() {
+  [INSPECT2]() {
     return this.toString();
   }
   #release() {
@@ -4619,24 +5317,24 @@ class CartesiaStream {
 }
 function createCartesiaTts(options) {
   if (typeof options.apiKey !== "string" || options.apiKey.length === 0) {
-    invalid4("apiKey");
+    invalid5("apiKey");
   }
   const maxBufferDelayMs = options.maxBufferDelayMs ?? 100;
   const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS;
   if (!Number.isInteger(maxBufferDelayMs) || maxBufferDelayMs < 0 || maxBufferDelayMs > 5000) {
-    invalid4("maxBufferDelayMs");
+    invalid5("maxBufferDelayMs");
   }
   if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 30000) {
-    invalid4("connectTimeoutMs");
+    invalid5("connectTimeoutMs");
   }
   const base = options.baseUrl ?? "wss://api.cartesia.ai";
-  if (!isSafeBaseUrl(base)) {
-    invalid4("baseUrl");
+  if (!isSafeBaseUrl2(base)) {
+    invalid5("baseUrl");
   }
   const voices = options.voices ?? {};
   for (const id of Object.values(voices)) {
     if (typeof id !== "string" || id.length === 0 || id.length > 128) {
-      invalid4("voices");
+      invalid5("voices");
     }
   }
   const config = {
@@ -4654,11 +5352,11 @@ function createCartesiaTts(options) {
   let open = 0;
   return {
     open(request) {
-      const checked = checkOpenRequest(request);
+      const checked = checkOpenRequest2(request);
       const named = Object.hasOwn(voices, request.voice) ? voices[request.voice] : undefined;
       const voiceId = named ?? (UUID.test(request.voice) ? request.voice : undefined);
       if (voiceId === undefined) {
-        invalid4("voice");
+        invalid5("voice");
       }
       open += 1;
       let released = false;
@@ -4692,7 +5390,7 @@ function createCartesiaTts(options) {
     }
   };
 }
-function isSafeBaseUrl(base) {
+function isSafeBaseUrl2(base) {
   let url;
   try {
     url = new URL(base);
@@ -4724,6 +5422,8 @@ export {
   CONTACT_UNAVAILABLE2 as CONTACT_UNAVAILABLE,
   CalendarConnection2 as CalendarConnection,
   CalendarError2 as CalendarError,
+  DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS,
+  DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS,
   DEFAULT_CALENDAR_RETRY_POLICY2 as DEFAULT_CALENDAR_RETRY_POLICY,
   DEFAULT_CALENDAR_TIMEOUT_MS2 as DEFAULT_CALENDAR_TIMEOUT_MS,
   DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS,
@@ -4861,10 +5561,12 @@ export {
   auditMetadataSchema2 as auditMetadataSchema,
   auditRecordedMessage,
   auditSubjectSchema2 as auditSubjectSchema,
+  bunAssemblyAiSocket,
   bunCartesiaSocket,
   calendarRetryDelayMs2 as calendarRetryDelayMs,
   checkTranscriptionResult2 as checkTranscriptionResult,
   classifyMessageIntent2 as classifyMessageIntent,
+  createAssemblyAiStreamingTranscribe,
   createAuthMiddleware,
   createCartesiaTts,
   createErrorReporter,

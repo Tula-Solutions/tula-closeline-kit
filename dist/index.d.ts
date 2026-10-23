@@ -2822,34 +2822,7 @@ declare class StorageError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-/** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
-declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
-	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
-	readonly invalidRequest: "streaming_transcribe.invalid_request";
-	/** A stream for this Call and track is already open. */
-	readonly conflict: "streaming_transcribe.conflict";
-	/** The stream has closed or failed, so audio can no longer be sent to it. */
-	readonly closed: "streaming_transcribe.closed";
-	/** The vendor refused the stream for a reason a retry cannot fix (credentials, quota, terms). */
-	readonly rejected: "streaming_transcribe.rejected";
-	/** The vendor could not be reached, or the stream could not be restored, after the bounded retries. */
-	readonly unavailable: "streaming_transcribe.unavailable";
-	/** The vendor sent something this adapter cannot use. */
-	readonly badResponse: "streaming_transcribe.bad_response";
-};
-/** One of {@link STREAMING_TRANSCRIBE_ERROR_CODES}'s values. */
-type StreamingTranscribeErrorCode = (typeof STREAMING_TRANSCRIBE_ERROR_CODES)[keyof typeof STREAMING_TRANSCRIBE_ERROR_CODES];
-/**
-* What a streaming transcribe adapter throws, and what it reports when a stream fails for good.
-* Its message and details never hold audio, transcript text, a credential or a vendor URL.
-*/
-declare class StreamingTranscribeError extends AppError {
-	readonly code: StreamingTranscribeErrorCode;
-	constructor(code: StreamingTranscribeErrorCode, message: string, options?: {
-		cause?: unknown;
-		details?: Record<string, unknown>;
-	});
-}
+import { CallId as CallId3, OrganizationId as OrganizationId9 } from "tula-closeline-contract";
 import { CallId as CallId2, OrganizationId as OrganizationId8 } from "tula-closeline-contract";
 /** The default time opening a stream may take, in milliseconds. */
 declare const DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS = 1e4;
@@ -3025,6 +2998,122 @@ declare const DEFAULT_RECONNECT_POLICY: ResolvedReconnectPolicy;
 * maximum, then scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
 */
 declare function reconnectDelayMs(attempt: number, policy: ResolvedReconnectPolicy, random?: () => number): number;
+/** The default time to open one connection, in milliseconds. */
+declare const DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS = 5e3;
+/** The default time `close` waits for the vendor to settle the last turn, in milliseconds. */
+declare const DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS = 3e3;
+/** Which AssemblyAI endpoint serves the audio: the US one, or the one that keeps it in the EU. */
+type AssemblyAiRegion = "us" | "eu";
+/** Who a socket is for. Used to route a test fake; never sent to the vendor. */
+interface AssemblyAiStreamMeta {
+	/** The Organization. */
+	organizationId: OrganizationId9;
+	/** The Call. */
+	callId: CallId3;
+	/** The track. */
+	track: StreamTrack;
+}
+/** The callbacks an {@link AssemblyAiSocket} reports through. */
+interface AssemblyAiSocketHandlers {
+	/** The connection is open. */
+	open(): void;
+	/** A message arrived; `data` is a string for a text frame. */
+	message(data: unknown): void;
+	/** The connection failed (no detail is kept: it may name a URL). */
+	error(): void;
+	/** The connection closed with this code. */
+	close(code: number): void;
+}
+/** The part of a WebSocket the adapter uses, so tests can drive a fake vendor. */
+interface AssemblyAiSocket {
+	/** Sends one text or binary frame; throws when the connection cannot take it. */
+	send(data: string | Uint8Array): void;
+	/** Closes the connection. */
+	close(code?: number): void;
+	/** Registers the handlers once, before any event. */
+	attach(handlers: AssemblyAiSocketHandlers): void;
+}
+/** Opens a WebSocket to `url` with `headers`; `meta` says whom it is for and is never sent. */
+type AssemblyAiSocketFactory = (url: string, headers: Readonly<Record<string, string>>, meta: AssemblyAiStreamMeta) => AssemblyAiSocket;
+/** The real factory, on the runtime's WebSocket (Bun accepts request headers). */
+declare const bunAssemblyAiSocket: AssemblyAiSocketFactory;
+/** Options for {@link createAssemblyAiStreamingTranscribe}. */
+interface AssemblyAiStreamingTranscribeOptions {
+	/** The AssemblyAI API key. Sent as the `Authorization` header only; never logged, reported or put in an error. */
+	apiKey: string;
+	/** `us` (default) or `eu`, the endpoint that processes the audio in the EU. */
+	region?: AssemblyAiRegion;
+	/** The WebSocket base URL, replacing the region's; `wss`, or `ws` to loopback, with no credentials or query. */
+	baseUrl?: string;
+	/** True to have AssemblyAI punctuate and capitalise turns; the final then arrives with the formatted text, a little later. Default false. */
+	formatTurns?: boolean;
+	/** How sure AssemblyAI must be that the speaker is done before it ends a turn, 0 to 1; the vendor's default when absent. */
+	endOfTurnConfidenceThreshold?: number;
+	/** The silence that ends a turn once the vendor is confident, 0 to 60000 ms; the vendor's default when absent. */
+	minEndOfTurnSilenceMs?: number;
+	/** The silence that ends a turn whatever the confidence, 0 to 60000 ms; the vendor's default when absent. */
+	maxTurnSilenceMs?: number;
+	/** The most time to open one connection, 1 to 30000 ms; default {@link DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS}. */
+	connectTimeoutMs?: number;
+	/** The most time `close` waits for the vendor to settle, 1 to 30000 ms; default {@link DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS}. */
+	closeTimeoutMs?: number;
+	/** Opens sockets; the real WebSocket by default. */
+	socket?: AssemblyAiSocketFactory;
+	/** Receives the errors that mean the vendor failed (metadata only); nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where reconnects and listener failures are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** Pauses between reconnect attempts; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/** A {@link StreamingTranscribePort} on AssemblyAI that also says how many streams are live. */
+interface AssemblyAiStreamingTranscribe extends StreamingTranscribePort {
+	/** How many streams are open or reconnecting. */
+	openStreams(): number;
+}
+/**
+* Builds a {@link StreamingTranscribePort} on AssemblyAI's streaming speech-to-text (v3) over
+* its WebSocket API, with the EU endpoint selectable. One connection per stream; audio is sent as
+* binary frames of 50 to 500 ms (small chunks are joined, big ones split), and a `Turn` message
+* becomes a turn event, the one with `end_of_turn` the final. Opening and each reconnect are
+* bounded by a timeout and a bounded, jittered retry; a dropped connection is retried with the
+* request's policy, replays the audio sent while it was down (up to the port's bound), and
+* shifts the new session's word times and turn numbers so they carry on. A refused credential
+* is `streaming_transcribe.rejected` and is never retried. The API key (sent only as the
+* `Authorization` header), the audio and the transcript never reach a log, a report, an error
+* or a printed form.
+*/
+declare function createAssemblyAiStreamingTranscribe(options: AssemblyAiStreamingTranscribeOptions): AssemblyAiStreamingTranscribe;
+/** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
+declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
+	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
+	readonly invalidRequest: "streaming_transcribe.invalid_request";
+	/** A stream for this Call and track is already open. */
+	readonly conflict: "streaming_transcribe.conflict";
+	/** The stream has closed or failed, so audio can no longer be sent to it. */
+	readonly closed: "streaming_transcribe.closed";
+	/** The vendor refused the stream for a reason a retry cannot fix (credentials, quota, terms). */
+	readonly rejected: "streaming_transcribe.rejected";
+	/** The vendor could not be reached, or the stream could not be restored, after the bounded retries. */
+	readonly unavailable: "streaming_transcribe.unavailable";
+	/** The vendor sent something this adapter cannot use. */
+	readonly badResponse: "streaming_transcribe.bad_response";
+};
+/** One of {@link STREAMING_TRANSCRIBE_ERROR_CODES}'s values. */
+type StreamingTranscribeErrorCode = (typeof STREAMING_TRANSCRIBE_ERROR_CODES)[keyof typeof STREAMING_TRANSCRIBE_ERROR_CODES];
+/**
+* What a streaming transcribe adapter throws, and what it reports when a stream fails for good.
+* Its message and details never hold audio, transcript text, a credential or a vendor URL.
+*/
+declare class StreamingTranscribeError extends AppError {
+	readonly code: StreamingTranscribeErrorCode;
+	constructor(code: StreamingTranscribeErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
 /** The `area.reason` codes the transcriber port and adapters throw. */
 declare const TRANSCRIBER_ERROR_CODES: {
 	/** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
@@ -3377,7 +3466,7 @@ declare class TtsAudioChunk {
 	/** A readable label without the audio. */
 	toString(): string;
 }
-import { OrganizationId as OrganizationId9 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId10 } from "tula-closeline-contract";
 /** The default overall deadline of one stream, from `open` to the last chunk, in milliseconds. */
 declare const DEFAULT_TTS_TIMEOUT_MS = 3e4;
 /** The longest overall deadline a caller may allow, in milliseconds. */
@@ -3420,7 +3509,7 @@ declare function ttsRetryDelayMs(retry: number, policy: ResolvedTtsRetryPolicy, 
 /** What opening a stream states: whose it is, the voice and format, and the limits that bound it. */
 interface TtsOpenRequest {
 	/** The Organization the stream is for; it scopes metering and error context. */
-	organizationId: OrganizationId9;
+	organizationId: OrganizationId10;
 	/** A stock voice style of the vendor, 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. Voice cloning is out of scope. */
 	voice: string;
 	/** How the audio is encoded: `pcm_mulaw` for telephony, `pcm_s16le` otherwise. */
@@ -3735,4 +3824,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { API_KEY_ACTOR, AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CARTESIA_API_VERSION, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, CartesiaSocket, CartesiaSocketFactory, CartesiaSocketHandlers, CartesiaTts, CartesiaTtsOptions, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS, DEFAULT_CARTESIA_MODEL, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, GOOGLE_CALENDAR_SCOPES, GoogleCalendarFetch, GoogleCalendarOptions, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, OUTLOOK_CALENDAR_SCOPES, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, OutlookCalendarFetch, OutlookCalendarOptions, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, ScopedAuthEnv, ScopedAuthVariables, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedApiKeyToken, VerifiedIdentity, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, apiKeyTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, bunCartesiaSocket, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createCartesiaTts, createErrorReporter, createFixedClock, createGoogleCalendar, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createOutlookCalendar, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isScopeGuard, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireScope, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
+export { API_KEY_ACTOR, AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AssemblyAiRegion, AssemblyAiSocket, AssemblyAiSocketFactory, AssemblyAiSocketHandlers, AssemblyAiStreamMeta, AssemblyAiStreamingTranscribe, AssemblyAiStreamingTranscribeOptions, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CARTESIA_API_VERSION, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, CartesiaSocket, CartesiaSocketFactory, CartesiaSocketHandlers, CartesiaTts, CartesiaTtsOptions, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_ASSEMBLYAI_CLOSE_TIMEOUT_MS, DEFAULT_ASSEMBLYAI_CONNECT_TIMEOUT_MS, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS, DEFAULT_CARTESIA_MODEL, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, GOOGLE_CALENDAR_SCOPES, GoogleCalendarFetch, GoogleCalendarOptions, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, OUTLOOK_CALENDAR_SCOPES, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, OutlookCalendarFetch, OutlookCalendarOptions, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, ScopedAuthEnv, ScopedAuthVariables, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedApiKeyToken, VerifiedIdentity, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, apiKeyTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, bunAssemblyAiSocket, bunCartesiaSocket, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAssemblyAiStreamingTranscribe, createAuthMiddleware, createCartesiaTts, createErrorReporter, createFixedClock, createGoogleCalendar, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createOutlookCalendar, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isScopeGuard, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireScope, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
