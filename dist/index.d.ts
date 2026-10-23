@@ -503,12 +503,13 @@ interface QueueAuditRecorderOptions {
 * queue call.
 */
 declare function createQueueAuditRecorder(options: QueueAuditRecorderOptions): AuditRecorder;
-import { OrganizationId, Region, Role, UserId } from "tula-closeline-contract";
+import { ApiKeyId, ApiKeyScope, OrganizationId, Region, Role, UserId } from "tula-closeline-contract";
 import { z as z3 } from "zod";
 /** The longest access token, in characters, that verification will look at. */
 declare const MAX_TOKEN_LENGTH = 4096;
-/** The claims every Closeline access token carries, besides the registered `iss`, `aud`, `exp`. */
+/** The claims of a member's access token, besides the registered `iss`, `aud`, `exp`. It has no `act`. */
 declare const accessTokenClaimsSchema: z3.ZodObject<{
+	act: z3.ZodOptional<z3.ZodUndefined>;
 	sub: z3.core.$ZodBranded<z3.ZodString, "usr", "out">;
 	org: z3.core.$ZodBranded<z3.ZodString, "org", "out">;
 	role: z3.ZodEnum<{
@@ -524,8 +525,43 @@ declare const accessTokenClaimsSchema: z3.ZodObject<{
 	iat: z3.ZodNumber;
 	exp: z3.ZodNumber;
 }, z3.core.$strip>;
-/** The identity a verified access token proves. */
+/** The `act` claim of a token minted for an API key. */
+declare const API_KEY_ACTOR = "api_key";
+/** The claims of an API key's access token: no `role`, and a closed, non-empty list of scopes. */
+declare const apiKeyTokenClaimsSchema: z3.ZodObject<{
+	act: z3.ZodLiteral<"api_key">;
+	sub: z3.core.$ZodBranded<z3.ZodString, "akey", "out">;
+	org: z3.core.$ZodBranded<z3.ZodString, "org", "out">;
+	role: z3.ZodOptional<z3.ZodUndefined>;
+	region: z3.ZodEnum<{
+		eu: "eu";
+		us: "us";
+	}>;
+	scp: z3.ZodArray<z3.ZodEnum<{
+		"bookings:read": "bookings:read";
+		"bookings:write": "bookings:write";
+		"calls:read": "calls:read";
+		"calls:write": "calls:write";
+		"campaigns:read": "campaigns:read";
+		"campaigns:write": "campaigns:write";
+		"consent:read": "consent:read";
+		"consent:write": "consent:write";
+		"enrichment:read": "enrichment:read";
+		"enrichment:write": "enrichment:write";
+		"messaging:read": "messaging:read";
+		"messaging:write": "messaging:write";
+		"playbook:read": "playbook:read";
+		"playbook:write": "playbook:write";
+		"prospects:read": "prospects:read";
+		"prospects:write": "prospects:write";
+	}>>;
+	iat: z3.ZodNumber;
+	exp: z3.ZodNumber;
+}, z3.core.$strip>;
+/** The identity a verified member's access token proves. */
 interface VerifiedToken {
+	/** A signed-in user acting through a Membership. */
+	actor: "member";
 	/** The signed-in user. */
 	userId: UserId;
 	/** The Organization every query for this request must be scoped to. */
@@ -538,7 +574,34 @@ interface VerifiedToken {
 	issuedAt: Date;
 	/** When the token stops being valid. */
 	expiresAt: Date;
+	/** Never present: a member's token has no scopes. */
+	scopes?: never;
+	/** Never present: a member's token is not an API key's. */
+	apiKeyId?: never;
 }
+/** The identity a verified API key token proves. It has no user and never a role. */
+interface VerifiedApiKeyToken {
+	/** An API key acting for an Organization. */
+	actor: "api_key";
+	/** The API key. */
+	apiKeyId: ApiKeyId;
+	/** What the key may do; `write` does not include `read`. */
+	scopes: readonly ApiKeyScope[];
+	/** The Organization every query for this request must be scoped to. */
+	organizationId: OrganizationId;
+	/** The Region the Organization lives in. */
+	region: Region;
+	/** When the token was issued. */
+	issuedAt: Date;
+	/** When the token stops being valid. */
+	expiresAt: Date;
+	/** Never present: an API key has no Membership. */
+	role?: never;
+	/** Never present: an API key is not a user. */
+	userId?: never;
+}
+/** What a verified access token proves: a member, or an API key; branch on `actor`. */
+type VerifiedIdentity = VerifiedToken | VerifiedApiKeyToken;
 /**
 * Why a token was not accepted. Deliberately coarse: it is safe to return to a client and to log.
 * `unavailable` means the signing keys could not be loaded, which says nothing about the token.
@@ -619,7 +682,7 @@ interface RemoteKeySet extends KeySet {
 */
 declare function createRemoteKeySet(options: RemoteKeySetOptions): RemoteKeySet;
 import { MiddlewareHandler } from "hono";
-import { OrganizationId as OrganizationId2, Region as Region2, Role as Role2, UserId as UserId2 } from "tula-closeline-contract";
+import { ApiKeyId as ApiKeyId2, ApiKeyScope as ApiKeyScope2, OrganizationId as OrganizationId2, Region as Region2, Role as Role2, UserId as UserId2 } from "tula-closeline-contract";
 /** Options for createTokenVerifier. */
 interface TokenVerifierOptions {
 	/** The `iss` claim every token must carry. */
@@ -639,7 +702,7 @@ interface TokenVerifier {
 	* Returns the identity in a valid token, or throws a TokenVerificationError: `expired` or
 	* `invalid` for the token, `unavailable` when the signing keys could not be loaded.
 	*/
-	verify(token: string): Promise<VerifiedToken>;
+	verify(token: string): Promise<VerifiedIdentity>;
 }
 /**
 * Creates a verifier for EdDSA access tokens. Complexity per call is O(token length) with one
@@ -650,8 +713,35 @@ declare function createTokenVerifier(options: TokenVerifierOptions): TokenVerifi
 interface AuthEnv {
 	Variables: AuthVariables;
 }
-/** The verified identity of the caller, read with `c.get('organizationId')` and so on. */
+/**
+* The context variables on a route that has opted in to API keys with requireScope; pass as
+* `new Hono<ScopedAuthEnv>()`. The caller is a member or an API key, so `role` and `userId`
+* exist only for a member, and `apiKeyId` and `scopes` only for an API key.
+*/
+interface ScopedAuthEnv {
+	Variables: ScopedAuthVariables;
+}
+/** The verified caller on a route behind requireScope; branch on `actor`. */
+interface ScopedAuthVariables {
+	/** Who is calling: a signed-in member or an API key. */
+	actor: "member" | "api_key";
+	/** The Organization every query for this request must be scoped to. */
+	organizationId: OrganizationId2;
+	/** The Region the Organization lives in. */
+	region: Region2;
+	/** The signed-in user; set only when `actor` is `member`. */
+	userId?: UserId2;
+	/** The user's role; set only when `actor` is `member`, never for an API key. */
+	role?: Role2;
+	/** The API key; set only when `actor` is `api_key`. */
+	apiKeyId?: ApiKeyId2;
+	/** What the API key may do; set only when `actor` is `api_key`. */
+	scopes?: readonly ApiKeyScope2[];
+}
+/** The verified member behind a route, read with `c.get('organizationId')` and so on. */
 interface AuthVariables {
+	/** Always a member here: the middleware refuses an API key on a route that has not opted in. */
+	actor: "member";
 	/** The Organization every query for this request must be scoped to. */
 	organizationId: OrganizationId2;
 	/** The signed-in user. */
@@ -675,12 +765,27 @@ interface AuthMiddlewareOptions {
 	clock?: Clock;
 }
 /**
-* Creates Hono middleware that requires a valid `Authorization: Bearer` access token. On success
-* it sets organizationId, userId, role and region; on failure it throws an AppError: 401 with
-* `auth.unauthenticated`, `auth.token_expired` or `auth.token_invalid`, or 503 with
-* `auth.unavailable` when the signing keys could not be loaded or verification threw.
+* Creates Hono middleware that requires a valid `Authorization: Bearer` access token. For a member
+* it sets actor, organizationId, userId, role and region. An API key token is refused with 403
+* `auth.forbidden` unless a matched route carries a requireScope guard, which opts the route in;
+* then it sets actor, organizationId, region, apiKeyId and scopes, and no role. On failure it
+* throws an AppError: 401 with `auth.unauthenticated`, `auth.token_expired` or
+* `auth.token_invalid`, or 503 with `auth.unavailable` when the signing keys could not be loaded
+* or verification threw.
 */
 declare function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv>;
+import { MiddlewareHandler as MiddlewareHandler2 } from "hono";
+import { ApiKeyScope as ApiKeyScope3 } from "tula-closeline-contract";
+/** True for a handler made by requireScope; the auth middleware reads it to let an API key in. */
+declare function isScopeGuard(handler: unknown): boolean;
+/**
+* Creates a route guard that opts the route in to API key tokens. A member token passes unchanged
+* (a member's access is governed by role, as on every other route); an API key token passes only
+* if its scopes include exactly `scope` (`write` does not imply `read`), else `auth.forbidden`.
+* Mount it on the route itself, after the auth middleware: the middleware refuses an API key on
+* any route where it finds no guard. Throws a TypeError for a name the contract does not list.
+*/
+declare function requireScope(scope: ApiKeyScope3): MiddlewareHandler2<ScopedAuthEnv>;
 import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /** What {@link CalendarConnection}'s constructor takes. */
 interface CalendarConnectionInit {
@@ -3434,4 +3539,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
+export { API_KEY_ACTOR, AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, ScopedAuthEnv, ScopedAuthVariables, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedApiKeyToken, VerifiedIdentity, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, apiKeyTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isScopeGuard, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireScope, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };

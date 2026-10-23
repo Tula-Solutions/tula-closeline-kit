@@ -1,5 +1,5 @@
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
-import { formatId } from 'tula-closeline-contract'
+import { type ApiKeyId, type ApiKeyScope, formatId } from 'tula-closeline-contract'
 import type { Clock } from '../clock'
 import type { Jwks } from './keys'
 
@@ -17,6 +17,9 @@ export interface TestKeyPair {
 export const testUserId = (n = 1) => formatId('usr', n.toString(16).padStart(32, '0'))
 /** An Organization id for tests; `n` picks which one. */
 export const testOrganizationId = (n = 1) => formatId('org', n.toString(16).padStart(32, '0'))
+
+/** An API key id for tests; `n` picks which one. */
+export const testApiKeyId = (n = 1) => formatId('akey', n.toString(16).padStart(32, '0'))
 
 /** Generates an Ed25519 key pair for tests. */
 export async function createTestKeyPair(kid = 'test-key-1'): Promise<TestKeyPair> {
@@ -101,4 +104,27 @@ export async function mintTestToken(options: MintTokenOptions): Promise<string> 
     }
   )
   return jwt.sign(options.keyPair.privateKey)
+}
+
+/** What to put in an API key's test token, on top of the options for any test token. */
+export interface MintApiKeyTokenOptions extends MintTokenOptions {
+  /** The key the token is for (`sub`); defaults to `testApiKeyId(1)`. */
+  apiKeyId?: ApiKeyId
+  /** The scopes it carries (`scp`); defaults to `['prospects:read']`. */
+  scopes?: readonly ApiKeyScope[]
+}
+
+/** Signs a valid API key access token for tests: `act: api_key`, scopes and no role. */
+export async function mintTestApiKeyToken(options: MintApiKeyTokenOptions): Promise<string> {
+  const { apiKeyId, scopes, claims, ...rest } = options
+  return mintTestToken({
+    ...rest,
+    claims: {
+      sub: apiKeyId ?? testApiKeyId(1),
+      act: 'api_key',
+      scp: scopes ?? ['prospects:read'],
+      role: undefined,
+      ...claims,
+    },
+  })
 }

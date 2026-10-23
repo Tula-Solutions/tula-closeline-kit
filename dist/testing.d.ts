@@ -127,6 +127,7 @@ interface MemoryAuditRecorder extends AuditRecorder {
 }
 /** Creates the in-memory recorder. The first entry for an event id is kept; later ones are ignored. */
 declare function createMemoryAuditRecorder(options?: MemoryAuditRecorderOptions): MemoryAuditRecorder;
+import { ApiKeyId, ApiKeyScope } from "tula-closeline-contract";
 /** A JSON Web Key Set as published by the auth service. */
 interface Jwks {
 	keys: readonly unknown[];
@@ -152,6 +153,8 @@ interface TestKeyPair {
 declare const testUserId: (n?: number) => Id_1tn<"usr">;
 /** An Organization id for tests; `n` picks which one. */
 declare const testOrganizationId: (n?: number) => Id_1tn<"org">;
+/** An API key id for tests; `n` picks which one. */
+declare const testApiKeyId: (n?: number) => Id_1tn<"akey">;
 /** Generates an Ed25519 key pair for tests. */
 declare function createTestKeyPair(kid?: string): Promise<TestKeyPair>;
 /** Builds the JWKS an auth service would publish for these key pairs. */
@@ -187,6 +190,15 @@ declare const DEFAULT_TEST_ORGANIZATION_ID: Id_1tn<"org">;
 declare const DEFAULT_TEST_USER_ID: Id_1tn<"usr">;
 /** Signs a valid access token for tests, with knobs to break one thing at a time. */
 declare function mintTestToken(options: MintTokenOptions): Promise<string>;
+/** What to put in an API key's test token, on top of the options for any test token. */
+interface MintApiKeyTokenOptions extends MintTokenOptions {
+	/** The key the token is for (`sub`); defaults to `testApiKeyId(1)`. */
+	apiKeyId?: ApiKeyId;
+	/** The scopes it carries (`scp`); defaults to `['prospects:read']`. */
+	scopes?: readonly ApiKeyScope[];
+}
+/** Signs a valid API key access token for tests: `act: api_key`, scopes and no role. */
+declare function mintTestApiKeyToken(options: MintApiKeyTokenOptions): Promise<string>;
 import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /**
 * Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
@@ -2700,4 +2712,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryAuditRecorder, MemoryAuditRecorderOptions, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryAuditRecorder, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryAuditRecorder, MemoryAuditRecorderOptions, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintApiKeyTokenOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryAuditRecorder, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestApiKeyToken, mintTestToken, testApiKeyId, testNote, testOrganizationId, testPing, testUserId };
