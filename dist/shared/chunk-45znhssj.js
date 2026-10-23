@@ -1,8 +1,24 @@
 import {
+  MESSAGING_ERROR_CODES2,
+  MessagingError2,
+  DEFAULT_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGE_BODY_CHARS2,
+  MAX_TEMPLATE_VARIABLES2,
+  MAX_TEMPLATE_VARIABLE_CHARS2,
+  MAX_MESSAGING_WEBHOOK_BYTES2,
+  MESSAGING_CHANNELS2,
+  MESSAGING_PURPOSES2,
+  DEFAULT_MESSAGING_RETRY_POLICY2,
+  messagingRetryDelayMs2,
+  InboundMessage2,
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2
-} from "./chunk-0dy266jn.js";
+} from "./chunk-hff6jkfx.js";
+import {
+  systemSleep2
+} from "./chunk-h070fpj8.js";
 import {
   AppError2,
   isAppError2
@@ -1073,6 +1089,204 @@ function prepareFields(fields) {
   return prepared;
 }
 
+// src/twilio-signature.ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+function signTwilioRequest2(authToken, url, params = {}) {
+  const pairs = Array.isArray(params) ? [...params] : Object.entries(params);
+  const text = pairs.sort(([a, av], [b, bv]) => a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0).reduce((acc, [name, value]) => acc + name + value, url);
+  return createHmac("sha1", authToken).update(text, "utf8").digest("base64");
+}
+function twilioUrlVariants(url) {
+  const variants = [url];
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) {
+      return variants;
+    }
+    const standard = parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "";
+    if (standard === "" || parsed.port !== "" && parsed.port !== standard) {
+      return variants;
+    }
+    const rest = `${parsed.pathname}${parsed.search}`;
+    const bare = `${parsed.protocol}//${parsed.hostname}${rest}`;
+    const withPort = `${parsed.protocol}//${parsed.hostname}:${standard}${rest}`;
+    for (const variant of [bare, withPort]) {
+      if (!variants.includes(variant)) {
+        variants.push(variant);
+      }
+    }
+  } catch {}
+  return variants;
+}
+function sameText(a, b) {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+function verifyTwilioFormSignature(authToken, url, fields, signature) {
+  let matched = false;
+  for (const variant of twilioUrlVariants(url)) {
+    matched = sameText(signTwilioRequest2(authToken, variant, fields), signature) || matched;
+  }
+  return matched;
+}
+
+// src/telephony/errors.ts
+var TELEPHONY_ERROR_CODES2 = {
+  invalidRequest: "telephony.invalid_request",
+  notFound: "telephony.not_found",
+  callEnded: "telephony.call_ended",
+  disclosureRequired: "telephony.disclosure_required",
+  recordingNotReady: "telephony.recording_not_ready",
+  rejected: "telephony.rejected",
+  unavailable: "telephony.unavailable",
+  badResponse: "telephony.bad_response"
+};
+var STATUS = {
+  "telephony.invalid_request": 400,
+  "telephony.not_found": 404,
+  "telephony.call_ended": 409,
+  "telephony.disclosure_required": 409,
+  "telephony.recording_not_ready": 409,
+  "telephony.rejected": 502,
+  "telephony.unavailable": 503,
+  "telephony.bad_response": 502
+};
+
+class TelephonyError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "TelephonyError";
+  }
+}
+
+// src/messaging/webhook.ts
+import { e164PhoneSchema } from "tula-closeline-contract";
+var STOP = new Set(["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"]);
+var START = new Set(["START", "UNSTOP", "YES"]);
+var HELP = new Set(["HELP", "INFO"]);
+var MESSAGE_SID = /^(SM|MM)[0-9a-fA-F]{32}$/;
+var FORM = /^application\/x-www-form-urlencoded(\s*;.*)?$/i;
+var MAX_INBOUND_BODY_CHARS = 4096;
+var MAX_MEDIA = 10;
+var STATUS2 = {
+  queued: "queued",
+  accepted: "queued",
+  scheduled: "queued",
+  sending: "queued",
+  sent: "sent",
+  delivered: "delivered",
+  undelivered: "undelivered",
+  failed: "failed",
+  canceled: "failed",
+  read: "read"
+};
+function classifyMessageIntent2(body) {
+  const word = body.trim().toUpperCase();
+  if (STOP.has(word)) {
+    return "stop";
+  }
+  if (START.has(word)) {
+    return "start";
+  }
+  if (HELP.has(word)) {
+    return "help";
+  }
+  return "message";
+}
+function bad(reason) {
+  throw new MessagingError2(MESSAGING_ERROR_CODES2.webhookInvalid, "The webhook is not valid", {
+    details: { reason }
+  });
+}
+function address(value) {
+  if (value === undefined) {
+    return bad("address");
+  }
+  const whatsapp = value.startsWith("whatsapp:");
+  const number = whatsapp ? value.slice("whatsapp:".length) : value;
+  if (!e164PhoneSchema.safeParse(number).success) {
+    return bad("address");
+  }
+  return { channel: whatsapp ? "whatsapp" : "sms", number };
+}
+function verifyAndParseWebhook(request, authToken, clock) {
+  if (typeof request !== "object" || request === null) {
+    return bad("request");
+  }
+  if (authToken === undefined || authToken === "") {
+    return bad("unconfigured");
+  }
+  if (typeof request.body !== "string" || typeof request.url !== "string") {
+    return bad("request");
+  }
+  if (Buffer.byteLength(request.body, "utf8") > MAX_MESSAGING_WEBHOOK_BYTES2) {
+    return bad("body_too_large");
+  }
+  if (request.contentType !== undefined && request.contentType !== null && !FORM.test(request.contentType)) {
+    return bad("content_type");
+  }
+  const signature = request.signature;
+  if (typeof signature !== "string" || signature === "" || signature.length > 200) {
+    return bad("signature");
+  }
+  const fields = [...new URLSearchParams(request.body)];
+  if (!verifyTwilioFormSignature(authToken, request.url, fields, signature)) {
+    return bad("signature");
+  }
+  const first = new Map;
+  for (const [name, value] of fields) {
+    if (!first.has(name)) {
+      first.set(name, value);
+    }
+  }
+  const sid = first.get("MessageSid") ?? first.get("SmsSid");
+  if (sid === undefined || !MESSAGE_SID.test(sid)) {
+    return bad("message_sid");
+  }
+  const body = first.get("Body");
+  if (body !== undefined) {
+    const from = address(first.get("From"));
+    const to = address(first.get("To"));
+    if (body.length > MAX_INBOUND_BODY_CHARS) {
+      return bad("body");
+    }
+    const media = Number(first.get("NumMedia") ?? "0");
+    if (!Number.isInteger(media) || media < 0 || media > MAX_MEDIA) {
+      return bad("num_media");
+    }
+    return new InboundMessage2({
+      channel: from.channel,
+      from: from.number,
+      to: to.number,
+      providerMessageId: sid,
+      body,
+      receivedAt: clock.now().toISOString(),
+      intent: classifyMessageIntent2(body),
+      mediaCount: media
+    });
+  }
+  const state = STATUS2[(first.get("MessageStatus") ?? first.get("SmsStatus") ?? "").toLowerCase()];
+  if (state === undefined) {
+    return bad("status");
+  }
+  const rawCode = first.get("ErrorCode");
+  if (rawCode === undefined || rawCode === "") {
+    return { kind: "status", providerMessageId: sid, status: state };
+  }
+  const errorCode = Number(rawCode);
+  if (!Number.isInteger(errorCode) || errorCode < 0 || errorCode > 99999) {
+    return bad("error_code");
+  }
+  return { kind: "status", providerMessageId: sid, status: state, errorCode };
+}
+
 // src/reporting/port.ts
 function isAppErrorShaped(error) {
   return typeof error === "object" && error !== null && error.name === "AppError" && typeof error.status === "number";
@@ -1097,7 +1311,7 @@ var STREAMING_TRANSCRIBE_ERROR_CODES2 = {
   unavailable: "streaming_transcribe.unavailable",
   badResponse: "streaming_transcribe.bad_response"
 };
-var STATUS = {
+var STATUS3 = {
   "streaming_transcribe.invalid_request": 400,
   "streaming_transcribe.conflict": 409,
   "streaming_transcribe.closed": 409,
@@ -1110,7 +1324,7 @@ class StreamingTranscribeError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS3[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1133,41 +1347,6 @@ var DEFAULT_RECONNECT_POLICY2 = {
 function reconnectDelayMs2(attempt, policy, random = Math.random) {
   const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
   return Math.max(1, Math.floor(exponential * (0.5 + random())));
-}
-
-// src/telephony/errors.ts
-var TELEPHONY_ERROR_CODES2 = {
-  invalidRequest: "telephony.invalid_request",
-  notFound: "telephony.not_found",
-  callEnded: "telephony.call_ended",
-  disclosureRequired: "telephony.disclosure_required",
-  recordingNotReady: "telephony.recording_not_ready",
-  rejected: "telephony.rejected",
-  unavailable: "telephony.unavailable",
-  badResponse: "telephony.bad_response"
-};
-var STATUS2 = {
-  "telephony.invalid_request": 400,
-  "telephony.not_found": 404,
-  "telephony.call_ended": 409,
-  "telephony.disclosure_required": 409,
-  "telephony.recording_not_ready": 409,
-  "telephony.rejected": 502,
-  "telephony.unavailable": 503,
-  "telephony.bad_response": 502
-};
-
-class TelephonyError2 extends AppError2 {
-  constructor(code, message, options = {}) {
-    super({
-      code,
-      status: STATUS2[code],
-      message,
-      ...options.cause === undefined ? {} : { cause: options.cause },
-      ...options.details === undefined ? {} : { details: options.details }
-    });
-    this.name = "TelephonyError";
-  }
 }
 
 // src/tts/audio.ts
@@ -1222,7 +1401,7 @@ var VECTOR_ERROR_CODES2 = {
   unavailable: "vector.unavailable",
   badResponse: "vector.bad_response"
 };
-var STATUS3 = {
+var STATUS4 = {
   "vector.invalid_request": 400,
   "vector.dimension_mismatch": 422,
   "vector.rejected": 500,
@@ -1234,7 +1413,7 @@ class VectorError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS3[code],
+      status: STATUS4[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -1255,7 +1434,7 @@ var MAX_ATTRIBUTE_STRING2 = 512;
 // src/telephony/validate.ts
 import {
   callIdSchema,
-  e164PhoneSchema,
+  e164PhoneSchema as e164PhoneSchema2,
   membershipIdSchema,
   organizationIdSchema
 } from "tula-closeline-contract";
@@ -1274,7 +1453,7 @@ function checkIdentity(value) {
   return membershipIdSchema.safeParse(value).success ? value : invalid("identity");
 }
 function checkNumber(value, what) {
-  return e164PhoneSchema.safeParse(value).success ? value : invalid(what);
+  return e164PhoneSchema2.safeParse(value).success ? value : invalid(what);
 }
 function checkProviderId(value, what) {
   return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid(what);
@@ -1330,4 +1509,265 @@ function requireDisclosure(played, needsAi = false) {
   return played;
 }
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+// src/messaging/consent.ts
+var DENIAL_CODES = [
+  "consent.missing",
+  "consent.withdrawn",
+  "consent.suppressed",
+  "consent.unavailable"
+];
+function denied(code) {
+  return new MessagingError2(MESSAGING_ERROR_CODES2.consentDenied, "The Contact Check did not allow this message", {
+    details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
+  });
+}
+async function requireConsent(guard, request) {
+  let result;
+  try {
+    result = await guard.check({
+      organizationId: request.organizationId,
+      prospectId: request.prospectId,
+      channel: request.channel,
+      purpose: request.purpose
+    });
+  } catch {
+    throw denied("consent.unavailable");
+  }
+  if (typeof result !== "object" || result === null || result.allowed !== true) {
+    throw denied(typeof result === "object" && result !== null && "code" in result ? String(result.code) : "consent.unavailable");
+  }
+  if (typeof result.checkId !== "string") {
+    throw denied("consent.unavailable");
+  }
+  return result.checkId;
+}
+
+// src/messaging/deadline.ts
+function startMessagingDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new MessagingError2(MESSAGING_ERROR_CODES2.timeout, "The send took too long", {
+          details: { timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new MessagingError2(MESSAGING_ERROR_CODES2.aborted, "The send was cancelled");
+      }
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+
+class AttemptAborted extends Error {
+  constructor() {
+    super("The attempt was aborted");
+    this.name = "AttemptAborted";
+  }
+}
+function raceAbort(promise, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      promise.catch(() => {
+        return;
+      });
+      reject(new AttemptAborted);
+      return;
+    }
+    const onAbort = () => reject(new AttemptAborted);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+}
+function isRetryableMessagingError(error) {
+  return error instanceof MessagingError2 && error.code === MESSAGING_ERROR_CODES2.unavailable;
+}
+async function withMessagingRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableMessagingError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const delayMs = messagingRetryDelayMs2(n, options.policy, options.random);
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/messaging/validate.ts
+import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema2, prospectIdSchema } from "tula-closeline-contract";
+var KEY = /^[A-Za-z0-9_.:-]{1,200}$/;
+var TEMPLATE_ID = /^HX[0-9a-fA-F]{32}$/;
+var VARIABLE_NAME = /^[A-Za-z0-9_]{1,64}$/;
+var REQUEST_KEYS = new Set([
+  "organizationId",
+  "prospectId",
+  "channel",
+  "purpose",
+  "to",
+  "content",
+  "idempotencyKey",
+  "timeoutMs",
+  "retry",
+  "signal"
+]);
+function invalid2(what) {
+  throw new MessagingError2(MESSAGING_ERROR_CODES2.invalidRequest, `${what} is not acceptable`, {
+    details: { field: what }
+  });
+}
+function integerIn(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resolveMessagingRetryPolicy(policy) {
+  if (policy !== undefined && !isRecord(policy)) {
+    invalid2("retry");
+  }
+  const maxRetries = policy?.maxRetries ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn(maxRetries, 0, 5)) {
+    invalid2("retry.maxRetries");
+  }
+  if (!integerIn(baseDelayMs, 1, 60000)) {
+    invalid2("retry.baseDelayMs");
+  }
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
+    invalid2("retry.maxDelayMs");
+  }
+  return { maxRetries, baseDelayMs, maxDelayMs };
+}
+function checkContent(value, channel) {
+  if (!isRecord(value)) {
+    return invalid2("content");
+  }
+  const extra = (allowed) => Object.keys(value).some((k) => !allowed.includes(k));
+  if (value.kind === "text") {
+    if (extra(["kind", "body"])) {
+      invalid2("content");
+    }
+    const body = value.body;
+    if (typeof body !== "string" || body.length < 1 || body.length > MAX_MESSAGE_BODY_CHARS2) {
+      invalid2("content.body");
+    }
+    if (body.trim().length === 0) {
+      invalid2("content.body");
+    }
+    return { kind: "text", body };
+  }
+  if (value.kind === "template") {
+    if (extra(["kind", "templateId", "variables"])) {
+      invalid2("content");
+    }
+    if (channel !== "whatsapp") {
+      invalid2("content.kind");
+    }
+    const templateId = value.templateId;
+    if (typeof templateId !== "string" || !TEMPLATE_ID.test(templateId)) {
+      invalid2("content.templateId");
+    }
+    if (value.variables === undefined) {
+      return { kind: "template", templateId };
+    }
+    if (!isRecord(value.variables)) {
+      return invalid2("content.variables");
+    }
+    const entries = Object.entries(value.variables);
+    if (entries.length > MAX_TEMPLATE_VARIABLES2) {
+      invalid2("content.variables");
+    }
+    const variables = {};
+    for (const [name, text] of entries) {
+      if (!VARIABLE_NAME.test(name) || typeof text !== "string" || text.length > MAX_TEMPLATE_VARIABLE_CHARS2) {
+        invalid2("content.variables");
+      }
+      variables[name] = text;
+    }
+    return { kind: "template", templateId, variables };
+  }
+  return invalid2("content.kind");
+}
+function checkSendRequest(request) {
+  if (!isRecord(request)) {
+    return invalid2("request");
+  }
+  for (const key of Object.keys(request)) {
+    if (!REQUEST_KEYS.has(key)) {
+      invalid2("request");
+    }
+  }
+  const organization = organizationIdSchema2.safeParse(request.organizationId);
+  if (!organization.success) {
+    return invalid2("organizationId");
+  }
+  const prospect = prospectIdSchema.safeParse(request.prospectId);
+  if (!prospect.success) {
+    return invalid2("prospectId");
+  }
+  const channel = MESSAGING_CHANNELS2.find((c) => c === request.channel);
+  if (channel === undefined) {
+    return invalid2("channel");
+  }
+  const purpose = MESSAGING_PURPOSES2.find((p) => p === request.purpose);
+  if (purpose === undefined) {
+    return invalid2("purpose");
+  }
+  if (!e164PhoneSchema3.safeParse(request.to).success || typeof request.to !== "string") {
+    return invalid2("to");
+  }
+  if (typeof request.idempotencyKey !== "string" || !KEY.test(request.idempotencyKey)) {
+    return invalid2("idempotencyKey");
+  }
+  const timeoutMs = request.timeoutMs ?? DEFAULT_MESSAGING_TIMEOUT_MS2;
+  if (!integerIn(timeoutMs, 1, MAX_MESSAGING_TIMEOUT_MS2)) {
+    return invalid2("timeoutMs");
+  }
+  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
+    return invalid2("signal");
+  }
+  return {
+    organizationId: organization.data,
+    prospectId: prospect.data,
+    channel,
+    purpose,
+    to: request.to,
+    content: checkContent(request.content, channel),
+    idempotencyKey: request.idempotencyKey,
+    timeoutMs,
+    retry: resolveMessagingRetryPolicy(request.retry),
+    signal: request.signal
+  };
+}
+
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, requireConsent, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

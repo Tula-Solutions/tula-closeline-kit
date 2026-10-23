@@ -330,6 +330,7 @@ interface CalendarSubject {
 */
 declare function calendarBehaviour(name: string, make: () => Promise<CalendarSubject>, skip?: boolean): void;
 import { ContactDenialCode as ContactDenialCode2, SuppressionReason as SuppressionReason2 } from "tula-closeline-contract";
+import { ContactCheckResult as ContactCheckResult2, ContactDenialCode, SuppressionReason } from "tula-closeline-contract";
 import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
 /**
 * What a calling service gives the guard: the Contact Check body without `caller`, which the
@@ -348,8 +349,24 @@ interface ContactGuard {
 	/** Asks the check; resolves with an allowance or a denial and never rejects. */
 	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
 }
+type Basis = Extract<ContactCheckResult2, {
+	allowed: true;
+}>["basis"];
 /** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
 type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
+/** A {@link ContactGuard} that tests configure, and that records what it was asked. */
+interface MemoryContactGuard extends ContactGuard {
+	/** Every valid request the guard answered, in order. */
+	readonly calls: readonly ContactGuardRequest[];
+	/** Allows contact with `target` on `channel` for any purpose. */
+	allow(target: ContactTarget, channel: ContactGuardRequest["channel"], basis?: Basis): MemoryContactGuard;
+	/** Denies contact with `target` on `channel` with `code`; a suppressed denial needs a reason. */
+	deny(target: ContactTarget, channel: ContactGuardRequest["channel"], code?: Exclude<ContactDenialCode, "consent.unavailable">, suppressionReason?: SuppressionReason): MemoryContactGuard;
+	/** Makes every check answer as if core could not be reached (or, with `false`, restores it). */
+	setUnavailable(unavailable?: boolean): MemoryContactGuard;
+	/** Forgets every preset and call. */
+	reset(): void;
+}
 /** What the behaviour suite needs from a {@link ContactGuard} under test. */
 interface ContactGuardSubject {
 	/** The guard under test, with nothing preset: an unknown target is denied. */
@@ -539,6 +556,262 @@ interface LlmSubject {
 * memory adapter and any real adapter (which needs a subject that drives the vendor's test mode).
 */
 declare function llmBehaviour(name: string, make: () => Promise<LlmSubject>, skip?: boolean): void;
+import { OrganizationId as OrganizationId7, ProspectId as ProspectId2 } from "tula-closeline-contract";
+import { ContactCheckId, OrganizationId as OrganizationId6, ProspectId } from "tula-closeline-contract";
+/** The channels a message can be sent on. */
+declare const MESSAGING_CHANNELS: readonly ["sms", "whatsapp"];
+/** One of {@link MESSAGING_CHANNELS}. */
+type MessagingChannel = (typeof MESSAGING_CHANNELS)[number];
+/** Why a message is sent; the Contact Check decides on it. A Rep's own message is not sent through this port. */
+declare const MESSAGING_PURPOSES: readonly ["agent_initiated", "reply"];
+/** One of {@link MESSAGING_PURPOSES}. */
+type MessagingPurpose = (typeof MESSAGING_PURPOSES)[number];
+/** How an adapter retries a retryable provider error (`messaging.unavailable`). */
+interface MessagingRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** What a message says: free text, or an approved template (WhatsApp only). */
+type MessageContent = {
+	/** Free text. */
+	kind: "text";
+	/** The text, 1 to {@link MAX_MESSAGE_BODY_CHARS} characters. Tenant data: never logged. */
+	body: string;
+} | {
+	/** An approved template; the only way to start a WhatsApp conversation outside the 24 hour window. */
+	kind: "template";
+	/** The template's Twilio Content SID: `HX` and 32 hex digits. */
+	templateId: string;
+	/** The template's variables by name or position, at most {@link MAX_TEMPLATE_VARIABLES}. Tenant data: never logged. */
+	variables?: Readonly<Record<string, string>>;
+};
+/**
+* One message to send. There is no field that skips or replaces the Contact Check: the adapter
+* asks its `ContactGuard` about (`organizationId`, `prospectId`, `channel`, `purpose`) on every
+* call, and an unknown field is refused. `to` must be the number the Prospect gave for this
+* channel, read from the Prospect `prospectId` names; the kit cannot check that they match.
+*/
+interface SendMessageRequest {
+	/** The Organization the message is sent for. */
+	organizationId: OrganizationId6;
+	/** The Prospect the message is for; the Contact Check is about this Prospect. */
+	prospectId: ProspectId;
+	/** SMS or WhatsApp. */
+	channel: MessagingChannel;
+	/** Why it is sent. */
+	purpose: MessagingPurpose;
+	/** The recipient's number, E.164. Never logged. */
+	to: string;
+	/** What to say. */
+	content: MessageContent;
+	/**
+	* Makes a retry, or a repeat of this call, send one message only: 1 to 200 characters of
+	* `A-Z a-z 0-9 _ . : -`, unique per message you mean to send. The Twilio adapter sends a keyed
+	* hash of it (with the Organization) as `I-Twilio-Idempotency-Token`; the memory adapter
+	* returns the first result for a repeat and refuses the same key with other content.
+	*/
+	idempotencyKey: string;
+	/** The most time the whole send may take, retries included, in ms, 1 to 60000; default 10000. */
+	timeoutMs?: number;
+	/** Retries of `messaging.unavailable`; the defaults when absent. */
+	retry?: MessagingRetryPolicy;
+	/** The caller's own cancellation. When it fires the provider request is aborted and the send fails with `messaging.aborted`. */
+	signal?: AbortSignal;
+}
+/** What a send returns: the provider accepted the message. Delivery is reported later as a status event. */
+interface SentMessage {
+	/** The id of the Contact Check that allowed this message: the proof of consent (ADR 0003). */
+	consentCheckId: ContactCheckId;
+	/** The provider's id for the message; a status event names the same id. */
+	providerMessageId: string;
+	/** The channel it went on. */
+	channel: MessagingChannel;
+	/** `queued` when the provider has taken it, `sent` when it has already left the provider. */
+	status: "queued" | "sent";
+	/** The key the send was made with. */
+	idempotencyKey: string;
+}
+/** What a recipient's text means to the sender, from Twilio's standard English keywords. */
+type MessageIntent = "stop" | "start" | "help" | "message";
+/** The fields of an {@link InboundMessage}. */
+interface InboundMessageFields {
+	/** The channel it arrived on. */
+	channel: MessagingChannel;
+	/** The sender's number, E.164 (any `whatsapp:` prefix removed). */
+	from: string;
+	/** Our number, E.164. */
+	to: string;
+	/** The provider's id for the message. */
+	providerMessageId: string;
+	/** The text. May be empty when only media was sent. */
+	body: string;
+	/** When the adapter received it, ISO 8601. */
+	receivedAt: string;
+	/** What the text means; see {@link classifyMessageIntent}. */
+	intent: MessageIntent;
+	/** How many media items came with it (they are not fetched). */
+	mediaCount: number;
+}
+/**
+* A message the recipient sent. Its `body`, `from` and `to` are tenant data: they are read
+* properties of the class (not own enumerable ones), so `String()`, `JSON.stringify`, a spread
+* and `util.inspect` show the channel, intent and id, and the length of the text, never the text
+* or the numbers.
+*/
+declare class InboundMessage {
+	private;
+	readonly kind: "message";
+	readonly channel: MessagingChannel;
+	readonly providerMessageId: string;
+	readonly receivedAt: string;
+	readonly intent: MessageIntent;
+	readonly mediaCount: number;
+	constructor(fields: InboundMessageFields);
+	/** The sender's number, E.164. */
+	get from(): string;
+	/** Our number, E.164. */
+	get to(): string;
+	/** The text the recipient sent. */
+	get body(): string;
+	/** The metadata for `JSON.stringify`: no text and no numbers. */
+	toJSON(): Record<string, unknown>;
+	/** A readable label without the text or the numbers. */
+	toString(): string;
+}
+/** The state of a message the provider reports on. */
+type MessageDeliveryStatus = "queued" | "sent" | "delivered" | "undelivered" | "failed" | "read";
+/** The provider reporting how a message it took is doing. Carries no text and no numbers. */
+interface StatusEvent {
+	/** Tells a status event from a message. */
+	kind: "status";
+	/** The id a send returned. */
+	providerMessageId: string;
+	/** The state. */
+	status: MessageDeliveryStatus;
+	/** The provider's numeric error code, present on `failed` and `undelivered`. */
+	errorCode?: number;
+}
+/** What a verified webhook carries: a message from a recipient, or a status report. */
+type InboundEvent = InboundMessage | StatusEvent;
+/** A webhook as the HTTP route received it. */
+interface MessagingWebhookRequest {
+	/** The full URL the provider called, as the provider saw it (a proxy may have rewritten it). */
+	url: string;
+	/** The `X-Twilio-Signature` header, or null/undefined when the request had none. */
+	signature: string | null | undefined;
+	/** The raw form body, unparsed, at most {@link MAX_MESSAGING_WEBHOOK_BYTES} bytes. */
+	body: string;
+	/** The `Content-Type` header, when known; if given it must be a form. */
+	contentType?: string | null | undefined;
+}
+/**
+* SMS and WhatsApp messaging behind a vendor (Twilio first), with the consent proof built in.
+*
+* **Consent (ADR 0003).** Every adapter is built with a `ContactGuard` and has no way to run
+* without one. `send` asks it first, every time; only `allowed: true` lets a request reach the
+* vendor. Any denial, including `consent.unavailable`, throws `messaging.consent_denied` with the
+* `consent.*` code in `details.code`, and the vendor is not called. A sent message returns the
+* check's id as `consentCheckId`.
+*
+* **STOP.** `receive` reports a recipient's STOP as an `InboundMessage` with `intent: 'stop'`
+* (the whole text, trimmed and case-insensitive, is one of Twilio's keywords). The port does not
+* revoke consent, because the kit has no way to write to core: the consumer must withdraw the
+* Prospect's consent through core when it sees `intent: 'stop'`. Twilio also blocks further sends
+* to that number by itself, which shows as `messaging.recipient_opted_out`.
+*
+* Every send has an overall deadline that aborts the vendor request. `messaging.unavailable` is
+* retried with a bounded, jittered pause and the same idempotency key, so a retry never texts
+* twice. `rejected`, `unavailable` and `bad_response` are also given to the ErrorReporter
+* (metadata only). The message text, the numbers and the credentials are tenant data or secrets:
+* they are never logged, reported or put in an error.
+*
+* Webhooks can arrive more than once: the consumer must handle them idempotently, keyed on
+* `providerMessageId` (with the status for a status event).
+*/
+interface MessagingPort {
+	/**
+	* Sends one message once the Contact Check allows it. An unacceptable request throws
+	* `messaging.invalid_request` and a denial `messaging.consent_denied`; neither reaches the vendor.
+	*/
+	send(request: SendMessageRequest): Promise<SentMessage>;
+	/**
+	* Verifies a webhook by its signature, in constant time, and parses it. A missing or wrong
+	* signature, a body over {@link MAX_MESSAGING_WEBHOOK_BYTES}, a body that is not a form or not a
+	* message or status event, is `messaging.webhook_invalid`. Verify before using anything in it.
+	*/
+	receive(request: MessagingWebhookRequest): Promise<InboundEvent>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface MessagingSubject {
+	/** The port under test. */
+	port: MessagingPort;
+	/** The Contact Check the port was built with; the suite presets what it allows and denies. */
+	guard: MemoryContactGuard;
+	/** Two unrelated Organization ids the port accepts. */
+	organizations: {
+		a: OrganizationId7;
+		b: OrganizationId7;
+	};
+	/** A Prospect id to message. */
+	prospect: ProspectId2;
+	/** A recipient number, E.164. */
+	recipient: string;
+	/** The number the port sends from, E.164. */
+	ourNumber: string;
+	/** The reporter the port was built with: the suite reads what it was given. */
+	reporter: MemoryErrorReporter;
+	/** Everything the port logged, one JSON or text line per entry. */
+	logs(): string[];
+	/** How many requests have reached the vendor, a retry counting as its own. */
+	vendorCalls(): number;
+	/** How many vendor requests were aborted while they were still pending. */
+	abortedCalls(): number;
+	/**
+	* Arranges that the next `times` vendor requests fail: `retryable` as throttling or a 5xx,
+	* `fatal` as refused credentials, `opted_out` as Twilio 21610, `template_required` as 63016 and
+	* `bad_response` as an answer the adapter cannot use.
+	*/
+	failNext(kind: "retryable" | "fatal" | "opted_out" | "template_required" | "bad_response", times: number): void;
+	/** Arranges that the next vendor request never answers, until aborted. */
+	hang(): void;
+	/** A correctly signed webhook for a message the recipient sent. */
+	signedInbound(fields: {
+		from: string;
+		to: string;
+		body: string;
+		channel?: MessagingChannel;
+		mediaCount?: number;
+	}): MessagingWebhookRequest;
+	/** A correctly signed status webhook. */
+	signedStatus(fields: {
+		providerMessageId: string;
+		status: MessageDeliveryStatus;
+		errorCode?: number;
+	}): MessagingWebhookRequest;
+	/** A correctly signed webhook over arbitrary form fields. */
+	sign(fields: Readonly<Record<string, string>>): MessagingWebhookRequest;
+	/** Credentials the port holds; none may appear in a log, a report, an error or a result. */
+	secrets(): string[];
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link MessagingPort} must show: a send asks the Contact Check first, every
+* time, and the vendor is never called after a denial of any code or when the request is not
+* acceptable (an unknown field cannot skip the check); an allowed send returns the provider's id
+* and the check's id; a retryable vendor error is retried a bounded number of times and the
+* others never; opt-out and template-required are their own codes; the overall deadline and the
+* caller's signal fail with their own codes and abort the vendor request; a webhook is accepted
+* only with a valid signature and parses into a message or a status event, with the STOP keywords
+* classified; and neither the text, the numbers nor the credentials reach a log, the error
+* reporter, an error, or the string, JSON or inspect form of anything the port returns. Run it
+* against the memory adapter and the Twilio adapter over a stubbed `fetch`.
+*/
+declare function messagingBehaviour(name: string, make: () => Promise<MessagingSubject>, skip?: boolean): void;
 import { z as z3 } from "zod";
 /** A source of the current time, so code under test never reads the real clock. */
 interface Clock {
@@ -1064,8 +1337,8 @@ interface ObjectStoreSubject {
 * one and fails for the other is a bug in one of them.
 */
 declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
-import { CallId as CallId2, OrganizationId as OrganizationId7 } from "tula-closeline-contract";
-import { CallId, OrganizationId as OrganizationId6 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId9 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId8 } from "tula-closeline-contract";
 /** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
 type StreamTrack = "rep" | "prospect";
 /** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
@@ -1148,7 +1421,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId6;
+	organizationId: OrganizationId8;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -1225,8 +1498,8 @@ interface StreamingTranscribeSubject {
 	port: StreamingTranscribePort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId7;
-		b: OrganizationId7;
+		a: OrganizationId9;
+		b: OrganizationId9;
 	};
 	/** The reporter the port was built with: the suite reads what it was given. */
 	reporter: MemoryErrorReporter;
@@ -1237,7 +1510,7 @@ interface StreamingTranscribeSubject {
 	* another: the first once the stream has been sent `bytesPerTurn` bytes, the next after twice
 	* that, and so on. Called before `open`.
 	*/
-	hear(organizationId: OrganizationId7, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
+	hear(organizationId: OrganizationId9, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
 	/** Drops the connection of a stream, as the vendor's socket closing would; resolves once it is back or has failed. */
 	dropConnection(streamId: string): Promise<void>;
 	/** Makes the next `times` reconnect attempts fail. */
@@ -1255,8 +1528,8 @@ interface StreamingTranscribeSubject {
 * adapter and any real adapter (which needs a subject that drives the vendor's test mode).
 */
 declare function streamingTranscribeBehaviour(name: string, make: () => Promise<StreamingTranscribeSubject>, skip?: boolean): void;
-import { OrganizationId as OrganizationId10 } from "tula-closeline-contract";
-import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId8, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId12 } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId10, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -1269,14 +1542,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId10;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId10;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId3;
 	/**
@@ -1358,7 +1631,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId10;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1385,7 +1658,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId10;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1398,7 +1671,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId10;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -1512,8 +1785,8 @@ interface TelephonySubject {
 	telephony: TelephonyPort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId10;
-		b: OrganizationId10;
+		a: OrganizationId12;
+		b: OrganizationId12;
 	};
 	/** Returns a number (E.164) that, when dialed, plays out as `scenario`. */
 	numberFor(scenario: ProspectScenario): string;
@@ -1799,8 +2072,8 @@ interface TranscriberSubject {
 * It never assumes how fast a send finishes: a result may be pending, done or failed.
 */
 declare function transcriberBehaviour(name: string, make: () => Promise<TranscriberSubject>, skip?: boolean): void;
-import { OrganizationId as OrganizationId12 } from "tula-closeline-contract";
-import { OrganizationId as OrganizationId11 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId14 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId13 } from "tula-closeline-contract";
 /**
 * One piece of synthesised speech, in order. The audio is held in a private field, so it is not in
 * `JSON.stringify`, a spread, `String()`, a log line or a console dump; only the sequence number
@@ -1835,7 +2108,7 @@ interface TtsRetryPolicy {
 /** What opening a stream states: whose it is, the voice and format, and the limits that bound it. */
 interface TtsOpenRequest {
 	/** The Organization the stream is for; it scopes metering and error context. */
-	organizationId: OrganizationId11;
+	organizationId: OrganizationId13;
 	/** A stock voice style of the vendor, 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. Voice cloning is out of scope. */
 	voice: string;
 	/** How the audio is encoded: `pcm_mulaw` for telephony, `pcm_s16le` otherwise. */
@@ -1920,8 +2193,8 @@ interface TtsSubject {
 	port: TtsPort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId12;
-		b: OrganizationId12;
+		a: OrganizationId14;
+		b: OrganizationId14;
 	};
 	/** A stock voice the vendor accepts. */
 	voice: string;
@@ -2076,4 +2349,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { CalendarSubject, ContactGuardSubject, HeardTurn, LlmSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, TtsSubject, VectorStoreSubject, calendarBehaviour, contactGuardBehaviour, llmBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, ttsBehaviour, vectorStoreBehaviour };
+export { CalendarSubject, ContactGuardSubject, HeardTurn, LlmSubject, MessagingSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, TtsSubject, VectorStoreSubject, calendarBehaviour, contactGuardBehaviour, llmBehaviour, messagingBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, ttsBehaviour, vectorStoreBehaviour };

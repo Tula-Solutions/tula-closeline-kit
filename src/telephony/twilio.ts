@@ -1,9 +1,10 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { SignJWT } from 'jose'
 import type { SoftphoneToken } from 'tula-closeline-contract'
 import { type Clock, systemClock } from '../clock'
 import { type Sleep, systemSleep } from '../queue/sleep'
 import type { Environment } from '../reporting/env'
+import { sameText, signTwilioRequest, twilioUrlVariants } from '../twilio-signature'
 import { TELEPHONY_ERROR_CODES, TelephonyError } from './errors'
 import {
   type AnswerCallRequest,
@@ -321,54 +322,7 @@ export function twilioApiHost(region?: TwilioRegion, edge?: string): string {
   return `api.${chosen}.${region}.twilio.com`
 }
 
-/**
- * Signs a webhook the way Twilio does (`X-Twilio-Signature`): HMAC-SHA1 with the Auth Token over
- * the URL followed by each form field's name and value in sorted order, in base64. For tests and
- * for simulating Twilio; the adapter itself only verifies.
- */
-export function signTwilioRequest(
-  authToken: string,
-  url: string,
-  params: Readonly<Record<string, string>> | readonly (readonly [string, string])[] = {}
-): string {
-  const pairs = Array.isArray(params) ? [...params] : Object.entries(params)
-  const text = pairs
-    .sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0))
-    .reduce((acc, [name, value]) => acc + name + value, url)
-  return createHmac('sha1', authToken).update(text, 'utf8').digest('base64')
-}
-
-function urlVariants(url: string): string[] {
-  const variants = [url]
-  try {
-    const parsed = new URL(url)
-    if (parsed.username || parsed.password) {
-      return variants
-    }
-    const standard = parsed.protocol === 'https:' ? '443' : parsed.protocol === 'http:' ? '80' : ''
-    // An explicit non-default port is part of the signed URL; only a default port may be added or dropped.
-    if (standard === '' || (parsed.port !== '' && parsed.port !== standard)) {
-      return variants
-    }
-    const rest = `${parsed.pathname}${parsed.search}`
-    const bare = `${parsed.protocol}//${parsed.hostname}${rest}`
-    const withPort = `${parsed.protocol}//${parsed.hostname}:${standard}${rest}`
-    for (const variant of [bare, withPort]) {
-      if (!variants.includes(variant)) {
-        variants.push(variant)
-      }
-    }
-  } catch {
-    // an unparseable URL is only ever compared as given
-  }
-  return variants
-}
-
-function sameText(a: string, b: string): boolean {
-  const left = Buffer.from(a, 'utf8')
-  const right = Buffer.from(b, 'utf8')
-  return left.length === right.length && timingSafeEqual(left, right)
-}
+export { signTwilioRequest }
 
 /**
  * Creates the {@link TelephonyPort} on Twilio: Programmable Voice over REST and TwiML, a Voice SDK
@@ -868,7 +822,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
           entries = [...new URLSearchParams(request.body).entries()]
         }
         let matched = false
-        for (const url of urlVariants(request.url)) {
+        for (const url of twilioUrlVariants(request.url)) {
           const expected = signTwilioRequest(authToken, url, entries)
           matched = sameText(expected, request.signature) || matched
         }
