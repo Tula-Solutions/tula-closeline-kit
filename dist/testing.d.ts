@@ -175,13 +175,208 @@ interface MemoryContactGuard extends ContactGuard {
 * does: an invalid one is denied with `consent.unavailable` and is not recorded. Not for production.
 */
 declare function createMemoryContactGuard(): MemoryContactGuard;
+import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+/**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+import { OrganizationId } from "tula-closeline-contract";
 import { z as z2 } from "zod";
+/**
+* The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
+* short answers) and `smart` for work that can wait longer for a better answer. An adapter maps
+* each tier to the model ids it uses.
+*/
+type ModelTier = "fast" | "smart";
+/** One turn of the conversation sent to the model. */
+interface LlmMessage {
+	/** Who said it. Instructions go in `system`, not here. */
+	role: "user" | "assistant";
+	/** The text. Tenant data: never logged. Prospect speech, Documents and web text are untrusted. */
+	content: string;
+}
+/** How an adapter retries a retryable vendor error (`llm.unavailable`) before giving up. */
+interface LlmRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** What every call states: whose it is, which model class, and the limits that bound it. */
+interface LlmRequestBase {
+	/** The Organization the call is for; it scopes metering and error context. */
+	organizationId: OrganizationId;
+	/** The model class. */
+	tier: ModelTier;
+	/** Instructions to the model. Tenant data: never logged. */
+	system?: string;
+	/** The conversation so far, 1 to {@link MAX_LLM_MESSAGES} messages, ending with a `user` message. */
+	messages: readonly LlmMessage[];
+	/**
+	* The most time the whole call may take, retries and streaming included, in ms, 1 to
+	* {@link MAX_LLM_TIMEOUT_MS}; default {@link DEFAULT_LLM_TIMEOUT_MS}. When it passes, the
+	* underlying vendor request is aborted and the call fails with `llm.timeout`.
+	*/
+	timeoutMs?: number;
+	/**
+	* The most tokens the prompt (system plus messages) may hold, 1 to
+	* {@link MAX_LLM_MAX_INPUT_TOKENS}; default {@link DEFAULT_LLM_MAX_INPUT_TOKENS}. A longer prompt
+	* fails with `llm.input_too_large` before any vendor call.
+	*/
+	maxInputTokens?: number;
+	/**
+	* The most tokens the model may write, 1 to {@link MAX_LLM_MAX_OUTPUT_TOKENS}; default
+	* {@link DEFAULT_LLM_MAX_OUTPUT_TOKENS}. It is passed to the vendor as the hard cap.
+	*/
+	maxOutputTokens?: number;
+	/** Retries of retryable vendor errors; the defaults when absent. */
+	retry?: LlmRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `llm.aborted`. */
+	signal?: AbortSignal;
+}
+/** A request for a value shaped by a schema. */
+interface LlmCompleteRequest<S extends z2.ZodType = z2.ZodType> extends LlmRequestBase {
+	/**
+	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
+	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
+	* model output is untrusted. It must be representable as JSON Schema.
+	*/
+	schema: S;
+	/** A name for the schema, 1 to 64 letters, digits, `_` or `-`; vendors use it as the tool name. */
+	schemaName: string;
+}
+/** A request for free text, delivered as it is written. */
+type LlmStreamRequest = LlmRequestBase;
+/** What a call used, for metering. */
+interface LlmUsage {
+	/** Tokens in the prompt. */
+	inputTokens: number;
+	/** Tokens the model wrote. */
+	outputTokens: number;
+}
+/** A structured answer. */
+interface LlmCompletion<T> {
+	/** The model's answer, parsed and valid for the schema. */
+	value: T;
+	/** The tokens the successful attempt used; a failed attempt that was retried is not counted. */
+	usage: LlmUsage;
+}
+/** A piece of text from the model. Tenant data: never logged. */
+interface LlmTextEvent {
+	/** Always `text`. */
+	type: "text";
+	/** The next piece, in order. Never empty. */
+	text: string;
+}
+/** The end of a stream: the last event of a stream that did not throw. */
+interface LlmDoneEvent {
+	/** Always `done`. */
+	type: "done";
+	/** Why the model stopped: it finished (`end`) or hit the output token budget (`max_tokens`). */
+	stopReason: "end" | "max_tokens";
+	/** The tokens used. */
+	usage: LlmUsage;
+}
+/** Everything a stream yields, in order: any number of `text`, then one `done`. */
+type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
+/**
+* A language model behind a vendor (Claude on Amazon Bedrock first), shared by the Copilot and
+* the Inbound Agent. Model choice is a {@link ModelTier}; the adapter maps it to model ids.
+*
+* Every call has a hard timeout and token budgets. Retryable vendor errors (throttling, 5xx,
+* connection loss) are retried with a bounded, jittered pause ({@link llmRetryDelayMs}) inside
+* the call's time limit; nothing else is retried, and a stream is retried only before its first
+* text. A call has no effects, so retrying it is always safe. Failures are `LlmError`s with
+* `llm.*` codes; `llm.unavailable`, `llm.rejected`, `llm.bad_response` and `llm.invalid_output`
+* are also given to the ErrorReporter (metadata only).
+*
+* **Model output is untrusted data.** `complete` returns only a value the schema accepts; text
+* that is not JSON, does not fit, or was cut off is `llm.invalid_output`, never a partial value.
+* What the model says is never an instruction to the caller.
+*
+* Nothing here logs, reports or puts in an error a prompt or a completion (tenant data).
+*/
+interface LlmPort {
+	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
+	complete<S extends z2.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z2.output<S>>>;
+	/**
+	* Streams free text. An unacceptable request throws `llm.invalid_request` or
+	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
+	* stream ends with one `done` event. Leaving the loop early (`break`) aborts the vendor
+	* request. The time limit covers the whole stream.
+	*/
+	stream(request: LlmStreamRequest): AsyncIterable<LlmStreamEvent>;
+}
+/** What the scripted model answers to the next call. */
+interface ScriptedReply {
+	/** The raw text the model writes: JSON text for `complete`, any text for `stream`. Tenant data: never logged. */
+	text: string;
+	/** Tokens to report for the prompt; the estimate of the prompt when absent. */
+	inputTokens?: number;
+	/** Tokens to report for the answer; the estimate of `text` when absent. */
+	outputTokens?: number;
+	/** Time the vendor takes before it answers, in ms; default 0. */
+	delayMs?: number;
+	/** Never answers; the request ends only when it is aborted. */
+	hang?: boolean;
+	/** For `stream`: the pieces to deliver; `text` split into words when absent. They must join to `text`. */
+	chunks?: readonly string[];
+	/** For `stream`: fail with `llm.unavailable` (not retried) after this many pieces were delivered. */
+	failAfterChunks?: number;
+}
+/** The codes the vendor can be made to fail with. */
+type ScriptedFailure = "llm.unavailable" | "llm.rejected" | "llm.bad_response";
+/** What a test sees of one vendor request (never the prompt or the text). */
+interface MemoryLlmRequestView {
+	/** Which method made it. */
+	kind: "complete" | "stream";
+	/** The Organization. */
+	organizationId: OrganizationId2;
+	/** The model class asked for. */
+	tier: ModelTier;
+	/** True once the request's AbortSignal fired while it was still pending (a timeout, a cancel, a stopped reader). */
+	aborted: boolean;
+	/** How it ended: still going, answered, failed or aborted. */
+	outcome: "pending" | "ok" | "failed" | "aborted";
+}
+/** Options for {@link createMemoryLlm}. */
+interface MemoryLlmOptions {
+	/** Receives the errors that mean the model or vendor failed; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where retries are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** Pauses between retries and models a vendor's delay; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/** An {@link LlmPort} that plays scripted answers in the process, for tests. Not for production. */
+interface MemoryLlm extends LlmPort {
+	/** Queues what the model answers to the next call that reaches it; later calls take later replies. */
+	reply(reply: ScriptedReply | string): void;
+	/** Makes the next `times` (default 1) vendor requests fail with `code`, before any reply is used. */
+	failNext(code: ScriptedFailure, times?: number): void;
+	/** Every vendor request so far, in order; a retry is a request of its own. */
+	requests(): MemoryLlmRequestView[];
+}
+/**
+* Builds an {@link LlmPort} for tests that plays scripted answers. It keeps the rules a real
+* adapter must: validation before any vendor call, the input and output token budgets, a hard
+* timeout that aborts the vendor request, schema-checked output, bounded jittered retries of
+* `llm.unavailable` only, and no prompt or completion in logs, reports or errors. Not for
+* production.
+*/
+declare function createMemoryLlm(options?: MemoryLlmOptions): MemoryLlm;
+import { z as z3 } from "zod";
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
 type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */
 interface MessageDefinition<
 	T extends string = string,
-	P extends z2.ZodType = z2.ZodType,
+	P extends z3.ZodType = z3.ZodType,
 	S extends MessageScope = MessageScope
 > {
 	readonly type: T;
@@ -201,12 +396,12 @@ interface PreviousVersion {
 	/** The older version number; must differ from the definition's own. */
 	version: number;
 	/** The payload schema of that version. */
-	payload: z2.ZodType;
+	payload: z3.ZodType;
 	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
 	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z2.ZodType, MessageScope>;
+type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
 /** The fields every envelope has. */
 interface EnvelopeBase<
 	T extends string,
@@ -231,7 +426,7 @@ type ScopeField<S> = S extends "organization" ? {
 	organizationId?: undefined;
 };
 /** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z2.output<P>> & ScopeField<S> : never;
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
 /** The shape every envelope has, whatever its type. */
 interface AnyEnvelope {
 	id: string;
@@ -245,7 +440,7 @@ interface AnyEnvelope {
 /** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
 type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
 	type: T;
-	payload: z2.input<P>;
+	payload: z3.input<P>;
 	traceId: string;
 	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
 	id?: string;
@@ -294,7 +489,7 @@ interface MessageRegistryOptions {
 	* The shape of an Organization id, checked for `organization` messages on the way in and out.
 	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
 	*/
-	organizationIdSchema?: z2.ZodType<string>;
+	organizationIdSchema?: z3.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -402,11 +597,6 @@ interface Queue<E extends AnyEnvelope = AnyEnvelope> {
 	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
 	release(receipt: Receipt): Promise<void>;
 }
-/**
-* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
-* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
-*/
-type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
 /** Options for {@link createMemoryQueue}. */
 interface MemoryQueueOptions<D extends AnyDefinition> {
 	/** The message types the queue accepts and delivers. */
@@ -454,7 +644,7 @@ interface MemoryQueue<D extends AnyDefinition> extends Queue<EnvelopeOf<D>> {
 * because it scans for the visible ones (fine for tests).
 */
 declare function createMemoryQueue<const D extends AnyDefinition>(options: MemoryQueueOptions<D>): MemoryQueue<D>;
-import { z as z3 } from "zod";
+import { z as z4 } from "zod";
 /** Time that moves only when a test says so: a clock and a {@link Sleep} that share it. */
 interface VirtualTime {
 	/** The clock; pass it to the memory queue and store. */
@@ -471,13 +661,13 @@ interface VirtualTime {
 /** Creates {@link VirtualTime} starting at 2026-01-01T00:00:00.000Z. */
 declare function createVirtualTime(): VirtualTime;
 /** A message that belongs to an Organization, for tests and examples. */
-declare const testPing: MessageDefinition<"test.ping", z3.ZodObject<{
-	n: z3.ZodNumber;
-}, z3.core.$strip>, "organization">;
+declare const testPing: MessageDefinition<"test.ping", z4.ZodObject<{
+	n: z4.ZodNumber;
+}, z4.core.$strip>, "organization">;
 /** A message that belongs to no Organization, for tests and examples. */
-declare const testNote: MessageDefinition<"test.note", z3.ZodObject<{
-	text: z3.ZodString;
-}, z3.core.$strip>, "global">;
+declare const testNote: MessageDefinition<"test.note", z4.ZodObject<{
+	text: z4.ZodString;
+}, z4.core.$strip>, "global">;
 /** The definitions the behaviour suite uses. */
 type TestDefinition = typeof testPing | typeof testNote;
 /** An envelope of either test type. */
@@ -661,7 +851,7 @@ interface MemoryObjectStore extends ObjectStore {
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
-import { CallId as CallId2, OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
 /** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
 declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
 	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
@@ -679,7 +869,7 @@ declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
 };
 /** One of {@link STREAMING_TRANSCRIBE_ERROR_CODES}'s values. */
 type StreamingTranscribeErrorCode = (typeof STREAMING_TRANSCRIBE_ERROR_CODES)[keyof typeof STREAMING_TRANSCRIBE_ERROR_CODES];
-import { CallId, OrganizationId } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
 type StreamTrack = "rep" | "prospect";
 /** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
@@ -762,7 +952,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -844,7 +1034,7 @@ interface MemoryStreamView {
 	/** The adapter's id. */
 	streamId: string;
 	/** The Organization. */
-	organizationId: OrganizationId2;
+	organizationId: OrganizationId4;
 	/** The Call. */
 	callId: CallId2;
 	/** The track. */
@@ -870,7 +1060,7 @@ interface MemoryStreamingTranscribeOptions {
 /** A {@link StreamingTranscribePort} that plays scripted speakers in the process, for tests. Not for production. */
 interface MemoryStreamingTranscribe extends StreamingTranscribePort {
 	/** Sets the turns the speaker of a Call's track says; a later script replaces the earlier. */
-	script(organizationId: OrganizationId2, callId: CallId2, track: StreamTrack, turns: readonly ScriptedTurn[]): void;
+	script(organizationId: OrganizationId4, callId: CallId2, track: StreamTrack, turns: readonly ScriptedTurn[]): void;
 	/**
 	* Drops the connection of a stream as a vendor socket closing would, and resolves once the
 	* stream is back (`reconnected`) or has failed. Does nothing to a stream that is not open.
@@ -892,7 +1082,7 @@ interface MemoryStreamingTranscribe extends StreamingTranscribePort {
 * for production.
 */
 declare function createMemoryStreamingTranscribe(options?: MemoryStreamingTranscribeOptions): MemoryStreamingTranscribe;
-import { CallId as CallId4, MembershipId as MembershipId2, OrganizationId as OrganizationId4, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
+import { CallId as CallId4, MembershipId as MembershipId2, OrganizationId as OrganizationId6, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
 /** The `area.reason` codes the telephony port and adapters throw. */
 declare const TELEPHONY_ERROR_CODES: {
 	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
@@ -914,7 +1104,7 @@ declare const TELEPHONY_ERROR_CODES: {
 };
 /** One of {@link TELEPHONY_ERROR_CODES}'s values. */
 type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
-import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId3, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -927,14 +1117,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId3;
 	/**
@@ -1016,7 +1206,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1043,7 +1233,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1056,7 +1246,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -1188,7 +1378,7 @@ interface MemoryTelephonyOptions {
 /** What a test sees of a provider call (never a number or a Disclosure text). */
 interface MemoryCallView {
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId6;
 	/** The provider's id. */
 	providerCallId: string;
 	/** Our Call id, when the call was placed or answered with one. */
@@ -1225,9 +1415,9 @@ interface MemoryTelephony extends TelephonyPort {
 	/** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
 	script(number: string, behaviour: ScriptedProspect): void;
 	/** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
-	receiveInbound(organizationId: OrganizationId4, from: string, to: string): string;
+	receiveInbound(organizationId: OrganizationId6, from: string, to: string): string;
 	/** Has the Prospect on this call hang up now; a call that has ended is left alone. */
-	prospectHangsUp(organizationId: OrganizationId4, providerCallId: string): void;
+	prospectHangsUp(organizationId: OrganizationId6, providerCallId: string): void;
 	/** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
 	failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void;
 	/** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
@@ -1692,4 +1882,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, ScriptedProspect, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

@@ -59,6 +59,7 @@ export function createTestDeps(overrides: Partial<TestDeps> = {}): TestDeps {
 
 export * from './auth/testing'
 export * from './consent/memory'
+export * from './llm/memory'
 export * from './queue/memory'
 export * from './queue/testing'
 export * from './reporting/testing'

@@ -167,7 +167,7 @@ interface LlmUsage {
 interface LlmCompletion<T> {
 	/** The model's answer, parsed and valid for the schema. */
 	value: T;
-	/** The tokens used, over all attempts that reached the model. */
+	/** The tokens the successful attempt used; a failed attempt that was retried is not counted. */
 	usage: LlmUsage;
 }
 /** A piece of text from the model. Tenant data: never logged. */

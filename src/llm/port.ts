@@ -110,7 +110,7 @@ export interface LlmUsage {
 export interface LlmCompletion<T> {
   /** The model's answer, parsed and valid for the schema. */
   value: T
-  /** The tokens used, over all attempts that reached the model. */
+  /** The tokens the successful attempt used; a failed attempt that was retried is not counted. */
   usage: LlmUsage
 }
 

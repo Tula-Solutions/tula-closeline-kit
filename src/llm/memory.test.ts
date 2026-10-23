@@ -139,3 +139,13 @@ describe('createMemoryLlm', () => {
     expect(memory.requests()[0]).toMatchObject({ outcome: 'ok', aborted: false, tier: 'smart' })
   })
 })
+
+describe('the testing entry', () => {
+  test('exports createMemoryLlm for consumers', async () => {
+    const testing = await import('../testing')
+    const memory = testing.createMemoryLlm()
+    memory.reply('{"n":5}')
+    const result = await memory.complete({ ...request, schema, schemaName: 'n' })
+    expect(result.value.n).toBe(5)
+  })
+})
