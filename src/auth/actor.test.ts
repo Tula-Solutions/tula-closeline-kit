@@ -274,4 +274,16 @@ describe('requireScope', () => {
     const res = await t.app.request('/v1/other', bearer(await apiKey()))
     expect(res.status).toBe(403)
   })
+
+  test('finds the guard on a route in a sub-app that has its own error handler', async () => {
+    const t = build()
+    const sub = new Hono<ScopedAuthEnv>()
+    sub.onError((error) => {
+      throw error
+    })
+    sub.get('/calls', requireScope('calls:read'), (c) => c.json({ ok: true }))
+    t.app.route('/v2', sub)
+    const res = await t.app.request('/v2/calls', bearer(await apiKey({ scopes: ['calls:read'] })))
+    expect(res.status).toBe(200)
+  })
 })

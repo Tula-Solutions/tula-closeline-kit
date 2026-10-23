@@ -537,10 +537,15 @@ function createRemoteKeySet(options) {
   };
 }
 // src/auth/scope.ts
+import { COMPOSED_HANDLER } from "hono/utils/constants";
 import { apiKeyScopeSchema as apiKeyScopeSchema2 } from "tula-closeline-contract";
 var SCOPE_GUARD = Symbol("tula-closeline-kit.requireScope");
 function isScopeGuard(handler) {
-  return typeof handler === "function" && handler[SCOPE_GUARD] === true;
+  if (typeof handler !== "function") {
+    return false;
+  }
+  const marked = handler;
+  return marked[SCOPE_GUARD] === true || isScopeGuard(marked[COMPOSED_HANDLER]);
 }
 function forbidden() {
   return new AppError2({
