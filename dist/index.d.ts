@@ -220,6 +220,335 @@ interface AuthMiddlewareOptions {
 * `auth.unavailable` when the signing keys could not be loaded or verification threw.
 */
 declare function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv>;
+import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+/** What {@link CalendarConnection}'s constructor takes. */
+interface CalendarConnectionInit {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId3;
+	/** The vendor, such as `google` or `microsoft`; `memory` for the test adapter. */
+	provider: string;
+	/** A stable, non-secret id of this connection; safe to log and to use as a database key. */
+	connectionId: string;
+	/** The secret the adapter needs to call the vendor (a refresh token or a sealed blob). Never logged. */
+	credential: string;
+}
+/**
+* A Rep's authorised link to their calendar, as the adapter handed it back from `connect`. It is
+* opaque: the OAuth credential is held in a private field, so it is not in `JSON.stringify`, a
+* spread, `String()`, a log line or a console dump; only `connectionId`, `provider` and the
+* Organization are. core stores {@link CalendarConnection.unsafeCredential} encrypted at rest and
+* rebuilds the connection with `new CalendarConnection(...)`; only an adapter reads it for any
+* other reason.
+*/
+declare class CalendarConnection {
+	private;
+	/** The Organization the connection belongs to. */
+	readonly organizationId: OrganizationId3;
+	/** The vendor name. */
+	readonly provider: string;
+	/** The non-secret id of the connection. */
+	readonly connectionId: string;
+	constructor(init: CalendarConnectionInit);
+	/** The vendor credential. For the adapter that issued the connection and for encrypted storage only; never log it. */
+	unsafeCredential(): string;
+	/** The non-secret parts, for `JSON.stringify`. */
+	toJSON(): {
+		organizationId: OrganizationId3;
+		provider: string;
+		connectionId: string;
+	};
+	/** A readable label without the credential. */
+	toString(): string;
+}
+/** Everything needed to build an AppError. */
+interface AppErrorInit {
+	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
+	code: string;
+	/** HTTP status the error maps to. */
+	status: number;
+	/** Human-readable message that is safe to return to a client. */
+	message: string;
+	/** Extra plain data that is safe to return to a client. */
+	details?: Record<string, unknown>;
+	/** The underlying error, kept for logs and never returned to a client. */
+	cause?: unknown;
+}
+/** The JSON body a service returns for a failed request. */
+interface ErrorBody {
+	error: {
+		code: string;
+		message: string;
+		details?: Record<string, unknown>;
+	};
+}
+/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
+declare class AppError extends Error {
+	readonly code: string;
+	readonly status: number;
+	readonly details?: Record<string, unknown>;
+	constructor(init: AppErrorInit);
+}
+/** Narrows an unknown value to an AppError. */
+declare function isAppError(value: unknown): value is AppError;
+/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
+declare function toErrorBody(error: AppError): ErrorBody;
+/** The `area.reason` codes the calendar port and adapters throw. */
+declare const CALENDAR_ERROR_CODES: {
+	/** The Organization id, connection, request id, times, event fields, grant, options or retry policy are not acceptable. Nothing was sent to the vendor. */
+	readonly invalidRequest: "calendar.invalid_request";
+	/** The Rep revoked access (or Closeline did): the connection can no longer be used and must be connected again. */
+	readonly revoked: "calendar.revoked";
+	/** The event does not exist on this connection's calendar. */
+	readonly notFound: "calendar.not_found";
+	/** The vendor refused for a reason a retry cannot fix (a refused grant, quota, a policy, a rejected event). */
+	readonly rejected: "calendar.rejected";
+	/** The vendor could not be reached, was throttled or failed, after the bounded retries. The only retryable code. */
+	readonly unavailable: "calendar.unavailable";
+	/** The time limit passed; the underlying request was aborted. */
+	readonly timeout: "calendar.timeout";
+	/** The caller's own AbortSignal fired; the underlying request was aborted. */
+	readonly aborted: "calendar.aborted";
+};
+/** One of {@link CALENDAR_ERROR_CODES}'s values. */
+type CalendarErrorCode = (typeof CALENDAR_ERROR_CODES)[keyof typeof CALENDAR_ERROR_CODES];
+/**
+* What a calendar adapter throws. Its message and details never hold a token, a grant, an event
+* title, description or attendee, or a vendor URL; they describe fields and codes only.
+*/
+declare class CalendarError extends AppError {
+	readonly code: CalendarErrorCode;
+	constructor(code: CalendarErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
+/** The default time a call may take, in milliseconds. */
+declare const DEFAULT_CALENDAR_TIMEOUT_MS = 1e4;
+/** The longest time a caller may allow a call, in milliseconds. */
+declare const MAX_CALENDAR_TIMEOUT_MS = 6e4;
+/** The longest range `busy` may ask for, in milliseconds (62 days). */
+declare const MAX_BUSY_RANGE_MS: number;
+/** The most intervals `busy` returns; an adapter whose calendar has more fails with `calendar.rejected`, never a cut-off list. */
+declare const MAX_BUSY_INTERVALS = 5e3;
+/** The longest an event may be, in milliseconds (7 days). */
+declare const MAX_EVENT_DURATION_MS: number;
+/** The most attendees one event may carry. */
+declare const MAX_EVENT_ATTENDEES = 20;
+/** How an adapter retries a retryable vendor error (`calendar.unavailable`) before giving up. */
+interface CalendarRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** The retry policy with its defaults filled in. */
+interface ResolvedCalendarRetryPolicy {
+	/** The most retries after the first attempt. */
+	maxRetries: number;
+	/** The base pause, in ms. */
+	baseDelayMs: number;
+	/** The longest pause before jitter, in ms. */
+	maxDelayMs: number;
+}
+/** The policy used when a call names none: two retries, 200 ms doubling to 2 s. */
+declare const DEFAULT_CALENDAR_RETRY_POLICY: ResolvedCalendarRetryPolicy;
+/**
+* The pause before retry `retry` (from 1): the base doubled each time up to the maximum, then
+* scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
+*/
+declare function calendarRetryDelayMs(retry: number, policy: ResolvedCalendarRetryPolicy, random?: () => number): number;
+/** Limits every call states. */
+interface CalendarCallOptions {
+	/**
+	* The most time the whole call may take, retries included, in ms, 1 to
+	* {@link MAX_CALENDAR_TIMEOUT_MS}; default {@link DEFAULT_CALENDAR_TIMEOUT_MS}. When it passes
+	* the vendor request is aborted and the call fails with `calendar.timeout`.
+	*/
+	timeoutMs?: number;
+	/** Retries of `calendar.unavailable`; the defaults when absent. */
+	retry?: CalendarRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `calendar.aborted`. */
+	signal?: AbortSignal;
+}
+/**
+* What a Rep authorises. The vendor is told the grant, never this library: `authorization_code`
+* is the code from the OAuth redirect (with the PKCE verifier and the redirect URI it was issued
+* for); `refresh_token` stores a grant the Rep already gave. Both are secrets: never logged.
+*/
+type CalendarGrant = {
+	/** Exchange the one-time code from the redirect. */
+	kind: "authorization_code";
+	/** The code. Secret. */
+	code: string;
+	/** The redirect URI the code was issued for. */
+	redirectUri: string;
+	/** The PKCE verifier, when the flow used one. Secret. */
+	codeVerifier?: string;
+} | {
+	/** Store a grant the Rep already gave. */
+	kind: "refresh_token";
+	/** The refresh token. Secret. */
+	refreshToken: string;
+};
+/** A time during which the calendar is busy. */
+interface BusyInterval {
+	/** The start, an ISO 8601 instant in UTC (`2026-03-02T15:00:00.000Z`). */
+	start: string;
+	/** The end, after the start, in the same form. */
+	end: string;
+}
+/** One person invited to an event. Tenant data: never logged. */
+interface CalendarAttendee {
+	/** The email address the invitation goes to. */
+	email: string;
+	/** The display name. */
+	name?: string;
+}
+/** The fields of a new event. Tenant data (Prospect names and addresses): never logged. */
+interface CalendarEventInput {
+	/** The title, 1 to 256 characters. */
+	title: string;
+	/** The start, an ISO 8601 instant with `Z` or an offset. */
+	start: string;
+	/** The end, after the start and at most {@link MAX_EVENT_DURATION_MS} later. */
+	end: string;
+	/** Notes, up to 8192 characters, such as a phone number to dial. */
+	description?: string;
+	/** A place, up to 512 characters. */
+	location?: string;
+	/** Up to {@link MAX_EVENT_ATTENDEES} invitees; the vendor sends the invitations. */
+	attendees?: readonly CalendarAttendee[];
+	/** `video` asks the vendor for a join link (Google Meet, Teams); `none` (default) adds none. */
+	conferencing?: "video" | "none";
+}
+/** The fields an update may change; at least one. Attendees replace the list. */
+interface CalendarEventChanges {
+	/** The new title. */
+	title?: string;
+	/** The new start. */
+	start?: string;
+	/** The new end. */
+	end?: string;
+	/** The new notes. */
+	description?: string;
+	/** The new place. */
+	location?: string;
+	/** The new invitee list. */
+	attendees?: readonly CalendarAttendee[];
+}
+/** What an adapter says about an event. */
+interface CalendarEventRef {
+	/** The vendor's id of the event; opaque, 1 to 256 characters. */
+	eventId: string;
+	/** The start, an ISO 8601 UTC instant. */
+	start: string;
+	/** The end, an ISO 8601 UTC instant. */
+	end: string;
+	/** The join link, when `conferencing: 'video'` was asked for and the vendor made one. */
+	joinUrl?: string;
+}
+/** What `createEvent` returns. */
+interface CalendarEventCreated extends CalendarEventRef {
+	/** True when this call made the event, false when the request id had already made it. */
+	created: boolean;
+}
+/** What every call after `connect` names: whose it is and which calendar. */
+interface CalendarRequestBase {
+	/** The Organization the call is for; it must be the connection's. */
+	organizationId: OrganizationId4;
+	/** The connection to use. */
+	connection: CalendarConnection;
+}
+/** A request to connect a calendar. */
+interface CalendarConnectRequest {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId4;
+	/** What the Rep authorised. */
+	grant: CalendarGrant;
+}
+/** A request for the busy times of a range. */
+interface CalendarBusyRequest extends CalendarRequestBase {
+	/** The start of the range, an ISO 8601 instant. */
+	from: string;
+	/** The end of the range, after `from` and at most {@link MAX_BUSY_RANGE_MS} later. */
+	to: string;
+}
+/** A request to create an event. */
+interface CalendarCreateRequest extends CalendarRequestBase {
+	/**
+	* Makes the call idempotent: 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. The same id with the
+	* same event returns the same event with `created: false`; the same id with a different event is
+	* `calendar.invalid_request`.
+	*/
+	requestId: string;
+	/** The event. */
+	event: CalendarEventInput;
+}
+/** A request to change an event. */
+interface CalendarUpdateRequest extends CalendarRequestBase {
+	/** The event to change. */
+	eventId: string;
+	/** Makes the call idempotent, like {@link CalendarCreateRequest.requestId}: a replay returns the first result. */
+	requestId: string;
+	/** What to change. */
+	changes: CalendarEventChanges;
+}
+/** A request to remove an event. */
+interface CalendarDeleteRequest extends CalendarRequestBase {
+	/** The event to remove. */
+	eventId: string;
+	/** Makes the call idempotent: a replay returns the first result. */
+	requestId: string;
+}
+/**
+* A Rep's calendar behind a vendor (Google Calendar first, Microsoft Graph next), used by core to
+* keep busy blocks and to write Bookings. Nothing vendor-specific is in the port.
+*
+* Every call has a hard timeout (see {@link CalendarCallOptions}) that aborts the vendor request.
+* Retryable vendor errors (throttling, 5xx, connection loss) are retried with a bounded, jittered
+* pause inside the time limit; nothing else is. Retrying is safe because every write carries a
+* request id the vendor (or the adapter) uses to recognise a repeat. `connect` is the
+* exception and is never retried (an authorization code is single-use); the caller retries with a
+* new grant. Failures are `CalendarError`s
+* with `calendar.*` codes; `calendar.unavailable` and `calendar.rejected` are also given to the
+* ErrorReporter (metadata only).
+*
+* **Secrets and tenant data.** A grant and a {@link CalendarConnection}'s credential are never
+* logged, reported or put in an error, and never appear in the connection's string or JSON form.
+* Event titles, notes, places and attendees are tenant data and are held to the same rule. Text a
+* calendar returns is untrusted data, never an instruction.
+*/
+interface CalendarPort {
+	/**
+	* Exchanges or stores the grant and returns the opaque connection. A grant the vendor refuses is
+	* `calendar.rejected`. One vendor call.
+	*/
+	connect(request: CalendarConnectRequest, options?: CalendarCallOptions): Promise<CalendarConnection>;
+	/**
+	* The times the calendar is busy within `[from, to)`: sorted, merged where they touch or
+	* overlap, and clipped to the range. At most {@link MAX_BUSY_INTERVALS}. O(events in the range).
+	*/
+	busy(request: CalendarBusyRequest, options?: CalendarCallOptions): Promise<BusyInterval[]>;
+	/** Makes an event, once per request id. One vendor call, plus the invitation the vendor sends. */
+	createEvent(request: CalendarCreateRequest, options?: CalendarCallOptions): Promise<CalendarEventCreated>;
+	/** Changes an event, once per request id. A missing event is `calendar.not_found`. */
+	updateEvent(request: CalendarUpdateRequest, options?: CalendarCallOptions): Promise<CalendarEventRef>;
+	/**
+	* Removes an event, once per request id. An event that is already gone is not an error: the
+	* answer is `deleted: false`, so a cancel is idempotent by end state.
+	*/
+	deleteEvent(request: CalendarDeleteRequest, options?: CalendarCallOptions): Promise<{
+		deleted: boolean;
+	}>;
+	/**
+	* Ends the grant at the vendor and makes the connection unusable (`calendar.revoked`). Revoking
+	* a connection that is already revoked succeeds. Events already written stay on the calendar.
+	*/
+	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
+}
 import { z as z2 } from "zod";
 /** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
 declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
@@ -505,38 +834,6 @@ interface HttpContactGuard extends ContactGuard {
 * the failure kind, a status, the channel and the purpose; never the secret, an address or a body.
 */
 declare function createHttpContactGuard(options: HttpContactGuardOptions): HttpContactGuard;
-/** Everything needed to build an AppError. */
-interface AppErrorInit {
-	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
-	code: string;
-	/** HTTP status the error maps to. */
-	status: number;
-	/** Human-readable message that is safe to return to a client. */
-	message: string;
-	/** Extra plain data that is safe to return to a client. */
-	details?: Record<string, unknown>;
-	/** The underlying error, kept for logs and never returned to a client. */
-	cause?: unknown;
-}
-/** The JSON body a service returns for a failed request. */
-interface ErrorBody {
-	error: {
-		code: string;
-		message: string;
-		details?: Record<string, unknown>;
-	};
-}
-/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
-declare class AppError extends Error {
-	readonly code: string;
-	readonly status: number;
-	readonly details?: Record<string, unknown>;
-	constructor(init: AppErrorInit);
-}
-/** Narrows an unknown value to an AppError. */
-declare function isAppError(value: unknown): value is AppError;
-/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
-declare function toErrorBody(error: AppError): ErrorBody;
 /** The `area.reason` codes the language model port and adapters throw. */
 declare const LLM_ERROR_CODES: {
 	/** The Organization id, tier, messages, schema, limits or retry policy are not acceptable. Nothing was sent to the vendor. */
@@ -569,7 +866,7 @@ declare class LlmError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
 import { z as z3 } from "zod";
 /** The default time a call may take, in milliseconds. */
 declare const DEFAULT_LLM_TIMEOUT_MS = 15e3;
@@ -612,7 +909,7 @@ interface LlmRetryPolicy {
 /** What every call states: whose it is, which model class, and the limits that bound it. */
 interface LlmRequestBase {
 	/** The Organization the call is for; it scopes metering and error context. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The model class. */
 	tier: ModelTier;
 	/** Instructions to the model. Tenant data: never logged. */
@@ -1394,7 +1691,7 @@ declare class StreamingTranscribeError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { CallId, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId6 } from "tula-closeline-contract";
 /** The default time opening a stream may take, in milliseconds. */
 declare const DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS = 1e4;
 /** The longest time a caller may allow opening a stream, in milliseconds. */
@@ -1487,7 +1784,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId6;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -1601,7 +1898,7 @@ declare class TelephonyError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { CallId as CallId2, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { CallId as CallId2, MembershipId, OrganizationId as OrganizationId7, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** The default time any telephony operation may take, in milliseconds. */
 declare const DEFAULT_TELEPHONY_TIMEOUT_MS = 1e4;
 /** The longest time a caller may allow one telephony operation, in milliseconds. */
@@ -1624,14 +1921,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId7;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId7;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId2;
 	/**
@@ -1713,7 +2010,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId7;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1740,7 +2037,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId7;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1753,7 +2050,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId7;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -2476,4 +2773,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };
+export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };

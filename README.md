@@ -955,6 +955,46 @@ for await (const event of llm.stream({ organizationId, tier: 'fast', messages })
   and `withLlmRetry` (`src/llm/deadline.ts`) and `checkCompleteRequest` / `parseModelOutput`
   (`src/llm/validate.ts`).
 
+## Calendar (`CalendarPort`)
+
+`CalendarPort` (0.17.0) is how core reads a Rep's busy times and writes Bookings to their calendar.
+It is vendor-neutral; Google Calendar and Microsoft Graph adapters come later. The port, the
+`CalendarConnection` and `CalendarError` come from `tula-closeline-kit`; the memory adapter
+(`createMemoryCalendar`) from `tula-closeline-kit/testing`; `calendarBehaviour` from
+`tula-closeline-kit/testing/behaviour`.
+
+```ts
+const connection = await calendar.connect({ organizationId, grant }, { timeoutMs: 3000 })
+const busy = await calendar.busy({ organizationId, connection, from, to })       // sorted, merged, clipped
+const { eventId, joinUrl, created } = await calendar.createEvent({ organizationId, connection, requestId, event })
+await calendar.updateEvent({ organizationId, connection, eventId, requestId: other, changes })
+const { deleted } = await calendar.deleteEvent({ organizationId, connection, eventId, requestId: third })
+await calendar.revoke({ organizationId, connection })
+```
+
+- `connect` takes an `authorization_code` grant (code, redirect URI, optional PKCE verifier) or a
+  `refresh_token` grant and returns an opaque `CalendarConnection`. The credential is in a private
+  field: it is not in `String()`, `JSON.stringify`, a spread or a console dump. core stores
+  `connection.unsafeCredential()` encrypted at rest and rebuilds the connection with
+  `new CalendarConnection({ organizationId, provider, connectionId, credential })`.
+- `busy` takes an ISO range of at most 62 days and returns at most 5,000 merged intervals; an
+  adapter whose calendar has more fails with `calendar.rejected`, never a cut-off list.
+- Creating, updating and deleting carry a `requestId` (1 to 128 characters of `A-Za-z0-9_.:-`).
+  The same id with the same content returns the first result; `created` is `false` on a repeat
+  (also on a retry after a lost response). The same id with different content is
+  `calendar.invalid_request`. Deleting an event that is already gone answers `deleted: false`.
+- Every call takes `timeoutMs` (default 10 s, at most 60 s) that aborts the vendor request, an
+  optional `signal`, and a retry policy. `calendar.unavailable` is retried with a bounded,
+  jittered pause inside the time limit; nothing else is.
+- Codes: `calendar.invalid_request`, `calendar.revoked` (connect again), `calendar.not_found`,
+  `calendar.rejected`, `calendar.unavailable` (the only retryable one), `calendar.timeout`,
+  `calendar.aborted`. `unavailable` and `rejected` also go to the ErrorReporter, metadata only.
+- Tokens, grants, titles, notes and attendee addresses are never logged, reported or put in an error.
+- Tests use `createMemoryCalendar()` (`allowGrant`, `addBusy`, `failNext`, `loseNextResponse`,
+  `hangNext`, `revokeAtProvider`, `events`, `requests`); an adapter passes `calendarBehaviour`. An
+  adapter reuses `startCalendarDeadline` and `withCalendarRetry` (`src/calendar/deadline.ts`) and the
+  checks in `src/calendar/validate.ts`.
+
 ## Telephony (`TelephonyPort`)
 
 The voice service places and answers calls, plays the Disclosure, bridges a Rep, records and

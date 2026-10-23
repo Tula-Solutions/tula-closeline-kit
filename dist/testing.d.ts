@@ -132,6 +132,324 @@ declare const DEFAULT_TEST_ORGANIZATION_ID: Id_1tn<"org">;
 declare const DEFAULT_TEST_USER_ID: Id_1tn<"usr">;
 /** Signs a valid access token for tests, with knobs to break one thing at a time. */
 declare function mintTestToken(options: MintTokenOptions): Promise<string>;
+import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+/**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+import { OrganizationId } from "tula-closeline-contract";
+/** What {@link CalendarConnection}'s constructor takes. */
+interface CalendarConnectionInit {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId;
+	/** The vendor, such as `google` or `microsoft`; `memory` for the test adapter. */
+	provider: string;
+	/** A stable, non-secret id of this connection; safe to log and to use as a database key. */
+	connectionId: string;
+	/** The secret the adapter needs to call the vendor (a refresh token or a sealed blob). Never logged. */
+	credential: string;
+}
+/**
+* A Rep's authorised link to their calendar, as the adapter handed it back from `connect`. It is
+* opaque: the OAuth credential is held in a private field, so it is not in `JSON.stringify`, a
+* spread, `String()`, a log line or a console dump; only `connectionId`, `provider` and the
+* Organization are. core stores {@link CalendarConnection.unsafeCredential} encrypted at rest and
+* rebuilds the connection with `new CalendarConnection(...)`; only an adapter reads it for any
+* other reason.
+*/
+declare class CalendarConnection {
+	private;
+	/** The Organization the connection belongs to. */
+	readonly organizationId: OrganizationId;
+	/** The vendor name. */
+	readonly provider: string;
+	/** The non-secret id of the connection. */
+	readonly connectionId: string;
+	constructor(init: CalendarConnectionInit);
+	/** The vendor credential. For the adapter that issued the connection and for encrypted storage only; never log it. */
+	unsafeCredential(): string;
+	/** The non-secret parts, for `JSON.stringify`. */
+	toJSON(): {
+		organizationId: OrganizationId;
+		provider: string;
+		connectionId: string;
+	};
+	/** A readable label without the credential. */
+	toString(): string;
+}
+import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+/** How an adapter retries a retryable vendor error (`calendar.unavailable`) before giving up. */
+interface CalendarRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** Limits every call states. */
+interface CalendarCallOptions {
+	/**
+	* The most time the whole call may take, retries included, in ms, 1 to
+	* {@link MAX_CALENDAR_TIMEOUT_MS}; default {@link DEFAULT_CALENDAR_TIMEOUT_MS}. When it passes
+	* the vendor request is aborted and the call fails with `calendar.timeout`.
+	*/
+	timeoutMs?: number;
+	/** Retries of `calendar.unavailable`; the defaults when absent. */
+	retry?: CalendarRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `calendar.aborted`. */
+	signal?: AbortSignal;
+}
+/**
+* What a Rep authorises. The vendor is told the grant, never this library: `authorization_code`
+* is the code from the OAuth redirect (with the PKCE verifier and the redirect URI it was issued
+* for); `refresh_token` stores a grant the Rep already gave. Both are secrets: never logged.
+*/
+type CalendarGrant = {
+	/** Exchange the one-time code from the redirect. */
+	kind: "authorization_code";
+	/** The code. Secret. */
+	code: string;
+	/** The redirect URI the code was issued for. */
+	redirectUri: string;
+	/** The PKCE verifier, when the flow used one. Secret. */
+	codeVerifier?: string;
+} | {
+	/** Store a grant the Rep already gave. */
+	kind: "refresh_token";
+	/** The refresh token. Secret. */
+	refreshToken: string;
+};
+/** A time during which the calendar is busy. */
+interface BusyInterval {
+	/** The start, an ISO 8601 instant in UTC (`2026-03-02T15:00:00.000Z`). */
+	start: string;
+	/** The end, after the start, in the same form. */
+	end: string;
+}
+/** One person invited to an event. Tenant data: never logged. */
+interface CalendarAttendee {
+	/** The email address the invitation goes to. */
+	email: string;
+	/** The display name. */
+	name?: string;
+}
+/** The fields of a new event. Tenant data (Prospect names and addresses): never logged. */
+interface CalendarEventInput {
+	/** The title, 1 to 256 characters. */
+	title: string;
+	/** The start, an ISO 8601 instant with `Z` or an offset. */
+	start: string;
+	/** The end, after the start and at most {@link MAX_EVENT_DURATION_MS} later. */
+	end: string;
+	/** Notes, up to 8192 characters, such as a phone number to dial. */
+	description?: string;
+	/** A place, up to 512 characters. */
+	location?: string;
+	/** Up to {@link MAX_EVENT_ATTENDEES} invitees; the vendor sends the invitations. */
+	attendees?: readonly CalendarAttendee[];
+	/** `video` asks the vendor for a join link (Google Meet, Teams); `none` (default) adds none. */
+	conferencing?: "video" | "none";
+}
+/** The fields an update may change; at least one. Attendees replace the list. */
+interface CalendarEventChanges {
+	/** The new title. */
+	title?: string;
+	/** The new start. */
+	start?: string;
+	/** The new end. */
+	end?: string;
+	/** The new notes. */
+	description?: string;
+	/** The new place. */
+	location?: string;
+	/** The new invitee list. */
+	attendees?: readonly CalendarAttendee[];
+}
+/** What an adapter says about an event. */
+interface CalendarEventRef {
+	/** The vendor's id of the event; opaque, 1 to 256 characters. */
+	eventId: string;
+	/** The start, an ISO 8601 UTC instant. */
+	start: string;
+	/** The end, an ISO 8601 UTC instant. */
+	end: string;
+	/** The join link, when `conferencing: 'video'` was asked for and the vendor made one. */
+	joinUrl?: string;
+}
+/** What `createEvent` returns. */
+interface CalendarEventCreated extends CalendarEventRef {
+	/** True when this call made the event, false when the request id had already made it. */
+	created: boolean;
+}
+/** What every call after `connect` names: whose it is and which calendar. */
+interface CalendarRequestBase {
+	/** The Organization the call is for; it must be the connection's. */
+	organizationId: OrganizationId2;
+	/** The connection to use. */
+	connection: CalendarConnection;
+}
+/** A request to connect a calendar. */
+interface CalendarConnectRequest {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId2;
+	/** What the Rep authorised. */
+	grant: CalendarGrant;
+}
+/** A request for the busy times of a range. */
+interface CalendarBusyRequest extends CalendarRequestBase {
+	/** The start of the range, an ISO 8601 instant. */
+	from: string;
+	/** The end of the range, after `from` and at most {@link MAX_BUSY_RANGE_MS} later. */
+	to: string;
+}
+/** A request to create an event. */
+interface CalendarCreateRequest extends CalendarRequestBase {
+	/**
+	* Makes the call idempotent: 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. The same id with the
+	* same event returns the same event with `created: false`; the same id with a different event is
+	* `calendar.invalid_request`.
+	*/
+	requestId: string;
+	/** The event. */
+	event: CalendarEventInput;
+}
+/** A request to change an event. */
+interface CalendarUpdateRequest extends CalendarRequestBase {
+	/** The event to change. */
+	eventId: string;
+	/** Makes the call idempotent, like {@link CalendarCreateRequest.requestId}: a replay returns the first result. */
+	requestId: string;
+	/** What to change. */
+	changes: CalendarEventChanges;
+}
+/** A request to remove an event. */
+interface CalendarDeleteRequest extends CalendarRequestBase {
+	/** The event to remove. */
+	eventId: string;
+	/** Makes the call idempotent: a replay returns the first result. */
+	requestId: string;
+}
+/**
+* A Rep's calendar behind a vendor (Google Calendar first, Microsoft Graph next), used by core to
+* keep busy blocks and to write Bookings. Nothing vendor-specific is in the port.
+*
+* Every call has a hard timeout (see {@link CalendarCallOptions}) that aborts the vendor request.
+* Retryable vendor errors (throttling, 5xx, connection loss) are retried with a bounded, jittered
+* pause inside the time limit; nothing else is. Retrying is safe because every write carries a
+* request id the vendor (or the adapter) uses to recognise a repeat. `connect` is the
+* exception and is never retried (an authorization code is single-use); the caller retries with a
+* new grant. Failures are `CalendarError`s
+* with `calendar.*` codes; `calendar.unavailable` and `calendar.rejected` are also given to the
+* ErrorReporter (metadata only).
+*
+* **Secrets and tenant data.** A grant and a {@link CalendarConnection}'s credential are never
+* logged, reported or put in an error, and never appear in the connection's string or JSON form.
+* Event titles, notes, places and attendees are tenant data and are held to the same rule. Text a
+* calendar returns is untrusted data, never an instruction.
+*/
+interface CalendarPort {
+	/**
+	* Exchanges or stores the grant and returns the opaque connection. A grant the vendor refuses is
+	* `calendar.rejected`. One vendor call.
+	*/
+	connect(request: CalendarConnectRequest, options?: CalendarCallOptions): Promise<CalendarConnection>;
+	/**
+	* The times the calendar is busy within `[from, to)`: sorted, merged where they touch or
+	* overlap, and clipped to the range. At most {@link MAX_BUSY_INTERVALS}. O(events in the range).
+	*/
+	busy(request: CalendarBusyRequest, options?: CalendarCallOptions): Promise<BusyInterval[]>;
+	/** Makes an event, once per request id. One vendor call, plus the invitation the vendor sends. */
+	createEvent(request: CalendarCreateRequest, options?: CalendarCallOptions): Promise<CalendarEventCreated>;
+	/** Changes an event, once per request id. A missing event is `calendar.not_found`. */
+	updateEvent(request: CalendarUpdateRequest, options?: CalendarCallOptions): Promise<CalendarEventRef>;
+	/**
+	* Removes an event, once per request id. An event that is already gone is not an error: the
+	* answer is `deleted: false`, so a cancel is idempotent by end state.
+	*/
+	deleteEvent(request: CalendarDeleteRequest, options?: CalendarCallOptions): Promise<{
+		deleted: boolean;
+	}>;
+	/**
+	* Ends the grant at the vendor and makes the connection unusable (`calendar.revoked`). Revoking
+	* a connection that is already revoked succeeds. Events already written stay on the calendar.
+	*/
+	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
+}
+/** The codes the vendor can be made to fail with. */
+type CalendarScriptedFailure = "calendar.unavailable" | "calendar.rejected";
+/** What a test sees of one vendor request (never a title, an address or a token). */
+interface MemoryCalendarRequestView {
+	/** Which call made it. */
+	kind: "connect" | "busy" | "create" | "update" | "delete" | "revoke";
+	/** The Organization. */
+	organizationId: OrganizationId3;
+	/** True once the request's AbortSignal fired while it was still pending. */
+	aborted: boolean;
+	/** How it ended: still going, answered, failed or aborted. */
+	outcome: "pending" | "ok" | "failed" | "aborted";
+}
+/** An event the memory calendar holds; for assertions only. */
+interface MemoryCalendarEvent {
+	/** The event id. */
+	eventId: string;
+	/** The title. */
+	title: string;
+	/** The start, ISO UTC. */
+	start: string;
+	/** The end, ISO UTC. */
+	end: string;
+	/** The notes. */
+	description?: string;
+	/** The place. */
+	location?: string;
+	/** The invitees. */
+	attendees: {
+		email: string;
+		name?: string;
+	}[];
+	/** The join link, if video was asked for. */
+	joinUrl?: string;
+}
+/** Options for {@link createMemoryCalendar}. */
+interface MemoryCalendarOptions {
+	/** Receives the errors that mean the vendor failed; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where retries are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** Pauses between retries; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/** A {@link CalendarPort} that keeps calendars in the process, for tests. Not for production. */
+interface MemoryCalendar extends CalendarPort {
+	/** Makes the vendor accept a grant whose code or refresh token is `secret`; any other grant is refused (`calendar.rejected`). */
+	allowGrant(secret: string): void;
+	/** Adds a busy block the vendor holds that no event of ours made, such as the Rep's own meeting. */
+	addBusy(connection: CalendarConnection, interval: BusyInterval): void;
+	/** Makes the next `times` (default 1) vendor requests fail with `code` before any effect. */
+	failNext(code: CalendarScriptedFailure, times?: number): void;
+	/** Makes the next `times` (default 1) vendor requests take effect and then fail with `calendar.unavailable`, as a lost response does. */
+	loseNextResponse(times?: number): void;
+	/** Makes the next vendor request never answer, until it is aborted. */
+	hangNext(): void;
+	/** The Rep revokes access at the vendor, so the connection stops working with `calendar.revoked`. */
+	revokeAtProvider(connection: CalendarConnection): void;
+	/** The events now on the calendar of `connection`, in creation order. */
+	events(connection: CalendarConnection): MemoryCalendarEvent[];
+	/** Every vendor request so far, in order; a retry is a request of its own. */
+	requests(): MemoryCalendarRequestView[];
+}
+/**
+* Builds a {@link CalendarPort} for tests with calendars held in memory. It keeps the rules a
+* real adapter must: validation before any vendor call, a hard timeout that aborts the vendor
+* request, idempotent writes by request id (also across a lost response), bounded jittered
+* retries of `calendar.unavailable` only, `calendar.revoked` after a revoke, and no token, title
+* or address in logs, reports or errors. Not for production.
+*/
+declare function createMemoryCalendar(options?: MemoryCalendarOptions): MemoryCalendar;
 import { ContactCheckResult as ContactCheckResult2, ContactDenialCode, SuppressionReason } from "tula-closeline-contract";
 import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
 /**
@@ -175,13 +493,8 @@ interface MemoryContactGuard extends ContactGuard {
 * does: an invalid one is denied with `consent.unavailable` and is not recorded. Not for production.
 */
 declare function createMemoryContactGuard(): MemoryContactGuard;
-import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
-/**
-* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
-* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
-*/
-type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
-import { OrganizationId } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
 import { z as z2 } from "zod";
 /**
 * The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
@@ -208,7 +521,7 @@ interface LlmRetryPolicy {
 /** What every call states: whose it is, which model class, and the limits that bound it. */
 interface LlmRequestBase {
 	/** The Organization the call is for; it scopes metering and error context. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId4;
 	/** The model class. */
 	tier: ModelTier;
 	/** Instructions to the model. Tenant data: never logged. */
@@ -334,7 +647,7 @@ interface MemoryLlmRequestView {
 	/** Which method made it. */
 	kind: "complete" | "stream";
 	/** The Organization. */
-	organizationId: OrganizationId2;
+	organizationId: OrganizationId5;
 	/** The model class asked for. */
 	tier: ModelTier;
 	/** True once the request's AbortSignal fired while it was still pending (a timeout, a cancel, a stopped reader). */
@@ -851,7 +1164,7 @@ interface MemoryObjectStore extends ObjectStore {
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
-import { CallId as CallId2, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId7 } from "tula-closeline-contract";
 /** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
 declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
 	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
@@ -869,7 +1182,7 @@ declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
 };
 /** One of {@link STREAMING_TRANSCRIBE_ERROR_CODES}'s values. */
 type StreamingTranscribeErrorCode = (typeof STREAMING_TRANSCRIBE_ERROR_CODES)[keyof typeof STREAMING_TRANSCRIBE_ERROR_CODES];
-import { CallId, OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId6 } from "tula-closeline-contract";
 /** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
 type StreamTrack = "rep" | "prospect";
 /** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
@@ -952,7 +1265,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId6;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -1034,7 +1347,7 @@ interface MemoryStreamView {
 	/** The adapter's id. */
 	streamId: string;
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId7;
 	/** The Call. */
 	callId: CallId2;
 	/** The track. */
@@ -1060,7 +1373,7 @@ interface MemoryStreamingTranscribeOptions {
 /** A {@link StreamingTranscribePort} that plays scripted speakers in the process, for tests. Not for production. */
 interface MemoryStreamingTranscribe extends StreamingTranscribePort {
 	/** Sets the turns the speaker of a Call's track says; a later script replaces the earlier. */
-	script(organizationId: OrganizationId4, callId: CallId2, track: StreamTrack, turns: readonly ScriptedTurn[]): void;
+	script(organizationId: OrganizationId7, callId: CallId2, track: StreamTrack, turns: readonly ScriptedTurn[]): void;
 	/**
 	* Drops the connection of a stream as a vendor socket closing would, and resolves once the
 	* stream is back (`reconnected`) or has failed. Does nothing to a stream that is not open.
@@ -1082,7 +1395,7 @@ interface MemoryStreamingTranscribe extends StreamingTranscribePort {
 * for production.
 */
 declare function createMemoryStreamingTranscribe(options?: MemoryStreamingTranscribeOptions): MemoryStreamingTranscribe;
-import { CallId as CallId4, MembershipId as MembershipId2, OrganizationId as OrganizationId6, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
+import { CallId as CallId4, MembershipId as MembershipId2, OrganizationId as OrganizationId9, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
 /** The `area.reason` codes the telephony port and adapters throw. */
 declare const TELEPHONY_ERROR_CODES: {
 	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
@@ -1104,7 +1417,7 @@ declare const TELEPHONY_ERROR_CODES: {
 };
 /** One of {@link TELEPHONY_ERROR_CODES}'s values. */
 type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
-import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId8, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -1117,14 +1430,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId3;
 	/**
@@ -1206,7 +1519,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1233,7 +1546,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1246,7 +1559,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -1378,7 +1691,7 @@ interface MemoryTelephonyOptions {
 /** What a test sees of a provider call (never a number or a Disclosure text). */
 interface MemoryCallView {
 	/** The Organization. */
-	organizationId: OrganizationId6;
+	organizationId: OrganizationId9;
 	/** The provider's id. */
 	providerCallId: string;
 	/** Our Call id, when the call was placed or answered with one. */
@@ -1415,9 +1728,9 @@ interface MemoryTelephony extends TelephonyPort {
 	/** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
 	script(number: string, behaviour: ScriptedProspect): void;
 	/** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
-	receiveInbound(organizationId: OrganizationId6, from: string, to: string): string;
+	receiveInbound(organizationId: OrganizationId9, from: string, to: string): string;
 	/** Has the Prospect on this call hang up now; a call that has ended is left alone. */
-	prospectHangsUp(organizationId: OrganizationId6, providerCallId: string): void;
+	prospectHangsUp(organizationId: OrganizationId9, providerCallId: string): void;
 	/** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
 	failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void;
 	/** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
@@ -1882,4 +2195,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

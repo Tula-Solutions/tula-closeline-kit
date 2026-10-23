@@ -2,7 +2,7 @@ import {
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2
-} from "./chunk-4msy66ck.js";
+} from "./chunk-w4kmnw1c.js";
 import {
   AppError2,
   isAppError2
