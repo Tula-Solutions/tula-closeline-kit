@@ -256,11 +256,7 @@ export function createMemoryMessaging(options: MemoryMessagingOptions): MemoryMe
       const checked = checkSendRequest(request)
       const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal)
       try {
-        const { consentCheckId, numberConsentCheckId } = await requireConsent(
-          options.guard,
-          checked,
-          deadline
-        )
+        const { consentCheckId } = await requireConsent(options.guard, checked, deadline)
         const fingerprint = createHash('sha256')
           .update(
             JSON.stringify([
@@ -309,7 +305,7 @@ export function createMemoryMessaging(options: MemoryMessagingOptions): MemoryMe
             )
             return {
               consentCheckId,
-              numberConsentCheckId,
+              numberConsentCheckId: consentCheckId,
               providerMessageId: answer.providerMessageId,
               channel: checked.channel,
               status: 'queued',

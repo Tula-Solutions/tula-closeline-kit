@@ -106,6 +106,52 @@ export function contactGuardBehaviour(
       expect(result.allowed).toBe(true)
     })
 
+    describe('a Prospect with one of its own addresses', () => {
+      const phone = '+14155550142'
+      const own = { organizationId: org, prospectId, phone } as const
+      const combined = { ...own, channel: 'sms', purpose: 'agent_initiated' } as const
+
+      test("is allowed when the address is the Prospect's and the Prospect consented", async () => {
+        const s = await subject()
+        s.allow(own, 'sms')
+        expect((await s.guard.check(combined)).allowed).toBe(true)
+        expect(s.reached()).toEqual([combined])
+      })
+
+      test("is denied as missing for another Prospect's address", async () => {
+        const s = await subject()
+        s.allow(own, 'sms')
+        const result = await s.guard.check({ ...combined, phone: '+14155550177' })
+        expect(result).toMatchObject({ allowed: false, code: 'consent.missing' })
+      })
+
+      test('is denied as missing when the Prospect has no such identity', async () => {
+        const s = await subject()
+        s.allow({ organizationId: org, prospectId }, 'sms')
+        const result = await s.guard.check(combined)
+        expect(result).toMatchObject({ allowed: false, code: 'consent.missing' })
+      })
+
+      test('is denied as suppressed when the address is suppressed, though the Prospect is not', async () => {
+        const s = await subject()
+        s.allow(own, 'sms')
+        s.deny({ organizationId: org, phone }, 'sms', 'consent.suppressed', 'unsubscribe')
+        const result = await s.guard.check(combined)
+        expect(result).toMatchObject({
+          allowed: false,
+          code: 'consent.suppressed',
+          suppressionReason: 'unsubscribe',
+        })
+      })
+
+      test('is denied in a second Organization', async () => {
+        const s = await subject()
+        s.allow(own, 'sms')
+        const result = await s.guard.check({ ...combined, organizationId: otherOrg })
+        expect(result.allowed).toBe(false)
+      })
+    })
+
     test('the channel and purpose reach the check', async () => {
       const s = await subject()
       await s.guard.check({ ...request, channel: 'whatsapp', purpose: 'reply' })
@@ -131,10 +177,14 @@ export function contactGuardBehaviour(
       })
     })
 
-    test('a request naming two targets is denied as unavailable and asks nothing', async () => {
+    test('a request naming two addresses is denied as unavailable and asks nothing', async () => {
       const s = await subject()
       s.allow(target, 'sms')
-      const result = await s.guard.check({ ...request, email: 'pat@example.com' })
+      const result = await s.guard.check({
+        ...request,
+        email: 'pat@example.com',
+        phone: '+14155550142',
+      })
       expect(result).toMatchObject({ allowed: false, code: 'consent.unavailable' })
       expect(s.reached()).toHaveLength(0)
     })

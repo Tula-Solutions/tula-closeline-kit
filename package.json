@@ -1,6 +1,6 @@
 {
   "name": "tula-closeline-kit",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "Closeline shared runtime helpers: token verification, queue, object storage, vector store, transcriber, streaming transcriber, language model, calendar, text-to-speech and telephony, messaging (SMS and WhatsApp) and audit recorder ports and adapters (Twilio included), logging, test fixtures",
   "private": true,
   "type": "module",
@@ -63,7 +63,7 @@
     "@sentry/bun": "^11.6.0",
     "jose": "^6.2.12",
     "pino": "^10.4.0",
-    "tula-closeline-contract": "git+ssh://git@github.com/Tula-Solutions/tula-closeline-contract.git#v0.19.0"
+    "tula-closeline-contract": "git+ssh://git@github.com/Tula-Solutions/tula-closeline-contract.git#v0.35.0"
   },
   "peerDependencies": {
     "hono": "^4.13.13",

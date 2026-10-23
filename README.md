@@ -1157,11 +1157,12 @@ receive({ url, signature, body, contentType? }): Promise<InboundMessage | Status
 ```
 
 **Consent cannot be skipped (ADR 0003).** Every adapter takes a required `ContactGuard` and asks it
-on every `send`, about the Prospect and about the number (`to`), and both must allow, before
-anything reaches the vendor. The checks count against the send's deadline. Any denial (or a guard that is down)
+on every `send`, once, about the Prospect and the number (`to`) together, before anything reaches
+the vendor. The check binds the number to the Prospect's stored identities (another Prospect's
+number is `consent.missing`) and reads suppression on the number. It counts against the send's deadline. Any denial (or a guard that is down)
 throws `messaging.consent_denied` with only the `consent.*` code in `details`, and the vendor is
 never called. There is no option or request field that skips it; an unknown field is refused as
-`messaging.invalid_request`. The `SentMessage` carries both checks' ids (`consentCheckId`, `numberConsentCheckId`) as proof.
+`messaging.invalid_request`. The `SentMessage` carries the check's id as proof (`consentCheckId`; `numberConsentCheckId` is the same id, kept for existing readers).
 
 **Inbound.** `receive` returns an `InboundMessage` (from, to, body, channel, `intent`) or a
 `StatusEvent`. `intent` is `stop` for STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT (the whole

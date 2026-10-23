@@ -21,30 +21,36 @@ function denied(code: string): MessagingError {
   )
 }
 
-/** The ids of the two Contact Checks that allowed a message. */
+/** The id of the Contact Check that allowed a message. */
 export interface ConsentProof {
-  /** The check about the Prospect. */
+  /** The check about the Prospect and the number it goes to. */
   consentCheckId: ContactCheckId
-  /** The check about the number the message goes to. */
-  numberConsentCheckId: ContactCheckId
 }
 
-async function ask(
+/**
+ * Asks the Contact Check whether this message may be sent (ADR 0003), once, about the Prospect
+ * and the number it goes to together: the check binds the number to the Prospect's stored
+ * identities, reads suppression on the number and consent on the Prospect. Anything but a clear
+ * allowance, including a guard that throws or answers oddly, is `messaging.consent_denied`; a
+ * guard that outlasts the send's deadline or the caller's signal is `messaging.timeout` or
+ * `messaging.aborted`. Nothing is logged and the vendor is not called.
+ */
+export async function requireConsent(
   guard: ContactGuard,
-  who: { prospectId: CheckedSendRequest['prospectId'] } | { phone: string },
   request: CheckedSendRequest,
   deadline: MessagingDeadline
-): Promise<ContactCheckId> {
+): Promise<ConsentProof> {
   let result: Awaited<ReturnType<ContactGuard['check']>>
   try {
     result = await raceAbort(
       Promise.resolve().then(() =>
         guard.check({
           organizationId: request.organizationId,
-          ...who,
+          prospectId: request.prospectId,
+          phone: request.to,
           channel: request.channel,
           purpose: request.purpose,
-        } as Parameters<ContactGuard['check']>[0])
+        })
       ),
       deadline.signal
     )
@@ -64,22 +70,5 @@ async function ask(
   if (typeof result.checkId !== 'string') {
     throw denied('consent.unavailable')
   }
-  return result.checkId
-}
-
-/**
- * Asks the Contact Check whether this message may be sent (ADR 0003): once about the Prospect and
- * once about the number it goes to, and both must allow. Anything but a clear allowance, including
- * a guard that throws or answers oddly, is `messaging.consent_denied`; a guard that outlasts the
- * send's deadline or the caller's signal is `messaging.timeout` or `messaging.aborted`. Nothing is
- * logged and the vendor is not called.
- */
-export async function requireConsent(
-  guard: ContactGuard,
-  request: CheckedSendRequest,
-  deadline: MessagingDeadline
-): Promise<ConsentProof> {
-  const consentCheckId = await ask(guard, { prospectId: request.prospectId }, request, deadline)
-  const numberConsentCheckId = await ask(guard, { phone: request.to }, request, deadline)
-  return { consentCheckId, numberConsentCheckId }
+  return { consentCheckId: result.checkId }
 }

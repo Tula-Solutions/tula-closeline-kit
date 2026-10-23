@@ -12,8 +12,7 @@ const prospect = formatId('prs', '1'.repeat(32)) as ProspectId
 function setup() {
   const guard = createMemoryContactGuard()
   for (const org of [orgA, orgB]) {
-    guard.allow({ organizationId: org, prospectId: prospect }, 'sms')
-    guard.allow({ organizationId: org, phone: '+14155550142' }, 'sms')
+    guard.allow({ organizationId: org, prospectId: prospect, phone: '+14155550142' }, 'sms')
   }
   const memory = createMemoryMessaging({ guard, sleep: async () => undefined })
   const req = (over: Partial<SendMessageRequest> = {}): SendMessageRequest => ({

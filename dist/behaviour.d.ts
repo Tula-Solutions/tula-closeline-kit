@@ -439,7 +439,11 @@ interface ContactGuard {
 type Basis = Extract<ContactCheckResult2, {
 	allowed: true;
 }>["basis"];
-/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
+/**
+* Who a preset is about: an Organization and a Prospect id, an address, or a Prospect id with one
+* of its addresses. The last form also records the address as one of the Prospect's identities;
+* consent is kept on the Prospect and a suppression on the address alone.
+*/
 type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
 /** A {@link ContactGuard} that tests configure, and that records what it was asked. */
 interface MemoryContactGuard extends ContactGuard {
@@ -678,10 +682,10 @@ type MessageContent = {
 };
 /**
 * One message to send. There is no field that skips or replaces the Contact Check: the adapter
-* asks its `ContactGuard` about (`organizationId`, `prospectId`, `channel`, `purpose`) and again
-* about (`organizationId`, `to`, `channel`, `purpose`) on every call, both must allow, and an
-* unknown field is refused. So a number that was suppressed or never consented is not texted even
-* when the Prospect is allowed, and `to` need not be proven to belong to the Prospect.
+* asks its `ContactGuard` once, about (`organizationId`, `prospectId`, `phone: to`, `channel`,
+* `purpose`), on every call, and an unknown field is refused. The check binds `to` to the
+* Prospect's stored identities, so a number that is not the Prospect's is `consent.missing`, and a
+* suppressed number is not texted even when the Prospect is allowed.
 */
 interface SendMessageRequest {
 	/** The Organization the message is sent for. */
@@ -712,9 +716,9 @@ interface SendMessageRequest {
 }
 /** What a send returns: the provider accepted the message. Delivery is reported later as a status event. */
 interface SentMessage {
-	/** The id of the Contact Check about the Prospect that allowed this message: proof of consent (ADR 0003). */
+	/** The id of the one Contact Check, about the Prospect and the number together, that allowed this message: proof of consent (ADR 0003). */
 	consentCheckId: ContactCheckId;
-	/** The id of the Contact Check about the number (`to`) that allowed this message. */
+	/** The same id as `consentCheckId`, kept so existing readers work: there is one check per send now. */
 	numberConsentCheckId: ContactCheckId;
 	/** The provider's id for the message; a status event names the same id. */
 	providerMessageId: string;
@@ -802,11 +806,12 @@ interface MessagingWebhookRequest {
 * SMS and WhatsApp messaging behind a vendor (Twilio first), with the consent proof built in.
 *
 * **Consent (ADR 0003).** Every adapter is built with a `ContactGuard` and has no way to run
-* without one. `send` asks it first, every time, about the Prospect and about the number; only two
-* `allowed: true` answers let a request reach the vendor, and asking counts against the send's
+* without one. `send` asks it first, every time, about the Prospect and the number together, which the
+* check binds (a number that is not the Prospect's is `consent.missing`); only an
+* `allowed: true` answer lets a request reach the vendor, and asking counts against the send's
 * deadline. Any denial, including `consent.unavailable`, throws `messaging.consent_denied` with the
 * `consent.*` code in `details.code`, and the vendor is not called. A sent message returns the
-* Prospect check's id as `consentCheckId` and the number check's as `numberConsentCheckId`.
+* check's id as `consentCheckId` (and as `numberConsentCheckId`).
 *
 * **STOP.** `receive` reports a recipient's STOP as an `InboundMessage` with `intent: 'stop'`
 * (the whole text, ignoring case, spaces, punctuation, emoji and invisible characters, is one of Twilio's keywords). The port does not

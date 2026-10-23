@@ -314,11 +314,7 @@ export function createTwilioMessaging(options: TwilioMessagingOptions): Messagin
       const text = body.toString()
       const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal)
       try {
-        const { consentCheckId, numberConsentCheckId } = await requireConsent(
-          guard,
-          checked,
-          deadline
-        )
+        const { consentCheckId } = await requireConsent(guard, checked, deadline)
         const answer = await withMessagingRetry(
           async () => {
             try {
@@ -347,7 +343,7 @@ export function createTwilioMessaging(options: TwilioMessagingOptions): Messagin
         )
         return {
           consentCheckId,
-          numberConsentCheckId,
+          numberConsentCheckId: consentCheckId,
           providerMessageId: answer.providerMessageId,
           channel: checked.channel,
           status: answer.status,
