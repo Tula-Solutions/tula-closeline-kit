@@ -1,47 +1,4 @@
-import { ContactDenialCode as ContactDenialCode2, SuppressionReason as SuppressionReason2 } from "tula-closeline-contract";
-import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
-/**
-* What a calling service gives the guard: the Contact Check body without `caller`, which the
-* guard fills in with the service's own name. There is no field that waives the check (ADR 0003).
-*/
-type ContactGuardRequest = Omit<ContactCheckRequest, "caller">;
-/** The answer of a Contact Check: an allowance with its basis, or a denial with a `consent.*` code. */
-type ContactGuardResult = ContactCheckResult;
-/**
-* The question every channel asks before it contacts a Prospect: may I contact this Prospect, or
-* this address, on this channel now, for this purpose (ADR 0003, ADR 0021)? It never throws and it
-* fails closed: anything but a clear allowance is a denial, and a check that could not be answered
-* is a denial with `consent.unavailable`. Only `allowed: true` permits a contact.
-*/
-interface ContactGuard {
-	/** Asks the check; resolves with an allowance or a denial and never rejects. */
-	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
-}
-/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
-type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
-/** What the behaviour suite needs from a {@link ContactGuard} under test. */
-interface ContactGuardSubject {
-	/** The guard under test, with nothing preset: an unknown target is denied. */
-	guard: ContactGuard;
-	/** Makes the check answer allowed for `target` on `channel`. */
-	allow(target: ContactTarget, channel: ContactGuardRequest["channel"]): void;
-	/** Makes the check answer denied with `code` for `target` on `channel`. */
-	deny(target: ContactTarget, channel: ContactGuardRequest["channel"], code: Exclude<ContactDenialCode2, "consent.unavailable">, suppressionReason?: SuppressionReason2): void;
-	/** Makes the check unreachable, as if core did not answer. */
-	makeUnavailable(): void;
-	/** The requests that reached the check, in order. */
-	reached(): readonly ContactGuardRequest[];
-	/** Removes what the subject created. */
-	close(): Promise<void>;
-}
-/**
-* The behaviour every {@link ContactGuard} must show: it answers what the check answers, an
-* unknown target is denied, and anything that is not a clear answer is a denial with
-* `consent.unavailable`; it never throws and never allows by default. Run it against the memory
-* adapter and the HTTP adapter.
-*/
-declare function contactGuardBehaviour(name: string, make: () => Promise<ContactGuardSubject>): void;
-import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /** What a service knows about the failed request; the only fields an ErrorReporter sends. */
 interface ErrorContext {
 	/** The request's id, for finding the log lines. */
@@ -88,6 +45,333 @@ interface MemoryErrorReporter extends ErrorReporter {
 	readonly closes: number[];
 }
 import { OrganizationId } from "tula-closeline-contract";
+/** What {@link CalendarConnection}'s constructor takes. */
+interface CalendarConnectionInit {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId;
+	/** The vendor, such as `google` or `microsoft`; `memory` for the test adapter. */
+	provider: string;
+	/** A stable, non-secret id of this connection; safe to log and to use as a database key. */
+	connectionId: string;
+	/** The secret the adapter needs to call the vendor (a refresh token or a sealed blob). Never logged. */
+	credential: string;
+}
+/**
+* A Rep's authorised link to their calendar, as the adapter handed it back from `connect`. It is
+* opaque: the OAuth credential is held in a private field, so it is not in `JSON.stringify`, a
+* spread, `String()`, a log line or a console dump; only `connectionId`, `provider` and the
+* Organization are. core stores {@link CalendarConnection.unsafeCredential} encrypted at rest and
+* rebuilds the connection with `new CalendarConnection(...)`; only an adapter reads it for any
+* other reason.
+*/
+declare class CalendarConnection {
+	private;
+	/** The Organization the connection belongs to. */
+	readonly organizationId: OrganizationId;
+	/** The vendor name. */
+	readonly provider: string;
+	/** The non-secret id of the connection. */
+	readonly connectionId: string;
+	constructor(init: CalendarConnectionInit);
+	/** The vendor credential. For the adapter that issued the connection and for encrypted storage only; never log it. */
+	unsafeCredential(): string;
+	/** The non-secret parts, for `JSON.stringify`. */
+	toJSON(): {
+		organizationId: OrganizationId;
+		provider: string;
+		connectionId: string;
+	};
+	/** A readable label without the credential. */
+	toString(): string;
+}
+import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+/** How an adapter retries a retryable vendor error (`calendar.unavailable`) before giving up. */
+interface CalendarRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** Limits every call states. */
+interface CalendarCallOptions {
+	/**
+	* The most time the whole call may take, retries included, in ms, 1 to
+	* {@link MAX_CALENDAR_TIMEOUT_MS}; default {@link DEFAULT_CALENDAR_TIMEOUT_MS}. When it passes
+	* the vendor request is aborted and the call fails with `calendar.timeout`.
+	*/
+	timeoutMs?: number;
+	/** Retries of `calendar.unavailable`; the defaults when absent. */
+	retry?: CalendarRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `calendar.aborted`. */
+	signal?: AbortSignal;
+}
+/**
+* What a Rep authorises. The vendor is told the grant, never this library: `authorization_code`
+* is the code from the OAuth redirect (with the PKCE verifier and the redirect URI it was issued
+* for); `refresh_token` stores a grant the Rep already gave. Both are secrets: never logged.
+*/
+type CalendarGrant = {
+	/** Exchange the one-time code from the redirect. */
+	kind: "authorization_code";
+	/** The code. Secret. */
+	code: string;
+	/** The redirect URI the code was issued for. */
+	redirectUri: string;
+	/** The PKCE verifier, when the flow used one. Secret. */
+	codeVerifier?: string;
+} | {
+	/** Store a grant the Rep already gave. */
+	kind: "refresh_token";
+	/** The refresh token. Secret. */
+	refreshToken: string;
+};
+/** A time during which the calendar is busy. */
+interface BusyInterval {
+	/** The start, an ISO 8601 instant in UTC (`2026-03-02T15:00:00.000Z`). */
+	start: string;
+	/** The end, after the start, in the same form. */
+	end: string;
+}
+/** One person invited to an event. Tenant data: never logged. */
+interface CalendarAttendee {
+	/** The email address the invitation goes to. */
+	email: string;
+	/** The display name. */
+	name?: string;
+}
+/** The fields of a new event. Tenant data (Prospect names and addresses): never logged. */
+interface CalendarEventInput {
+	/** The title, 1 to 256 characters. */
+	title: string;
+	/** The start, an ISO 8601 instant with `Z` or an offset. */
+	start: string;
+	/** The end, after the start and at most {@link MAX_EVENT_DURATION_MS} later. */
+	end: string;
+	/** Notes, up to 8192 characters, such as a phone number to dial. */
+	description?: string;
+	/** A place, up to 512 characters. */
+	location?: string;
+	/** Up to {@link MAX_EVENT_ATTENDEES} invitees; the vendor sends the invitations. */
+	attendees?: readonly CalendarAttendee[];
+	/** `video` asks the vendor for a join link (Google Meet, Teams); `none` (default) adds none. */
+	conferencing?: "video" | "none";
+}
+/** The fields an update may change; at least one. Attendees replace the list. */
+interface CalendarEventChanges {
+	/** The new title. */
+	title?: string;
+	/** The new start. */
+	start?: string;
+	/** The new end. */
+	end?: string;
+	/** The new notes. */
+	description?: string;
+	/** The new place. */
+	location?: string;
+	/** The new invitee list. */
+	attendees?: readonly CalendarAttendee[];
+}
+/** What an adapter says about an event. */
+interface CalendarEventRef {
+	/** The vendor's id of the event; opaque, 1 to 256 characters. */
+	eventId: string;
+	/** The start, an ISO 8601 UTC instant. */
+	start: string;
+	/** The end, an ISO 8601 UTC instant. */
+	end: string;
+	/** The join link, when `conferencing: 'video'` was asked for and the vendor made one. */
+	joinUrl?: string;
+}
+/** What `createEvent` returns. */
+interface CalendarEventCreated extends CalendarEventRef {
+	/** True when this call made the event, false when the request id had already made it. */
+	created: boolean;
+}
+/** What every call after `connect` names: whose it is and which calendar. */
+interface CalendarRequestBase {
+	/** The Organization the call is for; it must be the connection's. */
+	organizationId: OrganizationId2;
+	/** The connection to use. */
+	connection: CalendarConnection;
+}
+/** A request to connect a calendar. */
+interface CalendarConnectRequest {
+	/** The Organization the Rep belongs to. */
+	organizationId: OrganizationId2;
+	/** What the Rep authorised. */
+	grant: CalendarGrant;
+}
+/** A request for the busy times of a range. */
+interface CalendarBusyRequest extends CalendarRequestBase {
+	/** The start of the range, an ISO 8601 instant. */
+	from: string;
+	/** The end of the range, after `from` and at most {@link MAX_BUSY_RANGE_MS} later. */
+	to: string;
+}
+/** A request to create an event. */
+interface CalendarCreateRequest extends CalendarRequestBase {
+	/**
+	* Makes the call idempotent: 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. The same id with the
+	* same event returns the same event with `created: false`; the same id with a different event is
+	* `calendar.invalid_request`.
+	*/
+	requestId: string;
+	/** The event. */
+	event: CalendarEventInput;
+}
+/** A request to change an event. */
+interface CalendarUpdateRequest extends CalendarRequestBase {
+	/** The event to change. */
+	eventId: string;
+	/** Makes the call idempotent, like {@link CalendarCreateRequest.requestId}: a replay returns the first result. */
+	requestId: string;
+	/** What to change. */
+	changes: CalendarEventChanges;
+}
+/** A request to remove an event. */
+interface CalendarDeleteRequest extends CalendarRequestBase {
+	/** The event to remove. */
+	eventId: string;
+	/** Makes the call idempotent: a replay returns the first result. */
+	requestId: string;
+}
+/**
+* A Rep's calendar behind a vendor (Google Calendar first, Microsoft Graph next), used by core to
+* keep busy blocks and to write Bookings. Nothing vendor-specific is in the port.
+*
+* Every call has a hard timeout (see {@link CalendarCallOptions}) that aborts the vendor request.
+* Retryable vendor errors (throttling, 5xx, connection loss) are retried with a bounded, jittered
+* pause inside the time limit; nothing else is. Retrying is safe because every write carries a
+* request id the vendor (or the adapter) uses to recognise a repeat. Failures are `CalendarError`s
+* with `calendar.*` codes; `calendar.unavailable` and `calendar.rejected` are also given to the
+* ErrorReporter (metadata only).
+*
+* **Secrets and tenant data.** A grant and a {@link CalendarConnection}'s credential are never
+* logged, reported or put in an error, and never appear in the connection's string or JSON form.
+* Event titles, notes, places and attendees are tenant data and are held to the same rule. Text a
+* calendar returns is untrusted data, never an instruction.
+*/
+interface CalendarPort {
+	/**
+	* Exchanges or stores the grant and returns the opaque connection. A grant the vendor refuses is
+	* `calendar.rejected`. One vendor call.
+	*/
+	connect(request: CalendarConnectRequest, options?: CalendarCallOptions): Promise<CalendarConnection>;
+	/**
+	* The times the calendar is busy within `[from, to)`: sorted, merged where they touch or
+	* overlap, and clipped to the range. At most {@link MAX_BUSY_INTERVALS}. O(events in the range).
+	*/
+	busy(request: CalendarBusyRequest, options?: CalendarCallOptions): Promise<BusyInterval[]>;
+	/** Makes an event, once per request id. One vendor call, plus the invitation the vendor sends. */
+	createEvent(request: CalendarCreateRequest, options?: CalendarCallOptions): Promise<CalendarEventCreated>;
+	/** Changes an event, once per request id. A missing event is `calendar.not_found`. */
+	updateEvent(request: CalendarUpdateRequest, options?: CalendarCallOptions): Promise<CalendarEventRef>;
+	/**
+	* Removes an event, once per request id. An event that is already gone is not an error: the
+	* answer is `deleted: false`, so a cancel is idempotent by end state.
+	*/
+	deleteEvent(request: CalendarDeleteRequest, options?: CalendarCallOptions): Promise<{
+		deleted: boolean;
+	}>;
+	/**
+	* Ends the grant at the vendor and makes the connection unusable (`calendar.revoked`). Revoking
+	* a connection that is already revoked succeeds. Events already written stay on the calendar.
+	*/
+	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface CalendarSubject {
+	/** The port under test. */
+	port: CalendarPort;
+	/** Two unrelated Organization ids the port accepts. */
+	organizations: {
+		a: OrganizationId3;
+		b: OrganizationId3;
+	};
+	/** The reporter the port was built with: the suite reads what it was given. */
+	reporter: MemoryErrorReporter;
+	/** Everything the port logged, one JSON or text line per entry. */
+	logs(): string[];
+	/** A grant of `kind` the vendor accepts, whose secret part (code or refresh token) is `secret`. */
+	acceptedGrant(secret: string, kind?: CalendarGrant["kind"]): CalendarGrant;
+	/** A grant the vendor refuses. */
+	refusedGrant(): CalendarGrant;
+	/** Puts a busy block on the calendar that none of our events made, such as the Rep's own meeting. */
+	addBusy(connection: CalendarConnection, interval: BusyInterval): void;
+	/** Arranges that the next vendor request never answers, until it is aborted. */
+	hang(): void;
+	/** Arranges that the next `times` vendor requests fail: `retryable` as throttling or a 5xx, `fatal` as a refusal. */
+	failNext(kind: "retryable" | "fatal", times: number): void;
+	/** Arranges that the next `times` vendor requests take effect but their response is lost; leave out when the vendor cannot be made to. */
+	loseResponse?(times: number): void;
+	/** The Rep revokes access at the vendor, outside our own `revoke`. */
+	revokeAtProvider(connection: CalendarConnection): void;
+	/** How many requests have reached the vendor, a retry counting as its own. */
+	vendorRequests(): number;
+	/** How many vendor requests were aborted while they were still pending. */
+	abortedRequests(): number;
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link import('./port').CalendarPort} must show: a grant becomes an opaque
+* connection whose tokens never reach a string, JSON or log; busy times come back sorted, merged
+* and clipped; an event write is idempotent by request id (also when a response is lost and the
+* call retries) and a different event under the same id is refused; a failing provider leaves no
+* half-written event and only a retryable failure is retried, a bounded number of times; a revoked
+* connection fails every call with `calendar.revoked`; the timeout and the caller's signal abort
+* the vendor request; a bad request never reaches the vendor; and no token, title, note or address
+* reaches a log, the error reporter or an error. Run it against the memory adapter and any real
+* adapter (which needs a subject that drives the vendor's test mode).
+*/
+declare function calendarBehaviour(name: string, make: () => Promise<CalendarSubject>, skip?: boolean): void;
+import { ContactDenialCode as ContactDenialCode2, SuppressionReason as SuppressionReason2 } from "tula-closeline-contract";
+import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
+/**
+* What a calling service gives the guard: the Contact Check body without `caller`, which the
+* guard fills in with the service's own name. There is no field that waives the check (ADR 0003).
+*/
+type ContactGuardRequest = Omit<ContactCheckRequest, "caller">;
+/** The answer of a Contact Check: an allowance with its basis, or a denial with a `consent.*` code. */
+type ContactGuardResult = ContactCheckResult;
+/**
+* The question every channel asks before it contacts a Prospect: may I contact this Prospect, or
+* this address, on this channel now, for this purpose (ADR 0003, ADR 0021)? It never throws and it
+* fails closed: anything but a clear allowance is a denial, and a check that could not be answered
+* is a denial with `consent.unavailable`. Only `allowed: true` permits a contact.
+*/
+interface ContactGuard {
+	/** Asks the check; resolves with an allowance or a denial and never rejects. */
+	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
+}
+/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
+type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
+/** What the behaviour suite needs from a {@link ContactGuard} under test. */
+interface ContactGuardSubject {
+	/** The guard under test, with nothing preset: an unknown target is denied. */
+	guard: ContactGuard;
+	/** Makes the check answer allowed for `target` on `channel`. */
+	allow(target: ContactTarget, channel: ContactGuardRequest["channel"]): void;
+	/** Makes the check answer denied with `code` for `target` on `channel`. */
+	deny(target: ContactTarget, channel: ContactGuardRequest["channel"], code: Exclude<ContactDenialCode2, "consent.unavailable">, suppressionReason?: SuppressionReason2): void;
+	/** Makes the check unreachable, as if core did not answer. */
+	makeUnavailable(): void;
+	/** The requests that reached the check, in order. */
+	reached(): readonly ContactGuardRequest[];
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link ContactGuard} must show: it answers what the check answers, an
+* unknown target is denied, and anything that is not a clear answer is a denial with
+* `consent.unavailable`; it never throws and never allows by default. Run it against the memory
+* adapter and the HTTP adapter.
+*/
+declare function contactGuardBehaviour(name: string, make: () => Promise<ContactGuardSubject>): void;
+import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
 import { z as z2 } from "zod";
 /**
 * The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
@@ -114,7 +398,7 @@ interface LlmRetryPolicy {
 /** What every call states: whose it is, which model class, and the limits that bound it. */
 interface LlmRequestBase {
 	/** The Organization the call is for; it scopes metering and error context. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId4;
 	/** The model class. */
 	tier: ModelTier;
 	/** Instructions to the model. Tenant data: never logged. */
@@ -222,8 +506,8 @@ interface LlmSubject {
 	port: LlmPort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId2;
-		b: OrganizationId2;
+		a: OrganizationId5;
+		b: OrganizationId5;
 	};
 	/** The reporter the port was built with: the suite reads what it was given. */
 	reporter: MemoryErrorReporter;
@@ -778,8 +1062,8 @@ interface ObjectStoreSubject {
 * one and fails for the other is a bug in one of them.
 */
 declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
-import { CallId as CallId2, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
-import { CallId, OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId7 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId6 } from "tula-closeline-contract";
 /** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
 type StreamTrack = "rep" | "prospect";
 /** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
@@ -862,7 +1146,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId6;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -939,8 +1223,8 @@ interface StreamingTranscribeSubject {
 	port: StreamingTranscribePort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId4;
-		b: OrganizationId4;
+		a: OrganizationId7;
+		b: OrganizationId7;
 	};
 	/** The reporter the port was built with: the suite reads what it was given. */
 	reporter: MemoryErrorReporter;
@@ -951,7 +1235,7 @@ interface StreamingTranscribeSubject {
 	* another: the first once the stream has been sent `bytesPerTurn` bytes, the next after twice
 	* that, and so on. Called before `open`.
 	*/
-	hear(organizationId: OrganizationId4, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
+	hear(organizationId: OrganizationId7, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
 	/** Drops the connection of a stream, as the vendor's socket closing would; resolves once it is back or has failed. */
 	dropConnection(streamId: string): Promise<void>;
 	/** Makes the next `times` reconnect attempts fail. */
@@ -969,8 +1253,8 @@ interface StreamingTranscribeSubject {
 * adapter and any real adapter (which needs a subject that drives the vendor's test mode).
 */
 declare function streamingTranscribeBehaviour(name: string, make: () => Promise<StreamingTranscribeSubject>, skip?: boolean): void;
-import { OrganizationId as OrganizationId7 } from "tula-closeline-contract";
-import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId10 } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId8, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -983,14 +1267,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId3;
 	/**
@@ -1072,7 +1356,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1099,7 +1383,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1112,7 +1396,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId5;
+	organizationId: OrganizationId8;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -1226,8 +1510,8 @@ interface TelephonySubject {
 	telephony: TelephonyPort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId7;
-		b: OrganizationId7;
+		a: OrganizationId10;
+		b: OrganizationId10;
 	};
 	/** Returns a number (E.164) that, when dialed, plays out as `scenario`. */
 	numberFor(scenario: ProspectScenario): string;
@@ -1625,4 +1909,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { ContactGuardSubject, HeardTurn, LlmSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, VectorStoreSubject, contactGuardBehaviour, llmBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, vectorStoreBehaviour };
+export { CalendarSubject, ContactGuardSubject, HeardTurn, LlmSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, VectorStoreSubject, calendarBehaviour, contactGuardBehaviour, llmBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, vectorStoreBehaviour };

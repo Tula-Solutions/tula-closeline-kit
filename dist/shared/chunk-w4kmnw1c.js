@@ -2,6 +2,91 @@ import {
   AppError2
 } from "./chunk-tya44yhr.js";
 
+// src/calendar/connection.ts
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+
+class CalendarConnection2 {
+  organizationId;
+  provider;
+  connectionId;
+  #credential;
+  constructor(init) {
+    if (typeof init.provider !== "string" || init.provider.length < 1 || init.provider.length > 64 || typeof init.connectionId !== "string" || init.connectionId.length < 1 || init.connectionId.length > 256 || typeof init.credential !== "string" || init.credential.length < 1) {
+      throw new TypeError("CalendarConnection needs a provider, a connection id and a credential");
+    }
+    this.organizationId = init.organizationId;
+    this.provider = init.provider;
+    this.connectionId = init.connectionId;
+    this.#credential = init.credential;
+  }
+  unsafeCredential() {
+    return this.#credential;
+  }
+  toJSON() {
+    return {
+      organizationId: this.organizationId,
+      provider: this.provider,
+      connectionId: this.connectionId
+    };
+  }
+  toString() {
+    return `CalendarConnection(${this.provider}:${this.connectionId})`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+}
+
+// src/calendar/errors.ts
+var CALENDAR_ERROR_CODES2 = {
+  invalidRequest: "calendar.invalid_request",
+  revoked: "calendar.revoked",
+  notFound: "calendar.not_found",
+  rejected: "calendar.rejected",
+  unavailable: "calendar.unavailable",
+  timeout: "calendar.timeout",
+  aborted: "calendar.aborted"
+};
+var STATUS = {
+  "calendar.invalid_request": 400,
+  "calendar.revoked": 403,
+  "calendar.not_found": 404,
+  "calendar.rejected": 502,
+  "calendar.unavailable": 503,
+  "calendar.timeout": 504,
+  "calendar.aborted": 499
+};
+
+class CalendarError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "CalendarError";
+  }
+}
+
+// src/calendar/port.ts
+var DEFAULT_CALENDAR_TIMEOUT_MS2 = 1e4;
+var MAX_CALENDAR_TIMEOUT_MS2 = 60000;
+var MAX_BUSY_RANGE_MS2 = 62 * 24 * 60 * 60 * 1000;
+var MAX_BUSY_INTERVALS2 = 5000;
+var MAX_EVENT_DURATION_MS2 = 7 * 24 * 60 * 60 * 1000;
+var MAX_EVENT_ATTENDEES2 = 20;
+var DEFAULT_CALENDAR_RETRY_POLICY2 = {
+  maxRetries: 2,
+  baseDelayMs: 200,
+  maxDelayMs: 2000
+};
+function calendarRetryDelayMs2(retry, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
+}
+
 // src/llm/errors.ts
 var LLM_ERROR_CODES2 = {
   invalidRequest: "llm.invalid_request",
@@ -13,7 +98,7 @@ var LLM_ERROR_CODES2 = {
   unavailable: "llm.unavailable",
   badResponse: "llm.bad_response"
 };
-var STATUS = {
+var STATUS2 = {
   "llm.invalid_request": 400,
   "llm.input_too_large": 413,
   "llm.invalid_output": 502,
@@ -28,7 +113,7 @@ class LlmError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -52,7 +137,7 @@ var TRANSCRIBER_ERROR_CODES2 = {
   unavailable: "transcriber.unavailable",
   badResponse: "transcriber.bad_response"
 };
-var STATUS2 = {
+var STATUS3 = {
   "transcriber.invalid_request": 400,
   "transcriber.conflict": 409,
   "transcriber.rejected": 500,
@@ -64,7 +149,7 @@ class TranscriberError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS2[code],
+      status: STATUS3[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -179,4 +264,4 @@ function checkTranscriptionResult2(result, context) {
   return { status: "done", durationMs: raw.durationMs, turns };
 }
 
-export { LLM_ERROR_CODES2, LlmError2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2 };
+export { CalendarConnection2, CALENDAR_ERROR_CODES2, CalendarError2, DEFAULT_CALENDAR_TIMEOUT_MS2, MAX_CALENDAR_TIMEOUT_MS2, MAX_BUSY_RANGE_MS2, MAX_BUSY_INTERVALS2, MAX_EVENT_DURATION_MS2, MAX_EVENT_ATTENDEES2, DEFAULT_CALENDAR_RETRY_POLICY2, calendarRetryDelayMs2, LLM_ERROR_CODES2, LlmError2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2 };

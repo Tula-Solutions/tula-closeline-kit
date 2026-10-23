@@ -44,7 +44,33 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-naaze3eg.js";
+} from "./shared/chunk-t8q2xehd.js";
+import {
+  CalendarConnection2,
+  CALENDAR_ERROR_CODES2,
+  CalendarError2,
+  DEFAULT_CALENDAR_TIMEOUT_MS2,
+  MAX_CALENDAR_TIMEOUT_MS2,
+  MAX_BUSY_RANGE_MS2,
+  MAX_BUSY_INTERVALS2,
+  MAX_EVENT_DURATION_MS2,
+  MAX_EVENT_ATTENDEES2,
+  DEFAULT_CALENDAR_RETRY_POLICY2,
+  calendarRetryDelayMs2,
+  LLM_ERROR_CODES2,
+  LlmError2,
+  DEFAULT_TELEPHONY_TIMEOUT_MS2,
+  MAX_WEBHOOK_BODY_BYTES2,
+  TRANSCRIBER_ERROR_CODES2,
+  TranscriberError2,
+  MAX_CLIENT_REFERENCE_LENGTH2,
+  MAX_AUDIO_URL_LENGTH2,
+  MAX_SPEAKERS2,
+  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
+  MAX_TRANSCRIBER_LIST_LIMIT2,
+  MAX_VENDOR_ID_LENGTH2,
+  checkTranscriptionResult2
+} from "./shared/chunk-w4kmnw1c.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -67,21 +93,6 @@ import {
   encodeCursor,
   createStorageValidator
 } from "./shared/chunk-d77yh0fk.js";
-import {
-  LLM_ERROR_CODES2,
-  LlmError2,
-  DEFAULT_TELEPHONY_TIMEOUT_MS2,
-  MAX_WEBHOOK_BODY_BYTES2,
-  TRANSCRIBER_ERROR_CODES2,
-  TranscriberError2,
-  MAX_CLIENT_REFERENCE_LENGTH2,
-  MAX_AUDIO_URL_LENGTH2,
-  MAX_SPEAKERS2,
-  DEFAULT_TRANSCRIBER_LIST_LIMIT2,
-  MAX_TRANSCRIBER_LIST_LIMIT2,
-  MAX_VENDOR_ID_LENGTH2,
-  checkTranscriptionResult2
-} from "./shared/chunk-4msy66ck.js";
 import {
   systemSleep2,
   assertReceiveOptions2,
@@ -171,6 +182,482 @@ async function mintTestToken(options) {
   const jwt = new SignJWT(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));
   jwt.setProtectedHeader(Object.fromEntries(Object.entries(header).filter(([, value]) => value !== undefined)));
   return jwt.sign(options.keyPair.privateKey);
+}
+// src/calendar/deadline.ts
+function startCalendarDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new CalendarError2(CALENDAR_ERROR_CODES2.timeout, "The call took too long", {
+          details: { timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new CalendarError2(CALENDAR_ERROR_CODES2.aborted, "The call was cancelled");
+      }
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+function isRetryableCalendarError(error) {
+  return error instanceof CalendarError2 && error.code === CALENDAR_ERROR_CODES2.unavailable;
+}
+async function withCalendarRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const delayMs = calendarRetryDelayMs2(n, options.policy, options.random);
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/calendar/validate.ts
+import { organizationIdSchema } from "tula-closeline-contract";
+import { z } from "zod";
+function invalid2(what) {
+  throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function checkOptions(options) {
+  if (options !== undefined && (typeof options !== "object" || options === null)) {
+    invalid2("options");
+  }
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
+  if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
+    invalid2("timeoutMs");
+  }
+  if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+    invalid2("signal");
+  }
+  const policy = options?.retry;
+  const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn(maxRetries, 0, 5)) {
+    invalid2("retry.maxRetries");
+  }
+  if (!integerIn(baseDelayMs, 1, 60000)) {
+    invalid2("retry.baseDelayMs");
+  }
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
+    invalid2("retry.maxDelayMs");
+  }
+  return {
+    timeoutMs,
+    retry: { maxRetries, baseDelayMs, maxDelayMs },
+    ...options?.signal === undefined ? {} : { signal: options.signal }
+  };
+}
+function parse(schema, value, what) {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
+    return invalid2(path ? `${what}.${path}` : what);
+  }
+  return parsed.data;
+}
+var instant = z.iso.datetime({ offset: true });
+var requestIdSchema = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
+var eventIdSchema = z.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/);
+var attendeeSchema = z.strictObject({
+  email: z.email().max(254),
+  name: z.string().min(1).max(200).optional()
+});
+var titleSchema = z.string().min(1).max(256);
+var descriptionSchema = z.string().max(8192);
+var locationSchema = z.string().max(512);
+var attendeesSchema = z.array(attendeeSchema).max(MAX_EVENT_ATTENDEES2);
+var eventSchema = z.strictObject({
+  title: titleSchema,
+  start: instant,
+  end: instant,
+  description: descriptionSchema.optional(),
+  location: locationSchema.optional(),
+  attendees: attendeesSchema.optional(),
+  conferencing: z.enum(["video", "none"]).optional()
+});
+var changesSchema = z.strictObject({
+  title: titleSchema.optional(),
+  start: instant.optional(),
+  end: instant.optional(),
+  description: descriptionSchema.optional(),
+  location: locationSchema.optional(),
+  attendees: attendeesSchema.optional()
+}).refine((c) => Object.values(c).some((v) => v !== undefined));
+var grantSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("authorization_code"),
+    code: z.string().min(1).max(4096),
+    redirectUri: z.url().max(2048),
+    codeVerifier: z.string().min(1).max(256).optional()
+  }),
+  z.strictObject({ kind: z.literal("refresh_token"), refreshToken: z.string().min(1).max(4096) })
+]);
+function checkOrganizationId2(value) {
+  return organizationIdSchema.safeParse(value).success ? value : invalid2("organizationId");
+}
+function checkBase(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid2("request");
+  }
+  checkOrganizationId2(request.organizationId);
+  if (!(request.connection instanceof CalendarConnection2)) {
+    return invalid2("connection");
+  }
+  if (request.connection.organizationId !== request.organizationId) {
+    return invalid2("connection");
+  }
+  return request.connection;
+}
+function checkGrant(value) {
+  return parse(grantSchema, value, "grant");
+}
+function checkRequestId(value) {
+  return parse(requestIdSchema, value, "requestId");
+}
+function checkEventId(value) {
+  return parse(eventIdSchema, value, "eventId");
+}
+function checkRange(from, to) {
+  const fromMs = Date.parse(parse(instant, from, "from"));
+  const toMs = Date.parse(parse(instant, to, "to"));
+  if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
+    invalid2("range");
+  }
+  return { fromMs, toMs };
+}
+function checkEventTimes(startMs, endMs) {
+  if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
+    invalid2("event.times");
+  }
+}
+function checkEvent(value) {
+  const event = parse(eventSchema, value, "event");
+  const startMs = Date.parse(event.start);
+  const endMs = Date.parse(event.end);
+  checkEventTimes(startMs, endMs);
+  return { event, startMs, endMs };
+}
+function checkChanges(value) {
+  return parse(changesSchema, value, "changes");
+}
+
+// src/calendar/memory.ts
+function iso(ms) {
+  return new Date(ms).toISOString();
+}
+function ref(event) {
+  return {
+    eventId: event.eventId,
+    start: iso(event.startMs),
+    end: iso(event.endMs),
+    ...event.joinUrl === undefined ? {} : { joinUrl: event.joinUrl }
+  };
+}
+function createMemoryCalendar(options = {}) {
+  const sleep = options.sleep ?? systemSleep2;
+  const allowed = new Set;
+  const accounts = new Map;
+  const replays = new Map;
+  const script = [];
+  const requests = [];
+  let serial = 0;
+  function report(error, organizationId) {
+    if (!(error instanceof CalendarError2) || error.code !== CALENDAR_ERROR_CODES2.unavailable && error.code !== CALENDAR_ERROR_CODES2.rejected) {
+      return;
+    }
+    try {
+      options.reporter?.capture(error, { organizationId, tags: { feature: "calendar" } });
+    } catch {}
+  }
+  function account(connection) {
+    const found = accounts.get(connection.connectionId);
+    if (found === undefined || found.organizationId !== connection.organizationId) {
+      invalid2("connection");
+    }
+    return found;
+  }
+  async function vendorRequest(kind, organizationId, signal, connection, effect) {
+    const entry = { view: { kind, organizationId, aborted: false, outcome: "pending" } };
+    const view = entry.view;
+    requests.push(entry);
+    signal.addEventListener("abort", () => {
+      if (view.outcome === "pending") {
+        view.aborted = true;
+        view.outcome = "aborted";
+      }
+    }, { once: true });
+    const abortedError = () => new CalendarError2(CALENDAR_ERROR_CODES2.aborted, "The call was cancelled");
+    const fail = (error) => {
+      if (view.outcome === "pending") {
+        view.outcome = "failed";
+      }
+      throw error;
+    };
+    if (signal.aborted) {
+      throw abortedError();
+    }
+    if (connection !== undefined && kind !== "revoke" && account(connection).revoked) {
+      fail(new CalendarError2(CALENDAR_ERROR_CODES2.revoked, "The calendar connection was revoked"));
+    }
+    const step = script.shift();
+    if (step?.kind === "fail") {
+      fail(new CalendarError2(step.code, "The vendor failed"));
+    }
+    if (step?.kind === "hang") {
+      await new Promise((resolve) => signal.addEventListener("abort", () => resolve()));
+      throw abortedError();
+    }
+    let result;
+    try {
+      result = effect();
+    } catch (error) {
+      view.outcome = "failed";
+      throw error;
+    }
+    if (step?.kind === "lose") {
+      fail(new CalendarError2(CALENDAR_ERROR_CODES2.unavailable, "The vendor connection was lost"));
+    }
+    view.outcome = "ok";
+    return result;
+  }
+  async function call(kind, organizationId, connection, callOptions, effect) {
+    const checked = checkOptions(callOptions);
+    const deadline = startCalendarDeadline(checked.timeoutMs, checked.signal);
+    try {
+      return await withCalendarRetry(() => vendorRequest(kind, organizationId, deadline.signal, connection, effect), {
+        policy: checked.retry,
+        deadline,
+        sleep,
+        ...options.random === undefined ? {} : { random: options.random },
+        onRetry: (retry, delayMs) => options.logger?.warn("A calendar call is retrying", { kind, retry, delayMs })
+      });
+    } catch (error) {
+      report(error, organizationId);
+      throw error;
+    } finally {
+      deadline.stop();
+    }
+  }
+  function replay(key, fingerprint, make) {
+    const seen = replays.get(key);
+    if (seen !== undefined) {
+      if (seen.fingerprint !== fingerprint) {
+        invalid2("requestId");
+      }
+      return { result: seen.result, first: false };
+    }
+    const result = make();
+    replays.set(key, { fingerprint, result });
+    return { result, first: true };
+  }
+  function busyIntervals(acct, fromMs, toMs) {
+    const blocks = [
+      ...acct.foreignBusy,
+      ...[...acct.events.values()].map((e) => ({ startMs: e.startMs, endMs: e.endMs }))
+    ].map((b) => ({ startMs: Math.max(b.startMs, fromMs), endMs: Math.min(b.endMs, toMs) })).filter((b) => b.startMs < b.endMs).sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+    const merged = [];
+    for (const block of blocks) {
+      const last = merged.at(-1);
+      if (last !== undefined && block.startMs <= last.endMs) {
+        last.endMs = Math.max(last.endMs, block.endMs);
+      } else {
+        merged.push({ ...block });
+      }
+    }
+    if (merged.length > MAX_BUSY_INTERVALS2) {
+      throw new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The calendar has too many busy intervals", {
+        details: { reason: "too_many_intervals", max: MAX_BUSY_INTERVALS2 }
+      });
+    }
+    return merged.map((b) => ({ start: iso(b.startMs), end: iso(b.endMs) }));
+  }
+  function fingerprintOf(value) {
+    return JSON.stringify(value);
+  }
+  function eventFromInput(input, startMs, endMs) {
+    serial += 1;
+    const eventId = `evt_${serial}_${crypto.randomUUID()}`;
+    return {
+      eventId,
+      title: input.title,
+      startMs,
+      endMs,
+      attendees: (input.attendees ?? []).map((a) => ({ ...a })),
+      ...input.description === undefined ? {} : { description: input.description },
+      ...input.location === undefined ? {} : { location: input.location },
+      ...input.conferencing === "video" ? { joinUrl: `https://meet.memory.test/${eventId}` } : {}
+    };
+  }
+  const port = {
+    async connect(request, callOptions) {
+      checkOrganizationId2(request?.organizationId);
+      const grant = checkGrant(request.grant);
+      const secret = grant.kind === "authorization_code" ? grant.code : grant.refreshToken;
+      return call("connect", request.organizationId, undefined, callOptions, () => {
+        if (!allowed.has(secret)) {
+          throw new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The vendor refused the grant");
+        }
+        serial += 1;
+        const connectionId = `calconn_${serial}_${crypto.randomUUID()}`;
+        accounts.set(connectionId, {
+          organizationId: request.organizationId,
+          revoked: false,
+          events: new Map,
+          foreignBusy: []
+        });
+        return new CalendarConnection2({
+          organizationId: request.organizationId,
+          provider: "memory",
+          connectionId,
+          credential: `access-${connectionId}-${secret}`
+        });
+      });
+    },
+    async busy(request, callOptions) {
+      const connection = checkBase(request);
+      const { fromMs, toMs } = checkRange(request.from, request.to);
+      return call("busy", request.organizationId, connection, callOptions, () => busyIntervals(account(connection), fromMs, toMs));
+    },
+    async createEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const requestId = checkRequestId(request.requestId);
+      const { event, startMs, endMs } = checkEvent(request.event);
+      return call("create", request.organizationId, connection, callOptions, () => {
+        const acct = account(connection);
+        const { result, first } = replay(`${connection.connectionId}:create:${requestId}`, fingerprintOf({
+          ...event,
+          start: startMs,
+          end: endMs,
+          conferencing: event.conferencing ?? "none"
+        }), () => {
+          const stored = eventFromInput(event, startMs, endMs);
+          acct.events.set(stored.eventId, stored);
+          return stored.eventId;
+        });
+        const stored = acct.events.get(result);
+        if (stored === undefined) {
+          throw new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The event was removed since", {
+            details: { reason: "event_deleted" }
+          });
+        }
+        return { ...ref(stored), created: first };
+      });
+    },
+    async updateEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const eventId = checkEventId(request.eventId);
+      const requestId = checkRequestId(request.requestId);
+      const changes = checkChanges(request.changes);
+      return call("update", request.organizationId, connection, callOptions, () => {
+        const acct = account(connection);
+        return replay(`${connection.connectionId}:update:${requestId}`, fingerprintOf({ eventId, changes }), () => {
+          const stored = acct.events.get(eventId);
+          if (stored === undefined) {
+            throw new CalendarError2(CALENDAR_ERROR_CODES2.notFound, "The event does not exist");
+          }
+          const startMs = changes.start === undefined ? stored.startMs : Date.parse(changes.start);
+          const endMs = changes.end === undefined ? stored.endMs : Date.parse(changes.end);
+          checkEventTimes(startMs, endMs);
+          stored.startMs = startMs;
+          stored.endMs = endMs;
+          if (changes.title !== undefined) {
+            stored.title = changes.title;
+          }
+          if (changes.description !== undefined) {
+            stored.description = changes.description;
+          }
+          if (changes.location !== undefined) {
+            stored.location = changes.location;
+          }
+          if (changes.attendees !== undefined) {
+            stored.attendees = changes.attendees.map((a) => ({ ...a }));
+          }
+          return ref(stored);
+        }).result;
+      });
+    },
+    async deleteEvent(request, callOptions) {
+      const connection = checkBase(request);
+      const eventId = checkEventId(request.eventId);
+      const requestId = checkRequestId(request.requestId);
+      return call("delete", request.organizationId, connection, callOptions, () => {
+        const acct = account(connection);
+        return replay(`${connection.connectionId}:delete:${requestId}`, fingerprintOf({ eventId }), () => ({ deleted: acct.events.delete(eventId) })).result;
+      });
+    },
+    async revoke(request, callOptions) {
+      const connection = checkBase(request);
+      await call("revoke", request.organizationId, connection, callOptions, () => {
+        account(connection).revoked = true;
+      });
+    },
+    allowGrant(secret) {
+      allowed.add(secret);
+    },
+    addBusy(connection, interval) {
+      const { fromMs, toMs } = checkRange(interval.start, interval.end);
+      account(connection).foreignBusy.push({ startMs: fromMs, endMs: toMs });
+    },
+    failNext(code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        script.push({ kind: "fail", code });
+      }
+    },
+    loseNextResponse(times = 1) {
+      for (let i = 0;i < times; i++) {
+        script.push({ kind: "lose" });
+      }
+    },
+    hangNext() {
+      script.push({ kind: "hang" });
+    },
+    revokeAtProvider(connection) {
+      account(connection).revoked = true;
+    },
+    events(connection) {
+      return [...account(connection).events.values()].map((e) => ({
+        eventId: e.eventId,
+        title: e.title,
+        start: iso(e.startMs),
+        end: iso(e.endMs),
+        attendees: e.attendees.map((a) => ({ ...a })),
+        ...e.description === undefined ? {} : { description: e.description },
+        ...e.location === undefined ? {} : { location: e.location },
+        ...e.joinUrl === undefined ? {} : { joinUrl: e.joinUrl }
+      }));
+    },
+    requests() {
+      return requests.map((entry) => ({ ...entry.view }));
+    }
+  };
+  return port;
 }
 // src/consent/memory.ts
 import {
@@ -289,70 +776,70 @@ async function withLlmRetry(attempt, options) {
 }
 
 // src/llm/validate.ts
-import { organizationIdSchema } from "tula-closeline-contract";
-import { z } from "zod";
+import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
+import { z as z2 } from "zod";
 var SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-function invalid2(what) {
+function invalid3(what) {
   throw new LlmError2(LLM_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn(value, min, max) {
+function integerIn2(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function resolveRetryPolicy(policy) {
   const maxRetries = policy?.maxRetries ?? DEFAULT_LLM_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn(maxRetries, 0, 5)) {
-    invalid2("retry.maxRetries");
+  if (!integerIn2(maxRetries, 0, 5)) {
+    invalid3("retry.maxRetries");
   }
-  if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid2("retry.baseDelayMs");
+  if (!integerIn2(baseDelayMs, 1, 60000)) {
+    invalid3("retry.baseDelayMs");
   }
-  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid2("retry.maxDelayMs");
+  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
+    invalid3("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
 }
 function checkRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid2("request");
+    return invalid3("request");
   }
-  if (!organizationIdSchema.safeParse(request.organizationId).success) {
-    invalid2("organizationId");
+  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
+    invalid3("organizationId");
   }
   if (!MODEL_TIERS2.includes(request.tier)) {
-    invalid2("tier");
+    invalid3("tier");
   }
   if (request.system !== undefined && typeof request.system !== "string") {
-    invalid2("system");
+    invalid3("system");
   }
   const messages = request.messages;
   if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_LLM_MESSAGES2) {
-    invalid2("messages");
+    invalid3("messages");
   }
   for (const message of messages) {
     const m = message;
     if (typeof m !== "object" || m === null || m.role !== "user" && m.role !== "assistant" || typeof m.content !== "string" || m.content.length < 1) {
-      invalid2("messages");
+      invalid3("messages");
     }
   }
   if (messages.at(-1)?.role !== "user") {
-    invalid2("messages");
+    invalid3("messages");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS2;
-  if (!integerIn(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
-    invalid2("timeoutMs");
+  if (!integerIn2(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
+    invalid3("timeoutMs");
   }
   const maxInputTokens = request.maxInputTokens ?? DEFAULT_LLM_MAX_INPUT_TOKENS2;
-  if (!integerIn(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
-    invalid2("maxInputTokens");
+  if (!integerIn2(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
+    invalid3("maxInputTokens");
   }
   const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS2;
-  if (!integerIn(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
-    invalid2("maxOutputTokens");
+  if (!integerIn2(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
+    invalid3("maxOutputTokens");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid2("signal");
+    invalid3("signal");
   }
   const retry = resolveRetryPolicy(request.retry);
   const inputTokens = estimateTokens2(request.system ?? "") + messages.reduce((sum, m) => sum + estimateTokens2(m.content), 0);
@@ -365,17 +852,17 @@ function checkRequest(request) {
 }
 function checkCompleteRequest(request) {
   const checked = checkRequest(request);
-  if (!(request.schema instanceof z.ZodType)) {
-    invalid2("schema");
+  if (!(request.schema instanceof z2.ZodType)) {
+    invalid3("schema");
   }
   if (typeof request.schemaName !== "string" || !SCHEMA_NAME.test(request.schemaName)) {
-    invalid2("schemaName");
+    invalid3("schemaName");
   }
   let jsonSchema;
   try {
-    jsonSchema = z.toJSONSchema(request.schema, { io: "input" });
+    jsonSchema = z2.toJSONSchema(request.schema, { io: "input" });
   } catch {
-    return invalid2("schema");
+    return invalid3("schema");
   }
   return { checked, jsonSchema };
 }
@@ -547,10 +1034,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid2("reply text");
+        invalid3("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid2("reply chunks");
+        invalid3("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -736,7 +1223,7 @@ function createMemoryQueue(options) {
   };
 }
 // src/queue/testing.ts
-import { z as z2 } from "zod";
+import { z as z3 } from "zod";
 var SETTLE_ROUNDS = 8;
 function createVirtualTime() {
   const clock = createFixedClock2("2026-01-01T00:00:00.000Z");
@@ -789,17 +1276,17 @@ var testPing = defineMessage2({
   type: "test.ping",
   version: 1,
   scope: "organization",
-  payload: z2.object({ n: z2.number().int() })
+  payload: z3.object({ n: z3.number().int() })
 });
 var testNote = defineMessage2({
   type: "test.note",
   version: 1,
   scope: "global",
-  payload: z2.object({ text: z2.string() })
+  payload: z3.object({ text: z3.string() })
 });
 function createTestRegistry(options = {}) {
   return createMessageRegistry2([testPing, testNote], {
-    organizationIdSchema: z2.string().min(1).max(64),
+    organizationIdSchema: z3.string().min(1).max(64),
     ...options
   });
 }
@@ -967,41 +1454,41 @@ ${expires}`).digest("hex");
   return store;
 }
 // src/streaming-transcribe/validate.ts
-import { callIdSchema, organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
+import { callIdSchema, organizationIdSchema as organizationIdSchema3 } from "tula-closeline-contract";
 var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
 var TRACKS = ["rep", "prospect"];
-function invalid3(what) {
+function invalid4(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn2(value, min, max) {
+function integerIn3(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function checkOpenRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid3("request");
+    return invalid4("request");
   }
-  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
-    invalid3("organizationId");
+  if (!organizationIdSchema3.safeParse(request.organizationId).success) {
+    invalid4("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
-    invalid3("callId");
+    invalid4("callId");
   }
   if (!TRACKS.includes(request.track)) {
-    invalid3("track");
+    invalid4("track");
   }
   if (!ENCODINGS.includes(request.encoding)) {
-    invalid3("encoding");
+    invalid4("encoding");
   }
   if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid3("sampleRate");
+    invalid4("sampleRate");
   }
   if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
-    invalid3("language");
+    invalid4("language");
   }
   if (typeof request.onEvent !== "function") {
-    invalid3("onEvent");
+    invalid4("onEvent");
   }
   return resolveReconnectPolicy(request.reconnect);
 }
@@ -1009,24 +1496,24 @@ function resolveReconnectPolicy(policy) {
   const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
-  if (!integerIn2(maxAttempts, 0, 10)) {
-    invalid3("reconnect.maxAttempts");
+  if (!integerIn3(maxAttempts, 0, 10)) {
+    invalid4("reconnect.maxAttempts");
   }
-  if (!integerIn2(baseDelayMs, 1, 60000)) {
-    invalid3("reconnect.baseDelayMs");
+  if (!integerIn3(baseDelayMs, 1, 60000)) {
+    invalid4("reconnect.baseDelayMs");
   }
-  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
-    invalid3("reconnect.maxDelayMs");
+  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
+    invalid4("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn2(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid3("timeoutMs");
+  return integerIn3(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid4("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
-    return invalid3("chunk");
+    return invalid4("chunk");
   }
   return chunk;
 }
@@ -1042,19 +1529,19 @@ function wordsOf(text, startMs) {
 }
 function checkScript(turns) {
   if (!Array.isArray(turns) || turns.length > 1000) {
-    invalid3("turns");
+    invalid4("turns");
   }
   let previous = 0;
   for (const turn of turns) {
     const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
     if (count < 1 || count > 200) {
-      invalid3("turn text");
+      invalid4("turn text");
     }
     if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
-      invalid3("afterBytes");
+      invalid4("afterBytes");
     }
     if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
-      invalid3("interims");
+      invalid4("interims");
     }
     previous = turn.afterBytes;
   }
@@ -2234,6 +2721,7 @@ function createTestDeps(overrides = {}) {
 export {
   DEFAULT_TEST_ORGANIZATION_ID,
   DEFAULT_TEST_USER_ID,
+  createMemoryCalendar,
   createMemoryContactGuard,
   createMemoryErrorReporter,
   createMemoryLlm,
