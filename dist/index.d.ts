@@ -220,38 +220,6 @@ interface AuthMiddlewareOptions {
 * `auth.unavailable` when the signing keys could not be loaded or verification threw.
 */
 declare function createAuthMiddleware(options: AuthMiddlewareOptions): MiddlewareHandler<AuthEnv>;
-/** Everything needed to build an AppError. */
-interface AppErrorInit {
-	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
-	code: string;
-	/** HTTP status the error maps to. */
-	status: number;
-	/** Human-readable message that is safe to return to a client. */
-	message: string;
-	/** Extra plain data that is safe to return to a client. */
-	details?: Record<string, unknown>;
-	/** The underlying error, kept for logs and never returned to a client. */
-	cause?: unknown;
-}
-/** The JSON body a service returns for a failed request. */
-interface ErrorBody {
-	error: {
-		code: string;
-		message: string;
-		details?: Record<string, unknown>;
-	};
-}
-/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
-declare class AppError extends Error {
-	readonly code: string;
-	readonly status: number;
-	readonly details?: Record<string, unknown>;
-	constructor(init: AppErrorInit);
-}
-/** Narrows an unknown value to an AppError. */
-declare function isAppError(value: unknown): value is AppError;
-/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
-declare function toErrorBody(error: AppError): ErrorBody;
 import { z as z2 } from "zod";
 /** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
 declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
@@ -477,6 +445,98 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
+/**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+/** The real {@link Sleep}, on `setTimeout`. */
+declare const systemSleep: Sleep;
+import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
+/**
+* What a calling service gives the guard: the Contact Check body without `caller`, which the
+* guard fills in with the service's own name. There is no field that waives the check (ADR 0003).
+*/
+type ContactGuardRequest = Omit<ContactCheckRequest, "caller">;
+/** The answer of a Contact Check: an allowance with its basis, or a denial with a `consent.*` code. */
+type ContactGuardResult = ContactCheckResult;
+/**
+* The question every channel asks before it contacts a Prospect: may I contact this Prospect, or
+* this address, on this channel now, for this purpose (ADR 0003, ADR 0021)? It never throws and it
+* fails closed: anything but a clear allowance is a denial, and a check that could not be answered
+* is a denial with `consent.unavailable`. Only `allowed: true` permits a contact.
+*/
+interface ContactGuard {
+	/** Asks the check; resolves with an allowance or a denial and never rejects. */
+	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
+}
+/** The denial of a check that was not answered in time, or not at all (no logged check). */
+declare const CONTACT_UNAVAILABLE: ContactGuardResult;
+/** Whether `request` is a well-formed Contact Check body once the caller is named. */
+declare function isContactGuardRequest(request: unknown, caller: string): boolean;
+/** The request as the wire body: the caller added to a copy, never to the caller's object. */
+declare function withCaller(request: unknown, caller: string): unknown;
+/** The bound on one attempt of a Contact Check, in milliseconds (ADR 0021). */
+declare const CONTACT_GUARD_TIMEOUT_MS = 500;
+/** The base of the pause before the one retry; the pause is jittered between half and one and a half of it. */
+declare const CONTACT_GUARD_RETRY_DELAY_MS = 50;
+/** Options for {@link createHttpContactGuard}. There is deliberately no option that turns the check off. */
+type HttpContactGuardOptions = Pick<InternalClientOptions, "baseUrl" | "secret" | "environment" | "ca" | "keepAlive"> & {
+	/** The calling service's name, such as `voice` or `outbound`: lower-case letters, digits, `_` and `-`. */
+	caller: string;
+	/** Where failures are noted: fixed words, a failure kind, a status and counts only. */
+	logger: Pick<Logger, "warn">;
+	/** Injected for tests; the pause before the retry. */
+	sleep?: Sleep;
+	/** Injected for tests; a number in `[0, 1)`. */
+	random?: () => number;
+};
+/** A {@link ContactGuard} that can release its connections. */
+interface HttpContactGuard extends ContactGuard {
+	/** Closes the connections the guard holds; safe to call more than once. */
+	close(): void;
+}
+/**
+* Builds a {@link ContactGuard} that asks core's internal Contact Check over HTTP with the shared
+* secret the kit's other internal calls use (ADR 0013). Each attempt is bounded at 500 ms and a
+* timeout, a network error or a 5xx is tried once more after a jittered pause. It fails closed: if
+* both attempts fail, or the answer is not a valid result, the guard answers denied with
+* `consent.unavailable`. A denial from core is passed through as it came. Logs carry fixed words,
+* the failure kind, a status, the channel and the purpose; never the secret, an address or a body.
+*/
+declare function createHttpContactGuard(options: HttpContactGuardOptions): HttpContactGuard;
+/** Everything needed to build an AppError. */
+interface AppErrorInit {
+	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
+	code: string;
+	/** HTTP status the error maps to. */
+	status: number;
+	/** Human-readable message that is safe to return to a client. */
+	message: string;
+	/** Extra plain data that is safe to return to a client. */
+	details?: Record<string, unknown>;
+	/** The underlying error, kept for logs and never returned to a client. */
+	cause?: unknown;
+}
+/** The JSON body a service returns for a failed request. */
+interface ErrorBody {
+	error: {
+		code: string;
+		message: string;
+		details?: Record<string, unknown>;
+	};
+}
+/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
+declare class AppError extends Error {
+	readonly code: string;
+	readonly status: number;
+	readonly details?: Record<string, unknown>;
+	constructor(init: AppErrorInit);
+}
+/** Narrows an unknown value to an AppError. */
+declare function isAppError(value: unknown): value is AppError;
+/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
+declare function toErrorBody(error: AppError): ErrorBody;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
 import { z as z3 } from "zod";
@@ -768,13 +828,6 @@ declare function assertReceiveOptions(options: ReceiveOptions): void;
 declare function assertVisibility(seconds: number): void;
 /** Throws the QueueError for a batch of 0 or more than 10 messages. */
 declare function assertBatchCount(count: number): void;
-/**
-* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
-* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
-*/
-type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
-/** The real {@link Sleep}, on `setTimeout`. */
-declare const systemSleep: Sleep;
 /** Identifies one message for one consumer: what "already processed" is recorded against. */
 interface ConsumedKey {
 	/** The consumer's name, so two consumers of different queues in one service do not collide. */
@@ -1574,4 +1627,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ByteStream, ClaimResult, Clock, ConsumedKey, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PresignOptions, PreviousVersion, ProcessedStore, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StorageError, StorageErrorCode, StoredObject, Submission, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, dropHighSurrogate, environmentSchema, isAppError, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody, waitForTranscription };
+export { AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FixedClock, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PresignOptions, PreviousVersion, ProcessedStore, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StorageError, StorageErrorCode, StoredObject, Submission, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, dropHighSurrogate, environmentSchema, isAppError, isContactGuardRequest, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody, waitForTranscription, withCaller };

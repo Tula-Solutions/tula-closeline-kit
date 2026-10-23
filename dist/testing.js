@@ -1,4 +1,6 @@
 import {
+  CONTACT_UNAVAILABLE2,
+  isContactGuardRequest2,
   scrubText2,
   prepareFields,
   shouldReportError2,
@@ -10,7 +12,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-sf8f3fp3.js";
+} from "./shared/chunk-qarghb8f.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -45,11 +47,11 @@ import {
   checkTranscriptionResult2
 } from "./shared/chunk-5yzgse6v.js";
 import {
+  systemSleep2,
   assertReceiveOptions2,
   assertVisibility2,
-  assertBatchCount2,
-  systemSleep2
-} from "./shared/chunk-dpkegc79.js";
+  assertBatchCount2
+} from "./shared/chunk-h070fpj8.js";
 
 // src/reporting/testing.ts
 function copyContext(context) {
@@ -133,6 +135,67 @@ async function mintTestToken(options) {
   const jwt = new SignJWT(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));
   jwt.setProtectedHeader(Object.fromEntries(Object.entries(header).filter(([, value]) => value !== undefined)));
   return jwt.sign(options.keyPair.privateKey);
+}
+// src/consent/memory.ts
+import {
+  formatId as formatId2
+} from "tula-closeline-contract";
+var MEMORY_CALLER = "memory";
+function key(target, channel) {
+  const who = target.prospectId !== undefined ? `prospect:${target.prospectId}` : target.email !== undefined ? `email:${target.email}` : target.phone !== undefined ? `phone:${target.phone}` : `linkedin:${target.linkedinUrl}`;
+  return JSON.stringify([target.organizationId, who, channel]);
+}
+var counter = 0;
+function checkId() {
+  counter += 1;
+  return formatId2("chk", counter.toString(16).padStart(32, "0"));
+}
+function createMemoryContactGuard() {
+  const presets = new Map;
+  const calls = [];
+  let unavailable = false;
+  const guard = {
+    calls,
+    async check(request) {
+      if (!isContactGuardRequest2(request, MEMORY_CALLER)) {
+        return CONTACT_UNAVAILABLE2;
+      }
+      calls.push({ ...request });
+      if (unavailable) {
+        return CONTACT_UNAVAILABLE2;
+      }
+      return presets.get(key(request, request.channel)) ?? {
+        allowed: false,
+        checkId: checkId(),
+        code: "consent.missing",
+        suppressionReason: null
+      };
+    },
+    allow(target, channel, basis = "consent_granted") {
+      presets.set(key(target, channel), { allowed: true, checkId: checkId(), basis });
+      return guard;
+    },
+    deny(target, channel, code = "consent.missing", suppressionReason) {
+      const reason = code === "consent.suppressed" ? suppressionReason ?? "manual" : null;
+      presets.set(key(target, channel), {
+        allowed: false,
+        checkId: checkId(),
+        code,
+        suppressionReason: reason
+      });
+      return guard;
+    },
+    setUnavailable(value = true) {
+      unavailable = value;
+      return guard;
+    },
+    reset() {
+      presets.clear();
+      calls.length = 0;
+      unavailable = false;
+    }
+  };
+  return guard;
 }
 // src/queue/memory.ts
 function bytesOf(body) {
@@ -1117,6 +1180,7 @@ function createTestDeps(overrides = {}) {
 export {
   DEFAULT_TEST_ORGANIZATION_ID,
   DEFAULT_TEST_USER_ID,
+  createMemoryContactGuard,
   createMemoryErrorReporter,
   createMemoryLogger,
   createMemoryObjectStore,

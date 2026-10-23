@@ -3,6 +3,23 @@ import {
   isAppError2
 } from "./chunk-tya44yhr.js";
 
+// src/consent/port.ts
+import {
+  contactCheckRequestSchema
+} from "tula-closeline-contract";
+var CONTACT_UNAVAILABLE2 = Object.freeze({
+  allowed: false,
+  checkId: null,
+  code: "consent.unavailable",
+  suppressionReason: null
+});
+function isContactGuardRequest2(request, caller) {
+  return contactCheckRequestSchema.safeParse(withCaller2(request, caller)).success;
+}
+function withCaller2(request, caller) {
+  return typeof request === "object" && request !== null ? { ...request, caller } : request;
+}
+
 // src/pii.ts
 var MAX_LOCAL_PART = 64;
 var MAX_DOMAIN = 255;
@@ -1081,4 +1098,4 @@ var MAX_DIMENSIONS2 = 4096;
 var MAX_ATTRIBUTES2 = 16;
 var MAX_ATTRIBUTE_STRING2 = 512;
 
-export { isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

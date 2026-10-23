@@ -1,4 +1,7 @@
 import {
+  CONTACT_UNAVAILABLE2,
+  isContactGuardRequest2,
+  withCaller2,
   isSensitiveKey,
   dropHighSurrogate2,
   cutText2,
@@ -15,7 +18,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-sf8f3fp3.js";
+} from "./shared/chunk-qarghb8f.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -61,14 +64,14 @@ import {
   checkTranscriptionResult2
 } from "./shared/chunk-5yzgse6v.js";
 import {
+  systemSleep2,
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
   MAX_VISIBILITY_SECONDS2,
   assertReceiveOptions2,
   assertVisibility2,
-  assertBatchCount2,
-  systemSleep2
-} from "./shared/chunk-dpkegc79.js";
+  assertBatchCount2
+} from "./shared/chunk-h070fpj8.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";
@@ -540,6 +543,13 @@ function createTokenVerifier(options) {
     }
   };
 }
+// src/consent/http.ts
+import {
+  CONSENT_ROUTES,
+  contactCheckRequestSchema,
+  contactCheckResultSchema
+} from "tula-closeline-contract";
+
 // src/http/internal.ts
 import { Agent as HttpAgent, request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
@@ -973,6 +983,85 @@ async function pauseOrAbort(sleep, ms, signal, lifetime) {
     }
     stop.abort();
   }
+}
+
+// src/consent/http.ts
+var CONTACT_GUARD_TIMEOUT_MS = 500;
+var CONTACT_GUARD_RETRY_DELAY_MS = 50;
+async function attempt(client, body) {
+  const route = CONSENT_ROUTES.contactCheck;
+  try {
+    const response = await client.request({
+      method: route.method,
+      path: route.path,
+      body,
+      timeoutMs: CONTACT_GUARD_TIMEOUT_MS
+    });
+    if (response.status >= 500) {
+      return { kind: "failed", reason: "http_5xx", retry: true, status: response.status };
+    }
+    if (response.status !== 200) {
+      return { kind: "failed", reason: "http_unexpected", retry: false, status: response.status };
+    }
+    const parsed = contactCheckResultSchema.safeParse(response.json);
+    return parsed.success ? { kind: "answer", result: parsed.data } : { kind: "failed", reason: "malformed_response", retry: false };
+  } catch (error) {
+    return {
+      kind: "failed",
+      reason: error instanceof InternalCallError ? error.failure : "error",
+      retry: true
+    };
+  }
+}
+function createHttpContactGuard(options) {
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(options.caller)) {
+    throw new TypeError("the caller must be a short lower-case service name");
+  }
+  const { caller, logger } = options;
+  const sleep = options.sleep ?? systemSleep2;
+  const random = options.random ?? Math.random;
+  const client = createInternalClient({
+    baseUrl: options.baseUrl,
+    secret: options.secret,
+    environment: options.environment,
+    userAgent: `closeline-${caller}`,
+    timeoutMs: CONTACT_GUARD_TIMEOUT_MS,
+    retry: { maxAttempts: 1 },
+    ...options.ca === undefined ? {} : { ca: options.ca },
+    ...options.keepAlive === undefined ? {} : { keepAlive: options.keepAlive }
+  });
+  return {
+    async check(request) {
+      const body = withCaller2(request, caller);
+      const valid = contactCheckRequestSchema.safeParse(body);
+      if (!valid.success) {
+        logger.warn("contact check refused: the request is not valid, contact denied", {
+          reason: "invalid_request"
+        });
+        return CONTACT_UNAVAILABLE2;
+      }
+      const where = { channel: valid.data.channel, purpose: valid.data.purpose };
+      for (let n = 1;n <= 2; n++) {
+        const outcome = await attempt(client, valid.data);
+        if (outcome.kind === "answer") {
+          return outcome.result;
+        }
+        const again = n === 1 && outcome.retry;
+        logger.warn(again ? "contact check failed, retrying once" : "contact check failed, contact denied as unavailable", {
+          reason: outcome.reason,
+          attempt: n,
+          ...outcome.status === undefined ? {} : { status: outcome.status },
+          ...where
+        });
+        if (!again) {
+          break;
+        }
+        await sleep(Math.floor(CONTACT_GUARD_RETRY_DELAY_MS * (0.5 + random())));
+      }
+      return CONTACT_UNAVAILABLE2;
+    },
+    close: () => client.close()
+  };
 }
 // src/logger.ts
 import pino from "pino";
@@ -1622,6 +1711,9 @@ function createErrorReporter(options) {
 var PACKAGE = "tula-closeline-kit";
 export {
   AppError2 as AppError,
+  CONTACT_GUARD_RETRY_DELAY_MS,
+  CONTACT_GUARD_TIMEOUT_MS,
+  CONTACT_UNAVAILABLE2 as CONTACT_UNAVAILABLE,
   DEFAULT_CONTENT_TYPE2 as DEFAULT_CONTENT_TYPE,
   DEFAULT_LIST_LIMIT2 as DEFAULT_LIST_LIMIT,
   DEFAULT_MAX_OBJECT_BYTES2 as DEFAULT_MAX_OBJECT_BYTES,
@@ -1693,6 +1785,7 @@ export {
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
+  createHttpContactGuard,
   createInternalClient,
   createLogger,
   createMemoryProcessedStore,
@@ -1706,6 +1799,7 @@ export {
   dropHighSurrogate2 as dropHighSurrogate,
   environmentSchema,
   isAppError2 as isAppError,
+  isContactGuardRequest2 as isContactGuardRequest,
   isSentryDsn,
   requireSentryDsn,
   scrubText2 as scrubText,
@@ -1714,5 +1808,6 @@ export {
   systemClock2 as systemClock,
   systemSleep2 as systemSleep,
   toErrorBody2 as toErrorBody,
-  waitForTranscription2 as waitForTranscription
+  waitForTranscription2 as waitForTranscription,
+  withCaller2 as withCaller
 };
