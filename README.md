@@ -955,6 +955,29 @@ for await (const event of llm.stream({ organizationId, tier: 'fast', messages })
   and `withLlmRetry` (`src/llm/deadline.ts`) and `checkCompleteRequest` / `parseModelOutput`
   (`src/llm/validate.ts`).
 
+### Claude on Bedrock (`createBedrockLlm`, 0.23.0)
+
+```ts
+import { createBedrockLlm } from 'tula-closeline-kit/llm'
+
+const llm = createBedrockLlm({ region: 'eu-west-1' }) // models: { fast, smart } to override
+```
+
+- It sits behind its own entry so the root does not load the AWS SDK. Credentials come from the
+  default AWS chain only.
+- `fast` is Claude Haiku 5.5 (`anthropic.claude-haiku-5-5`), `smart` is Claude Sonnet 5.5
+  (`anthropic.claude-sonnet-5-5`); both are settings (`models`).
+- Region is a setting, and a call never leaves it: the endpoint cannot be overridden (the endpoint
+  environment variables are refused, the config file's `endpoint_url` is ignored). A cross-Region
+  inference profile id (`eu.…`, `us.…`, `apac.…`) is accepted only when its prefix is the geography
+  of the Region; a `global.` profile or an ARN is refused, at construction.
+- `complete` forces one tool whose input schema is yours, so the answer is JSON checked by Zod; the
+  SDK's own retry is off and the kit's bounded, jittered retry is the only one. A stream retries
+  only before its first text.
+- The shared behaviour suite runs against a scripted client (`bedrock.behaviour.test.ts`).
+  `src/llm/bedrock.integration.ts` calls the real service when `BEDROCK_TEST_REGION` is set and
+  AWS credentials are present; without it, it is skipped and says so.
+
 ## Text to speech (`TtsPort`)
 
 `TtsPort` (0.18.0) turns an agent's reply text into audio while the Call is live. It is

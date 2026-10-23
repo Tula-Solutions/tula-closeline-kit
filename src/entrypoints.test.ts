@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 const ROOT = new URL('./index.ts', import.meta.url).pathname
 const QUEUE = new URL('./queue.ts', import.meta.url).pathname
+const LLM = new URL('./llm.ts', import.meta.url).pathname
 const STORAGE = new URL('./storage.ts', import.meta.url).pathname
 const TESTING = new URL('./testing.ts', import.meta.url).pathname
 const BEHAVIOUR = new URL('./behaviour.ts', import.meta.url).pathname
@@ -48,6 +49,15 @@ describe('importing the kit does not load an AWS SDK client unless its own entry
     expect(queue).not.toContain('@aws-sdk/client-s3')
   })
 
+  test('the llm entry names the Bedrock client and neither the S3 nor the SQS one', async () => {
+    const llm = await packagesImportedBy(LLM)
+    expect(llm).toContain('@aws-sdk/client-bedrock-runtime')
+    expect(llm).not.toContain('@aws-sdk/client-s3')
+    expect(llm).not.toContain('@aws-sdk/client-sqs')
+    expect(await packagesImportedBy(QUEUE)).not.toContain('@aws-sdk/client-bedrock-runtime')
+    expect(await packagesImportedBy(STORAGE)).not.toContain('@aws-sdk/client-bedrock-runtime')
+  })
+
   test.each([
     ['root', ROOT],
     ['testing', TESTING],
@@ -60,7 +70,7 @@ describe('importing the kit does not load an AWS SDK client unless its own entry
 
   test('only the behaviour entry names bun:test', async () => {
     expect((await analyse(BEHAVIOUR)).output).toContain('bun:test')
-    for (const entry of [ROOT, TESTING, QUEUE, STORAGE]) {
+    for (const entry of [ROOT, TESTING, QUEUE, STORAGE, LLM]) {
       expect((await analyse(entry)).output).not.toContain('bun:test')
     }
   })

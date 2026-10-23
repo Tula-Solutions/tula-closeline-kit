@@ -7,14 +7,16 @@ import {
   MAX_MESSAGE_BYTES2
 } from "./shared/chunk-mjkmsg3r.js";
 import {
-  systemSleep2,
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
   MAX_VISIBILITY_SECONDS2,
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-h070fpj8.js";
+} from "./shared/chunk-3n6tvg2s.js";
+import {
+  systemSleep2
+} from "./shared/chunk-hybwyj31.js";
 
 // src/queue/aws.ts
 import {

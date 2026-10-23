@@ -3,21 +3,6 @@ import {
   QueueError2
 } from "./chunk-mjkmsg3r.js";
 
-// src/queue/sleep.ts
-var systemSleep2 = (ms, signal) => new Promise((resolve) => {
-  if (signal?.aborted) {
-    resolve();
-    return;
-  }
-  const done = () => {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", done);
-    resolve();
-  };
-  const timer = setTimeout(done, ms);
-  signal?.addEventListener("abort", done, { once: true });
-});
-
 // src/queue/port.ts
 var MAX_BATCH_SIZE2 = 10;
 var MAX_WAIT_SECONDS2 = 20;
@@ -45,4 +30,4 @@ function assertBatchCount2(count) {
   }
 }
 
-export { systemSleep2, MAX_BATCH_SIZE2, MAX_WAIT_SECONDS2, MAX_VISIBILITY_SECONDS2, assertReceiveOptions2, assertVisibility2, assertBatchCount2 };
+export { MAX_BATCH_SIZE2, MAX_WAIT_SECONDS2, MAX_VISIBILITY_SECONDS2, assertReceiveOptions2, assertVisibility2, assertBatchCount2 };

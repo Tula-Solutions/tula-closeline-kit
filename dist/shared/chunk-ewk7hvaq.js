@@ -17,10 +17,10 @@ import {
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2
-} from "./chunk-q819sn0x.js";
+} from "./chunk-jkpcd738.js";
 import {
   systemSleep2
-} from "./chunk-h070fpj8.js";
+} from "./chunk-hybwyj31.js";
 import {
   systemClock2
 } from "./chunk-mjkmsg3r.js";
@@ -117,29 +117,6 @@ function isContactGuardRequest2(request, caller) {
 }
 function withCaller2(request, caller) {
   return typeof request === "object" && request !== null ? { ...request, caller } : request;
-}
-
-// src/llm/port.ts
-var DEFAULT_LLM_TIMEOUT_MS2 = 15000;
-var MAX_LLM_TIMEOUT_MS2 = 120000;
-var DEFAULT_LLM_MAX_INPUT_TOKENS2 = 16000;
-var MAX_LLM_MAX_INPUT_TOKENS2 = 200000;
-var DEFAULT_LLM_MAX_OUTPUT_TOKENS2 = 1024;
-var MAX_LLM_MAX_OUTPUT_TOKENS2 = 8192;
-var MAX_LLM_MESSAGES2 = 100;
-var MODEL_TIERS2 = ["fast", "smart"];
-var ESTIMATED_CHARS_PER_TOKEN2 = 3;
-function estimateTokens2(text) {
-  return Math.ceil(text.length / ESTIMATED_CHARS_PER_TOKEN2);
-}
-var DEFAULT_LLM_RETRY_POLICY2 = {
-  maxRetries: 2,
-  baseDelayMs: 200,
-  maxDelayMs: 2000
-};
-function llmRetryDelayMs2(retry, policy, random = Math.random) {
-  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
-  return Math.max(1, Math.floor(exponential * (0.5 + random())));
 }
 
 // src/pii.ts
@@ -1855,4 +1832,4 @@ function checkSendRequest(request) {
   };
 }
 
-export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, requireConsent, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, requireConsent, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
