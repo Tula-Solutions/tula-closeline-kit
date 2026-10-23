@@ -305,6 +305,11 @@ export function llmBehaviour(name: string, make: () => Promise<LlmSubject>, skip
       const s = await subject()
       s.hang()
       await codeOf(complete(s, { timeoutMs: 20 }))
+      s.hang()
+      const controller = new AbortController()
+      const pending = codeOf(complete(s, { signal: controller.signal }))
+      setTimeout(() => controller.abort(), 10)
+      expect(await pending).toBe(LLM_ERROR_CODES.aborted)
       expect(s.reporter.captured).toHaveLength(0)
     })
 

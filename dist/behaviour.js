@@ -358,6 +358,11 @@ function llmBehaviour(name, make, skip = false) {
       const s = await subject();
       s.hang();
       await codeOf(complete(s, { timeoutMs: 20 }));
+      s.hang();
+      const controller = new AbortController;
+      const pending = codeOf(complete(s, { signal: controller.signal }));
+      setTimeout(() => controller.abort(), 10);
+      expect2(await pending).toBe(LLM_ERROR_CODES2.aborted);
       expect2(s.reporter.captured).toHaveLength(0);
     });
     test2("no prompt and no completion reaches a log, the error reporter or an error", async () => {
