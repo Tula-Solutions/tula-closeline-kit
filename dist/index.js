@@ -1761,6 +1761,53 @@ function mapTwilioFailure(status, body) {
 function retryable(status) {
   return status === 429 || status >= 500;
 }
+function guardBody(response, timer, signal, timedOut) {
+  const source = response.body;
+  if (source === null) {
+    clearTimeout(timer);
+    return response;
+  }
+  const reader = source.getReader();
+  const aborted = new Promise((_, reject) => {
+    const fail = () => reject(unavailable2(timedOut() ? "timed out" : "the request failed"));
+    if (signal.aborted) {
+      fail();
+    } else {
+      signal.addEventListener("abort", fail, { once: true });
+    }
+  });
+  aborted.catch(() => {
+    return;
+  });
+  const guarded = new ReadableStream({
+    async pull(controller) {
+      try {
+        const chunk = await Promise.race([reader.read(), aborted]);
+        if (chunk.done) {
+          clearTimeout(timer);
+          controller.close();
+        } else {
+          controller.enqueue(chunk.value);
+        }
+      } catch (error) {
+        clearTimeout(timer);
+        reader.cancel().catch(() => {
+          return;
+        });
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      return reader.cancel(reason);
+    }
+  });
+  return new Response(guarded, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
 function createTwilioHttp(options) {
   const maxAttempts = options.maxAttempts ?? TWILIO_MAX_ATTEMPTS;
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
@@ -1797,6 +1844,7 @@ function createTwilioHttp(options) {
         timedOut = true;
         controller.abort();
       }, remaining);
+      let keepTimer = false;
       try {
         const response = await options.fetch(`${options.baseUrl}${request.path}`, {
           method: request.method,
@@ -1807,7 +1855,12 @@ function createTwilioHttp(options) {
         });
         const ok = response.status >= 200 && response.status < 300;
         if (ok && mode === "stream") {
-          return { status: response.status, json: null, response };
+          keepTimer = true;
+          return {
+            status: response.status,
+            json: null,
+            response: guardBody(response, timer, controller.signal, () => timedOut)
+          };
         }
         const json = await readJson(response, ok || allow.includes(response.status));
         if (ok || allow.includes(response.status)) {
@@ -1832,7 +1885,9 @@ function createTwilioHttp(options) {
           last = unavailable2("the request failed");
         }
       } finally {
-        clearTimeout(timer);
+        if (!keepTimer) {
+          clearTimeout(timer);
+        }
       }
       if (attempt < maxAttempts) {
         const base = Math.min(TWILIO_RETRY_MAX_MS, TWILIO_RETRY_BASE_MS * 2 ** (attempt - 1));
@@ -1914,6 +1969,14 @@ function createMemoryTwilioStore() {
     putCall: async (id, record) => {
       calls.set(id, record);
     },
+    claimCall: async (id, record) => {
+      const existing = calls.get(id);
+      if (existing) {
+        return existing;
+      }
+      calls.set(id, record);
+      return record;
+    },
     getRecording: async (id) => {
       const providerCallId = recordings.get(id);
       return providerCallId === undefined ? null : { providerCallId };
@@ -1936,7 +1999,7 @@ var LANGUAGE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$/;
 var HOLD_SECONDS = 3600;
 function estimateSpeechMs(text) {
   const words = text.trim().split(/\s+/).length;
-  return Math.ceil(words * 400 * 1.25) + 1000;
+  return Math.ceil(Math.max(words * 400 * 1.25, text.length * 90)) + 1000;
 }
 function escapeXml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -1997,7 +2060,7 @@ function urlVariants(url) {
       return variants;
     }
     const standard = parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "";
-    if (standard === "") {
+    if (standard === "" || parsed.port !== "" && parsed.port !== standard) {
       return variants;
     }
     const rest = `${parsed.pathname}${parsed.search}`;
@@ -2058,6 +2121,9 @@ function createTwilioTelephony(options) {
   const nowMs = options.nowMs ?? Date.now;
   const sleep = options.sleep ?? systemSleep2;
   const random = options.random ?? Math.random;
+  if (options.store === undefined && environment !== "local" && environment !== "dev") {
+    throw new TypeError("a durable store is required outside the local and dev environments");
+  }
   const store = options.store ?? createMemoryTwilioStore();
   const authToken = options.authToken;
   const base = `/2010-04-01/Accounts/${accountSid}`;
@@ -2075,6 +2141,26 @@ function createTwilioTelephony(options) {
   }
   function token(...parts) {
     return createHash("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
+  }
+  const patching = new Map;
+  async function patchCall(providerCallId, patch) {
+    const run = async () => {
+      const current = await store.getCall(providerCallId);
+      if (current === null) {
+        throw notFound();
+      }
+      await store.putCall(providerCallId, { ...current, ...patch });
+    };
+    const previous = patching.get(providerCallId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    patching.set(providerCallId, next);
+    try {
+      await next;
+    } finally {
+      if (patching.get(providerCallId) === next) {
+        patching.delete(providerCallId);
+      }
+    }
   }
   async function ownedCall(organizationId, providerCallId) {
     const record = await store.getCall(providerCallId);
@@ -2170,8 +2256,7 @@ function createTwilioTelephony(options) {
       if (!await callIsUp(providerCallId, deadline)) {
         throw callEnded();
       }
-      await updateCall(providerCallId, { Twiml: hold() }, deadline);
-      await store.putCall(providerCallId, {
+      const claimed = await store.claimCall(providerCallId, {
         organizationId,
         callId,
         direction: "inbound",
@@ -2181,7 +2266,11 @@ function createTwilioTelephony(options) {
         recordingId: null,
         streamId: null
       });
-      return { ringing: identities.length };
+      if (claimed.organizationId !== organizationId) {
+        throw notFound();
+      }
+      await updateCall(providerCallId, { Twiml: hold() }, deadline);
+      return { ringing: claimed.ringIdentities.length };
     },
     async playDisclosure(request, opts) {
       const { organizationId, providerCallId } = refOf(request);
@@ -2215,7 +2304,7 @@ function createTwilioTelephony(options) {
         aiAssisted: request.aiAssisted,
         playedAt: clock.now().toISOString()
       };
-      await store.putCall(providerCallId, { ...record, disclosure: played });
+      await patchCall(providerCallId, { disclosure: played, bridgedTo: null });
       return played;
     },
     async bridge(request, opts) {
@@ -2230,7 +2319,7 @@ function createTwilioTelephony(options) {
       await updateCall(providerCallId, {
         Twiml: `<Response><Dial answerOnBridge="true"><Client><Identity>${escapeXml(rep)}</Identity><Parameter name="organizationId" value="${escapeXml(organizationId)}"/></Client></Dial></Response>`
       }, deadline);
-      await store.putCall(providerCallId, { ...record, bridgedTo: rep });
+      await patchCall(providerCallId, { bridgedTo: rep });
     },
     async startRecording(request, opts) {
       const { organizationId, providerCallId } = refOf(request);
@@ -2258,7 +2347,7 @@ function createTwilioTelephony(options) {
       });
       const recordingId = sid(json, "RE");
       await store.putRecording(recordingId, providerCallId);
-      await store.putCall(providerCallId, { ...record, recordingId });
+      await patchCall(providerCallId, { recordingId });
       return { recordingId, channels: 2 };
     },
     async forkTracks(request, opts) {
@@ -2278,7 +2367,7 @@ function createTwilioTelephony(options) {
         deadline
       });
       const streamId = sid(json, "MZ");
-      await store.putCall(providerCallId, { ...record, streamId });
+      await patchCall(providerCallId, { streamId });
       return { streamId, tracks: ["rep", "prospect"] };
     },
     async hangUp(request, opts) {

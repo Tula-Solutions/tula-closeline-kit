@@ -62,6 +62,7 @@ function harness(handler: (seen: Seen) => Reply | undefined, extra: Partial<Twil
     apiKeySecret: SECRET,
     authToken: AUTH_TOKEN,
     twimlAppSid: APP,
+    store: createMemoryTwilioStore(),
     clock: createFixedClock('2026-01-01T00:00:00.000Z'),
     random: () => 0.5,
     sleep: async (ms) => {
@@ -926,5 +927,111 @@ describe('twilio telephony: nothing sensitive leaks', () => {
     const placement = await store.getPlacement(org, 'key-1')
     expect(JSON.stringify(placement)).not.toContain(PROSPECT)
     expect(JSON.stringify(placement)).not.toContain(LINE)
+  })
+})
+
+describe('twilio telephony: review round 1 regressions', () => {
+  test('a Disclosure in unspaced text is estimated by its length, erring long', () => {
+    expect(estimateSpeechMs('x'.repeat(200))).toBeGreaterThanOrEqual(15_000)
+    expect(estimateSpeechMs('\u65e5'.repeat(200))).toBeGreaterThanOrEqual(15_000)
+  })
+
+  test('playDisclosure waits the length-based estimate before it counts as played', async () => {
+    const h = harness(happy)
+    const ref = await placed(h)
+    const text = 'x'.repeat(200)
+    await h.telephony.playDisclosure({ ...ref, ...wording, text }, { timeoutMs: 60_000 })
+    expect(h.sleeps).toContain(estimateSpeechMs(text))
+  })
+
+  test('without a durable store only local and dev may start', () => {
+    const { store: _store, ...rest } = harness(happy).options
+    for (const environment of [undefined, 'prod', 'staging'] as const) {
+      expect(() =>
+        createTwilioTelephony({ ...rest, ...(environment ? { environment } : {}) })
+      ).toThrow(TypeError)
+    }
+    for (const environment of ['local', 'dev'] as const) {
+      expect(() => createTwilioTelephony({ ...rest, environment })).not.toThrow()
+    }
+  })
+
+  test('two Organizations answering the same record-less call: only one claims it', async () => {
+    const h = harness(happy)
+    const base = { providerCallId: CALL_SID, callId, ringIdentities: [rep] }
+    const results = await Promise.allSettled([
+      h.telephony.answerCall({ ...base, organizationId: org }),
+      h.telephony.answerCall({ ...base, organizationId: otherOrg }),
+    ])
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
+    const failed = results.find((r) => r.status === 'rejected') as PromiseRejectedResult
+    expect((failed.reason as { code: string }).code).toBe('telephony.not_found')
+  })
+
+  test('a Recording download that stalls after the headers is cut off at the deadline', async () => {
+    const h = harness((s) => {
+      if (s.method === 'GET' && s.url.includes(`/Recordings/${RECORDING_SID}.wav`)) {
+        return new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), {
+          status: 200,
+          headers: { 'content-type': 'audio/x-wav' },
+        })
+      }
+      return happy(s)
+    })
+    const ref = await prepared(h)
+    const { recordingId } = await h.telephony.startRecording(ref)
+    const fetched = await h.telephony.fetchRecording(
+      { organizationId: org, recordingId },
+      { timeoutMs: 50 }
+    )
+    const reader = (fetched.body as ReadableStream<Uint8Array>).getReader()
+    const outcome = await Promise.race([
+      reader.read().then(
+        () => 'read',
+        () => 'rejected'
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('hung'), 1000)),
+    ])
+    expect(outcome).toBe('rejected')
+  })
+
+  test('a new Disclosure version drops the Rep leg, so the next bridge dials again', async () => {
+    const h = harness(happy)
+    const ref = await prepared(h)
+    await h.telephony.bridge({ ...ref, repIdentity: rep })
+    await h.telephony.playDisclosure({ ...ref, ...wording, wordingVersion: 2 })
+    await h.telephony.bridge({ ...ref, repIdentity: rep })
+    expect(h.seen.filter((s) => s.form.get('Twiml')?.includes('<Dial'))).toHaveLength(2)
+  })
+
+  test('concurrent startRecording and forkTracks keep both ids with a slow store', async () => {
+    const inner = createMemoryTwilioStore()
+    const store = {
+      ...inner,
+      getCall: async (id: string) => {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return inner.getCall(id)
+      },
+    }
+    const h = harness(happy, { store })
+    const ref = await prepared(h)
+    await Promise.all([
+      h.telephony.startRecording(ref),
+      h.telephony.forkTracks({ ...ref, destinationUrl: 'wss://copilot.example/s' }),
+    ])
+    const record = await inner.getCall(CALL_SID)
+    expect(record?.recordingId).toBe(RECORDING_SID)
+    expect(record?.streamId).toBe(STREAM_SID)
+  })
+
+  test('a signature for the default port is not accepted for another port', () => {
+    const { telephony } = harness(happy)
+    const signature = signTwilioRequest(AUTH_TOKEN, 'https://h.example/p', { A: '1' })
+    expect(telephony.verifyWebhook({ url: 'https://h.example/p', body: 'A=1', signature })).toBe(
+      true
+    )
+    expect(
+      telephony.verifyWebhook({ url: 'https://h.example:8443/p', body: 'A=1', signature })
+    ).toBe(false)
   })
 })

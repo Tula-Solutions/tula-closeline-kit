@@ -90,7 +90,7 @@ export interface TwilioPlacement {
  * Where the adapter keeps the Organization of each provider call, the state of its Disclosure and
  * its idempotency keys. Twilio holds none of it, and the port promises that one Organization never
  * reaches another's calls, so a production service must pass a durable store (Postgres, in its own
- * schema). The default is in process memory and is for tests and local runs. A store that has lost
+ * schema). Omitting it (in process memory) is allowed only in the `local` and `dev` environments. A store that has lost
  * a call fails closed: the call is `telephony.not_found`, or its Disclosure counts as not played.
  */
 export interface TwilioStore {
@@ -98,6 +98,11 @@ export interface TwilioStore {
   getCall(providerCallId: string): Promise<TwilioCallRecord | null>
   /** Creates or replaces the record of a provider call. */
   putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>
+  /**
+   * Atomically creates the record when none exists and returns the record that now stands, which
+   * is the caller's own when it won and the earlier one when it lost.
+   */
+  claimCall(providerCallId: string, record: TwilioCallRecord): Promise<TwilioCallRecord>
   /** Returns the provider call a Recording belongs to, or null. */
   getRecording(recordingId: string): Promise<{ providerCallId: string } | null>
   /** Remembers which provider call a Recording belongs to. */
@@ -117,6 +122,14 @@ export function createMemoryTwilioStore(): TwilioStore {
     getCall: async (id) => calls.get(id) ?? null,
     putCall: async (id, record) => {
       calls.set(id, record)
+    },
+    claimCall: async (id, record) => {
+      const existing = calls.get(id)
+      if (existing) {
+        return existing
+      }
+      calls.set(id, record)
+      return record
     },
     getRecording: async (id) => {
       const providerCallId = recordings.get(id)
@@ -170,7 +183,7 @@ export interface TwilioOptions {
   statusCallbackUrl?: string
   /** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
   recordingStatusCallbackUrl?: string
-  /** The store of per-call state; in memory by default. A production service injects a durable one. */
+  /** The store of per-call state; required outside `local` and `dev`, where it is in memory. */
   store?: TwilioStore
   /** The `fetch` to use; the global one by default. */
   fetch?: TwilioFetch
@@ -212,7 +225,8 @@ const HOLD_SECONDS = 3600
  */
 export function estimateSpeechMs(text: string): number {
   const words = text.trim().split(/\s+/).length
-  return Math.ceil(words * 400 * 1.25) + 1000
+  // Unspaced scripts (Japanese, Chinese, Thai) count as one word, so the length bounds them too.
+  return Math.ceil(Math.max(words * 400 * 1.25, text.length * 90)) + 1000
 }
 
 function escapeXml(text: string): string {
@@ -306,7 +320,8 @@ function urlVariants(url: string): string[] {
       return variants
     }
     const standard = parsed.protocol === 'https:' ? '443' : parsed.protocol === 'http:' ? '80' : ''
-    if (standard === '') {
+    // An explicit non-default port is part of the signed URL; only a default port may be added or dropped.
+    if (standard === '' || (parsed.port !== '' && parsed.port !== standard)) {
       return variants
     }
     const rest = `${parsed.pathname}${parsed.search}`
@@ -386,6 +401,9 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
   const nowMs = options.nowMs ?? Date.now
   const sleep = options.sleep ?? systemSleep
   const random = options.random ?? Math.random
+  if (options.store === undefined && environment !== 'local' && environment !== 'dev') {
+    throw new TypeError('a durable store is required outside the local and dev environments')
+  }
   const store = options.store ?? createMemoryTwilioStore()
   const authToken = options.authToken
   const base = `/2010-04-01/Accounts/${accountSid}`
@@ -407,6 +425,35 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
     return createHash('sha256')
       .update([accountSid, ...parts].join('\u0000'))
       .digest('hex')
+  }
+
+  const patching = new Map<string, Promise<unknown>>()
+  /**
+   * Writes only the changed fields onto the freshest record, one patch at a time per call in this
+   * process, so concurrent steps keep each other's ids. Across instances a durable store should
+   * make the read and write one transaction.
+   */
+  async function patchCall(
+    providerCallId: string,
+    patch: Partial<TwilioCallRecord>
+  ): Promise<void> {
+    const run = async () => {
+      const current = await store.getCall(providerCallId)
+      if (current === null) {
+        throw notFound()
+      }
+      await store.putCall(providerCallId, { ...current, ...patch })
+    }
+    const previous = patching.get(providerCallId) ?? Promise.resolve()
+    const next = previous.then(run, run)
+    patching.set(providerCallId, next)
+    try {
+      await next
+    } finally {
+      if (patching.get(providerCallId) === next) {
+        patching.delete(providerCallId)
+      }
+    }
   }
 
   async function ownedCall(
@@ -518,10 +565,11 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       if (!(await callIsUp(providerCallId, deadline))) {
         throw callEnded()
       }
-      // The first Organization to answer a call claims it. The voice service only answers calls
-      // that arrived on a number it resolved to that Organization.
-      await updateCall(providerCallId, { Twiml: hold() }, deadline)
-      await store.putCall(providerCallId, {
+      // The claim is atomic, so two Organizations naming one call cannot both win. Binding a
+      // never-registered inbound call to the right Organization stays with the voice service,
+      // which only answers calls that arrived on a number it resolved to that Organization. The
+      // Reps are rung at bridge, once the Disclosure has played; this only holds the caller.
+      const claimed = await store.claimCall(providerCallId, {
         organizationId,
         callId,
         direction: 'inbound',
@@ -531,7 +579,11 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         recordingId: null,
         streamId: null,
       })
-      return { ringing: identities.length }
+      if (claimed.organizationId !== organizationId) {
+        throw notFound()
+      }
+      await updateCall(providerCallId, { Twiml: hold() }, deadline)
+      return { ringing: claimed.ringIdentities.length }
     },
 
     async playDisclosure(
@@ -573,7 +625,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         aiAssisted: request.aiAssisted,
         playedAt: clock.now().toISOString(),
       }
-      await store.putCall(providerCallId, { ...record, disclosure: played })
+      await patchCall(providerCallId, { disclosure: played, bridgedTo: null })
       return played
     },
 
@@ -593,7 +645,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         },
         deadline
       )
-      await store.putCall(providerCallId, { ...record, bridgedTo: rep })
+      await patchCall(providerCallId, { bridgedTo: rep })
     },
 
     async startRecording(
@@ -630,7 +682,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       })
       const recordingId = sid(json, 'RE')
       await store.putRecording(recordingId, providerCallId)
-      await store.putCall(providerCallId, { ...record, recordingId })
+      await patchCall(providerCallId, { recordingId })
       return { recordingId, channels: 2 }
     },
 
@@ -651,7 +703,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         deadline,
       })
       const streamId = sid(json, 'MZ')
-      await store.putCall(providerCallId, { ...record, streamId })
+      await patchCall(providerCallId, { streamId })
       return { streamId, tracks: ['rep', 'prospect'] }
     },
 

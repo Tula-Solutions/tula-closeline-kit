@@ -1486,7 +1486,7 @@ interface TwilioPlacement {
 * Where the adapter keeps the Organization of each provider call, the state of its Disclosure and
 * its idempotency keys. Twilio holds none of it, and the port promises that one Organization never
 * reaches another's calls, so a production service must pass a durable store (Postgres, in its own
-* schema). The default is in process memory and is for tests and local runs. A store that has lost
+* schema). Omitting it (in process memory) is allowed only in the `local` and `dev` environments. A store that has lost
 * a call fails closed: the call is `telephony.not_found`, or its Disclosure counts as not played.
 */
 interface TwilioStore {
@@ -1494,6 +1494,11 @@ interface TwilioStore {
 	getCall(providerCallId: string): Promise<TwilioCallRecord | null>;
 	/** Creates or replaces the record of a provider call. */
 	putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>;
+	/**
+	* Atomically creates the record when none exists and returns the record that now stands, which
+	* is the caller's own when it won and the earlier one when it lost.
+	*/
+	claimCall(providerCallId: string, record: TwilioCallRecord): Promise<TwilioCallRecord>;
 	/** Returns the provider call a Recording belongs to, or null. */
 	getRecording(recordingId: string): Promise<{
 		providerCallId: string;
@@ -1544,7 +1549,7 @@ interface TwilioOptions {
 	statusCallbackUrl?: string;
 	/** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
 	recordingStatusCallbackUrl?: string;
-	/** The store of per-call state; in memory by default. A production service injects a durable one. */
+	/** The store of per-call state; required outside `local` and `dev`, where it is in memory. */
 	store?: TwilioStore;
 	/** The `fetch` to use; the global one by default. */
 	fetch?: TwilioFetch;

@@ -116,6 +116,60 @@ function retryable(status: number): boolean {
 }
 
 /**
+ * Wraps a streamed response so the request deadline also covers the body: the timer stays armed
+ * until the body is read to the end or cancelled, and a stalled read fails when it fires, even if
+ * the fetch implementation ignores the abort signal.
+ */
+function guardBody(
+  response: Response,
+  timer: ReturnType<typeof setTimeout>,
+  signal: AbortSignal,
+  timedOut: () => boolean
+): Response {
+  const source = response.body
+  if (source === null) {
+    clearTimeout(timer)
+    return response
+  }
+  const reader = source.getReader()
+  const aborted = new Promise<never>((_, reject) => {
+    const fail = () => reject(unavailable(timedOut() ? 'timed out' : 'the request failed'))
+    if (signal.aborted) {
+      fail()
+    } else {
+      signal.addEventListener('abort', fail, { once: true })
+    }
+  })
+  aborted.catch(() => undefined)
+  const guarded = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await Promise.race([reader.read(), aborted])
+        if (chunk.done) {
+          clearTimeout(timer)
+          controller.close()
+        } else {
+          controller.enqueue(chunk.value)
+        }
+      } catch (error) {
+        clearTimeout(timer)
+        void reader.cancel().catch(() => undefined)
+        controller.error(error)
+      }
+    },
+    cancel(reason) {
+      clearTimeout(timer)
+      return reader.cancel(reason)
+    },
+  })
+  return new Response(guarded, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+}
+
+/**
  * Builds the request client. Every attempt is cut off at the operation's deadline; a network
  * error, a 429 or a 5xx is tried again after a pause of between half and one and a half of an
  * exponentially growing delay (at most {@link TWILIO_MAX_ATTEMPTS} attempts, all inside the
@@ -163,6 +217,7 @@ export function createTwilioHttp(options: TwilioHttpOptions): TwilioHttp {
         timedOut = true
         controller.abort()
       }, remaining)
+      let keepTimer = false
       try {
         const response = await options.fetch(`${options.baseUrl}${request.path}`, {
           method: request.method,
@@ -173,7 +228,12 @@ export function createTwilioHttp(options: TwilioHttpOptions): TwilioHttp {
         })
         const ok = response.status >= 200 && response.status < 300
         if (ok && mode === 'stream') {
-          return { status: response.status, json: null, response }
+          keepTimer = true
+          return {
+            status: response.status,
+            json: null,
+            response: guardBody(response, timer, controller.signal, () => timedOut),
+          }
         }
         const json = await readJson(response, ok || allow.includes(response.status))
         if (ok || allow.includes(response.status)) {
@@ -196,7 +256,9 @@ export function createTwilioHttp(options: TwilioHttpOptions): TwilioHttp {
           last = unavailable('the request failed')
         }
       } finally {
-        clearTimeout(timer)
+        if (!keepTimer) {
+          clearTimeout(timer)
+        }
       }
       if (attempt < maxAttempts) {
         const base = Math.min(TWILIO_RETRY_MAX_MS, TWILIO_RETRY_BASE_MS * 2 ** (attempt - 1))

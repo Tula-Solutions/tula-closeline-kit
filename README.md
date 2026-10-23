@@ -1021,6 +1021,16 @@ confirm the stream's `inbound_track` and `outbound_track` frames each carry one 
 two recording channels are Prospect and Rep in that order); also whether Media Streams work in the
 Ireland region, and that the `I-Twilio-Idempotency-Token` header is honoured.
 
+Twilio keeps none of the per-call state, so the adapter takes a `TwilioStore` (`getCall`, `putCall`,
+atomic `claimCall`, recordings, placements). `store` may be omitted only when `environment` is
+`local` or `dev` (memory); otherwise construction throws. A Disclosure is held back for an
+estimated speaking time (0.4 s a word, or 90 ms a character for unspaced scripts, plus margins)
+unless a `disclosureDone` hook confirms it. Limits: `answerCall` binds a never-registered inbound
+call to the first Organization that names it, atomically, but cannot itself prove that Organization
+owns the dialled number, so the voice service must resolve that before calling; Reps are rung at
+`bridge`, not at `answerCall`. Also unverified: that a browser `connect({params})` cannot override
+the `organizationId` the grant sets (the voice service should not trust that parameter alone).
+
 **Scripting the memory adapter.** `script(number, ...)` makes the Prospect answer, not answer
 (`no_answer`), be busy, hang up (during the Disclosure or after the bridge) or the carrier fail.
 `failNext` and `stallNext` make the next call of an operation fail or hang until its timeout;
