@@ -41,7 +41,219 @@ interface ContactGuardSubject {
 * adapter and the HTTP adapter.
 */
 declare function contactGuardBehaviour(name: string, make: () => Promise<ContactGuardSubject>): void;
-import { z } from "zod";
+import { OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
+interface ErrorContext {
+	/** The request's id, for finding the log lines. */
+	requestId?: string;
+	/** The Organization the request was for, so one customer's errors can be filtered. */
+	organizationId?: string;
+	/** HTTP method of the failed request. */
+	method?: string;
+	/** Request path without its query string. */
+	path?: string;
+	/** HTTP status the service answered with. */
+	status?: number;
+	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
+	tags?: Record<string, string>;
+}
+/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
+interface ErrorReporter {
+	/**
+	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
+	* and never waits for the network.
+	*/
+	capture(error: unknown, context?: ErrorContext): void;
+	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
+	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
+}
+/** One error a MemoryErrorReporter recorded, with the context it was reported with. */
+interface CapturedError {
+	error: unknown;
+	context: ErrorContext;
+}
+/** An ErrorReporter that keeps what it is given in memory so tests can assert on it. */
+interface MemoryErrorReporter extends ErrorReporter {
+	/** Every error that would have been sent, in order; expected (below 500) AppErrors are left out. */
+	readonly captured: CapturedError[];
+	/** The timeout of every flush, in order. */
+	readonly flushes: number[];
+	/** The timeout of every close, in order. */
+	readonly closes: number[];
+}
+import { OrganizationId } from "tula-closeline-contract";
+import { z as z2 } from "zod";
+/**
+* The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
+* short answers) and `smart` for work that can wait longer for a better answer. An adapter maps
+* each tier to the model ids it uses.
+*/
+type ModelTier = "fast" | "smart";
+/** One turn of the conversation sent to the model. */
+interface LlmMessage {
+	/** Who said it. Instructions go in `system`, not here. */
+	role: "user" | "assistant";
+	/** The text. Tenant data: never logged. Prospect speech, Documents and web text are untrusted. */
+	content: string;
+}
+/** How an adapter retries a retryable vendor error (`llm.unavailable`) before giving up. */
+interface LlmRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** What every call states: whose it is, which model class, and the limits that bound it. */
+interface LlmRequestBase {
+	/** The Organization the call is for; it scopes metering and error context. */
+	organizationId: OrganizationId;
+	/** The model class. */
+	tier: ModelTier;
+	/** Instructions to the model. Tenant data: never logged. */
+	system?: string;
+	/** The conversation so far, 1 to {@link MAX_LLM_MESSAGES} messages, ending with a `user` message. */
+	messages: readonly LlmMessage[];
+	/**
+	* The most time the whole call may take, retries and streaming included, in ms, 1 to
+	* {@link MAX_LLM_TIMEOUT_MS}; default {@link DEFAULT_LLM_TIMEOUT_MS}. When it passes, the
+	* underlying vendor request is aborted and the call fails with `llm.timeout`.
+	*/
+	timeoutMs?: number;
+	/**
+	* The most tokens the prompt (system plus messages) may hold, 1 to
+	* {@link MAX_LLM_MAX_INPUT_TOKENS}; default {@link DEFAULT_LLM_MAX_INPUT_TOKENS}. A longer prompt
+	* fails with `llm.input_too_large` before any vendor call.
+	*/
+	maxInputTokens?: number;
+	/**
+	* The most tokens the model may write, 1 to {@link MAX_LLM_MAX_OUTPUT_TOKENS}; default
+	* {@link DEFAULT_LLM_MAX_OUTPUT_TOKENS}. It is passed to the vendor as the hard cap.
+	*/
+	maxOutputTokens?: number;
+	/** Retries of retryable vendor errors; the defaults when absent. */
+	retry?: LlmRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `llm.aborted`. */
+	signal?: AbortSignal;
+}
+/** A request for a value shaped by a schema. */
+interface LlmCompleteRequest<S extends z2.ZodType = z2.ZodType> extends LlmRequestBase {
+	/**
+	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
+	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
+	* model output is untrusted. It must be representable as JSON Schema.
+	*/
+	schema: S;
+	/** A name for the schema, 1 to 64 letters, digits, `_` or `-`; vendors use it as the tool name. */
+	schemaName: string;
+}
+/** A request for free text, delivered as it is written. */
+type LlmStreamRequest = LlmRequestBase;
+/** What a call used, for metering. */
+interface LlmUsage {
+	/** Tokens in the prompt. */
+	inputTokens: number;
+	/** Tokens the model wrote. */
+	outputTokens: number;
+}
+/** A structured answer. */
+interface LlmCompletion<T> {
+	/** The model's answer, parsed and valid for the schema. */
+	value: T;
+	/** The tokens used, over all attempts that reached the model. */
+	usage: LlmUsage;
+}
+/** A piece of text from the model. Tenant data: never logged. */
+interface LlmTextEvent {
+	/** Always `text`. */
+	type: "text";
+	/** The next piece, in order. Never empty. */
+	text: string;
+}
+/** The end of a stream: the last event of a stream that did not throw. */
+interface LlmDoneEvent {
+	/** Always `done`. */
+	type: "done";
+	/** Why the model stopped: it finished (`end`) or hit the output token budget (`max_tokens`). */
+	stopReason: "end" | "max_tokens";
+	/** The tokens used. */
+	usage: LlmUsage;
+}
+/** Everything a stream yields, in order: any number of `text`, then one `done`. */
+type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
+/**
+* A language model behind a vendor (Claude on Amazon Bedrock first), shared by the Copilot and
+* the Inbound Agent. Model choice is a {@link ModelTier}; the adapter maps it to model ids.
+*
+* Every call has a hard timeout and token budgets. Retryable vendor errors (throttling, 5xx,
+* connection loss) are retried with a bounded, jittered pause ({@link llmRetryDelayMs}) inside
+* the call's time limit; nothing else is retried, and a stream is retried only before its first
+* text. A call has no effects, so retrying it is always safe. Failures are `LlmError`s with
+* `llm.*` codes; `llm.unavailable`, `llm.rejected`, `llm.bad_response` and `llm.invalid_output`
+* are also given to the ErrorReporter (metadata only).
+*
+* **Model output is untrusted data.** `complete` returns only a value the schema accepts; text
+* that is not JSON, does not fit, or was cut off is `llm.invalid_output`, never a partial value.
+* What the model says is never an instruction to the caller.
+*
+* Nothing here logs, reports or puts in an error a prompt or a completion (tenant data).
+*/
+interface LlmPort {
+	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
+	complete<S extends z2.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z2.output<S>>>;
+	/**
+	* Streams free text. An unacceptable request throws `llm.invalid_request` or
+	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
+	* stream ends with one `done` event. Leaving the loop early (`break`) aborts the vendor
+	* request. The time limit covers the whole stream.
+	*/
+	stream(request: LlmStreamRequest): AsyncIterable<LlmStreamEvent>;
+}
+/** What the behaviour suite needs from an adapter under test. */
+interface LlmSubject {
+	/** The port under test. */
+	port: LlmPort;
+	/** Two unrelated Organization ids the port accepts. */
+	organizations: {
+		a: OrganizationId2;
+		b: OrganizationId2;
+	};
+	/** The reporter the port was built with: the suite reads what it was given. */
+	reporter: MemoryErrorReporter;
+	/** Everything the port logged, one JSON or text line per entry. */
+	logs(): string[];
+	/** Arranges that the next call that reaches the model is answered with `text`. */
+	reply(text: string, usage?: Partial<LlmUsage>): void;
+	/** Arranges that the next call that reaches the model never answers, until it is aborted. */
+	hang(): void;
+	/** Arranges that the next `times` vendor requests fail: `retryable` as throttling or a 5xx, `fatal` as refused credentials. */
+	failNext(kind: "retryable" | "fatal", times: number): void;
+	/** How many requests have reached the vendor, a retry counting as its own. */
+	vendorRequests(): number;
+	/** How many vendor requests were aborted while they were still pending. */
+	abortedRequests(): number;
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link LlmPort} must show: a structured answer comes back typed with its
+* usage; output that is not JSON, does not fit the schema or was cut off is `llm.invalid_output`
+* and never a partial value; the timeout and the caller's signal abort the vendor request; a
+* prompt over the input budget never reaches the vendor; a stream delivers text then one `done`
+* and a reader that stops early aborts the request; only retryable vendor errors are retried and
+* only a bounded number of times; a bad request is refused before any vendor call; and neither a
+* prompt nor a completion reaches a log, the error reporter or an error. Run it against the
+* memory adapter and any real adapter (which needs a subject that drives the vendor's test mode).
+*/
+declare function llmBehaviour(name: string, make: () => Promise<LlmSubject>, skip?: boolean): void;
+import { z as z3 } from "zod";
 /** A source of the current time, so code under test never reads the real clock. */
 interface Clock {
 	/** Returns the current time as a new Date each call. */
@@ -52,7 +264,7 @@ type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */
 interface MessageDefinition<
 	T extends string = string,
-	P extends z.ZodType = z.ZodType,
+	P extends z3.ZodType = z3.ZodType,
 	S extends MessageScope = MessageScope
 > {
 	readonly type: T;
@@ -72,12 +284,12 @@ interface PreviousVersion {
 	/** The older version number; must differ from the definition's own. */
 	version: number;
 	/** The payload schema of that version. */
-	payload: z.ZodType;
+	payload: z3.ZodType;
 	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
 	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z.ZodType, MessageScope>;
+type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
 /** The fields every envelope has. */
 interface EnvelopeBase<
 	T extends string,
@@ -102,7 +314,7 @@ type ScopeField<S> = S extends "organization" ? {
 	organizationId?: undefined;
 };
 /** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z.output<P>> & ScopeField<S> : never;
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
 /** The shape every envelope has, whatever its type. */
 interface AnyEnvelope {
 	id: string;
@@ -116,7 +328,7 @@ interface AnyEnvelope {
 /** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
 type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
 	type: T;
-	payload: z.input<P>;
+	payload: z3.input<P>;
 	traceId: string;
 	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
 	id?: string;
@@ -165,7 +377,7 @@ interface MessageRegistryOptions {
 	* The shape of an Organization id, checked for `organization` messages on the way in and out.
 	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
 	*/
-	organizationIdSchema?: z.ZodType<string>;
+	organizationIdSchema?: z3.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -273,15 +485,15 @@ interface Queue<E extends AnyEnvelope = AnyEnvelope> {
 	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
 	release(receipt: Receipt): Promise<void>;
 }
-import { z as z2 } from "zod";
+import { z as z4 } from "zod";
 /** A message that belongs to an Organization, for tests and examples. */
-declare const testPing: MessageDefinition<"test.ping", z2.ZodObject<{
-	n: z2.ZodNumber;
-}, z2.core.$strip>, "organization">;
+declare const testPing: MessageDefinition<"test.ping", z4.ZodObject<{
+	n: z4.ZodNumber;
+}, z4.core.$strip>, "organization">;
 /** A message that belongs to no Organization, for tests and examples. */
-declare const testNote: MessageDefinition<"test.note", z2.ZodObject<{
-	text: z2.ZodString;
-}, z2.core.$strip>, "global">;
+declare const testNote: MessageDefinition<"test.note", z4.ZodObject<{
+	text: z4.ZodString;
+}, z4.core.$strip>, "global">;
 /** The definitions the behaviour suite uses. */
 type TestDefinition = typeof testPing | typeof testNote;
 /** An envelope of either test type. */
@@ -566,53 +778,8 @@ interface ObjectStoreSubject {
 * one and fails for the other is a bug in one of them.
 */
 declare function objectStoreBehaviour(name: string, make: () => Promise<ObjectStoreSubject>, skip?: boolean): void;
-import { CallId as CallId2, OrganizationId as OrganizationId2 } from "tula-closeline-contract";
-/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
-interface ErrorContext {
-	/** The request's id, for finding the log lines. */
-	requestId?: string;
-	/** The Organization the request was for, so one customer's errors can be filtered. */
-	organizationId?: string;
-	/** HTTP method of the failed request. */
-	method?: string;
-	/** Request path without its query string. */
-	path?: string;
-	/** HTTP status the service answered with. */
-	status?: number;
-	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
-	tags?: Record<string, string>;
-}
-/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
-interface ErrorReporter {
-	/**
-	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
-	* and never waits for the network.
-	*/
-	capture(error: unknown, context?: ErrorContext): void;
-	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
-	flush(timeoutMs: number): Promise<boolean>;
-	/**
-	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
-	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
-	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
-	*/
-	close(timeoutMs: number): Promise<boolean>;
-}
-/** One error a MemoryErrorReporter recorded, with the context it was reported with. */
-interface CapturedError {
-	error: unknown;
-	context: ErrorContext;
-}
-/** An ErrorReporter that keeps what it is given in memory so tests can assert on it. */
-interface MemoryErrorReporter extends ErrorReporter {
-	/** Every error that would have been sent, in order; expected (below 500) AppErrors are left out. */
-	readonly captured: CapturedError[];
-	/** The timeout of every flush, in order. */
-	readonly flushes: number[];
-	/** The timeout of every close, in order. */
-	readonly closes: number[];
-}
-import { CallId, OrganizationId } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId3 } from "tula-closeline-contract";
 /** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
 type StreamTrack = "rep" | "prospect";
 /** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
@@ -695,7 +862,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -772,8 +939,8 @@ interface StreamingTranscribeSubject {
 	port: StreamingTranscribePort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId2;
-		b: OrganizationId2;
+		a: OrganizationId4;
+		b: OrganizationId4;
 	};
 	/** The reporter the port was built with: the suite reads what it was given. */
 	reporter: MemoryErrorReporter;
@@ -784,7 +951,7 @@ interface StreamingTranscribeSubject {
 	* another: the first once the stream has been sent `bytesPerTurn` bytes, the next after twice
 	* that, and so on. Called before `open`.
 	*/
-	hear(organizationId: OrganizationId2, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
+	hear(organizationId: OrganizationId4, callId: CallId2, track: StreamTrack, turns: readonly HeardTurn[], bytesPerTurn: number): void;
 	/** Drops the connection of a stream, as the vendor's socket closing would; resolves once it is back or has failed. */
 	dropConnection(streamId: string): Promise<void>;
 	/** Makes the next `times` reconnect attempts fail. */
@@ -802,8 +969,8 @@ interface StreamingTranscribeSubject {
 * adapter and any real adapter (which needs a subject that drives the vendor's test mode).
 */
 declare function streamingTranscribeBehaviour(name: string, make: () => Promise<StreamingTranscribeSubject>, skip?: boolean): void;
-import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
-import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId3, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId7 } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -816,14 +983,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId3;
 	/**
@@ -905,7 +1072,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -932,7 +1099,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -945,7 +1112,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId5;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -1059,8 +1226,8 @@ interface TelephonySubject {
 	telephony: TelephonyPort;
 	/** Two unrelated Organization ids the port accepts. */
 	organizations: {
-		a: OrganizationId5;
-		b: OrganizationId5;
+		a: OrganizationId7;
+		b: OrganizationId7;
 	};
 	/** Returns a number (E.164) that, when dialed, plays out as `scenario`. */
 	numberFor(scenario: ProspectScenario): string;
@@ -1458,4 +1625,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { ContactGuardSubject, HeardTurn, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, VectorStoreSubject, contactGuardBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, vectorStoreBehaviour };
+export { ContactGuardSubject, HeardTurn, LlmSubject, ObjectStoreSubject, ProspectScenario, QueueSubject, StoreSubject, StreamingTranscribeSubject, TelephonySubject, TranscriberSubject, VectorStoreSubject, contactGuardBehaviour, llmBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, streamingTranscribeBehaviour, telephonyBehaviour, transcriberBehaviour, vectorStoreBehaviour };

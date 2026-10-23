@@ -100,8 +100,10 @@ import {
   assertBatchCount2
 } from "./shared/chunk-h070fpj8.js";
 import {
+  LLM_ERROR_CODES2,
+  LlmError2,
   waitForTranscription2
-} from "./shared/chunk-83cpvtqk.js";
+} from "./shared/chunk-v4dvbeft.js";
 import {
   AppError2,
   isAppError2,
@@ -1089,6 +1091,28 @@ function createHttpContactGuard(options) {
     },
     close: () => client.close()
   };
+}
+// src/llm/port.ts
+var DEFAULT_LLM_TIMEOUT_MS = 15000;
+var MAX_LLM_TIMEOUT_MS = 120000;
+var DEFAULT_LLM_MAX_INPUT_TOKENS = 16000;
+var MAX_LLM_MAX_INPUT_TOKENS = 200000;
+var DEFAULT_LLM_MAX_OUTPUT_TOKENS = 1024;
+var MAX_LLM_MAX_OUTPUT_TOKENS = 8192;
+var MAX_LLM_MESSAGES = 100;
+var MODEL_TIERS = ["fast", "smart"];
+var ESTIMATED_CHARS_PER_TOKEN = 3;
+function estimateTokens(text) {
+  return Math.ceil(text.length / ESTIMATED_CHARS_PER_TOKEN);
+}
+var DEFAULT_LLM_RETRY_POLICY = {
+  maxRetries: 2,
+  baseDelayMs: 200,
+  maxDelayMs: 2000
+};
+function llmRetryDelayMs(retry, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
 }
 // src/logger.ts
 import pino from "pino";
@@ -2535,6 +2559,10 @@ export {
   CONTACT_UNAVAILABLE2 as CONTACT_UNAVAILABLE,
   DEFAULT_CONTENT_TYPE2 as DEFAULT_CONTENT_TYPE,
   DEFAULT_LIST_LIMIT2 as DEFAULT_LIST_LIMIT,
+  DEFAULT_LLM_MAX_INPUT_TOKENS,
+  DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+  DEFAULT_LLM_RETRY_POLICY,
+  DEFAULT_LLM_TIMEOUT_MS,
   DEFAULT_MAX_OBJECT_BYTES2 as DEFAULT_MAX_OBJECT_BYTES,
   DEFAULT_PRESIGN_SECONDS2 as DEFAULT_PRESIGN_SECONDS,
   DEFAULT_RECONNECT_POLICY2 as DEFAULT_RECONNECT_POLICY,
@@ -2542,6 +2570,7 @@ export {
   DEFAULT_TELEPHONY_TIMEOUT_MS2 as DEFAULT_TELEPHONY_TIMEOUT_MS,
   DEFAULT_TRANSCRIBER_LIST_LIMIT2 as DEFAULT_TRANSCRIBER_LIST_LIMIT,
   ENVIRONMENTS,
+  ESTIMATED_CHARS_PER_TOKEN,
   INTERNAL_CALL_FAILURES,
   INTERNAL_DEFAULT_IDLE_TIMEOUT_MS,
   INTERNAL_DEFAULT_MAX_FREE_SOCKETS,
@@ -2555,6 +2584,8 @@ export {
   INTERNAL_RETRY_STATUSES,
   INVALID_REASONS2 as INVALID_REASONS,
   InternalCallError,
+  LLM_ERROR_CODES2 as LLM_ERROR_CODES,
+  LlmError2 as LlmError,
   MAX_ATTRIBUTES2 as MAX_ATTRIBUTES,
   MAX_ATTRIBUTE_STRING2 as MAX_ATTRIBUTE_STRING,
   MAX_AUDIO_CHUNK_BYTES2 as MAX_AUDIO_CHUNK_BYTES,
@@ -2571,6 +2602,10 @@ export {
   MAX_KEY_BYTES2 as MAX_KEY_BYTES,
   MAX_KEY_SEGMENTS2 as MAX_KEY_SEGMENTS,
   MAX_LIST_LIMIT2 as MAX_LIST_LIMIT,
+  MAX_LLM_MAX_INPUT_TOKENS,
+  MAX_LLM_MAX_OUTPUT_TOKENS,
+  MAX_LLM_MESSAGES,
+  MAX_LLM_TIMEOUT_MS,
   MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
   MAX_OBJECT_BYTES_LIMIT2 as MAX_OBJECT_BYTES_LIMIT,
   MAX_PRESIGN_SECONDS2 as MAX_PRESIGN_SECONDS,
@@ -2595,6 +2630,7 @@ export {
   MAX_WAIT_SECONDS2 as MAX_WAIT_SECONDS,
   MAX_WEBHOOK_BODY_BYTES2 as MAX_WEBHOOK_BODY_BYTES,
   MAX_WORDS_PER_TURN2 as MAX_WORDS_PER_TURN,
+  MODEL_TIERS,
   PACKAGE,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
@@ -2637,9 +2673,11 @@ export {
   dropHighSurrogate2 as dropHighSurrogate,
   environmentSchema,
   estimateSpeechMs,
+  estimateTokens,
   isAppError2 as isAppError,
   isContactGuardRequest2 as isContactGuardRequest,
   isSentryDsn,
+  llmRetryDelayMs,
   reconnectDelayMs2 as reconnectDelayMs,
   requireSentryDsn,
   scrubText2 as scrubText,
