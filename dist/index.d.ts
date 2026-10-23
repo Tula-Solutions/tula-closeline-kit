@@ -58,6 +58,7 @@ declare const auditEventPayloadSchema: z.ZodObject<{
 		id: z.ZodString;
 	}, z.core.$strict>;
 	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	prospectId: z.ZodOptional<z.ZodNullable<z.core.$ZodBranded<z.ZodString, "prs", "out">>>;
 	requestId: z.ZodOptional<z.ZodString>;
 	occurredAt: z.ZodOptional<z.ZodISODateTime>;
 	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
@@ -79,6 +80,7 @@ declare const auditEntrySchema: z.ZodObject<{
 		id: z.ZodString;
 	}, z.core.$strict>;
 	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	prospectId: z.ZodOptional<z.ZodNullable<z.core.$ZodBranded<z.ZodString, "prs", "out">>>;
 	requestId: z.ZodOptional<z.ZodString>;
 	occurredAt: z.ZodOptional<z.ZodISODateTime>;
 	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
@@ -305,6 +307,8 @@ import { ZodOptional as ZodOptional_csos33 } from "zod";
 import { ZodString as ZodString_t3dacg } from "zod";
 import { $strict as $strict_gffh7x } from "zod/v4/core";
 import { ZodNumber as ZodNumber_qqlmmw } from "zod";
+import { ZodNullable as ZodNullable_hf13o0 } from "zod";
+import { $ZodBranded as $ZodBranded_7i43x7 } from "zod/v4/core";
 import { ZodISODateTime as ZodISODateTime_n0rd9r } from "zod";
 import { ZodRecord as ZodRecord_sdtasg } from "zod";
 import { ZodUnion as ZodUnion_a4q2qo } from "zod";
@@ -326,6 +330,7 @@ declare const auditRecordedMessage: MessageDefinition_xp6xd2<"audit.recorded", Z
 		id: ZodString_t3dacg;
 	}, $strict_gffh7x>;
 	instructionVersion: ZodOptional_csos33<ZodNumber_qqlmmw>;
+	prospectId: ZodOptional_csos33<ZodNullable_hf13o0<$ZodBranded_7i43x7<ZodString_t3dacg, "prs", "out">>>;
 	requestId: ZodOptional_csos33<ZodString_t3dacg>;
 	occurredAt: ZodOptional_csos33<ZodISODateTime_n0rd9r>;
 	metadata: ZodOptional_csos33<ZodRecord_sdtasg<ZodString_t3dacg, ZodUnion_a4q2qo<readonly [ZodString_t3dacg, ZodNumber_qqlmmw, ZodBoolean_aoutmh]>>>;

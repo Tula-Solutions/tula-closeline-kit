@@ -1,4 +1,4 @@
-import { organizationIdSchema } from 'tula-closeline-contract'
+import { organizationIdSchema, prospectIdSchema } from 'tula-closeline-contract'
 import { z } from 'zod'
 import { type Clock, systemClock } from '../clock'
 import { AUDIT_ERROR_CODES, AuditError } from './errors'
@@ -84,6 +84,8 @@ export const auditEventPayloadSchema = z.strictObject({
   subject: auditSubjectSchema,
   /** The Agent instruction version the action ran under. */
   instructionVersion: z.number().int().positive().optional(),
+  /** The Prospect the action concerns, so a Team-scoped audit view can filter by it; absent or null when none. */
+  prospectId: prospectIdSchema.nullish(),
   requestId: id.optional(),
   /** When it happened, ISO 8601 UTC; the recorder's clock when absent. */
   occurredAt: z.iso.datetime().optional(),

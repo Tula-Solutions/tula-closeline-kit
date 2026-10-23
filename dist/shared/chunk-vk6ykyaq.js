@@ -42,7 +42,7 @@ import {
 } from "./chunk-tya44yhr.js";
 
 // src/audit/entry.ts
-import { organizationIdSchema } from "tula-closeline-contract";
+import { organizationIdSchema, prospectIdSchema } from "tula-closeline-contract";
 import { z } from "zod";
 var AUDIT_LIMITS2 = {
   maxMetadataKeys: 20,
@@ -86,6 +86,7 @@ var auditEventPayloadSchema2 = z.strictObject({
   action: z.string().regex(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/).max(64),
   subject: auditSubjectSchema2,
   instructionVersion: z.number().int().positive().optional(),
+  prospectId: prospectIdSchema.nullish(),
   requestId: id.optional(),
   occurredAt: z.iso.datetime().optional(),
   metadata: auditMetadataSchema2.optional()
@@ -1883,7 +1884,7 @@ async function requireConsent(guard, request, deadline) {
 }
 
 // src/messaging/validate.ts
-import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema4, prospectIdSchema } from "tula-closeline-contract";
+import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema4, prospectIdSchema as prospectIdSchema2 } from "tula-closeline-contract";
 var KEY = /^[A-Za-z0-9_.:-]{1,200}$/;
 var TEMPLATE_ID = /^HX[0-9a-fA-F]{32}$/;
 var VARIABLE_NAME = /^[A-Za-z0-9_]{1,64}$/;
@@ -1991,7 +1992,7 @@ function checkSendRequest(request) {
   if (!organization.success) {
     return invalid3("organizationId");
   }
-  const prospect = prospectIdSchema.safeParse(request.prospectId);
+  const prospect = prospectIdSchema2.safeParse(request.prospectId);
   if (!prospect.success) {
     return invalid3("prospectId");
   }

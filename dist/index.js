@@ -92,7 +92,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-eeqc39vw.js";
+} from "./shared/chunk-vk6ykyaq.js";
 import {
   systemClock2,
   createFixedClock2,
