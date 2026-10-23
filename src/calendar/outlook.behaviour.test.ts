@@ -30,6 +30,7 @@ calendarBehaviour('outlook adapter (fake Microsoft Graph)', async () => {
     vendorRequests: () => h.fake.seen.length,
     abortedRequests: () => h.fake.seen.filter((r) => r.aborted).length,
     remembersDeletes: false,
+    revokesAtVendor: false,
     close: async () => undefined,
   }
 })

@@ -88,7 +88,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-zy1js6ey.js";
+} from "./shared/chunk-77fb749y.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -1354,7 +1354,7 @@ var MAX_RESPONSE_BYTES2 = 2097152;
 var DEFAULT_ATTEMPT_TIMEOUT_MS2 = 5000;
 var TOKEN_MARGIN_MS2 = 60000;
 var MAX_CACHED_TOKENS2 = 1024;
-var MAX_REVOKED = 1e4;
+var MAX_ROTATED = 1e4;
 var CREATED_SKEW_MS = 5000;
 var PAGE_SIZE = 200;
 var MAX_PAGES = 50;
@@ -1368,8 +1368,22 @@ var THROTTLE_CODES = new Set([
   "activityLimitReached"
 ]);
 var BUSY_STATES = new Set(["busy", "tentative", "oof", "unknown"]);
-function unavailable3(phase, status) {
-  return new CalendarError2(CALENDAR_ERROR_CODES2.unavailable, "The calendar provider is unavailable", { details: { phase, ...status === undefined ? {} : { status } } });
+var MAX_RETRY_AFTER_MS = 60000;
+var retryAfterOf = new WeakMap;
+function parseRetryAfter(value, nowMs) {
+  if (value === null) {
+    return;
+  }
+  const text = value.trim();
+  const ms = /^\d{1,9}$/.test(text) ? Number(text) * 1000 : Date.parse(text) - nowMs;
+  return Number.isFinite(ms) && ms >= 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : undefined;
+}
+function unavailable3(phase, status, retryAfterMs) {
+  const error = new CalendarError2(CALENDAR_ERROR_CODES2.unavailable, "The calendar provider is unavailable", { details: { phase, ...status === undefined ? {} : { status } } });
+  if (retryAfterMs !== undefined) {
+    retryAfterOf.set(error, retryAfterMs);
+  }
+  return error;
 }
 function rejected2(reason, status) {
   return new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The calendar provider refused the request", { details: { reason, ...status === undefined ? {} : { status } } });
@@ -1504,7 +1518,7 @@ function createOutlookCalendar(options) {
   const calendarUrl = calendarId === undefined ? `${GRAPH}/me/calendar` : `${GRAPH}/me/calendars/${encodeURIComponent(calendarId)}`;
   const scope = OUTLOOK_CALENDAR_SCOPES.join(" ");
   const tokens = new Map;
-  const revokedHere = new Set;
+  const rotated = new Map;
   function tokenKey(credential) {
     return sha256Hex(credential);
   }
@@ -1534,7 +1548,12 @@ function createOutlookCalendar(options) {
     try {
       const response = await raceAbort(doFetch(url, { ...init, redirect: "manual", signal }), signal);
       const text = await raceAbort(readBounded3(response), signal);
-      return { status: response.status, json: parseJson2(text) };
+      const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), clock.now().getTime());
+      return {
+        status: response.status,
+        json: parseJson2(text),
+        ...retryAfterMs === undefined ? {} : { retryAfterMs }
+      };
     } catch (error) {
       if (error instanceof CalendarError2) {
         throw error;
@@ -1564,7 +1583,7 @@ function createOutlookCalendar(options) {
   }
   function tokenAnswer(answer, grantGone) {
     if (answer.status === 429 || answer.status >= 500) {
-      throw unavailable3("token", answer.status);
+      throw unavailable3("token", answer.status, answer.retryAfterMs);
     }
     if ((answer.status === 400 || answer.status === 401) && (answer.json?.error === "invalid_grant" || answer.json?.error === "interaction_required")) {
       throw grantGone();
@@ -1587,23 +1606,41 @@ function createOutlookCalendar(options) {
     const seconds = typeof expiresIn === "number" && Number.isFinite(expiresIn) ? Math.min(Math.max(expiresIn, 0), 86400) : 3600;
     return { accessToken, seconds, refreshToken: answer.json?.refresh_token };
   }
-  async function accessToken(credential, overall) {
-    const cached = tokens.get(tokenKey(credential));
+  async function rotation(connection, used, next) {
+    if (typeof next !== "string" || next.length < 1 || next === used) {
+      return;
+    }
+    const key = tokenKey(connection.unsafeCredential());
+    rotated.delete(key);
+    rotated.set(key, next);
+    if (rotated.size > MAX_ROTATED) {
+      const oldest = rotated.keys().next().value;
+      if (oldest !== undefined) {
+        rotated.delete(oldest);
+      }
+    }
+    try {
+      await options.onCredentialRotated?.(connection, next);
+    } catch {
+      options.logger?.warn("A rotated calendar credential was not stored", { feature: "calendar" });
+    }
+  }
+  async function accessToken(connection, overall) {
+    const key = tokenKey(connection.unsafeCredential());
+    const cached = tokens.get(key);
     if (cached !== undefined && cached.expiresAtMs > clock.now().getTime()) {
       return cached.accessToken;
     }
-    const answer = await tokenRequest({ grant_type: "refresh_token", refresh_token: credential }, overall);
+    const used = rotated.get(key) ?? connection.unsafeCredential();
+    const answer = await tokenRequest({ grant_type: "refresh_token", refresh_token: used }, overall);
     const read = tokenAnswer(answer, revoked2);
-    remember(credential, read.accessToken, read.seconds);
+    remember(connection.unsafeCredential(), read.accessToken, read.seconds);
+    await rotation(connection, used, read.refreshToken);
     return read.accessToken;
   }
   async function api(connection, method, url, body, overall) {
-    const credential = connection.unsafeCredential();
-    if (revokedHere.has(tokenKey(credential))) {
-      throw revoked2();
-    }
     for (let pass = 0;; pass++) {
-      const token = await accessToken(credential, overall);
+      const token = await accessToken(connection, overall);
       const answer = await http(url, {
         method,
         headers: {
@@ -1615,7 +1652,7 @@ function createOutlookCalendar(options) {
         ...body === undefined ? {} : { body: JSON.stringify(body) }
       }, overall);
       if (answer.status === 401 && pass === 0) {
-        tokens.delete(tokenKey(credential));
+        tokens.delete(tokenKey(connection.unsafeCredential()));
         continue;
       }
       if (answer.status === 401) {
@@ -1630,11 +1667,11 @@ function createOutlookCalendar(options) {
       return notFound;
     }
     if (status === 429 || status >= 500) {
-      return unavailable3("http", status);
+      return unavailable3("http", status, answer.retryAfterMs);
     }
     const code = graphCode(answer.json);
     if (code !== undefined && THROTTLE_CODES.has(code)) {
-      return unavailable3("rate_limit", status);
+      return unavailable3("rate_limit", status, answer.retryAfterMs);
     }
     return rejected2(code ?? "http", status);
   }
@@ -1664,6 +1701,7 @@ function createOutlookCalendar(options) {
         policy: retries ? checked.retry : { ...checked.retry, maxRetries: 0 },
         deadline,
         sleep,
+        adjustDelay: (error, delayMs) => error instanceof CalendarError2 ? retryAfterOf.get(error) ?? delayMs : delayMs,
         ...options.random === undefined ? {} : { random: options.random },
         onRetry: (retry, delayMs) => options.logger?.warn("A calendar call is retrying", {
           feature: "calendar",
@@ -1707,8 +1745,9 @@ function createOutlookCalendar(options) {
         if (grant.kind === "refresh_token") {
           const answer = await tokenRequest({ grant_type: "refresh_token", refresh_token: grant.refreshToken }, overall);
           const read = tokenAnswer(answer, () => rejected2("invalid_grant", answer.status));
-          remember(grant.refreshToken, read.accessToken, read.seconds);
-          return grant.refreshToken;
+          const next = typeof read.refreshToken === "string" && read.refreshToken.length > 0 ? read.refreshToken : grant.refreshToken;
+          remember(next, read.accessToken, read.seconds);
+          return next;
         }
         const answer = await tokenRequest({
           grant_type: "authorization_code",
@@ -1899,14 +1938,7 @@ function createOutlookCalendar(options) {
       const key = tokenKey(connection.unsafeCredential());
       await call("revoke", request.organizationId, callOptions, async () => {
         tokens.delete(key);
-        revokedHere.delete(key);
-        revokedHere.add(key);
-        if (revokedHere.size > MAX_REVOKED) {
-          const oldest = revokedHere.values().next().value;
-          if (oldest !== undefined) {
-            revokedHere.delete(oldest);
-          }
-        }
+        rotated.delete(key);
       });
     }
   };

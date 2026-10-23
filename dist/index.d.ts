@@ -1252,6 +1252,12 @@ interface OutlookCalendarOptions {
 	sleep?: Sleep;
 	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
 	random?: () => number;
+	/**
+	* Told when Microsoft rotates a refresh token: `credential` is the newest one, which core must
+	* store in place of the connection's (the old one stops working after a while). Called with the
+	* secret itself, so never log it. A throw is swallowed so the calendar call still completes.
+	*/
+	onCredentialRotated?: (connection: CalendarConnection, credential: string) => void | Promise<void>;
 }
 /**
 * Creates the {@link CalendarPort} on Microsoft Graph (v1.0) with OAuth 2.0 against the Microsoft
@@ -1278,11 +1284,16 @@ interface OutlookCalendarOptions {
 * is applied again, not recognised).
 *
 * Microsoft has no call that revokes one refresh token (only all of a user's sign-in sessions,
-* which is too broad). `revoke` therefore forgets the cached access token and refuses the
-* connection from then on in this process; core must delete the stored credential, and the Rep can
-* withdraw the app's access in their Microsoft account. Rotated refresh tokens are not followed:
-* the one stored stays valid until Microsoft expires it, after which calls fail with
-* `calendar.revoked`. Retry-After is not read; the jittered backoff applies.
+* which would sign the Rep out everywhere, so it is not used). `revoke` therefore validates the
+* request and drops the cached access token, nothing more: it keeps no revoked state, in this
+* process or at Microsoft. Core deleting the stored credential is what ends access, and the Rep
+* can withdraw the app's access in their Microsoft account (later refreshes then fail with
+* `calendar.revoked`).
+*
+* Microsoft rotates the refresh token. When a token answer carries a new one, it is used for later
+* refreshes in this process and handed to `onCredentialRotated`, which core must use to replace the
+* stored credential. `Retry-After` on a 429 or 5xx (seconds or an HTTP date, at most 60 s) replaces
+* the computed backoff for that retry; the retry count and the call's deadline still bound it.
 *
 * Nothing is logged but retry metadata, and no token, title, note, address or URL is put in an
 * error, a log line or a report. Text Graph returns is data.

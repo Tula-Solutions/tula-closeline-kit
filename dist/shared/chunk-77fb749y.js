@@ -1626,7 +1626,8 @@ async function withCalendarRetry(attempt, options) {
       if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
         throw error;
       }
-      const delayMs = calendarRetryDelayMs2(n, options.policy, options.random);
+      const computed = calendarRetryDelayMs2(n, options.policy, options.random);
+      const delayMs = options.adjustDelay?.(error, computed) ?? computed;
       options.onRetry?.(n, delayMs);
       await sleep(delayMs, options.deadline.signal);
     }

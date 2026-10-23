@@ -36,6 +36,8 @@ export interface CalendarSubject {
   abortedRequests(): number
   /** False when the vendor keeps no record of a delete request id, so a replay of a delete that worked reports `{deleted:false}` (the event is gone either way); true by default. */
   remembersDeletes?: boolean
+  /** False when the vendor has no way to revoke one grant, so `revoke` only validates and core deleting the credential ends access (Outlook); true by default. */
+  revokesAtVendor?: boolean
   /** Removes what the subject created. */
   close(): Promise<void>
 }
@@ -513,6 +515,15 @@ export function calendarBehaviour(
     test('after revoke every call fails with calendar.revoked, and revoking again succeeds', async () => {
       const s = await subject()
       const c = await connect(s)
+      if (s.revokesAtVendor === false) {
+        // SKIPPED: this vendor cannot revoke one grant; revoke validates and succeeds, nothing more.
+        process.stderr.write(
+          `SKIPPED: "after revoke every call fails" for ${name}: no vendor revoke.\n`
+        )
+        await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts)
+        await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts)
+        return
+      }
       const other = await connect(s, 'secret-2')
       const made = await create(s, c, 'req-1')
       await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts)

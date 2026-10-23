@@ -26,18 +26,22 @@ async function codeOf(promise: Promise<unknown>): Promise<string | undefined> {
 type Fetch = (input: string, init: RequestInit) => Promise<Response>
 
 /** A connected adapter whose fetch is `wrap(fake)`: the fake serves what `wrap` lets through. */
-async function connectedVia(wrap: (real: Fetch) => Fetch = (real) => real) {
+async function connectedVia(
+  wrap: (real: Fetch) => Fetch = (real) => real,
+  tick = '10s',
+  extra: Parameters<typeof outlookHarness>[0] = {}
+) {
   const fake = outlookHarness()
   // The wrapped fetch bypasses the harness' own clock tick, so tick both clocks here.
   const ticking: Fetch = async (input, init) => {
     try {
       return await fake.fake.fetch(input, init)
     } finally {
-      fake.clock.advance('10s')
-      h.clock.advance('10s')
+      fake.clock.advance(tick)
+      h.clock.advance(tick)
     }
   }
-  const h = outlookHarness({ fetch: wrap(ticking) })
+  const h = outlookHarness({ ...extra, fetch: wrap(ticking) })
   fake.fake.allowRefresh('refresh-1')
   const connection = await h.port.connect(
     { organizationId: org, grant: { kind: 'refresh_token', refreshToken: 'refresh-1' } },
@@ -362,7 +366,7 @@ describe('Outlook calendar adapter', () => {
   })
 
   test('a replay inside the skew window with a different event is calendar.invalid_request', async () => {
-    const { h, base } = await connectedVia()
+    const { h, base } = await connectedVia(undefined, '1s')
     await h.port.createEvent({ ...base, requestId: 'req-1', event }, opts)
     expect(
       await codeOf(
@@ -424,15 +428,78 @@ describe('Outlook calendar adapter', () => {
     })
   })
 
-  test('revoke forgets the token and refuses the connection without calling Microsoft', async () => {
+  test('revoke validates and calls nothing: it keeps no revoked state and core deletes the credential', async () => {
     const { h, fake, base } = await connectedVia()
     const before = fake.fake.seen.length
     await h.port.revoke(base, opts)
     await h.port.revoke(base, opts)
     expect(fake.fake.seen.length).toBe(before)
-    expect(await codeOf(h.port.busy({ ...base, from, to }, opts))).toBe(
-      CALENDAR_ERROR_CODES.revoked
+    expect(await h.port.busy({ ...base, from, to }, opts)).toEqual([])
+    expect(await codeOf(h.port.revoke({ ...base, organizationId: 'org_x' as never }, opts))).toBe(
+      CALENDAR_ERROR_CODES.invalidRequest
     )
+  })
+
+  test('a rotated refresh token is handed to onCredentialRotated and used by the next refresh', async () => {
+    const rotatedTo: string[] = []
+    const { h, fake, base } = await connectedVia(undefined, '10s', {
+      onCredentialRotated: (_connection, credential) => {
+        rotatedTo.push(credential)
+      },
+    })
+    fake.fake.rotateRefresh()
+    h.clock.advance('2h')
+    await h.port.busy({ ...base, from, to }, opts)
+    expect(rotatedTo.length).toBe(1)
+    expect(rotatedTo[0]).not.toBe('refresh-1')
+    h.clock.advance('2h')
+    // The old token no longer works at the fake, so this only succeeds on the rotated one.
+    await h.port.busy({ ...base, from, to }, opts)
+    expect(rotatedTo.length).toBe(2)
+    const refreshes = fake.fake.seen.filter((r) => r.form.get('grant_type') === 'refresh_token')
+    expect(refreshes.at(-1)?.form.get('refresh_token')).toBe(rotatedTo[0])
+    expect(JSON.stringify(h.logs)).not.toContain(rotatedTo[0] ?? 'x')
+  })
+
+  test('a throwing onCredentialRotated does not fail the call', async () => {
+    const { h, fake, base } = await connectedVia(undefined, '10s', {
+      onCredentialRotated: () => {
+        throw new Error('db down')
+      },
+    })
+    fake.fake.rotateRefresh()
+    h.clock.advance('2h')
+    expect(await h.port.busy({ ...base, from, to }, opts)).toEqual([])
+  })
+
+  test('Retry-After in seconds or as an HTTP date replaces the backoff, capped at a minute', async () => {
+    const pause = async (header: string) => {
+      const { h, fake, base } = await connectedVia()
+      fake.fake.retryAfterNext(header)
+      fake.fake.failNext('retryable', 1)
+      await h.port.busy({ ...base, from, to }, opts)
+      return h.sleeps[0]
+    }
+    expect(await pause('3')).toBe(3000)
+    expect(await pause('86400')).toBe(60_000)
+    expect(await pause('garbage')).toBe(100) // falls back to the jittered backoff
+    const { h, fake, base } = await connectedVia()
+    const inSeven = new Date(h.clock.now().getTime() + 7_000 + 10_000).toUTCString()
+    fake.fake.retryAfterNext(inSeven)
+    fake.fake.failNext('retryable', 1)
+    await h.port.busy({ ...base, from, to }, opts)
+    expect(h.sleeps[0]).toBeGreaterThanOrEqual(6000)
+    expect(h.sleeps[0]).toBeLessThanOrEqual(7000)
+  })
+
+  test('Retry-After does not lift the retry limit or the deadline', async () => {
+    const { h, fake, base } = await connectedVia()
+    fake.fake.retryAfterNext('1')
+    fake.fake.failNext('retryable', 5)
+    expect(await codeOf(h.port.busy({ ...base, from, to }, opts))).toBe(
+      CALENDAR_ERROR_CODES.unavailable
+    )
+    expect(h.sleeps.length).toBe(2)
   })
 
   test('a response over the size limit is calendar.rejected', async () => {

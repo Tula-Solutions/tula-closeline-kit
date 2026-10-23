@@ -500,6 +500,13 @@ function calendarBehaviour(name, make, skip = false) {
     test2("after revoke every call fails with calendar.revoked, and revoking again succeeds", async () => {
       const s = await subject();
       const c = await connect(s);
+      if (s.revokesAtVendor === false) {
+        process.stderr.write(`SKIPPED: "after revoke every call fails" for ${name}: no vendor revoke.
+`);
+        await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts);
+        await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts);
+        return;
+      }
       const other = await connect(s, "secret-2");
       const made = await create(s, c, "req-1");
       await s.port.revoke({ organizationId: c.organizationId, connection: c }, opts);

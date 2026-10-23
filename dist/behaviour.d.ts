@@ -403,6 +403,8 @@ interface CalendarSubject {
 	abortedRequests(): number;
 	/** False when the vendor keeps no record of a delete request id, so a replay of a delete that worked reports `{deleted:false}` (the event is gone either way); true by default. */
 	remembersDeletes?: boolean;
+	/** False when the vendor has no way to revoke one grant, so `revoke` only validates and core deleting the credential ends access (Outlook); true by default. */
+	revokesAtVendor?: boolean;
 	/** Removes what the subject created. */
 	close(): Promise<void>;
 }

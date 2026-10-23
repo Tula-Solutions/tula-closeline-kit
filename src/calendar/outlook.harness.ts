@@ -66,6 +66,8 @@ export function fakeOutlook(now: () => Date = () => new Date()) {
   const seen: OutlookSeen[] = []
   const failures: ('retryable' | 'fatal')[] = []
   let lose = 0
+  let rotate = false
+  let retryAfter: string | undefined
   let hang = false
   let tokenCounter = 0
   let eventCounter = 0
@@ -112,6 +114,19 @@ export function fakeOutlook(now: () => Date = () => new Date()) {
     const found = accounts.get(refresh)
     if (found === undefined || found.revoked) {
       return outlookJson(400, { error: 'invalid_grant' })
+    }
+    if (rotate) {
+      // Like Microsoft: a new refresh token with every refresh, the old one no longer good.
+      const next = `${refresh.split('~')[0]}~${++tokenCounter}`
+      accounts.delete(refresh)
+      accounts.set(next, found)
+      return outlookJson(200, {
+        access_token: issue(next),
+        refresh_token: next,
+        expires_in: 3599,
+        scope,
+        token_type: 'Bearer',
+      })
     }
     return outlookJson(200, {
       access_token: issue(refresh),
@@ -288,7 +303,12 @@ export function fakeOutlook(now: () => Date = () => new Date()) {
       }
       const failure = failures.shift()
       if (failure === 'retryable') {
-        return graphError(429, 'TooManyRequests')
+        const limited = graphError(429, 'TooManyRequests')
+        if (retryAfter !== undefined) {
+          limited.headers.set('retry-after', retryAfter)
+          retryAfter = undefined
+        }
+        return limited
       }
       if (failure === 'fatal') {
         return graphError(403, 'ErrorAccessDenied')
@@ -336,6 +356,14 @@ export function fakeOutlook(now: () => Date = () => new Date()) {
       for (let i = 0; i < times; i++) {
         failures.push(kind)
       }
+    },
+    /** From now on every refresh returns a new refresh token and retires the old one. */
+    rotateRefresh() {
+      rotate = true
+    },
+    /** The next retryable failure carries this `Retry-After` header value. */
+    retryAfterNext(value: string) {
+      retryAfter = value
     },
     loseNext(times: number) {
       lose += times

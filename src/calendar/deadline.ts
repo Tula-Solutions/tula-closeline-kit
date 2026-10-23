@@ -59,6 +59,8 @@ export interface CalendarRetryOptions {
   sleep?: Sleep
   /** A number in `[0, 1)` for the jitter; `Math.random` by default. */
   random?: () => number
+  /** Lets a vendor's own pause (a `Retry-After`) replace the computed one; given the error and the computed delay. */
+  adjustDelay?: (error: unknown, delayMs: number) => number
   /** Told before each retry, with its number and pause (metadata only). */
   onRetry?: (retry: number, delayMs: number) => void
 }
@@ -82,7 +84,8 @@ export async function withCalendarRetry<T>(
       if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
         throw error
       }
-      const delayMs = calendarRetryDelayMs(n, options.policy, options.random)
+      const computed = calendarRetryDelayMs(n, options.policy, options.random)
+      const delayMs = options.adjustDelay?.(error, computed) ?? computed
       options.onRetry?.(n, delayMs)
       await sleep(delayMs, options.deadline.signal)
     }

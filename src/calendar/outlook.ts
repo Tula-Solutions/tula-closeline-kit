@@ -47,7 +47,7 @@ const MAX_RESPONSE_BYTES = 2_097_152
 const DEFAULT_ATTEMPT_TIMEOUT_MS = 5_000
 const TOKEN_MARGIN_MS = 60_000
 const MAX_CACHED_TOKENS = 1_024
-const MAX_REVOKED = 10_000
+const MAX_ROTATED = 10_000
 /** How much older than the start of a create attempt an event must be, in ms, to be one made earlier; absorbs clock skew with Graph. */
 const CREATED_SKEW_MS = 5_000
 const PAGE_SIZE = 200
@@ -91,6 +91,12 @@ export interface OutlookCalendarOptions {
   sleep?: Sleep
   /** A number in `[0, 1)` for the jitter; `Math.random` by default. */
   random?: () => number
+  /**
+   * Told when Microsoft rotates a refresh token: `credential` is the newest one, which core must
+   * store in place of the connection's (the old one stops working after a while). Called with the
+   * secret itself, so never log it. A throw is swallowed so the calendar call still completes.
+   */
+  onCredentialRotated?: (connection: CalendarConnection, credential: string) => void | Promise<void>
 }
 
 type Json = Record<string, unknown>
@@ -98,14 +104,36 @@ type Json = Record<string, unknown>
 interface Answer {
   status: number
   json: Json | null
+  /** The `Retry-After` pause in ms, when the response carried a usable one. */
+  retryAfterMs?: number
 }
 
-function unavailable(phase: string, status?: number): CalendarError {
-  return new CalendarError(
+/** The longest `Retry-After` pause honoured, in ms; the call's deadline still cuts a sleep short. */
+const MAX_RETRY_AFTER_MS = 60_000
+
+/** The pause Microsoft asked for, kept off the error so nothing about it reaches a log. */
+const retryAfterOf = new WeakMap<CalendarError, number>()
+
+/** Reads `Retry-After` as seconds or an HTTP date; undefined when absent or unusable. */
+function parseRetryAfter(value: string | null, nowMs: number): number | undefined {
+  if (value === null) {
+    return undefined
+  }
+  const text = value.trim()
+  const ms = /^\d{1,9}$/.test(text) ? Number(text) * 1000 : Date.parse(text) - nowMs
+  return Number.isFinite(ms) && ms >= 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : undefined
+}
+
+function unavailable(phase: string, status?: number, retryAfterMs?: number): CalendarError {
+  const error = new CalendarError(
     CALENDAR_ERROR_CODES.unavailable,
     'The calendar provider is unavailable',
     { details: { phase, ...(status === undefined ? {} : { status }) } }
   )
+  if (retryAfterMs !== undefined) {
+    retryAfterOf.set(error, retryAfterMs)
+  }
+  return error
 }
 
 function rejected(reason: string, status?: number): CalendarError {
@@ -263,11 +291,16 @@ function attendeesBody(attendees: readonly CalendarAttendee[]) {
  * is applied again, not recognised).
  *
  * Microsoft has no call that revokes one refresh token (only all of a user's sign-in sessions,
- * which is too broad). `revoke` therefore forgets the cached access token and refuses the
- * connection from then on in this process; core must delete the stored credential, and the Rep can
- * withdraw the app's access in their Microsoft account. Rotated refresh tokens are not followed:
- * the one stored stays valid until Microsoft expires it, after which calls fail with
- * `calendar.revoked`. Retry-After is not read; the jittered backoff applies.
+ * which would sign the Rep out everywhere, so it is not used). `revoke` therefore validates the
+ * request and drops the cached access token, nothing more: it keeps no revoked state, in this
+ * process or at Microsoft. Core deleting the stored credential is what ends access, and the Rep
+ * can withdraw the app's access in their Microsoft account (later refreshes then fail with
+ * `calendar.revoked`).
+ *
+ * Microsoft rotates the refresh token. When a token answer carries a new one, it is used for later
+ * refreshes in this process and handed to `onCredentialRotated`, which core must use to replace the
+ * stored credential. `Retry-After` on a 429 or 5xx (seconds or an HTTP date, at most 60 s) replaces
+ * the computed backoff for that retry; the retry count and the call's deadline still bound it.
  *
  * Nothing is logged but retry metadata, and no token, title, note, address or URL is put in an
  * error, a log line or a report. Text Graph returns is data.
@@ -305,7 +338,7 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
       : `${GRAPH}/me/calendars/${encodeURIComponent(calendarId)}`
   const scope = OUTLOOK_CALENDAR_SCOPES.join(' ')
   const tokens = new Map<string, { accessToken: string; expiresAtMs: number }>()
-  const revokedHere = new Set<string>()
+  const rotated = new Map<string, string>()
 
   function tokenKey(credential: string): string {
     return sha256Hex(credential)
@@ -346,7 +379,15 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
         signal
       )
       const text = await raceAbort(readBounded(response), signal)
-      return { status: response.status, json: parseJson(text) }
+      const retryAfterMs = parseRetryAfter(
+        response.headers.get('retry-after'),
+        clock.now().getTime()
+      )
+      return {
+        status: response.status,
+        json: parseJson(text),
+        ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+      }
     } catch (error) {
       if (error instanceof CalendarError) {
         throw error
@@ -383,7 +424,7 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
   /** Reads an OAuth token answer; `grantGone` is what `invalid_grant` means for the caller. */
   function tokenAnswer(answer: Answer, grantGone: () => CalendarError) {
     if (answer.status === 429 || answer.status >= 500) {
-      throw unavailable('token', answer.status)
+      throw unavailable('token', answer.status, answer.retryAfterMs)
     }
     if (
       (answer.status === 400 || answer.status === 401) &&
@@ -416,17 +457,41 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
     return { accessToken, seconds, refreshToken: answer.json?.refresh_token }
   }
 
-  async function accessToken(credential: string, overall: AbortSignal): Promise<string> {
-    const cached = tokens.get(tokenKey(credential))
+  /** Notes a refresh token Microsoft rotated: later refreshes use it, and core is told to store it. */
+  async function rotation(connection: CalendarConnection, used: string, next: unknown) {
+    if (typeof next !== 'string' || next.length < 1 || next === used) {
+      return
+    }
+    const key = tokenKey(connection.unsafeCredential())
+    rotated.delete(key)
+    rotated.set(key, next)
+    if (rotated.size > MAX_ROTATED) {
+      const oldest = rotated.keys().next().value
+      if (oldest !== undefined) {
+        rotated.delete(oldest)
+      }
+    }
+    try {
+      await options.onCredentialRotated?.(connection, next)
+    } catch {
+      options.logger?.warn('A rotated calendar credential was not stored', { feature: 'calendar' })
+    }
+  }
+
+  async function accessToken(
+    connection: CalendarConnection,
+    overall: AbortSignal
+  ): Promise<string> {
+    const key = tokenKey(connection.unsafeCredential())
+    const cached = tokens.get(key)
     if (cached !== undefined && cached.expiresAtMs > clock.now().getTime()) {
       return cached.accessToken
     }
-    const answer = await tokenRequest(
-      { grant_type: 'refresh_token', refresh_token: credential },
-      overall
-    )
+    const used = rotated.get(key) ?? connection.unsafeCredential()
+    const answer = await tokenRequest({ grant_type: 'refresh_token', refresh_token: used }, overall)
     const read = tokenAnswer(answer, revoked)
-    remember(credential, read.accessToken, read.seconds)
+    remember(connection.unsafeCredential(), read.accessToken, read.seconds)
+    await rotation(connection, used, read.refreshToken)
     return read.accessToken
   }
 
@@ -438,12 +503,8 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
     body: unknown,
     overall: AbortSignal
   ): Promise<Answer> {
-    const credential = connection.unsafeCredential()
-    if (revokedHere.has(tokenKey(credential))) {
-      throw revoked()
-    }
     for (let pass = 0; ; pass++) {
-      const token = await accessToken(credential, overall)
+      const token = await accessToken(connection, overall)
       const answer = await http(
         url,
         {
@@ -459,7 +520,7 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
         overall
       )
       if (answer.status === 401 && pass === 0) {
-        tokens.delete(tokenKey(credential))
+        tokens.delete(tokenKey(connection.unsafeCredential()))
         continue
       }
       if (answer.status === 401) {
@@ -479,11 +540,11 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
       return notFound
     }
     if (status === 429 || status >= 500) {
-      return unavailable('http', status)
+      return unavailable('http', status, answer.retryAfterMs)
     }
     const code = graphCode(answer.json)
     if (code !== undefined && THROTTLE_CODES.has(code)) {
-      return unavailable('rate_limit', status)
+      return unavailable('rate_limit', status, answer.retryAfterMs)
     }
     return rejected(code ?? 'http', status)
   }
@@ -530,6 +591,8 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
           policy: retries ? checked.retry : { ...checked.retry, maxRetries: 0 },
           deadline,
           sleep,
+          adjustDelay: (error, delayMs) =>
+            error instanceof CalendarError ? (retryAfterOf.get(error) ?? delayMs) : delayMs,
           ...(options.random === undefined ? {} : { random: options.random }),
           onRetry: (retry, delayMs) =>
             options.logger?.warn('A calendar call is retrying', {
@@ -600,8 +663,12 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
               overall
             )
             const read = tokenAnswer(answer, () => rejected('invalid_grant', answer.status))
-            remember(grant.refreshToken, read.accessToken, read.seconds)
-            return grant.refreshToken
+            const next =
+              typeof read.refreshToken === 'string' && read.refreshToken.length > 0
+                ? read.refreshToken
+                : grant.refreshToken
+            remember(next, read.accessToken, read.seconds)
+            return next
           }
           const answer = await tokenRequest(
             {
@@ -824,15 +891,9 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
       const connection = checkBase(request)
       const key = tokenKey(connection.unsafeCredential())
       await call('revoke', request.organizationId, callOptions, async () => {
+        // Nothing to revoke at Microsoft; only the cached access token is let go.
         tokens.delete(key)
-        revokedHere.delete(key)
-        revokedHere.add(key)
-        if (revokedHere.size > MAX_REVOKED) {
-          const oldest = revokedHere.values().next().value
-          if (oldest !== undefined) {
-            revokedHere.delete(oldest)
-          }
-        }
+        rotated.delete(key)
       })
     },
   }
