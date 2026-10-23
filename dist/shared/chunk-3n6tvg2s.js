@@ -1,7 +1,7 @@
 import {
   QUEUE_ERROR_CODES2,
   QueueError2
-} from "./chunk-5cxd570z.js";
+} from "./chunk-mjkmsg3r.js";
 
 // src/queue/port.ts
 var MAX_BATCH_SIZE2 = 10;
