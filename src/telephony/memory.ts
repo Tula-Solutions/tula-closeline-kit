@@ -43,6 +43,7 @@ import {
   checkProviderId,
   checkRingIdentities,
   invalid,
+  requireDisclosure,
   resolveTimeout,
 } from './validate'
 
@@ -291,14 +292,8 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
     }
   }
 
-  function needDisclosure(call: Call): DisclosurePlayed {
-    if (call.disclosure === null) {
-      throw new TelephonyError(
-        TELEPHONY_ERROR_CODES.disclosureRequired,
-        'The Disclosure has not played on this call'
-      )
-    }
-    return call.disclosure
+  function needDisclosure(call: Call, needsAi = false): DisclosurePlayed {
+    return requireDisclosure(call.disclosure, needsAi)
   }
 
   function checkRef(request: ProviderCallRef) {
@@ -477,13 +472,7 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
           return { streamId: call.streamId, tracks: ['rep', 'prospect'] }
         }
         live(call)
-        const disclosure = needDisclosure(call)
-        if (!disclosure.aiAssisted) {
-          throw new TelephonyError(
-            TELEPHONY_ERROR_CODES.disclosureRequired,
-            'The Disclosure did not say an AI takes part'
-          )
-        }
+        needDisclosure(call, true)
         call.streamId = nextId('memstream-')
         record('forkTracks', call.providerCallId)
         return { streamId: call.streamId, tracks: ['rep', 'prospect'] }

@@ -25,15 +25,15 @@ export interface TelephonySubject {
   /** Returns a number (E.164) that, when dialed, plays out as `scenario`. */
   numberFor(scenario: ProspectScenario): string
   /** Makes a provider call arrive on a Line, as an inbound webhook would; returns its provider id. */
-  receiveInbound(organizationId: string): string
+  receiveInbound(organizationId: string): string | Promise<string>
   /** Has the Prospect on a call hang up now. */
-  prospectHangsUp(organizationId: string, providerCallId: string): void
+  prospectHangsUp(organizationId: string, providerCallId: string): void | Promise<void>
   /** Makes the next call of `operation` never get an answer from the provider. */
   stallNext(operation: TelephonyOperation): void
   /** Makes the next call of `operation` fail at the provider, as `telephony.unavailable`. */
   failNext(operation: TelephonyOperation): void
   /** Returns the events the provider has reported since the last call, in order. */
-  takeEvents(): TelephonyEvent[]
+  takeEvents(): TelephonyEvent[] | Promise<TelephonyEvent[]>
   /** The signed webhook the provider would send for `event`. */
   signedWebhook(event: TelephonyEvent): SignedWebhook
   /** Removes what the subject created, including every provider call and Recording. */
@@ -100,7 +100,7 @@ export function telephonyBehaviour(
         const placed = await place(s)
         expect(placed.created).toBe(true)
         expect(placed.providerCallId.length).toBeGreaterThan(0)
-        expect(s.takeEvents().map((e) => e.type)).toEqual(['ringing', 'answered'])
+        expect((await s.takeEvents()).map((e) => e.type)).toEqual(['ringing', 'answered'])
       })
 
       test('the same idempotency key places exactly one call', async () => {
@@ -115,7 +115,7 @@ export function telephonyBehaviour(
         const first = await s.telephony.placeCall(request)
         const second = await s.telephony.placeCall(request)
         expect(second).toEqual({ providerCallId: first.providerCallId, created: false })
-        expect(s.takeEvents().filter((e) => e.type === 'ringing')).toHaveLength(1)
+        expect((await s.takeEvents()).filter((e) => e.type === 'ringing')).toHaveLength(1)
       })
 
       test('the same key for another number is refused', async () => {
@@ -158,13 +158,13 @@ export function telephonyBehaviour(
         await expect(s.telephony.placeCall(request as never)).rejects.toMatchObject(
           code('telephony.invalid_request')
         )
-        expect(s.takeEvents()).toHaveLength(0)
+        expect(await s.takeEvents()).toHaveLength(0)
       })
 
       test('a Prospect who does not answer: no_answer', async () => {
         const s = await subject()
         await place(s, 'no_answer')
-        const events = s.takeEvents()
+        const events = await s.takeEvents()
         expect(events.map((e) => e.type)).toEqual(['ringing', 'no_answer'])
         expect(events[1]).toMatchObject({ failureReason: 'no_answer' })
       })
@@ -172,13 +172,13 @@ export function telephonyBehaviour(
       test('a busy Prospect: busy', async () => {
         const s = await subject()
         await place(s, 'busy')
-        expect(s.takeEvents().at(-1)).toMatchObject({ type: 'busy', failureReason: 'busy' })
+        expect((await s.takeEvents()).at(-1)).toMatchObject({ type: 'busy', failureReason: 'busy' })
       })
 
       test('a carrier failure: failed with a contract reason, and the call is over', async () => {
         const s = await subject()
         const placed = await place(s, 'carrier_failure')
-        const last = s.takeEvents().at(-1)
+        const last = (await s.takeEvents()).at(-1)
         expect(last?.type).toBe('failed')
         expect(['carrier_dropped', 'carrier_rejected', 'provider_error']).toContain(
           last?.failureReason as string
@@ -198,7 +198,7 @@ export function telephonyBehaviour(
           from: line,
           to,
         })
-        const text = JSON.stringify(s.takeEvents())
+        const text = JSON.stringify(await s.takeEvents())
         expect(text).not.toContain(to)
         expect(text).not.toContain(line)
       })
@@ -207,7 +207,7 @@ export function telephonyBehaviour(
     describe('answering an inbound call', () => {
       test('answers it and rings the browser legs', async () => {
         const s = await subject()
-        const providerCallId = s.receiveInbound(s.organizations.a)
+        const providerCallId = await s.receiveInbound(s.organizations.a)
         const answered = await s.telephony.answerCall({
           organizationId: s.organizations.a,
           providerCallId,
@@ -215,12 +215,12 @@ export function telephonyBehaviour(
           ringIdentities: [rep, otherRep],
         })
         expect(answered).toEqual({ ringing: 2 })
-        expect(s.takeEvents().map((e) => e.type)).toContain('answered')
+        expect((await s.takeEvents()).map((e) => e.type)).toContain('answered')
       })
 
       test('answering again changes nothing', async () => {
         const s = await subject()
-        const providerCallId = s.receiveInbound(s.organizations.a)
+        const providerCallId = await s.receiveInbound(s.organizations.a)
         const request = {
           organizationId: s.organizations.a,
           providerCallId,
@@ -228,14 +228,14 @@ export function telephonyBehaviour(
           ringIdentities: [rep],
         }
         await s.telephony.answerCall(request)
-        s.takeEvents()
+        await s.takeEvents()
         expect(await s.telephony.answerCall(request)).toEqual({ ringing: 1 })
-        expect(s.takeEvents()).toHaveLength(0)
+        expect(await s.takeEvents()).toHaveLength(0)
       })
 
       test('another Organization cannot answer it', async () => {
         const s = await subject()
-        const providerCallId = s.receiveInbound(s.organizations.a)
+        const providerCallId = await s.receiveInbound(s.organizations.a)
         await expect(
           s.telephony.answerCall({
             organizationId: s.organizations.b,
@@ -251,7 +251,7 @@ export function telephonyBehaviour(
         ['a bad identity', ['mem_1']],
       ])('%s is refused', async (_label, ringIdentities) => {
         const s = await subject()
-        const providerCallId = s.receiveInbound(s.organizations.a)
+        const providerCallId = await s.receiveInbound(s.organizations.a)
         await expect(
           s.telephony.answerCall({
             organizationId: s.organizations.a,
@@ -264,7 +264,7 @@ export function telephonyBehaviour(
 
       test('a call nobody answered cannot play the Disclosure yet', async () => {
         const s = await subject()
-        const providerCallId = s.receiveInbound(s.organizations.a)
+        const providerCallId = await s.receiveInbound(s.organizations.a)
         await expect(
           s.telephony.playDisclosure({
             organizationId: s.organizations.a,
@@ -317,7 +317,10 @@ export function telephonyBehaviour(
         await expect(
           s.telephony.playDisclosure({ ...placed.ref, ...wording })
         ).rejects.toMatchObject(code('telephony.call_ended'))
-        expect(s.takeEvents().at(-1)).toMatchObject({ type: 'completed', endedBy: 'prospect' })
+        expect((await s.takeEvents()).at(-1)).toMatchObject({
+          type: 'completed',
+          endedBy: 'prospect',
+        })
         await expect(s.telephony.bridge({ ...placed.ref, repIdentity: rep })).rejects.toMatchObject(
           code('telephony.call_ended')
         )
@@ -428,9 +431,9 @@ export function telephonyBehaviour(
         const s = await subject()
         const placed = await disclosed(s)
         await s.telephony.bridge({ ...placed.ref, repIdentity: rep })
-        s.takeEvents()
-        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId)
-        expect(s.takeEvents().find((e) => e.type === 'completed')).toMatchObject({
+        await s.takeEvents()
+        await s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId)
+        expect((await s.takeEvents()).find((e) => e.type === 'completed')).toMatchObject({
           endedBy: 'prospect',
         })
         await expect(
@@ -465,7 +468,7 @@ export function telephonyBehaviour(
         const placed = await disclosed(s)
         const started = await s.telephony.startRecording(placed.ref)
         await s.telephony.hangUp({ ...placed.ref, by: 'rep' })
-        expect(s.takeEvents().at(-1)).toMatchObject({
+        expect((await s.takeEvents()).at(-1)).toMatchObject({
           type: 'recording_ready',
           recordingId: started.recordingId,
         })
@@ -489,7 +492,7 @@ export function telephonyBehaviour(
         const s = await subject()
         const placed = await disclosed(s)
         const started = await s.telephony.startRecording(placed.ref)
-        s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId)
+        await s.prospectHangsUp(placed.ref.organizationId, placed.providerCallId)
         const fetched = await s.telephony.fetchRecording({
           organizationId: placed.ref.organizationId,
           recordingId: started.recordingId,
@@ -565,11 +568,11 @@ export function telephonyBehaviour(
       test('ends the call with who ended it, and again is a no-op', async () => {
         const s = await subject()
         const placed = await place(s)
-        s.takeEvents()
+        await s.takeEvents()
         await s.telephony.hangUp({ ...placed.ref, by: 'rep' })
-        expect(s.takeEvents()).toMatchObject([{ type: 'completed', endedBy: 'rep' }])
+        expect(await s.takeEvents()).toMatchObject([{ type: 'completed', endedBy: 'rep' }])
         await s.telephony.hangUp(placed.ref)
-        expect(s.takeEvents()).toHaveLength(0)
+        expect(await s.takeEvents()).toHaveLength(0)
       })
 
       test('another Organization cannot hang it up', async () => {
@@ -610,7 +613,7 @@ export function telephonyBehaviour(
       async function webhook() {
         const s = await subject()
         const placed = await place(s)
-        const event = s.takeEvents()[0] as TelephonyEvent
+        const event = (await s.takeEvents())[0] as TelephonyEvent
         return { s, placed, event, hook: s.signedWebhook(event) }
       }
 
@@ -736,7 +739,7 @@ export function telephonyBehaviour(
             ),
         },
         answerCall: {
-          ready: async (s) => ({ providerCallId: s.receiveInbound(s.organizations.a) }),
+          ready: async (s) => ({ providerCallId: await s.receiveInbound(s.organizations.a) }),
           call: (s, c) =>
             s.telephony.answerCall(
               {
@@ -884,7 +887,7 @@ export function telephonyBehaviour(
         await expect(s.telephony.placeCall(request, { timeoutMs: TIMEOUT })).rejects.toMatchObject(
           code('telephony.unavailable')
         )
-        expect(s.takeEvents()).toHaveLength(0)
+        expect(await s.takeEvents()).toHaveLength(0)
         expect((await s.telephony.placeCall(request)).created).toBe(true)
       })
 

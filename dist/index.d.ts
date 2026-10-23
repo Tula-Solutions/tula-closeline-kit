@@ -1448,6 +1448,154 @@ interface TelephonyPort {
 	*/
 	mintBrowserToken(request: BrowserTokenRequest, options?: TelephonyOptions): Promise<SoftphoneToken>;
 }
+/** The HTTP client the adapter uses: `fetch`, injected for tests. */
+type TwilioFetch = (input: string, init: RequestInit) => Promise<Response>;
+/** The Twilio regions this adapter knows, as Twilio names them in a host (`api.dublin.ie1.twilio.com`). */
+declare const TWILIO_REGIONS: readonly ["us1", "ie1", "au1"];
+/** One of {@link TWILIO_REGIONS}. */
+type TwilioRegion = (typeof TWILIO_REGIONS)[number];
+/** The edge Twilio serves each region from by default. */
+declare const TWILIO_DEFAULT_EDGES: Readonly<Record<TwilioRegion, string>>;
+/** What the adapter remembers about one provider call, since Twilio has no tag to hold it. */
+interface TwilioCallRecord {
+	/** The Organization the call belongs to. */
+	organizationId: string;
+	/** Our Call id, when known. */
+	callId: string | null;
+	/** Placed by us, or received. */
+	direction: "outbound" | "inbound";
+	/** The Disclosure that has played on the call, or null. */
+	disclosure: DisclosurePlayed | null;
+	/** The Rep whose browser leg the call is bridged to, or null. */
+	bridgedTo: string | null;
+	/** The Reps the inbound call was meant to ring. */
+	ringIdentities: readonly string[];
+	/** The Recording started on the call, or null. */
+	recordingId: string | null;
+	/** The stream forked from the call, or null. */
+	streamId: string | null;
+}
+/** What the adapter remembers about a placement, to answer a repeated idempotency key. */
+interface TwilioPlacement {
+	/** The provider call the key placed. */
+	providerCallId: string;
+	/** A keyed hash of the numbers; a repeat with other numbers is refused. Never the numbers. */
+	fingerprint: string;
+}
+/**
+* Where the adapter keeps the Organization of each provider call, the state of its Disclosure and
+* its idempotency keys. Twilio holds none of it, and the port promises that one Organization never
+* reaches another's calls, so a production service must pass a durable store (Postgres, in its own
+* schema). The default is in process memory and is for tests and local runs. A store that has lost
+* a call fails closed: the call is `telephony.not_found`, or its Disclosure counts as not played.
+*/
+interface TwilioStore {
+	/** Returns the record of a provider call, or null. */
+	getCall(providerCallId: string): Promise<TwilioCallRecord | null>;
+	/** Creates or replaces the record of a provider call. */
+	putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>;
+	/** Returns the provider call a Recording belongs to, or null. */
+	getRecording(recordingId: string): Promise<{
+		providerCallId: string;
+	} | null>;
+	/** Remembers which provider call a Recording belongs to. */
+	putRecording(recordingId: string, providerCallId: string): Promise<void>;
+	/** Returns the placement an idempotency key made, or null. */
+	getPlacement(organizationId: string, key: string): Promise<TwilioPlacement | null>;
+	/** Remembers a placement. */
+	putPlacement(organizationId: string, key: string, placement: TwilioPlacement): Promise<void>;
+}
+/** Creates the in-process {@link TwilioStore}, for tests and local runs. */
+declare function createMemoryTwilioStore(): TwilioStore;
+/** What {@link TwilioOptions.disclosureDone} is told about the Disclosure it waits for. */
+interface DisclosureWait {
+	/** The Organization. */
+	organizationId: string;
+	/** The provider call. */
+	providerCallId: string;
+	/** When the wait must give up, as ms since the epoch. */
+	deadline: number;
+}
+/** Options for {@link createTwilioTelephony}. */
+interface TwilioOptions {
+	/** The Account SID (`AC` and 32 hex digits). */
+	accountSid: string;
+	/** An API key's SID (`SK` and 32 hex digits): signs requests and Softphone tokens. */
+	apiKeySid: string;
+	/** The API key's secret. A credential: never logged or put in an error. */
+	apiKeySecret: string;
+	/**
+	* The Auth Token, used only to check webhook signatures. Twilio signs webhooks with it and not
+	* with an API key's secret. Without it `verifyWebhook` is always false.
+	*/
+	authToken?: string;
+	/** The TwiML App's SID (`AP` and 32 hex digits) the Softphone dials out through. */
+	twimlAppSid: string;
+	/**
+	* The Twilio region, such as `ie1` for Ireland. Needs API keys made in that region. Default is
+	* the US default host `api.twilio.com`.
+	*/
+	region?: TwilioRegion;
+	/** The edge, such as `dublin`; default is the region's own edge. Needs `region`. */
+	edge?: string;
+	/** The `ENVIRONMENT`; a `ws:` fork destination is accepted only in `local`; default `prod`. */
+	environment?: Environment;
+	/** Where Twilio reports call progress; the adapter adds `organizationId` and `callId` to the query. */
+	statusCallbackUrl?: string;
+	/** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
+	recordingStatusCallbackUrl?: string;
+	/** The store of per-call state; in memory by default. A production service injects a durable one. */
+	store?: TwilioStore;
+	/** The `fetch` to use; the global one by default. */
+	fetch?: TwilioFetch;
+	/** Waits between retries; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for retry jitter; `Math.random` by default. */
+	random?: () => number;
+	/** The clock for token and Disclosure times; the system clock by default. */
+	clock?: Clock;
+	/** The wall clock in ms for deadlines; `Date.now` by default. */
+	nowMs?: () => number;
+	/** The timeout of an operation that names none, in ms; default {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. */
+	defaultTimeoutMs?: number;
+	/** The most attempts per request, the first included; default 3. */
+	maxAttempts?: number;
+	/** The language the Disclosure is spoken in, such as `en-US`; default `en-US`. */
+	disclosureLanguage?: string;
+	/**
+	* Resolves when the Disclosure has finished playing. Twilio has no "finished speaking" event on
+	* a REST update, so by default the adapter waits for an estimate of how long the wording takes
+	* (see {@link estimateSpeechMs}). A service with a webhook for it passes a hook that waits for
+	* that instead; the hook must throw `telephony.unavailable` if the deadline passes.
+	*/
+	disclosureDone?: (wait: DisclosureWait) => Promise<void>;
+}
+/**
+* How long a Disclosure takes to speak, in ms: 0.4 s a word, a quarter more for safety, and a
+* second for the call to start speaking. It deliberately errs long: waiting too long delays the
+* Rep a moment, but bridging too early would let the Rep talk over the Disclosure.
+*/
+declare function estimateSpeechMs(text: string): number;
+/** The host Twilio's REST API is called on for a region and edge. */
+declare function twilioApiHost(region?: TwilioRegion, edge?: string): string;
+/**
+* Signs a webhook the way Twilio does (`X-Twilio-Signature`): HMAC-SHA1 with the Auth Token over
+* the URL followed by each form field's name and value in sorted order, in base64. For tests and
+* for simulating Twilio; the adapter itself only verifies.
+*/
+declare function signTwilioRequest(authToken: string, url: string, params?: Readonly<Record<string, string>> | readonly (readonly [string, string])[]): string;
+/**
+* Creates the {@link TelephonyPort} on Twilio: Programmable Voice over REST and TwiML, a Voice SDK
+* access token, dual-channel Recordings and a Media Streams fork. Every request has a timeout and
+* a bounded, jittered retry on network errors, 429 and 5xx (never on another 4xx); an operation
+* as a whole is bounded by its `timeoutMs`. Nothing is logged, and no number, Disclosure text,
+* token, signature, secret or Recording URL is put in an error.
+*
+* The Disclosure rules are the shared ones (`requireDisclosure`): the adapter refuses to bridge,
+* record or fork a call whose Disclosure it has not seen play. The Disclosure state lives in the
+* {@link TwilioStore}.
+*/
+declare function createTwilioTelephony(options: TwilioOptions): TelephonyPort;
 /** The `area.reason` codes the transcriber port and adapters throw. */
 declare const TRANSCRIBER_ERROR_CODES: {
 	/** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
@@ -1910,4 +2058,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, cutText, defineMessage, dropHighSurrogate, environmentSchema, isAppError, isContactGuardRequest, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, systemClock, systemSleep, toErrorBody, waitForTranscription, withCaller };
+export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResultContext, STORAGE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, isAppError, isContactGuardRequest, isSentryDsn, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };
