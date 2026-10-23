@@ -48,15 +48,12 @@ import {
   DEFAULT_RECONNECT_POLICY2,
   reconnectDelayMs2,
   TtsAudioChunk2,
-  DEFAULT_TTS_TIMEOUT_MS2,
-  MAX_TTS_TIMEOUT_MS2,
-  DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2,
-  MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2,
-  DEFAULT_TTS_MAX_TEXT_CHARS2,
-  MAX_TTS_MAX_TEXT_CHARS2,
   MAX_TTS_AUDIO_CHUNK_BYTES2,
-  DEFAULT_TTS_RETRY_POLICY2,
-  ttsRetryDelayMs2,
+  startTtsDeadline,
+  watchFirstChunk,
+  withTtsRetry,
+  invalid4,
+  checkOpenRequest,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -65,7 +62,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-wsb2gcje.js";
+} from "./shared/chunk-zy1js6ey.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -90,11 +87,11 @@ import {
 import {
   startDeadline,
   withLlmRetry,
-  invalid4,
+  invalid5,
   checkRequest,
   checkCompleteRequest,
   parseModelOutput
-} from "./shared/chunk-z850m2w7.js";
+} from "./shared/chunk-67y2hsjp.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -788,10 +785,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid4("reply text");
+        invalid5("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid4("reply chunks");
+        invalid5("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -1411,36 +1408,36 @@ var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
 var TRACKS = ["rep", "prospect"];
-function invalid5(what) {
+function invalid6(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
-function checkOpenRequest(request) {
+function checkOpenRequest2(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid5("request");
+    return invalid6("request");
   }
   if (!organizationIdSchema.safeParse(request.organizationId).success) {
-    invalid5("organizationId");
+    invalid6("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
-    invalid5("callId");
+    invalid6("callId");
   }
   if (!TRACKS.includes(request.track)) {
-    invalid5("track");
+    invalid6("track");
   }
   if (!ENCODINGS.includes(request.encoding)) {
-    invalid5("encoding");
+    invalid6("encoding");
   }
   if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid5("sampleRate");
+    invalid6("sampleRate");
   }
   if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
-    invalid5("language");
+    invalid6("language");
   }
   if (typeof request.onEvent !== "function") {
-    invalid5("onEvent");
+    invalid6("onEvent");
   }
   return resolveReconnectPolicy(request.reconnect);
 }
@@ -1449,23 +1446,23 @@ function resolveReconnectPolicy(policy) {
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
   if (!integerIn(maxAttempts, 0, 10)) {
-    invalid5("reconnect.maxAttempts");
+    invalid6("reconnect.maxAttempts");
   }
   if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid5("reconnect.baseDelayMs");
+    invalid6("reconnect.baseDelayMs");
   }
   if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid5("reconnect.maxDelayMs");
+    invalid6("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
+  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid6("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
-    return invalid5("chunk");
+    return invalid6("chunk");
   }
   return chunk;
 }
@@ -1481,19 +1478,19 @@ function wordsOf(text, startMs) {
 }
 function checkScript(turns) {
   if (!Array.isArray(turns) || turns.length > 1000) {
-    invalid5("turns");
+    invalid6("turns");
   }
   let previous = 0;
   for (const turn of turns) {
     const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
     if (count < 1 || count > 200) {
-      invalid5("turn text");
+      invalid6("turn text");
     }
     if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
-      invalid5("afterBytes");
+      invalid6("afterBytes");
     }
     if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
-      invalid5("interims");
+      invalid6("interims");
     }
     previous = turn.afterBytes;
   }
@@ -1605,7 +1602,7 @@ function createMemoryStreamingTranscribe(options = {}) {
   }
   const port = {
     async open(request, opts) {
-      const policy = checkOpenRequest(request);
+      const policy = checkOpenRequest2(request);
       resolveTimeout2(opts);
       const code = openFailures.shift();
       if (code !== undefined) {
@@ -2396,151 +2393,6 @@ function createMemoryTranscriber(options = {}) {
     }
   };
 }
-// src/tts/deadline.ts
-function startTtsDeadline(timeoutMs, caller) {
-  const controller = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  timer.unref?.();
-  const onCaller = () => controller.abort();
-  if (caller?.aborted) {
-    controller.abort();
-  }
-  caller?.addEventListener("abort", onCaller, { once: true });
-  return {
-    signal: controller.signal,
-    check() {
-      if (timedOut) {
-        throw new TtsError2(TTS_ERROR_CODES2.timeout, "The stream took too long", {
-          details: { phase: "overall", timeoutMs }
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new TtsError2(TTS_ERROR_CODES2.aborted, "The stream was cancelled");
-      }
-    },
-    cancel() {
-      controller.abort();
-    },
-    stop() {
-      clearTimeout(timer);
-      caller?.removeEventListener("abort", onCaller);
-    }
-  };
-}
-function watchFirstChunk(signals, firstChunkTimeoutMs) {
-  const own = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    own.abort();
-  }, firstChunkTimeoutMs);
-  return {
-    signal: AbortSignal.any([own.signal, ...signals]),
-    check() {
-      if (timedOut) {
-        throw new TtsError2(TTS_ERROR_CODES2.timeout, "The first audio chunk took too long", {
-          details: { phase: "first_chunk", firstChunkTimeoutMs }
-        });
-      }
-    },
-    stop() {
-      clearTimeout(timer);
-    }
-  };
-}
-function isRetryableTtsError(error) {
-  return error instanceof TtsError2 && error.code === TTS_ERROR_CODES2.unavailable;
-}
-async function withTtsRetry(attempt, options) {
-  const sleep = options.sleep ?? systemSleep2;
-  for (let n = 1;; n++) {
-    options.deadline.check();
-    try {
-      return await attempt(n);
-    } catch (error) {
-      options.deadline.check();
-      if (!isRetryableTtsError(error) || n > options.policy.maxRetries) {
-        throw error;
-      }
-      const delayMs = ttsRetryDelayMs2(n, options.policy, options.random);
-      options.onRetry?.(n, delayMs);
-      await sleep(delayMs, options.deadline.signal);
-    }
-  }
-}
-
-// src/tts/validate.ts
-import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
-var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
-var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
-var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
-function invalid6(what) {
-  throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function integerIn2(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function resolveTtsRetryPolicy(policy) {
-  if (policy !== undefined && (typeof policy !== "object" || policy === null)) {
-    invalid6("retry");
-  }
-  const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn2(maxRetries, 0, 5)) {
-    invalid6("retry.maxRetries");
-  }
-  if (!integerIn2(baseDelayMs, 1, 60000)) {
-    invalid6("retry.baseDelayMs");
-  }
-  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
-    invalid6("retry.maxDelayMs");
-  }
-  return { maxRetries, baseDelayMs, maxDelayMs };
-}
-function checkOpenRequest2(request) {
-  if (typeof request !== "object" || request === null) {
-    return invalid6("request");
-  }
-  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
-    invalid6("organizationId");
-  }
-  if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
-    invalid6("voice");
-  }
-  if (!ENCODINGS2.includes(request.encoding)) {
-    invalid6("encoding");
-  }
-  if (!SAMPLE_RATES2.includes(request.sampleRate)) {
-    invalid6("sampleRate");
-  }
-  const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
-  if (!integerIn2(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
-    invalid6("timeoutMs");
-  }
-  const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
-  if (!integerIn2(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
-    invalid6("firstChunkTimeoutMs");
-  }
-  const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
-  if (!integerIn2(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
-    invalid6("maxTextChars");
-  }
-  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid6("signal");
-  }
-  return {
-    timeoutMs,
-    firstChunkTimeoutMs,
-    maxTextChars,
-    retry: resolveTtsRetryPolicy(request.retry)
-  };
-}
-
 // src/tts/memory.ts
 var INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
@@ -2559,7 +2411,7 @@ class MemoryTtsStream {
     this.#assertOpen();
     this.#deadline.check();
     if (typeof text !== "string") {
-      invalid6("text");
+      invalid4("text");
     }
     if (text.length === 0) {
       return;
@@ -2778,7 +2630,7 @@ function createMemoryTts(options = {}) {
   let open = 0;
   return {
     open(request) {
-      const checked = checkOpenRequest2(request);
+      const checked = checkOpenRequest(request);
       open += 1;
       let released = false;
       return new MemoryTtsStream({
@@ -2831,11 +2683,11 @@ function createMemoryTts(options = {}) {
     speak(speech) {
       const scripted = Array.isArray(speech) ? { chunks: speech } : speech;
       if (typeof scripted !== "object" || scripted === null || !Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
-        invalid6("speech chunks");
+        invalid4("speech chunks");
       }
       const failAfter = scripted.failAfterChunks;
       if (failAfter !== undefined && (!Number.isInteger(failAfter) || failAfter < 1 || failAfter > scripted.chunks.length)) {
-        invalid6("speech failAfterChunks");
+        invalid4("speech failAfterChunks");
       }
       scripts.push({ ...scripted });
     },

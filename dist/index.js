@@ -74,6 +74,11 @@ import {
   MAX_TTS_AUDIO_CHUNK_BYTES2,
   DEFAULT_TTS_RETRY_POLICY2,
   ttsRetryDelayMs2,
+  startTtsDeadline,
+  watchFirstChunk,
+  withTtsRetry,
+  invalid4,
+  checkOpenRequest,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -83,7 +88,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-wsb2gcje.js";
+} from "./shared/chunk-zy1js6ey.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -3521,6 +3526,586 @@ function createErrorReporter(options) {
   }
   return reporter;
 }
+// src/tts/cartesia.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+var UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+var VENDOR_CODE = /^[a-z0-9_]{1,64}$/;
+var MAX_BACKLOG_EVENTS = 8192;
+var MAX_BACKLOG_BYTES = 8 * 1024 * 1024;
+var CARTESIA_API_VERSION = "2026-08-14";
+var DEFAULT_CARTESIA_MODEL = "sonic-3.6";
+var DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS = 3000;
+var bunCartesiaSocket = (url, headers) => {
+  const ws = new WebSocket(url, { headers: { ...headers } });
+  return {
+    send: (data) => ws.send(data),
+    close: (code) => ws.close(code),
+    attach(h) {
+      ws.onopen = () => h.open();
+      ws.onmessage = (event) => h.message(event.data);
+      ws.onerror = () => h.error();
+      ws.onclose = (event) => h.close(event.code);
+    }
+  };
+};
+
+class Attempt {
+  contextId = randomUUID2();
+  events = [];
+  ready = false;
+  ended = false;
+  closed = false;
+  finalSent = false;
+  sentTexts = 0;
+  backlogBytes = 0;
+  wake;
+  #socket;
+  #timer;
+  constructor(socket) {
+    this.#socket = socket;
+  }
+  start(connectTimeoutMs, onReady) {
+    this.#timer = setTimeout(() => {
+      this.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor connection timed out", {
+          details: { phase: "connect", connectTimeoutMs }
+        })
+      });
+    }, connectTimeoutMs);
+    this.#socket.attach({
+      open: () => {
+        if (this.closed) {
+          return;
+        }
+        clearTimeout(this.#timer);
+        this.ready = true;
+        onReady();
+      },
+      message: (data) => this.#onMessage(data),
+      error: () => {
+        this.push({
+          kind: "error",
+          error: new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor connection failed")
+        });
+      },
+      close: (code) => {
+        if (!this.ended && !this.closed) {
+          this.push({
+            kind: "error",
+            error: new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor connection closed", {
+              details: { code }
+            })
+          });
+        }
+      }
+    });
+  }
+  push(event) {
+    if (this.closed || this.ended) {
+      return;
+    }
+    if (event.kind !== "audio") {
+      this.ended = true;
+      clearTimeout(this.#timer);
+    }
+    const bytes = event.kind === "audio" ? event.pieces.reduce((n, p) => n + p.byteLength, 0) : 0;
+    if (this.events.length >= MAX_BACKLOG_EVENTS || this.backlogBytes + bytes > MAX_BACKLOG_BYTES) {
+      this.events.length = 0;
+      this.backlogBytes = 0;
+      this.events.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.unavailable, "The audio was not read fast enough")
+      });
+      this.ended = true;
+    } else {
+      this.backlogBytes += bytes;
+      this.events.push(event);
+    }
+    this.wake?.();
+  }
+  send(message) {
+    try {
+      this.#socket.send(JSON.stringify(message));
+    } catch {
+      this.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor connection failed")
+      });
+    }
+  }
+  shutdown() {
+    if (this.closed) {
+      return;
+    }
+    const wasLive = this.ready && !this.ended;
+    this.closed = true;
+    clearTimeout(this.#timer);
+    if (wasLive) {
+      try {
+        this.#socket.send(JSON.stringify({ context_id: this.contextId, cancel: true }));
+      } catch {}
+    }
+    try {
+      this.#socket.close(1000);
+    } catch {}
+    this.events.length = 0;
+    this.wake?.();
+  }
+  #onMessage(data) {
+    if (typeof data !== "string") {
+      this.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor sent a frame this adapter cannot read")
+      });
+      return;
+    }
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      this.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor sent a message that is not JSON")
+      });
+      return;
+    }
+    if (typeof message !== "object" || message === null) {
+      this.push({
+        kind: "error",
+        error: new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor sent an unexpected message")
+      });
+      return;
+    }
+    const m = message;
+    if (m.context_id !== undefined && m.context_id !== this.contextId) {
+      return;
+    }
+    switch (m.type) {
+      case "chunk": {
+        if (typeof m.data !== "string") {
+          this.push({
+            kind: "error",
+            error: new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor sent audio this adapter cannot read")
+          });
+          return;
+        }
+        const bytes = Buffer.from(m.data, "base64");
+        if (bytes.byteLength === 0) {
+          return;
+        }
+        const pieces = [];
+        for (let at = 0;at < bytes.byteLength; at += MAX_TTS_AUDIO_CHUNK_BYTES2) {
+          pieces.push(new Uint8Array(bytes.buffer, bytes.byteOffset + at, Math.min(MAX_TTS_AUDIO_CHUNK_BYTES2, bytes.byteLength - at)));
+        }
+        this.push({ kind: "audio", pieces });
+        return;
+      }
+      case "done":
+        this.push({ kind: "done" });
+        return;
+      case "error":
+        this.push({ kind: "error", error: vendorError(m) });
+        return;
+      default:
+        return;
+    }
+  }
+}
+function vendorError(m) {
+  const status = typeof m.status_code === "number" ? m.status_code : 0;
+  const code = typeof m.error_code === "string" && VENDOR_CODE.test(m.error_code) ? m.error_code : undefined;
+  const details = { vendorStatus: status, ...code === undefined ? {} : { vendorCode: code } };
+  if (status === 408 || status === 429 || status >= 500) {
+    return new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor could not serve the request", {
+      details
+    });
+  }
+  if (status >= 400) {
+    return new TtsError2(TTS_ERROR_CODES2.rejected, "The vendor refused the request", { details });
+  }
+  return new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor reported an error this adapter cannot read", { details });
+}
+function closedError(message) {
+  return new TtsError2(TTS_ERROR_CODES2.closed, message);
+}
+
+class CartesiaStream {
+  #host;
+  #deadline;
+  #state = "open";
+  #chars = 0;
+  #texts = [];
+  #firstDelivered = false;
+  #attempt;
+  #wake;
+  #iterator;
+  constructor(host) {
+    this.#host = host;
+    this.#deadline = startTtsDeadline(host.checked.timeoutMs, host.request.signal);
+  }
+  write(text) {
+    this.#assertOpen();
+    this.#deadline.check();
+    if (typeof text !== "string") {
+      invalid4("text");
+    }
+    if (text.length === 0) {
+      return;
+    }
+    const max = this.#host.checked.maxTextChars;
+    if (this.#chars + text.length > max) {
+      throw new TtsError2(TTS_ERROR_CODES2.textTooLarge, "The text is over the length limit", {
+        details: { maxTextChars: max }
+      });
+    }
+    this.#chars += text.length;
+    this.#texts.push(text);
+    this.#flush();
+    this.#wake?.();
+  }
+  finish() {
+    if (this.#state === "closed") {
+      throw closedError("The stream is closed");
+    }
+    if (this.#state !== "open") {
+      return;
+    }
+    this.#state = "finished";
+    this.#flush();
+    this.#wake?.();
+  }
+  cancel() {
+    if (this.#state === "closed" || this.#state === "cancelled" || this.#state === "ended") {
+      return;
+    }
+    this.#state = "cancelled";
+    this.#release();
+  }
+  async close() {
+    if (this.#state === "closed") {
+      return;
+    }
+    this.#state = "closed";
+    this.#release();
+    this.#host.released();
+  }
+  [Symbol.asyncIterator]() {
+    if (this.#iterator === undefined) {
+      const inner = this.#produce();
+      const self = this;
+      this.#iterator = {
+        next() {
+          if (self.#state === "closed") {
+            return Promise.reject(closedError("The stream is closed"));
+          }
+          return inner.next();
+        },
+        return() {
+          self.cancel();
+          return inner.return(undefined);
+        }
+      };
+    }
+    return this.#iterator;
+  }
+  toJSON() {
+    return { state: this.#state, chars: this.#chars };
+  }
+  toString() {
+    return `CartesiaStream(${this.#state}, ${this.#chars} chars)`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+  #release() {
+    this.#deadline.cancel();
+    this.#deadline.stop();
+    this.#attempt?.shutdown();
+    this.#texts = [];
+    this.#wake?.();
+  }
+  #assertOpen() {
+    if (this.#state === "closed") {
+      throw closedError("The stream is closed");
+    }
+    if (this.#state === "cancelled") {
+      throw closedError("The stream was cancelled");
+    }
+    if (this.#state === "ended") {
+      throw closedError("The stream has ended");
+    }
+    if (this.#state === "finished") {
+      throw closedError("The stream was finished");
+    }
+  }
+  #stopped() {
+    return this.#state === "cancelled" || this.#state === "closed";
+  }
+  #message(transcript, more) {
+    const { config, request, voiceId } = this.#host;
+    return {
+      model_id: config.model,
+      transcript,
+      voice: { mode: "id", id: voiceId },
+      language: config.language,
+      context_id: this.#attempt?.contextId,
+      output_format: {
+        container: "raw",
+        encoding: this.#host.encoding,
+        sample_rate: request.sampleRate
+      },
+      continue: more,
+      max_buffer_delay_ms: config.maxBufferDelayMs
+    };
+  }
+  #flush() {
+    const attempt = this.#attempt;
+    if (attempt === undefined || !attempt.ready || attempt.closed || attempt.ended) {
+      return;
+    }
+    const pending = this.#texts.slice(attempt.sentTexts).join("");
+    attempt.sentTexts = this.#texts.length;
+    if (pending.length > 0) {
+      attempt.send(this.#message(pending, true));
+    }
+    if (this.#state === "finished" && !attempt.finalSent) {
+      attempt.finalSent = true;
+      attempt.send(this.#message("", false));
+    }
+    if (this.#firstDelivered) {
+      this.#texts = [];
+      attempt.sentTexts = 0;
+    }
+  }
+  async#pull(attempt, signal) {
+    for (;; ) {
+      const event = attempt.events.shift();
+      if (event !== undefined) {
+        if (event.kind === "audio") {
+          attempt.backlogBytes -= event.pieces.reduce((n, p) => n + p.byteLength, 0);
+        }
+        return event;
+      }
+      if (signal.aborted || this.#stopped()) {
+        return;
+      }
+      await new Promise((resolve) => {
+        const done = () => {
+          signal.removeEventListener("abort", done);
+          resolve();
+        };
+        attempt.wake = done;
+        signal.addEventListener("abort", done, { once: true });
+      });
+      attempt.wake = undefined;
+    }
+  }
+  async#waitForText() {
+    while (!(this.#chars > 0 || this.#state === "finished") && !this.#stopped()) {
+      this.#deadline.check();
+      await new Promise((resolve) => {
+        const done = () => {
+          this.#deadline.signal.removeEventListener("abort", done);
+          resolve();
+        };
+        this.#wake = done;
+        this.#deadline.signal.addEventListener("abort", done, { once: true });
+      });
+      this.#wake = undefined;
+    }
+  }
+  async#connectAndFirst() {
+    const { config } = this.#host;
+    const deadline = this.#deadline;
+    const attempt = new Attempt(config.socket(config.url, {
+      "X-API-Key": config.apiKey,
+      "Cartesia-Version": CARTESIA_API_VERSION
+    }));
+    this.#attempt?.shutdown();
+    this.#attempt = attempt;
+    const watch = watchFirstChunk([deadline.signal], this.#host.checked.firstChunkTimeoutMs);
+    try {
+      attempt.start(config.connectTimeoutMs, () => this.#flush());
+      const first = await this.#pull(attempt, watch.signal);
+      if (first === undefined) {
+        if (!this.#stopped()) {
+          deadline.check();
+          watch.check();
+        }
+        attempt.shutdown();
+        return;
+      }
+      if (first.kind === "error") {
+        throw first.error;
+      }
+      return { attempt, first };
+    } catch (error) {
+      attempt.shutdown();
+      throw error;
+    } finally {
+      watch.stop();
+    }
+  }
+  async* #produce() {
+    const host = this.#host;
+    const deadline = this.#deadline;
+    let sequence = 0;
+    try {
+      await this.#waitForText();
+      if (this.#stopped()) {
+        return;
+      }
+      deadline.check();
+      if (this.#chars === 0) {
+        return;
+      }
+      const started = await withTtsRetry(() => this.#connectAndFirst(), {
+        policy: host.checked.retry,
+        deadline,
+        sleep: host.config.sleep,
+        ...host.config.options.random === undefined ? {} : { random: host.config.options.random },
+        onRetry: (retry, delayMs) => host.config.options.logger?.warn("A speech request is retrying", {
+          voice: host.request.voice,
+          retry,
+          delayMs
+        })
+      });
+      if (started === undefined || this.#stopped()) {
+        return;
+      }
+      const { attempt } = started;
+      this.#firstDelivered = true;
+      this.#flush();
+      let event = started.first;
+      while (event !== undefined && event.kind !== "done") {
+        if (event.kind === "error") {
+          throw event.error;
+        }
+        for (const piece of event.pieces) {
+          yield new TtsAudioChunk2(sequence++, piece);
+          if (this.#stopped()) {
+            return;
+          }
+        }
+        event = await this.#pull(attempt, deadline.signal);
+        if (event === undefined) {
+          if (this.#stopped()) {
+            return;
+          }
+          deadline.check();
+        }
+      }
+      attempt.shutdown();
+    } catch (error) {
+      if (this.#stopped()) {
+        return;
+      }
+      this.#attempt?.shutdown();
+      host.report(error);
+      throw error;
+    } finally {
+      if (this.#state === "open" || this.#state === "finished") {
+        this.#state = "ended";
+      }
+      this.#attempt?.shutdown();
+      deadline.stop();
+      this.#chars = 0;
+      this.#texts = [];
+    }
+  }
+}
+function createCartesiaTts(options) {
+  if (typeof options.apiKey !== "string" || options.apiKey.length === 0) {
+    invalid4("apiKey");
+  }
+  const maxBufferDelayMs = options.maxBufferDelayMs ?? 100;
+  const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS;
+  if (!Number.isInteger(maxBufferDelayMs) || maxBufferDelayMs < 0 || maxBufferDelayMs > 5000) {
+    invalid4("maxBufferDelayMs");
+  }
+  if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 30000) {
+    invalid4("connectTimeoutMs");
+  }
+  const base = options.baseUrl ?? "wss://api.cartesia.ai";
+  if (!isSafeBaseUrl(base)) {
+    invalid4("baseUrl");
+  }
+  const voices = options.voices ?? {};
+  for (const id of Object.values(voices)) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 128) {
+      invalid4("voices");
+    }
+  }
+  const config = {
+    apiKey: options.apiKey,
+    voices,
+    model: options.model ?? DEFAULT_CARTESIA_MODEL,
+    language: options.language ?? "en",
+    maxBufferDelayMs,
+    connectTimeoutMs,
+    url: `${base.replace(/\/+$/, "")}/tts/websocket?cartesia_version=${CARTESIA_API_VERSION}`,
+    socket: options.socket ?? bunCartesiaSocket,
+    options,
+    sleep: options.sleep ?? systemSleep2
+  };
+  let open = 0;
+  return {
+    open(request) {
+      const checked = checkOpenRequest(request);
+      const named = Object.hasOwn(voices, request.voice) ? voices[request.voice] : undefined;
+      const voiceId = named ?? (UUID.test(request.voice) ? request.voice : undefined);
+      if (voiceId === undefined) {
+        invalid4("voice");
+      }
+      open += 1;
+      let released = false;
+      return new CartesiaStream({
+        config,
+        request,
+        checked,
+        voiceId,
+        encoding: request.encoding,
+        report(error) {
+          if (!(error instanceof TtsError2) || error.code !== TTS_ERROR_CODES2.unavailable && error.code !== TTS_ERROR_CODES2.rejected && error.code !== TTS_ERROR_CODES2.badResponse) {
+            return;
+          }
+          try {
+            options.reporter?.capture(error, {
+              organizationId: request.organizationId,
+              tags: { feature: "tts" }
+            });
+          } catch {}
+        },
+        released() {
+          if (!released) {
+            released = true;
+            open -= 1;
+          }
+        }
+      });
+    },
+    openStreams() {
+      return open;
+    }
+  };
+}
+function isSafeBaseUrl(base) {
+  let url;
+  try {
+    url = new URL(base);
+  } catch {
+    return false;
+  }
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return false;
+  }
+  if (url.protocol === "wss:") {
+    return true;
+  }
+  return url.protocol === "ws:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+}
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
@@ -3532,6 +4117,7 @@ export {
   AppError2 as AppError,
   AuditError2 as AuditError,
   CALENDAR_ERROR_CODES2 as CALENDAR_ERROR_CODES,
+  CARTESIA_API_VERSION,
   CONTACT_GUARD_RETRY_DELAY_MS,
   CONTACT_GUARD_TIMEOUT_MS,
   CONTACT_UNAVAILABLE2 as CONTACT_UNAVAILABLE,
@@ -3539,6 +4125,8 @@ export {
   CalendarError2 as CalendarError,
   DEFAULT_CALENDAR_RETRY_POLICY2 as DEFAULT_CALENDAR_RETRY_POLICY,
   DEFAULT_CALENDAR_TIMEOUT_MS2 as DEFAULT_CALENDAR_TIMEOUT_MS,
+  DEFAULT_CARTESIA_CONNECT_TIMEOUT_MS,
+  DEFAULT_CARTESIA_MODEL,
   DEFAULT_CONTENT_TYPE2 as DEFAULT_CONTENT_TYPE,
   DEFAULT_LIST_LIMIT2 as DEFAULT_LIST_LIMIT,
   DEFAULT_LLM_MAX_INPUT_TOKENS2 as DEFAULT_LLM_MAX_INPUT_TOKENS,
@@ -3671,10 +4259,12 @@ export {
   auditMetadataSchema2 as auditMetadataSchema,
   auditRecordedMessage,
   auditSubjectSchema2 as auditSubjectSchema,
+  bunCartesiaSocket,
   calendarRetryDelayMs2 as calendarRetryDelayMs,
   checkTranscriptionResult2 as checkTranscriptionResult,
   classifyMessageIntent2 as classifyMessageIntent,
   createAuthMiddleware,
+  createCartesiaTts,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
   createGoogleCalendar,
