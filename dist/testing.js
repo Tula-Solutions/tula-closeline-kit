@@ -1,5 +1,22 @@
 import {
   parseAuditEntry2,
+  startMessagingDeadline,
+  AttemptAborted,
+  raceAbort,
+  withMessagingRetry,
+  startCalendarDeadline,
+  withCalendarRetry,
+  invalid,
+  checkOptions,
+  checkOrganizationId,
+  checkBase,
+  checkGrant,
+  checkRequestId,
+  checkEventId,
+  checkRange,
+  checkEventTimes,
+  checkEvent,
+  checkChanges,
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
   scrubText2,
@@ -7,8 +24,8 @@ import {
   signTwilioRequest2,
   TELEPHONY_ERROR_CODES2,
   TelephonyError2,
-  invalid,
-  checkOrganizationId,
+  invalid2,
+  checkOrganizationId2,
   checkCallId,
   checkIdentity,
   checkNumber,
@@ -18,12 +35,8 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
-  startMessagingDeadline,
-  AttemptAborted,
-  raceAbort,
-  withMessagingRetry,
   requireConsent,
-  invalid2,
+  invalid3,
   checkSendRequest,
   verifyAndParseWebhook,
   shouldReportError2,
@@ -52,21 +65,14 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-ewk7hvaq.js";
+} from "./shared/chunk-wsb2gcje.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
   CalendarError2,
-  DEFAULT_CALENDAR_TIMEOUT_MS2,
-  MAX_CALENDAR_TIMEOUT_MS2,
-  MAX_BUSY_RANGE_MS2,
-  MAX_BUSY_INTERVALS2,
-  MAX_EVENT_DURATION_MS2,
-  MAX_EVENT_ATTENDEES2,
-  DEFAULT_CALENDAR_RETRY_POLICY2,
-  calendarRetryDelayMs2,
   MessagingError2,
   isReportableMessagingError2,
+  MAX_BUSY_INTERVALS2,
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
   MAX_WEBHOOK_BODY_BYTES2,
   TRANSCRIBER_ERROR_CODES2,
@@ -80,15 +86,15 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-jkpcd738.js";
+} from "./shared/chunk-y4v94n67.js";
 import {
   startDeadline,
   withLlmRetry,
-  invalid3,
+  invalid4,
   checkRequest,
   checkCompleteRequest,
   parseModelOutput
-} from "./shared/chunk-rj1qezzq.js";
+} from "./shared/chunk-z850m2w7.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -247,191 +253,6 @@ async function mintTestApiKeyToken(options) {
     }
   });
 }
-// src/calendar/deadline.ts
-function startCalendarDeadline(timeoutMs, caller) {
-  const controller = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const onCaller = () => controller.abort();
-  if (caller?.aborted) {
-    controller.abort();
-  }
-  caller?.addEventListener("abort", onCaller, { once: true });
-  return {
-    signal: controller.signal,
-    check() {
-      if (timedOut) {
-        throw new CalendarError2(CALENDAR_ERROR_CODES2.timeout, "The call took too long", {
-          details: { timeoutMs }
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new CalendarError2(CALENDAR_ERROR_CODES2.aborted, "The call was cancelled");
-      }
-    },
-    stop() {
-      clearTimeout(timer);
-      caller?.removeEventListener("abort", onCaller);
-    }
-  };
-}
-function isRetryableCalendarError(error) {
-  return error instanceof CalendarError2 && error.code === CALENDAR_ERROR_CODES2.unavailable;
-}
-async function withCalendarRetry(attempt, options) {
-  const sleep = options.sleep ?? systemSleep2;
-  for (let n = 1;; n++) {
-    options.deadline.check();
-    try {
-      return await attempt(n);
-    } catch (error) {
-      options.deadline.check();
-      if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
-        throw error;
-      }
-      const delayMs = calendarRetryDelayMs2(n, options.policy, options.random);
-      options.onRetry?.(n, delayMs);
-      await sleep(delayMs, options.deadline.signal);
-    }
-  }
-}
-
-// src/calendar/validate.ts
-import { organizationIdSchema } from "tula-closeline-contract";
-import { z } from "zod";
-function invalid4(what) {
-  throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function integerIn(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function checkOptions(options) {
-  if (options !== undefined && (typeof options !== "object" || options === null)) {
-    invalid4("options");
-  }
-  const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
-  if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
-    invalid4("timeoutMs");
-  }
-  if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
-    invalid4("signal");
-  }
-  const policy = options?.retry;
-  const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn(maxRetries, 0, 5)) {
-    invalid4("retry.maxRetries");
-  }
-  if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid4("retry.baseDelayMs");
-  }
-  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid4("retry.maxDelayMs");
-  }
-  return {
-    timeoutMs,
-    retry: { maxRetries, baseDelayMs, maxDelayMs },
-    ...options?.signal === undefined ? {} : { signal: options.signal }
-  };
-}
-function parse(schema, value, what) {
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) {
-    const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
-    return invalid4(path ? `${what}.${path}` : what);
-  }
-  return parsed.data;
-}
-var instant = z.iso.datetime({ offset: true });
-var requestIdSchema = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
-var eventIdSchema = z.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/);
-var attendeeSchema = z.strictObject({
-  email: z.email().max(254),
-  name: z.string().min(1).max(200).optional()
-});
-var titleSchema = z.string().min(1).max(256);
-var descriptionSchema = z.string().max(8192);
-var locationSchema = z.string().max(512);
-var attendeesSchema = z.array(attendeeSchema).max(MAX_EVENT_ATTENDEES2);
-var eventSchema = z.strictObject({
-  title: titleSchema,
-  start: instant,
-  end: instant,
-  description: descriptionSchema.optional(),
-  location: locationSchema.optional(),
-  attendees: attendeesSchema.optional(),
-  conferencing: z.enum(["video", "none"]).optional()
-});
-var changesSchema = z.strictObject({
-  title: titleSchema.optional(),
-  start: instant.optional(),
-  end: instant.optional(),
-  description: descriptionSchema.optional(),
-  location: locationSchema.optional(),
-  attendees: attendeesSchema.optional()
-}).refine((c) => Object.values(c).some((v) => v !== undefined));
-var grantSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    kind: z.literal("authorization_code"),
-    code: z.string().min(1).max(4096),
-    redirectUri: z.url().max(2048),
-    codeVerifier: z.string().min(1).max(256).optional()
-  }),
-  z.strictObject({ kind: z.literal("refresh_token"), refreshToken: z.string().min(1).max(4096) })
-]);
-function checkOrganizationId2(value) {
-  return organizationIdSchema.safeParse(value).success ? value : invalid4("organizationId");
-}
-function checkBase(request) {
-  if (typeof request !== "object" || request === null) {
-    return invalid4("request");
-  }
-  checkOrganizationId2(request.organizationId);
-  if (!(request.connection instanceof CalendarConnection2)) {
-    return invalid4("connection");
-  }
-  if (request.connection.organizationId !== request.organizationId) {
-    return invalid4("connection");
-  }
-  return request.connection;
-}
-function checkGrant(value) {
-  return parse(grantSchema, value, "grant");
-}
-function checkRequestId(value) {
-  return parse(requestIdSchema, value, "requestId");
-}
-function checkEventId(value) {
-  return parse(eventIdSchema, value, "eventId");
-}
-function checkRange(from, to) {
-  const fromMs = Date.parse(parse(instant, from, "from"));
-  const toMs = Date.parse(parse(instant, to, "to"));
-  if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
-    invalid4("range");
-  }
-  return { fromMs, toMs };
-}
-function checkEventTimes(startMs, endMs) {
-  if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
-    invalid4("event.times");
-  }
-}
-function checkEvent(value) {
-  const event = parse(eventSchema, value, "event");
-  const startMs = Date.parse(event.start);
-  const endMs = Date.parse(event.end);
-  checkEventTimes(startMs, endMs);
-  return { event, startMs, endMs };
-}
-function checkChanges(value) {
-  return parse(changesSchema, value, "changes");
-}
-
 // src/calendar/memory.ts
 function iso(ms) {
   return new Date(ms).toISOString();
@@ -463,7 +284,7 @@ function createMemoryCalendar(options = {}) {
   function account(connection) {
     const found = accounts.get(connection.connectionId);
     if (found === undefined || found.organizationId !== connection.organizationId) {
-      invalid4("connection");
+      invalid("connection");
     }
     return found;
   }
@@ -533,7 +354,7 @@ function createMemoryCalendar(options = {}) {
     const seen = replays.get(key);
     if (seen !== undefined) {
       if (seen.fingerprint !== fingerprint) {
-        invalid4("requestId");
+        invalid("requestId");
       }
       return { result: seen.result, first: false };
     }
@@ -581,7 +402,7 @@ function createMemoryCalendar(options = {}) {
   }
   const port = {
     async connect(request, callOptions) {
-      checkOrganizationId2(request?.organizationId);
+      checkOrganizationId(request?.organizationId);
       const grant = checkGrant(request.grant);
       const secret = grant.kind === "authorization_code" ? grant.code : grant.refreshToken;
       return call("connect", request.organizationId, undefined, callOptions, () => {
@@ -967,10 +788,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid3("reply text");
+        invalid4("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid3("reply chunks");
+        invalid4("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -1130,7 +951,7 @@ function createMemoryMessaging(options) {
         const existing = stored.get(key);
         if (existing !== undefined) {
           if (existing.fingerprint !== fingerprint) {
-            return invalid2("idempotencyKey");
+            return invalid3("idempotencyKey");
           }
           return existing.result;
         }
@@ -1354,7 +1175,7 @@ function createMemoryQueue(options) {
   };
 }
 // src/queue/testing.ts
-import { z as z2 } from "zod";
+import { z } from "zod";
 var SETTLE_ROUNDS = 8;
 function createVirtualTime() {
   const clock = createFixedClock2("2026-01-01T00:00:00.000Z");
@@ -1407,17 +1228,17 @@ var testPing = defineMessage2({
   type: "test.ping",
   version: 1,
   scope: "organization",
-  payload: z2.object({ n: z2.number().int() })
+  payload: z.object({ n: z.number().int() })
 });
 var testNote = defineMessage2({
   type: "test.note",
   version: 1,
   scope: "global",
-  payload: z2.object({ text: z2.string() })
+  payload: z.object({ text: z.string() })
 });
 function createTestRegistry(options = {}) {
   return createMessageRegistry2([testPing, testNote], {
-    organizationIdSchema: z2.string().min(1).max(64),
+    organizationIdSchema: z.string().min(1).max(64),
     ...options
   });
 }
@@ -1585,7 +1406,7 @@ ${expires}`).digest("hex");
   return store;
 }
 // src/streaming-transcribe/validate.ts
-import { callIdSchema, organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
+import { callIdSchema, organizationIdSchema } from "tula-closeline-contract";
 var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
@@ -1593,14 +1414,14 @@ var TRACKS = ["rep", "prospect"];
 function invalid5(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn2(value, min, max) {
+function integerIn(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function checkOpenRequest(request) {
   if (typeof request !== "object" || request === null) {
     return invalid5("request");
   }
-  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
+  if (!organizationIdSchema.safeParse(request.organizationId).success) {
     invalid5("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
@@ -1627,20 +1448,20 @@ function resolveReconnectPolicy(policy) {
   const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
-  if (!integerIn2(maxAttempts, 0, 10)) {
+  if (!integerIn(maxAttempts, 0, 10)) {
     invalid5("reconnect.maxAttempts");
   }
-  if (!integerIn2(baseDelayMs, 1, 60000)) {
+  if (!integerIn(baseDelayMs, 1, 60000)) {
     invalid5("reconnect.baseDelayMs");
   }
-  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
     invalid5("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn2(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
+  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
@@ -1947,14 +1768,14 @@ function createMemoryTelephony(options = {}) {
       throw new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call has ended");
     }
     if (call.state === "incoming") {
-      invalid("call: it has not been answered, so it");
+      invalid2("call: it has not been answered, so it");
     }
   }
   function needDisclosure(call, needsAi = false) {
     return requireDisclosure(call.disclosure, needsAi);
   }
   function checkRef(request) {
-    checkOrganizationId(request.organizationId);
+    checkOrganizationId2(request.organizationId);
     checkProviderId(request.providerCallId, "providerCallId");
   }
   async function run(operation, opts, body) {
@@ -1979,7 +1800,7 @@ function createMemoryTelephony(options = {}) {
     operations,
     placeCall(request, opts) {
       return run("placeCall", opts, () => {
-        checkOrganizationId(request.organizationId);
+        checkOrganizationId2(request.organizationId);
         checkCallId(request.callId);
         checkProviderId(request.idempotencyKey, "idempotencyKey");
         checkNumber(request.from, "from");
@@ -1989,7 +1810,7 @@ function createMemoryTelephony(options = {}) {
         if (existing !== undefined) {
           const first = calls.get(existing);
           if (first && (first.to !== request.to || first.from !== request.from)) {
-            invalid("idempotencyKey: it was used for another call, so it");
+            invalid2("idempotencyKey: it was used for another call, so it");
           }
           return { providerCallId: existing, created: false };
         }
@@ -2129,7 +1950,7 @@ function createMemoryTelephony(options = {}) {
       return run("hangUp", opts, () => {
         checkRef(request);
         if (request.by !== undefined && request.by !== "rep" && request.by !== "system") {
-          invalid("by");
+          invalid2("by");
         }
         const call = find(request.organizationId, request.providerCallId);
         if (call.state === "ended") {
@@ -2141,7 +1962,7 @@ function createMemoryTelephony(options = {}) {
     },
     fetchRecording(request, opts) {
       return run("fetchRecording", opts, () => {
-        checkOrganizationId(request.organizationId);
+        checkOrganizationId2(request.organizationId);
         checkProviderId(request.recordingId, "recordingId");
         const found = recordings.get(request.recordingId);
         if (!found || found.organizationId !== request.organizationId) {
@@ -2161,7 +1982,7 @@ function createMemoryTelephony(options = {}) {
     },
     deleteRecording(request, opts) {
       return run("deleteRecording", opts, () => {
-        checkOrganizationId(request.organizationId);
+        checkOrganizationId2(request.organizationId);
         checkProviderId(request.recordingId, "recordingId");
         const found = recordings.get(request.recordingId);
         if (!found || found.organizationId !== request.organizationId) {
@@ -2182,11 +2003,11 @@ function createMemoryTelephony(options = {}) {
     },
     mintBrowserToken(request, opts) {
       return run("mintBrowserToken", opts, () => {
-        checkOrganizationId(request.organizationId);
+        checkOrganizationId2(request.organizationId);
         checkIdentity(request.identity);
         const ttl = request.ttlSeconds ?? DEFAULT_TTL_SECONDS;
         if (!Number.isInteger(ttl) || ttl < 60 || ttl > 3600) {
-          invalid("ttlSeconds");
+          invalid2("ttlSeconds");
         }
         return {
           token: `memtok.${randomBytes3(24).toString("base64url")}`,
@@ -2201,7 +2022,7 @@ function createMemoryTelephony(options = {}) {
       scripts.set(number, behaviour);
     },
     receiveInbound(organizationId, from, to) {
-      checkOrganizationId(organizationId);
+      checkOrganizationId2(organizationId);
       checkNumber(from, "from");
       checkNumber(to, "to");
       const call = {
@@ -2653,14 +2474,14 @@ async function withTtsRetry(attempt, options) {
 }
 
 // src/tts/validate.ts
-import { organizationIdSchema as organizationIdSchema3 } from "tula-closeline-contract";
+import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
 var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
 var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
 var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
 function invalid6(what) {
   throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn3(value, min, max) {
+function integerIn2(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function resolveTtsRetryPolicy(policy) {
@@ -2670,13 +2491,13 @@ function resolveTtsRetryPolicy(policy) {
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn3(maxRetries, 0, 5)) {
+  if (!integerIn2(maxRetries, 0, 5)) {
     invalid6("retry.maxRetries");
   }
-  if (!integerIn3(baseDelayMs, 1, 60000)) {
+  if (!integerIn2(baseDelayMs, 1, 60000)) {
     invalid6("retry.baseDelayMs");
   }
-  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
+  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
     invalid6("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
@@ -2685,7 +2506,7 @@ function checkOpenRequest2(request) {
   if (typeof request !== "object" || request === null) {
     return invalid6("request");
   }
-  if (!organizationIdSchema3.safeParse(request.organizationId).success) {
+  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
     invalid6("organizationId");
   }
   if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
@@ -2698,15 +2519,15 @@ function checkOpenRequest2(request) {
     invalid6("sampleRate");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
-  if (!integerIn3(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
+  if (!integerIn2(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
     invalid6("timeoutMs");
   }
   const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
-  if (!integerIn3(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
+  if (!integerIn2(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
     invalid6("firstChunkTimeoutMs");
   }
   const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
-  if (!integerIn3(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
+  if (!integerIn2(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
     invalid6("maxTextChars");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {

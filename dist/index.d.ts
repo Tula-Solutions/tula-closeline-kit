@@ -857,6 +857,100 @@ declare class CalendarError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
+/**
+* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
+* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
+*/
+type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+/** The real {@link Sleep}, on `setTimeout`. */
+declare const systemSleep: Sleep;
+import { Region as Region3 } from "tula-closeline-contract";
+import { z as z4 } from "zod";
+/** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
+declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
+/** One of the deployment environments. */
+type Environment = (typeof ENVIRONMENTS)[number];
+/** Zod schema for the `ENVIRONMENT` variable. */
+declare const environmentSchema: z4.ZodEnum<{
+	dev: "dev";
+	local: "local";
+	prod: "prod";
+	staging: "staging";
+}>;
+/**
+* True for a string the Sentry SDK takes as a DSN: `https://<public key>@<host>/<project id>`, with
+* an optional secret, port and path prefix and no trailing slash. A DSN with the `http:` scheme
+* passes only when `environment` is `local`, so events and the project key are never sent in clear
+* text from a deployed service. It checks the shape only; whether the project exists, and in which
+* data region, is Sentry's.
+*/
+declare function isSentryDsn(value: string, environment: Environment): boolean;
+/**
+* Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". Surrounding
+* whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
+* the value a service boots with is the one the reporter uses.
+*/
+declare const sentryDsnSchema: z4.ZodPreprocess<z4.ZodOptional<z4.ZodString>, unknown>;
+/**
+* Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
+* `dev`, `staging` and `prod`, where it must use `https:`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
+* so boot fails when a deployed service has no error tracker.
+*/
+declare function requireSentryDsn(env: {
+	ENVIRONMENT: Environment;
+	SENTRY_DSN?: string | undefined;
+}, ctx: z4.RefinementCtx): void;
+/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
+interface ErrorContext {
+	/** The request's id, for finding the log lines. */
+	requestId?: string;
+	/** The Organization the request was for, so one customer's errors can be filtered. */
+	organizationId?: string;
+	/** HTTP method of the failed request. */
+	method?: string;
+	/** Request path without its query string. */
+	path?: string;
+	/** HTTP status the service answered with. */
+	status?: number;
+	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
+	tags?: Record<string, string>;
+}
+/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
+interface ErrorReporter {
+	/**
+	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
+	* and never waits for the network.
+	*/
+	capture(error: unknown, context?: ErrorContext): void;
+	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
+	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
+}
+/** Options for createErrorReporter. */
+interface ErrorReporterOptions {
+	/** The Sentry DSN of this Region's project; no DSN gives a reporter that sends nothing. */
+	dsn?: string | undefined;
+	/** Service name, sent as the `service` tag. */
+	service: string;
+	/** The `ENVIRONMENT` the service runs in, sent as the `environment` tag. */
+	environment: Environment;
+	/** The Region this deployment serves, sent as the `region` tag. */
+	region: Region3;
+	/** The git SHA of the running build, sent as the event's release. */
+	release?: string | undefined;
+	/** Where the reporter says that it is off or that a send failed; errors themselves never go here. */
+	logger: Logger;
+}
+/**
+* True for an error worth reporting: any unknown error, and an AppError with status 500 or above.
+* An AppError below 500 is an expected outcome (bad input, expired token) and is never sent.
+*/
+declare function shouldReportError(error: unknown): boolean;
 import { OrganizationId as OrganizationId4 } from "tula-closeline-contract";
 /** The default time a call may take, in milliseconds. */
 declare const DEFAULT_CALENDAR_TIMEOUT_MS = 1e4;
@@ -1084,41 +1178,52 @@ interface CalendarPort {
 	*/
 	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
 }
-import { z as z4 } from "zod";
-/** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
-declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
-/** One of the deployment environments. */
-type Environment = (typeof ENVIRONMENTS)[number];
-/** Zod schema for the `ENVIRONMENT` variable. */
-declare const environmentSchema: z4.ZodEnum<{
-	dev: "dev";
-	local: "local";
-	prod: "prod";
-	staging: "staging";
-}>;
+/** The least scopes the adapter needs: free/busy times and the events it writes. Ask for exactly these in the consent URL (with `access_type=offline`). */
+declare const GOOGLE_CALENDAR_SCOPES: readonly string[];
+/** The HTTP client the adapter uses: `fetch`, injected for tests. */
+type GoogleCalendarFetch = (input: string, init: RequestInit) => Promise<Response>;
+/** Options for {@link createGoogleCalendar}. The kit takes options, not environment variables. */
+interface GoogleCalendarOptions {
+	/** The OAuth client id of the Closeline Google Cloud project. */
+	clientId: string;
+	/** The OAuth client secret. Never logged. */
+	clientSecret: string;
+	/** The calendar read and written; the Rep's primary calendar by default. */
+	calendarId?: string;
+	/** The HTTP client; the global `fetch` by default. For tests. */
+	fetch?: GoogleCalendarFetch;
+	/** The time limit of one HTTP request, in ms, 1 to 60000; default 5000. The call's own deadline still applies. */
+	attemptTimeoutMs?: number;
+	/** Receives the errors that mean Google failed; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where retries are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** The time source for access-token expiry; the system clock by default. */
+	clock?: Clock;
+	/** Pauses between retries; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
 /**
-* True for a string the Sentry SDK takes as a DSN: `https://<public key>@<host>/<project id>`, with
-* an optional secret, port and path prefix and no trailing slash. A DSN with the `http:` scheme
-* passes only when `environment` is `local`, so events and the project key are never sent in clear
-* text from a deployed service. It checks the shape only; whether the project exists, and in which
-* data region, is Sentry's.
+* Creates the {@link CalendarPort} on the Google Calendar REST API (v3) with OAuth 2.0.
+*
+* Scopes are the least that work ({@link GOOGLE_CALENDAR_SCOPES}): `calendar.freebusy` for busy
+* times (the Rep's event titles are never read) and `calendar.events` for the events it writes. The
+* credential of a {@link CalendarConnection} is the Rep's refresh token; access tokens are
+* short-lived, held in a bounded in-process cache and refreshed when they near expiry. A refresh
+* Google refuses with `invalid_grant` is `calendar.revoked`.
+*
+* Every HTTP request has its own time limit and each call an overall deadline that aborts the
+* request; a network error, 429, 5xx and Google's rate-limit 403s are retried a bounded number of
+* times with jitter, any other failure never, and `connect` never (a code is single-use). A write
+* is idempotent by request id: `createEvent` sends a client-chosen event id derived from the
+* connection and request id, and a duplicate (409) is read back and compared by a fingerprint kept
+* in the event's private extended properties; `updateEvent` keeps the last request id and
+* fingerprint the same way (a late replay of an older update is applied again, not recognised). Nothing is logged but retry metadata, and no token, title, note,
+* address or URL is put in an error, a log line or a report. Text Google returns is data.
 */
-declare function isSentryDsn(value: string, environment: Environment): boolean;
-/**
-* Zod schema for `SENTRY_DSN`: a Sentry DSN, where an empty string means "not set". Surrounding
-* whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
-* the value a service boots with is the one the reporter uses.
-*/
-declare const sentryDsnSchema: z4.ZodPreprocess<z4.ZodOptional<z4.ZodString>, unknown>;
-/**
-* Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
-* `dev`, `staging` and `prod`, where it must use `https:`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
-* so boot fails when a deployed service has no error tracker.
-*/
-declare function requireSentryDsn(env: {
-	ENVIRONMENT: Environment;
-	SENTRY_DSN?: string | undefined;
-}, ctx: z4.RefinementCtx): void;
+declare function createGoogleCalendar(options: GoogleCalendarOptions): CalendarPort;
 /** The header that carries a call's idempotency key. */
 declare const INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
 /** The default bound on one attempt, connecting to the last byte of the answer. */
@@ -1309,13 +1414,6 @@ interface InternalClient {
 * authorities, as it does for every process; that is an operator's choice, not a way to skip checks.
 */
 declare function createInternalClient(options: InternalClientOptions): InternalClient;
-/**
-* Waits `ms` milliseconds, or less when `signal` aborts. Resolves either way, never rejects, so a
-* loop that sleeps checks its own stop flag. Injected so tests drive time by hand.
-*/
-type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
-/** The real {@link Sleep}, on `setTimeout`. */
-declare const systemSleep: Sleep;
 import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
 /**
 * What a calling service gives the guard: the Contact Check body without `caller`, which the
@@ -1830,58 +1928,6 @@ interface MessagingPort {
 	*/
 	receive(request: MessagingWebhookRequest): Promise<InboundEvent>;
 }
-import { Region as Region3 } from "tula-closeline-contract";
-/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
-interface ErrorContext {
-	/** The request's id, for finding the log lines. */
-	requestId?: string;
-	/** The Organization the request was for, so one customer's errors can be filtered. */
-	organizationId?: string;
-	/** HTTP method of the failed request. */
-	method?: string;
-	/** Request path without its query string. */
-	path?: string;
-	/** HTTP status the service answered with. */
-	status?: number;
-	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
-	tags?: Record<string, string>;
-}
-/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
-interface ErrorReporter {
-	/**
-	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
-	* and never waits for the network.
-	*/
-	capture(error: unknown, context?: ErrorContext): void;
-	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
-	flush(timeoutMs: number): Promise<boolean>;
-	/**
-	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
-	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
-	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
-	*/
-	close(timeoutMs: number): Promise<boolean>;
-}
-/** Options for createErrorReporter. */
-interface ErrorReporterOptions {
-	/** The Sentry DSN of this Region's project; no DSN gives a reporter that sends nothing. */
-	dsn?: string | undefined;
-	/** Service name, sent as the `service` tag. */
-	service: string;
-	/** The `ENVIRONMENT` the service runs in, sent as the `environment` tag. */
-	environment: Environment;
-	/** The Region this deployment serves, sent as the `region` tag. */
-	region: Region3;
-	/** The git SHA of the running build, sent as the event's release. */
-	release?: string | undefined;
-	/** Where the reporter says that it is off or that a send failed; errors themselves never go here. */
-	logger: Logger;
-}
-/**
-* True for an error worth reporting: any unknown error, and an AppError with status 500 or above.
-* An AppError below 500 is an expected outcome (bad input, expired token) and is never sent.
-*/
-declare function shouldReportError(error: unknown): boolean;
 /**
 * Signs a webhook the way Twilio does (`X-Twilio-Signature`): HMAC-SHA1 with the Auth Token over
 * the URL followed by each form field's name and value in sorted order, in base64. For tests and
@@ -3540,4 +3586,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { API_KEY_ACTOR, AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, ScopedAuthEnv, ScopedAuthVariables, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedApiKeyToken, VerifiedIdentity, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, apiKeyTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isScopeGuard, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireScope, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
+export { API_KEY_ACTOR, AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, GOOGLE_CALENDAR_SCOPES, GoogleCalendarFetch, GoogleCalendarOptions, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, ScopedAuthEnv, ScopedAuthVariables, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedApiKeyToken, VerifiedIdentity, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, apiKeyTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createGoogleCalendar, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isScopeGuard, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireScope, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };

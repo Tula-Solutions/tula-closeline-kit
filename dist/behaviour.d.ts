@@ -401,6 +401,8 @@ interface CalendarSubject {
 	vendorRequests(): number;
 	/** How many vendor requests were aborted while they were still pending. */
 	abortedRequests(): number;
+	/** False when the vendor keeps no record of a delete request id, so a replay of a delete that worked reports `{deleted:false}` (the event is gone either way); true by default. */
+	remembersDeletes?: boolean;
 	/** Removes what the subject created. */
 	close(): Promise<void>;
 }
