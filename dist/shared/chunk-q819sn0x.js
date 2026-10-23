@@ -2,6 +2,31 @@ import {
   AppError2
 } from "./chunk-tya44yhr.js";
 
+// src/audit/errors.ts
+var AUDIT_ERROR_CODES2 = {
+  invalidEntry: "audit.invalid_entry",
+  entryTooLarge: "audit.entry_too_large",
+  unavailable: "audit.unavailable"
+};
+var STATUS = {
+  "audit.invalid_entry": 422,
+  "audit.entry_too_large": 413,
+  "audit.unavailable": 503
+};
+
+class AuditError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "AuditError";
+  }
+}
+
 // src/calendar/connection.ts
 var INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
@@ -47,7 +72,7 @@ var CALENDAR_ERROR_CODES2 = {
   timeout: "calendar.timeout",
   aborted: "calendar.aborted"
 };
-var STATUS = {
+var STATUS2 = {
   "calendar.invalid_request": 400,
   "calendar.revoked": 403,
   "calendar.not_found": 404,
@@ -61,7 +86,7 @@ class CalendarError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -98,7 +123,7 @@ var LLM_ERROR_CODES2 = {
   unavailable: "llm.unavailable",
   badResponse: "llm.bad_response"
 };
-var STATUS2 = {
+var STATUS3 = {
   "llm.invalid_request": 400,
   "llm.input_too_large": 413,
   "llm.invalid_output": 502,
@@ -113,7 +138,7 @@ class LlmError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS2[code],
+      status: STATUS3[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -135,7 +160,7 @@ var MESSAGING_ERROR_CODES2 = {
   badResponse: "messaging.bad_response",
   webhookInvalid: "messaging.webhook_invalid"
 };
-var STATUS3 = {
+var STATUS4 = {
   "messaging.invalid_request": 400,
   "messaging.consent_denied": 403,
   "messaging.recipient_opted_out": 409,
@@ -152,7 +177,7 @@ class MessagingError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS3[code],
+      status: STATUS4[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -247,7 +272,7 @@ var TRANSCRIBER_ERROR_CODES2 = {
   unavailable: "transcriber.unavailable",
   badResponse: "transcriber.bad_response"
 };
-var STATUS4 = {
+var STATUS5 = {
   "transcriber.invalid_request": 400,
   "transcriber.conflict": 409,
   "transcriber.rejected": 500,
@@ -259,7 +284,7 @@ class TranscriberError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS4[code],
+      status: STATUS5[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -385,7 +410,7 @@ var TTS_ERROR_CODES2 = {
   unavailable: "tts.unavailable",
   badResponse: "tts.bad_response"
 };
-var STATUS5 = {
+var STATUS6 = {
   "tts.invalid_request": 400,
   "tts.text_too_large": 413,
   "tts.closed": 409,
@@ -400,7 +425,7 @@ class TtsError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS5[code],
+      status: STATUS6[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -409,4 +434,4 @@ class TtsError2 extends AppError2 {
   }
 }
 
-export { CalendarConnection2, CALENDAR_ERROR_CODES2, CalendarError2, DEFAULT_CALENDAR_TIMEOUT_MS2, MAX_CALENDAR_TIMEOUT_MS2, MAX_BUSY_RANGE_MS2, MAX_BUSY_INTERVALS2, MAX_EVENT_DURATION_MS2, MAX_EVENT_ATTENDEES2, DEFAULT_CALENDAR_RETRY_POLICY2, calendarRetryDelayMs2, LLM_ERROR_CODES2, LlmError2, MESSAGING_ERROR_CODES2, MessagingError2, isReportableMessagingError2, DEFAULT_MESSAGING_TIMEOUT_MS2, MAX_MESSAGING_TIMEOUT_MS2, MAX_MESSAGE_BODY_CHARS2, MAX_TEMPLATE_VARIABLES2, MAX_TEMPLATE_VARIABLE_CHARS2, MAX_MESSAGING_WEBHOOK_BYTES2, MESSAGING_CHANNELS2, MESSAGING_PURPOSES2, DEFAULT_MESSAGING_RETRY_POLICY2, messagingRetryDelayMs2, InboundMessage2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2, TTS_ERROR_CODES2, TtsError2 };
+export { AUDIT_ERROR_CODES2, AuditError2, CalendarConnection2, CALENDAR_ERROR_CODES2, CalendarError2, DEFAULT_CALENDAR_TIMEOUT_MS2, MAX_CALENDAR_TIMEOUT_MS2, MAX_BUSY_RANGE_MS2, MAX_BUSY_INTERVALS2, MAX_EVENT_DURATION_MS2, MAX_EVENT_ATTENDEES2, DEFAULT_CALENDAR_RETRY_POLICY2, calendarRetryDelayMs2, LLM_ERROR_CODES2, LlmError2, MESSAGING_ERROR_CODES2, MessagingError2, isReportableMessagingError2, DEFAULT_MESSAGING_TIMEOUT_MS2, MAX_MESSAGING_TIMEOUT_MS2, MAX_MESSAGE_BODY_CHARS2, MAX_TEMPLATE_VARIABLES2, MAX_TEMPLATE_VARIABLE_CHARS2, MAX_MESSAGING_WEBHOOK_BYTES2, MESSAGING_CHANNELS2, MESSAGING_PURPOSES2, DEFAULT_MESSAGING_RETRY_POLICY2, messagingRetryDelayMs2, InboundMessage2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2, TTS_ERROR_CODES2, TtsError2 };

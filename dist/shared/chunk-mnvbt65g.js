@@ -1,4 +1,6 @@
 import {
+  AUDIT_ERROR_CODES2,
+  AuditError2,
   MESSAGING_ERROR_CODES2,
   MessagingError2,
   DEFAULT_MESSAGING_TIMEOUT_MS2,
@@ -15,7 +17,7 @@ import {
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2
-} from "./chunk-hff6jkfx.js";
+} from "./chunk-q819sn0x.js";
 import {
   systemSleep2
 } from "./chunk-h070fpj8.js";
@@ -23,6 +25,75 @@ import {
   AppError2,
   isAppError2
 } from "./chunk-tya44yhr.js";
+
+// src/audit/entry.ts
+import { organizationIdSchema } from "tula-closeline-contract";
+import { z } from "zod";
+var AUDIT_LIMITS2 = {
+  maxMetadataKeys: 20,
+  maxStringChars: 200,
+  maxEntryBytes: 4096
+};
+var AUDIT_DENIED_METADATA_KEYS2 = [
+  "body",
+  "content",
+  "text",
+  "message",
+  "transcript",
+  "token",
+  "secret",
+  "password",
+  "email"
+];
+var DENIED = new Set(AUDIT_DENIED_METADATA_KEYS2);
+function isDeniedKey(key) {
+  return DENIED.has(key.toLowerCase().replace(/[^a-z0-9]/g, ""));
+}
+var label = z.string().regex(/^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/);
+var id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);
+var metadataKey = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/).refine((key) => !isDeniedKey(key));
+var metadataValue = z.union([
+  z.string().max(AUDIT_LIMITS2.maxStringChars),
+  z.number().finite(),
+  z.boolean()
+]);
+var auditMetadataSchema2 = z.record(metadataKey, metadataValue).refine((record) => Object.keys(record).length <= AUDIT_LIMITS2.maxMetadataKeys);
+var auditActorSchema2 = z.strictObject({
+  kind: z.enum(["member", "agent", "api_key", "system"]),
+  id: id.optional()
+}).refine((actor) => actor.kind === "system" || actor.id !== undefined);
+var auditSubjectSchema2 = z.strictObject({ type: label, id });
+var auditEventPayloadSchema2 = z.strictObject({
+  actor: auditActorSchema2,
+  action: z.string().regex(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/).max(64),
+  subject: auditSubjectSchema2,
+  instructionVersion: z.number().int().positive().optional(),
+  requestId: id.optional(),
+  occurredAt: z.iso.datetime().optional(),
+  metadata: auditMetadataSchema2.optional()
+});
+var auditEntrySchema2 = auditEventPayloadSchema2.extend({
+  id,
+  organizationId: organizationIdSchema
+});
+function issuesOf(error) {
+  return error.issues.slice(0, 20).map((issue) => `${issue.path.map(String).join(".")}: ${issue.code}`);
+}
+function parseAuditEntry2(input) {
+  const parsed = auditEntrySchema2.safeParse(input);
+  if (!parsed.success) {
+    throw new AuditError2(AUDIT_ERROR_CODES2.invalidEntry, "the audit entry is not valid", {
+      details: { issues: issuesOf(parsed.error) }
+    });
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(parsed.data)).length;
+  if (bytes > AUDIT_LIMITS2.maxEntryBytes) {
+    throw new AuditError2(AUDIT_ERROR_CODES2.entryTooLarge, "the audit entry is too large", {
+      details: { bytes, maxBytes: AUDIT_LIMITS2.maxEntryBytes }
+    });
+  }
+  return parsed.data;
+}
 
 // src/consent/port.ts
 import {
@@ -1439,7 +1510,7 @@ import {
   callIdSchema,
   e164PhoneSchema as e164PhoneSchema2,
   membershipIdSchema,
-  organizationIdSchema
+  organizationIdSchema as organizationIdSchema2
 } from "tula-closeline-contract";
 var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 var CONTROL = /[\u0000-\u001f\u007f]/;
@@ -1447,7 +1518,7 @@ function invalid(what) {
   throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function checkOrganizationId(value) {
-  return organizationIdSchema.safeParse(value).success ? value : invalid("organizationId");
+  return organizationIdSchema2.safeParse(value).success ? value : invalid("organizationId");
 }
 function checkCallId(value) {
   return callIdSchema.safeParse(value).success ? value : invalid("callId");
@@ -1634,7 +1705,7 @@ async function requireConsent(guard, request, deadline) {
 }
 
 // src/messaging/validate.ts
-import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema2, prospectIdSchema } from "tula-closeline-contract";
+import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema3, prospectIdSchema } from "tula-closeline-contract";
 var KEY = /^[A-Za-z0-9_.:-]{1,200}$/;
 var TEMPLATE_ID = /^HX[0-9a-fA-F]{32}$/;
 var VARIABLE_NAME = /^[A-Za-z0-9_]{1,64}$/;
@@ -1738,7 +1809,7 @@ function checkSendRequest(request) {
       invalid2("request");
     }
   }
-  const organization = organizationIdSchema2.safeParse(request.organizationId);
+  const organization = organizationIdSchema3.safeParse(request.organizationId);
   if (!organization.success) {
     return invalid2("organizationId");
   }
@@ -1781,4 +1852,4 @@ function checkSendRequest(request) {
   };
 }
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, requireConsent, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, requireConsent, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

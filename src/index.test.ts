@@ -27,3 +27,16 @@ test('the ports, errors and limits a consumer needs are exported', () => {
     expect(Object.keys(root)).toContain(name)
   }
 })
+
+test('the audit recorder port and queue adapter are in the root, the memory adapter in testing', () => {
+  for (const name of [
+    'AuditError',
+    'AUDIT_LIMITS',
+    'auditRecordedMessage',
+    'createQueueAuditRecorder',
+  ]) {
+    expect(Object.keys(root)).toContain(name)
+  }
+  expect(Object.keys(testing)).toContain('createMemoryAuditRecorder')
+  expect(Object.keys(root)).not.toContain('createMemoryAuditRecorder')
+})

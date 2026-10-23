@@ -1,6 +1,11 @@
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 export const PACKAGE = 'tula-closeline-kit'
 
+export * from './audit/entry'
+export * from './audit/errors'
+export * from './audit/message'
+export * from './audit/port'
+export * from './audit/queue'
 export * from './auth/claims'
 export * from './auth/errors'
 export * from './auth/keys'

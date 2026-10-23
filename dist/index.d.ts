@@ -1,49 +1,140 @@
-import { OrganizationId, Region, Role, UserId } from "tula-closeline-contract";
 import { z } from "zod";
-/** The longest access token, in characters, that verification will look at. */
-declare const MAX_TOKEN_LENGTH = 4096;
-/** The claims every Closeline access token carries, besides the registered `iss`, `aud`, `exp`. */
-declare const accessTokenClaimsSchema: z.ZodObject<{
-	sub: z.core.$ZodBranded<z.ZodString, "usr", "out">;
-	org: z.core.$ZodBranded<z.ZodString, "org", "out">;
-	role: z.ZodEnum<{
-		admin: "admin";
-		manager: "manager";
-		owner: "owner";
-		rep: "rep";
+/** The bounds on an audit entry. */
+declare const AUDIT_LIMITS: {
+	/** Most keys in `metadata`. */
+	readonly maxMetadataKeys: 20;
+	/** Longest string value in `metadata`, in characters. */
+	readonly maxStringChars: 200;
+	/** Largest serialised entry, in UTF-8 bytes. */
+	readonly maxEntryBytes: 4096;
+};
+/** Metadata keys that are refused in any case, because they would carry content or credentials. */
+declare const AUDIT_DENIED_METADATA_KEYS: readonly ["body", "content", "text", "message", "transcript", "token", "secret", "password", "email"];
+/** Flat metadata of ids and labels: at most 20 keys, strings of at most 200 characters, numbers and booleans. */
+declare const auditMetadataSchema: z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>;
+/** Who or what acted. */
+declare const auditActorSchema: z.ZodObject<{
+	kind: z.ZodEnum<{
+		agent: "agent";
+		api_key: "api_key";
+		member: "member";
+		system: "system";
 	}>;
-	region: z.ZodEnum<{
-		eu: "eu";
-		us: "us";
-	}>;
-	iat: z.ZodNumber;
-	exp: z.ZodNumber;
-}, z.core.$strip>;
-/** The identity a verified access token proves. */
-interface VerifiedToken {
-	/** The signed-in user. */
-	userId: UserId;
-	/** The Organization every query for this request must be scoped to. */
-	organizationId: OrganizationId;
-	/** The user's role in that Organization. */
-	role: Role;
-	/** The Region the Organization lives in. */
-	region: Region;
-	/** When the token was issued. */
-	issuedAt: Date;
-	/** When the token stops being valid. */
-	expiresAt: Date;
-}
+	id: z.ZodOptional<z.ZodString>;
+}, z.core.$strict>;
+/** What the action was done to. */
+declare const auditSubjectSchema: z.ZodObject<{
+	type: z.ZodString;
+	id: z.ZodString;
+}, z.core.$strict>;
+/** The fields of an audit entry other than its event id and Organization. */
+declare const auditEventPayloadSchema: z.ZodObject<{
+	actor: z.ZodObject<{
+		kind: z.ZodEnum<{
+			agent: "agent";
+			api_key: "api_key";
+			member: "member";
+			system: "system";
+		}>;
+		id: z.ZodOptional<z.ZodString>;
+	}, z.core.$strict>;
+	action: z.ZodString;
+	subject: z.ZodObject<{
+		type: z.ZodString;
+		id: z.ZodString;
+	}, z.core.$strict>;
+	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	requestId: z.ZodOptional<z.ZodString>;
+	occurredAt: z.ZodOptional<z.ZodISODateTime>;
+	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
+}, z.core.$strict>;
+/** The shape of one audit entry; unknown fields are refused. */
+declare const auditEntrySchema: z.ZodObject<{
+	actor: z.ZodObject<{
+		kind: z.ZodEnum<{
+			agent: "agent";
+			api_key: "api_key";
+			member: "member";
+			system: "system";
+		}>;
+		id: z.ZodOptional<z.ZodString>;
+	}, z.core.$strict>;
+	action: z.ZodString;
+	subject: z.ZodObject<{
+		type: z.ZodString;
+		id: z.ZodString;
+	}, z.core.$strict>;
+	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	requestId: z.ZodOptional<z.ZodString>;
+	occurredAt: z.ZodOptional<z.ZodISODateTime>;
+	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
+	id: z.ZodString;
+	organizationId: z.core.$ZodBranded<z.ZodString, "org", "out">;
+}, z.core.$strict>;
+/** A validated audit entry. */
+type AuditEntry = z.output<typeof auditEntrySchema>;
+/** What a caller gives {@link AuditRecorder.record}. */
+type AuditEntryInput = z.input<typeof auditEntrySchema>;
 /**
-* Why a token was not accepted. Deliberately coarse: it is safe to return to a client and to log.
-* `unavailable` means the signing keys could not be loaded, which says nothing about the token.
+* Validates an entry and checks its serialised size. Throws an AuditError `audit.invalid_entry`
+* or `audit.entry_too_large`; neither holds a value from the entry. O(entry size).
 */
-type TokenRejection = "expired" | "invalid" | "unavailable";
-/** Thrown by a TokenVerifier for any token it will not accept, or cannot check; carries no token content. */
-declare class TokenVerificationError extends Error {
-	readonly reason: TokenRejection;
-	constructor(reason: TokenRejection);
+declare function parseAuditEntry(input: unknown): AuditEntry;
+/** Everything needed to build an AppError. */
+interface AppErrorInit {
+	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
+	code: string;
+	/** HTTP status the error maps to. */
+	status: number;
+	/** Human-readable message that is safe to return to a client. */
+	message: string;
+	/** Extra plain data that is safe to return to a client. */
+	details?: Record<string, unknown>;
+	/** The underlying error, kept for logs and never returned to a client. */
+	cause?: unknown;
 }
+/** The JSON body a service returns for a failed request. */
+interface ErrorBody {
+	error: {
+		code: string;
+		message: string;
+		details?: Record<string, unknown>;
+	};
+}
+/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
+declare class AppError extends Error {
+	readonly code: string;
+	readonly status: number;
+	readonly details?: Record<string, unknown>;
+	constructor(init: AppErrorInit);
+}
+/** Narrows an unknown value to an AppError. */
+declare function isAppError(value: unknown): value is AppError;
+/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
+declare function toErrorBody(error: AppError): ErrorBody;
+/** The `area.reason` codes the audit recorder throws. */
+declare const AUDIT_ERROR_CODES: {
+	/** The entry has a field, key, value or shape the recorder does not accept. Nothing was recorded. */
+	readonly invalidEntry: "audit.invalid_entry";
+	/** The serialised entry is over the size cap. Nothing was recorded. */
+	readonly entryTooLarge: "audit.entry_too_large";
+	/** The queue did not take the event, after its own bounded retries. A retry with the same event id is safe. */
+	readonly unavailable: "audit.unavailable";
+};
+/** One of {@link AUDIT_ERROR_CODES}'s values. */
+type AuditErrorCode = (typeof AUDIT_ERROR_CODES)[keyof typeof AUDIT_ERROR_CODES];
+/**
+* What the audit recorder throws. Its message is fixed text and its details hold only field
+* paths, issue codes and sizes: never a metadata value.
+*/
+declare class AuditError extends AppError {
+	readonly code: AuditErrorCode;
+	constructor(code: AuditErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+import { z as z2 } from "zod";
 /** A source of the current time, so code under test never reads the real clock. */
 interface Clock {
 	/** Returns the current time as a new Date each call. */
@@ -58,6 +149,199 @@ interface FixedClock extends Clock {
 declare const systemClock: Clock;
 /** Creates a clock frozen at `start` that only moves when `advance` is called. */
 declare function createFixedClock(start: Date | string): FixedClock;
+/** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
+declare const MAX_MESSAGE_BYTES = 262144;
+/** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
+type MessageScope = "organization" | "global";
+/** What one kind of message is: its name, its current version, its scope and its payload schema. */
+interface MessageDefinition<
+	T extends string = string,
+	P extends z2.ZodType = z2.ZodType,
+	S extends MessageScope = MessageScope
+> {
+	readonly type: T;
+	readonly version: number;
+	readonly scope: S;
+	readonly payload: P;
+	/** Older versions this consumer still accepts, each upcast to the current payload shape. */
+	readonly previous?: readonly PreviousVersion[];
+}
+/**
+* An older version of a message that is still accepted, so a rolling deploy does not bounce the
+* messages in flight. The payload is validated with `payload` (the old shape), turned into the
+* current shape by `upcast`, and then validated again with the current schema. The handler only
+* ever sees the current shape, and the envelope it gets says the current version.
+*/
+interface PreviousVersion {
+	/** The older version number; must differ from the definition's own. */
+	version: number;
+	/** The payload schema of that version. */
+	payload: z2.ZodType;
+	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
+	upcast: (payload: unknown) => unknown;
+}
+/** A definition of any type, for code that accepts every kind. */
+type AnyDefinition = MessageDefinition<string, z2.ZodType, MessageScope>;
+/**
+* Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
+* `version` is a positive integer you raise when the payload changes incompatibly. A consumer
+* accepts its current version and the `previous` versions it lists (each upcast to the current
+* shape); any other version waits in the queue with a growing delay, and reaches the dead-letter
+* queue if no consumer that understands it is deployed in time. Roll out a new version by deploying
+* consumers that list it as current (or the old one as `previous`) before publishers send it.
+*/
+declare function defineMessage<
+	const T extends string,
+	P extends z2.ZodType,
+	const S extends MessageScope
+>(definition: {
+	type: T;
+	version: number;
+	scope: S;
+	payload: P;
+	previous?: readonly PreviousVersion[];
+}): MessageDefinition<T, P, S>;
+/** The fields every envelope has. */
+interface EnvelopeBase<
+	T extends string,
+	P
+> {
+	/** Unique id of this message; stays the same when the publisher retries, so consumers can dedupe. */
+	id: string;
+	/** The message type, such as `core.organization_created`. */
+	type: T;
+	/** The version of the type's definition this was written with. */
+	version: number;
+	/** When the thing happened, ISO 8601 UTC. */
+	occurredAt: string;
+	/** The request or trace id that caused it, for finding the log lines. */
+	traceId: string;
+	/** The validated payload. */
+	payload: P;
+}
+type ScopeField<S> = S extends "organization" ? {
+	organizationId: string;
+} : {
+	organizationId?: undefined;
+};
+/** The envelope of a definition, or the union of the envelopes of a union of definitions. */
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z2.output<P>> & ScopeField<S> : never;
+/** The shape every envelope has, whatever its type. */
+interface AnyEnvelope {
+	id: string;
+	type: string;
+	version: number;
+	occurredAt: string;
+	organizationId?: string | undefined;
+	traceId: string;
+	payload: unknown;
+}
+/** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
+type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
+	type: T;
+	payload: z2.input<P>;
+	traceId: string;
+	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
+	id?: string;
+	/** Defaults to the registry clock's now. */
+	occurredAt?: Date;
+} & ScopeField<S> : never;
+/** Why a received body is not a message this registry accepts. */
+declare const INVALID_REASONS: readonly ["malformed", "unknown_type", "unsupported_version", "invalid_scope", "invalid_payload"];
+/** One of {@link INVALID_REASONS}. */
+type InvalidReason = (typeof INVALID_REASONS)[number];
+/** The outcome of {@link MessageRegistry.decode}. `issues` are field paths and codes, never values. */
+type DecodeResult<E> = {
+	ok: true;
+	envelope: E;
+} | {
+	ok: false;
+	reason: InvalidReason;
+	issues: string[];
+	messageId?: string;
+};
+/** Knows every message type a service handles; builds, encodes and decodes envelopes. */
+interface MessageRegistry<D extends AnyDefinition> {
+	/** The definitions, by type. */
+	readonly definitions: ReadonlyMap<string, D>;
+	/** Builds a validated envelope. Throws a ZodError when the payload does not fit its schema. */
+	create(input: CreateInput<D>): EnvelopeOf<D>;
+	/**
+	* Validates an envelope and turns it into the JSON body to send. Throws a QueueError with code
+	* `queue.invalid_message` for an unknown type, a wrong version or scope, or a bad payload.
+	* Complexity O(body size).
+	*/
+	encode(envelope: EnvelopeOf<D>): string;
+	/**
+	* Parses and validates a received body. Never throws: a body that is not an accepted message
+	* comes back as `ok: false` so the caller decides what happens to it. O(body size).
+	*/
+	decode(body: string): DecodeResult<EnvelopeOf<D>>;
+}
+/** Options for {@link createMessageRegistry}. */
+interface MessageRegistryOptions {
+	/** Time source for `occurredAt`; defaults to the system clock. */
+	clock?: Clock;
+	/** Id source; defaults to `crypto.randomUUID`. */
+	newId?: () => string;
+	/**
+	* The shape of an Organization id, checked for `organization` messages on the way in and out.
+	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
+	*/
+	organizationIdSchema?: z2.ZodType<string>;
+}
+/**
+* Builds a registry from the message definitions a service knows. Two definitions with the same
+* type are a mistake and throw.
+*/
+declare function createMessageRegistry<const D extends AnyDefinition>(definitions: readonly D[], options?: MessageRegistryOptions): MessageRegistry<D>;
+import { MessageDefinition as MessageDefinition_xp6xd2 } from "..";
+import { ZodObject as ZodObject_qx5az2 } from "zod";
+import { ZodEnum as ZodEnum_piue6o } from "zod";
+import { ZodOptional as ZodOptional_csos33 } from "zod";
+import { ZodString as ZodString_t3dacg } from "zod";
+import { $strict as $strict_gffh7x } from "zod/v4/core";
+import { ZodNumber as ZodNumber_qqlmmw } from "zod";
+import { ZodISODateTime as ZodISODateTime_n0rd9r } from "zod";
+import { ZodRecord as ZodRecord_sdtasg } from "zod";
+import { ZodUnion as ZodUnion_a4q2qo } from "zod";
+import { ZodBoolean as ZodBoolean_aoutmh } from "zod";
+/** The `audit.recorded` message: one audit event. The envelope id is the event id. */
+declare const auditRecordedMessage: MessageDefinition_xp6xd2<"audit.recorded", ZodObject_qx5az2<{
+	actor: ZodObject_qx5az2<{
+		kind: ZodEnum_piue6o<{
+			agent: "agent";
+			api_key: "api_key";
+			member: "member";
+			system: "system";
+		}>;
+		id: ZodOptional_csos33<ZodString_t3dacg>;
+	}, $strict_gffh7x>;
+	action: ZodString_t3dacg;
+	subject: ZodObject_qx5az2<{
+		type: ZodString_t3dacg;
+		id: ZodString_t3dacg;
+	}, $strict_gffh7x>;
+	instructionVersion: ZodOptional_csos33<ZodNumber_qqlmmw>;
+	requestId: ZodOptional_csos33<ZodString_t3dacg>;
+	occurredAt: ZodOptional_csos33<ZodISODateTime_n0rd9r>;
+	metadata: ZodOptional_csos33<ZodRecord_sdtasg<ZodString_t3dacg, ZodUnion_a4q2qo<readonly [ZodString_t3dacg, ZodNumber_qqlmmw, ZodBoolean_aoutmh]>>>;
+}, $strict_gffh7x>, "organization">;
+/** The envelope of {@link auditRecordedMessage}. */
+type AuditRecordedEnvelope = EnvelopeOf<typeof auditRecordedMessage>;
+/**
+* Records one audit event: who or what did what to which subject. An entry holds ids, labels and
+* an action code, never a message body, transcript, secret or address. Core consumes the events
+* (`audit.recorded`) and writes the log.
+*/
+interface AuditRecorder {
+	/**
+	* Records the entry. Idempotent per `entry.id`: recording the same id again changes nothing. Throws
+	* an AuditError: `audit.invalid_entry`, `audit.entry_too_large` or, for the queue adapter,
+	* `audit.unavailable` (retry with the same id). O(entry size), at most 4 KiB.
+	*/
+	record(entry: AuditEntryInput): Promise<void>;
+}
 /** Where log lines go: anything with a `write` that takes one newline-terminated JSON line. */
 interface LogDestination {
 	write(line: string): void;
@@ -88,6 +372,180 @@ interface LoggerOptions {
 }
 /** Creates a JSON-lines logger for one service that redacts sensitive fields at any depth. */
 declare function createLogger(options: LoggerOptions): Logger;
+/** Opaque handle for one delivery of a message; pass it back to acknowledge or change visibility. */
+type Receipt = string;
+/** The largest batch SQS takes or gives. */
+declare const MAX_BATCH_SIZE = 10;
+/** The longest long-poll wait SQS allows, in seconds. */
+declare const MAX_WAIT_SECONDS = 20;
+/** The longest visibility timeout SQS allows, in seconds (12 hours). */
+declare const MAX_VISIBILITY_SECONDS = 43200;
+/** A message that arrived and passed validation. */
+interface ValidDelivery<E> {
+	kind: "message";
+	/** The validated envelope. */
+	envelope: E;
+	/** Handle for acknowledging this delivery. */
+	receipt: Receipt;
+	/** How many times the queue has handed this message out, this delivery included (1 on the first). */
+	receiveCount: number;
+}
+/**
+* A message that arrived but is not one this service accepts: not JSON, an unknown type, a
+* different version, a wrong scope or a payload that fails its schema. It is handed to the caller
+* rather than dropped, so it can be logged, reported and left to reach the dead-letter queue. It
+* carries no body: only the reason, field paths and the envelope id when one could be read.
+*/
+interface InvalidDelivery {
+	kind: "invalid";
+	/** Why it was rejected. */
+	reason: InvalidReason;
+	/** Field paths and codes of what failed; never values. */
+	issues: string[];
+	/** The envelope's id, when the body had one. */
+	messageId?: string;
+	/** Handle for acknowledging, or delaying, this delivery. */
+	receipt: Receipt;
+	/** How many times the queue has handed this message out. */
+	receiveCount: number;
+}
+/** One thing {@link Queue.receive} returns. */
+type Delivery<E> = ValidDelivery<E> | InvalidDelivery;
+/** What {@link Queue.receive} is asked for. */
+interface ReceiveOptions {
+	/** How many messages at most, 1 to 10. */
+	maxMessages: number;
+	/** How long the messages stay hidden from other receivers, in seconds, 0 to 43200. */
+	visibilityTimeoutSeconds: number;
+	/** How long to wait for a message when the queue is empty (long poll), in seconds, 0 to 20. */
+	waitSeconds: number;
+	/** Ends the wait early; the call then returns an empty list. */
+	signal?: AbortSignal;
+}
+/** What {@link Queue.publishBatch} reports for one message that was not accepted. */
+interface BatchFailure {
+	/** The envelope id. */
+	id: string;
+	/** The queue's error code, such as `InternalError` or `ServiceUnavailable`. */
+	code: string;
+	/** True when the failure is the sender's fault (retrying the same message will not help). */
+	senderFault: boolean;
+}
+/** The outcome of a batch publish: which envelope ids were accepted and which were not. */
+interface BatchResult {
+	/** Ids of the envelopes the queue accepted, in input order. */
+	sent: string[];
+	/** The ones it did not; the caller retries these (the same envelope, so the id is stable). */
+	failed: BatchFailure[];
+}
+/**
+* A queue of typed messages. Delivery is at-least-once and unordered: a message can be handed out
+* more than once (a consumer that is slow, crashes, or a duplicate in the queue itself) and two
+* messages can arrive in either order, so a handler must be idempotent (see
+* {@link createConsumer}). An envelope is validated against the registry on the way in and on the
+* way out. The queue holds the message until it is acknowledged; after the queue's
+* `maxReceiveCount` deliveries it moves to the dead-letter queue instead of being delivered again.
+*/
+interface Queue<E extends AnyEnvelope = AnyEnvelope> {
+	/**
+	* Sends one message. Resolves when the queue has accepted it. Throws a QueueError: invalid
+	* message, message too large, or unavailable (after the adapter's bounded, jittered retries).
+	* A retry after an `unavailable` error can leave two copies in the queue with the same envelope
+	* id; the idempotent consumer drops the second. O(message size).
+	*/
+	publish(envelope: E): Promise<void>;
+	/**
+	* Sends up to 10 messages (and up to 256 KiB in total) in one call. Everything is validated
+	* before anything is sent. A message the queue refuses comes back in `failed`; the call throws
+	* only when the whole request fails. O(total size).
+	*/
+	publishBatch(envelopes: readonly E[]): Promise<BatchResult>;
+	/**
+	* Receives up to `maxMessages` messages and hides them for `visibilityTimeoutSeconds`. With
+	* `waitSeconds` above 0 it waits that long for a message when the queue is empty. Messages that
+	* are not valid come back as `kind: 'invalid'`. O(batch size).
+	*/
+	receive(options: ReceiveOptions): Promise<Delivery<E>[]>;
+	/**
+	* Removes the message for good. Safe to call twice and for a delivery that was already
+	* redelivered: it resolves either way.
+	*/
+	acknowledge(receipt: Receipt): Promise<void>;
+	/**
+	* Hides the message for `seconds` more from now (a lease extension, or a delay before retry).
+	* Throws a QueueError `queue.receipt_invalid` when the message is no longer in flight.
+	*/
+	extendVisibility(receipt: Receipt, seconds: number): Promise<void>;
+	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
+	release(receipt: Receipt): Promise<void>;
+}
+/** Throws the QueueError for a `receive` call whose numbers are out of range. */
+declare function assertReceiveOptions(options: ReceiveOptions): void;
+/** Throws the QueueError for a visibility timeout outside 0 to 43200 whole seconds. */
+declare function assertVisibility(seconds: number): void;
+/** Throws the QueueError for a batch of 0 or more than 10 messages. */
+declare function assertBatchCount(count: number): void;
+/** Options for {@link createQueueAuditRecorder}. */
+interface QueueAuditRecorderOptions {
+	/** Where `audit.recorded` is published; a queue that accepts that message type. */
+	queue: Pick<Queue<AuditRecordedEnvelope>, "publish">;
+	/** Time source for entries without `occurredAt`. */
+	clock?: Clock;
+	/** Receives one line per entry with ids and counts, never metadata values. */
+	logger?: Logger;
+}
+/**
+* Creates the recorder that publishes `audit.recorded`. The event id is the envelope id, so a
+* retry or a second call sends a message the consumer drops as a duplicate. O(entry size) and one
+* queue call.
+*/
+declare function createQueueAuditRecorder(options: QueueAuditRecorderOptions): AuditRecorder;
+import { OrganizationId, Region, Role, UserId } from "tula-closeline-contract";
+import { z as z3 } from "zod";
+/** The longest access token, in characters, that verification will look at. */
+declare const MAX_TOKEN_LENGTH = 4096;
+/** The claims every Closeline access token carries, besides the registered `iss`, `aud`, `exp`. */
+declare const accessTokenClaimsSchema: z3.ZodObject<{
+	sub: z3.core.$ZodBranded<z3.ZodString, "usr", "out">;
+	org: z3.core.$ZodBranded<z3.ZodString, "org", "out">;
+	role: z3.ZodEnum<{
+		admin: "admin";
+		manager: "manager";
+		owner: "owner";
+		rep: "rep";
+	}>;
+	region: z3.ZodEnum<{
+		eu: "eu";
+		us: "us";
+	}>;
+	iat: z3.ZodNumber;
+	exp: z3.ZodNumber;
+}, z3.core.$strip>;
+/** The identity a verified access token proves. */
+interface VerifiedToken {
+	/** The signed-in user. */
+	userId: UserId;
+	/** The Organization every query for this request must be scoped to. */
+	organizationId: OrganizationId;
+	/** The user's role in that Organization. */
+	role: Role;
+	/** The Region the Organization lives in. */
+	region: Region;
+	/** When the token was issued. */
+	issuedAt: Date;
+	/** When the token stops being valid. */
+	expiresAt: Date;
+}
+/**
+* Why a token was not accepted. Deliberately coarse: it is safe to return to a client and to log.
+* `unavailable` means the signing keys could not be loaded, which says nothing about the token.
+*/
+type TokenRejection = "expired" | "invalid" | "unavailable";
+/** Thrown by a TokenVerifier for any token it will not accept, or cannot check; carries no token content. */
+declare class TokenVerificationError extends Error {
+	readonly reason: TokenRejection;
+	constructor(reason: TokenRejection);
+}
 /** The most keys a JWKS may hold; a larger set is refused outright. */
 declare const MAX_JWKS_KEYS = 20;
 /** The largest JWKS response body, in bytes, that the remote key set will read. */
@@ -260,38 +718,6 @@ declare class CalendarConnection {
 	/** A readable label without the credential. */
 	toString(): string;
 }
-/** Everything needed to build an AppError. */
-interface AppErrorInit {
-	/** Stable machine-readable code of the form `area.reason`, e.g. `auth.token_expired`. */
-	code: string;
-	/** HTTP status the error maps to. */
-	status: number;
-	/** Human-readable message that is safe to return to a client. */
-	message: string;
-	/** Extra plain data that is safe to return to a client. */
-	details?: Record<string, unknown>;
-	/** The underlying error, kept for logs and never returned to a client. */
-	cause?: unknown;
-}
-/** The JSON body a service returns for a failed request. */
-interface ErrorBody {
-	error: {
-		code: string;
-		message: string;
-		details?: Record<string, unknown>;
-	};
-}
-/** An expected failure with a stable `area.reason` code and the HTTP status it maps to. */
-declare class AppError extends Error {
-	readonly code: string;
-	readonly status: number;
-	readonly details?: Record<string, unknown>;
-	constructor(init: AppErrorInit);
-}
-/** Narrows an unknown value to an AppError. */
-declare function isAppError(value: unknown): value is AppError;
-/** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
-declare function toErrorBody(error: AppError): ErrorBody;
 /** The `area.reason` codes the calendar port and adapters throw. */
 declare const CALENDAR_ERROR_CODES: {
 	/** The Organization id, connection, request id, times, event fields, grant, options or retry policy are not acceptable. Nothing was sent to the vendor. */
@@ -549,13 +975,13 @@ interface CalendarPort {
 	*/
 	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
 }
-import { z as z2 } from "zod";
+import { z as z4 } from "zod";
 /** The deployment environments a service can run in, from its `ENVIRONMENT` variable. */
 declare const ENVIRONMENTS: readonly ["local", "dev", "staging", "prod"];
 /** One of the deployment environments. */
 type Environment = (typeof ENVIRONMENTS)[number];
 /** Zod schema for the `ENVIRONMENT` variable. */
-declare const environmentSchema: z2.ZodEnum<{
+declare const environmentSchema: z4.ZodEnum<{
 	dev: "dev";
 	local: "local";
 	prod: "prod";
@@ -574,7 +1000,7 @@ declare function isSentryDsn(value: string, environment: Environment): boolean;
 * whitespace (a trailing newline from a secret file) is trimmed, as `createErrorReporter` does, so
 * the value a service boots with is the one the reporter uses.
 */
-declare const sentryDsnSchema: z2.ZodPreprocess<z2.ZodOptional<z2.ZodString>, unknown>;
+declare const sentryDsnSchema: z4.ZodPreprocess<z4.ZodOptional<z4.ZodString>, unknown>;
 /**
 * Refinement for a service's env object: `SENTRY_DSN` may be missing in `local` and must be set in
 * `dev`, `staging` and `prod`, where it must use `https:`. Use it as `z.object({ ENVIRONMENT, SENTRY_DSN, ... }).superRefine(requireSentryDsn)`
@@ -583,7 +1009,7 @@ declare const sentryDsnSchema: z2.ZodPreprocess<z2.ZodOptional<z2.ZodString>, un
 declare function requireSentryDsn(env: {
 	ENVIRONMENT: Environment;
 	SENTRY_DSN?: string | undefined;
-}, ctx: z2.RefinementCtx): void;
+}, ctx: z4.RefinementCtx): void;
 /** The header that carries a call's idempotency key. */
 declare const INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
 /** The default bound on one attempt, connecting to the last byte of the answer. */
@@ -867,7 +1293,7 @@ declare class LlmError extends AppError {
 	});
 }
 import { OrganizationId as OrganizationId5 } from "tula-closeline-contract";
-import { z as z3 } from "zod";
+import { z as z5 } from "zod";
 /** The default time a call may take, in milliseconds. */
 declare const DEFAULT_LLM_TIMEOUT_MS = 15e3;
 /** The longest time a caller may allow a call, in milliseconds. */
@@ -939,7 +1365,7 @@ interface LlmRequestBase {
 	signal?: AbortSignal;
 }
 /** A request for a value shaped by a schema. */
-interface LlmCompleteRequest<S extends z3.ZodType = z3.ZodType> extends LlmRequestBase {
+interface LlmCompleteRequest<S extends z5.ZodType = z5.ZodType> extends LlmRequestBase {
 	/**
 	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
 	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
@@ -1002,7 +1428,7 @@ type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
 */
 interface LlmPort {
 	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
-	complete<S extends z3.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z3.output<S>>>;
+	complete<S extends z5.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z5.output<S>>>;
 	/**
 	* Streams free text. An unacceptable request throws `llm.invalid_request` or
 	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
@@ -2022,153 +2448,6 @@ declare function createTwilioMessaging(options: TwilioMessagingOptions): Messagi
 declare function classifyMessageIntent(body: string): MessageIntent;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
-import { z as z4 } from "zod";
-/** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
-declare const MAX_MESSAGE_BYTES = 262144;
-/** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
-type MessageScope = "organization" | "global";
-/** What one kind of message is: its name, its current version, its scope and its payload schema. */
-interface MessageDefinition<
-	T extends string = string,
-	P extends z4.ZodType = z4.ZodType,
-	S extends MessageScope = MessageScope
-> {
-	readonly type: T;
-	readonly version: number;
-	readonly scope: S;
-	readonly payload: P;
-	/** Older versions this consumer still accepts, each upcast to the current payload shape. */
-	readonly previous?: readonly PreviousVersion[];
-}
-/**
-* An older version of a message that is still accepted, so a rolling deploy does not bounce the
-* messages in flight. The payload is validated with `payload` (the old shape), turned into the
-* current shape by `upcast`, and then validated again with the current schema. The handler only
-* ever sees the current shape, and the envelope it gets says the current version.
-*/
-interface PreviousVersion {
-	/** The older version number; must differ from the definition's own. */
-	version: number;
-	/** The payload schema of that version. */
-	payload: z4.ZodType;
-	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
-	upcast: (payload: unknown) => unknown;
-}
-/** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z4.ZodType, MessageScope>;
-/**
-* Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
-* `version` is a positive integer you raise when the payload changes incompatibly. A consumer
-* accepts its current version and the `previous` versions it lists (each upcast to the current
-* shape); any other version waits in the queue with a growing delay, and reaches the dead-letter
-* queue if no consumer that understands it is deployed in time. Roll out a new version by deploying
-* consumers that list it as current (or the old one as `previous`) before publishers send it.
-*/
-declare function defineMessage<
-	const T extends string,
-	P extends z4.ZodType,
-	const S extends MessageScope
->(definition: {
-	type: T;
-	version: number;
-	scope: S;
-	payload: P;
-	previous?: readonly PreviousVersion[];
-}): MessageDefinition<T, P, S>;
-/** The fields every envelope has. */
-interface EnvelopeBase<
-	T extends string,
-	P
-> {
-	/** Unique id of this message; stays the same when the publisher retries, so consumers can dedupe. */
-	id: string;
-	/** The message type, such as `core.organization_created`. */
-	type: T;
-	/** The version of the type's definition this was written with. */
-	version: number;
-	/** When the thing happened, ISO 8601 UTC. */
-	occurredAt: string;
-	/** The request or trace id that caused it, for finding the log lines. */
-	traceId: string;
-	/** The validated payload. */
-	payload: P;
-}
-type ScopeField<S> = S extends "organization" ? {
-	organizationId: string;
-} : {
-	organizationId?: undefined;
-};
-/** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z4.output<P>> & ScopeField<S> : never;
-/** The shape every envelope has, whatever its type. */
-interface AnyEnvelope {
-	id: string;
-	type: string;
-	version: number;
-	occurredAt: string;
-	organizationId?: string | undefined;
-	traceId: string;
-	payload: unknown;
-}
-/** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
-type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
-	type: T;
-	payload: z4.input<P>;
-	traceId: string;
-	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
-	id?: string;
-	/** Defaults to the registry clock's now. */
-	occurredAt?: Date;
-} & ScopeField<S> : never;
-/** Why a received body is not a message this registry accepts. */
-declare const INVALID_REASONS: readonly ["malformed", "unknown_type", "unsupported_version", "invalid_scope", "invalid_payload"];
-/** One of {@link INVALID_REASONS}. */
-type InvalidReason = (typeof INVALID_REASONS)[number];
-/** The outcome of {@link MessageRegistry.decode}. `issues` are field paths and codes, never values. */
-type DecodeResult<E> = {
-	ok: true;
-	envelope: E;
-} | {
-	ok: false;
-	reason: InvalidReason;
-	issues: string[];
-	messageId?: string;
-};
-/** Knows every message type a service handles; builds, encodes and decodes envelopes. */
-interface MessageRegistry<D extends AnyDefinition> {
-	/** The definitions, by type. */
-	readonly definitions: ReadonlyMap<string, D>;
-	/** Builds a validated envelope. Throws a ZodError when the payload does not fit its schema. */
-	create(input: CreateInput<D>): EnvelopeOf<D>;
-	/**
-	* Validates an envelope and turns it into the JSON body to send. Throws a QueueError with code
-	* `queue.invalid_message` for an unknown type, a wrong version or scope, or a bad payload.
-	* Complexity O(body size).
-	*/
-	encode(envelope: EnvelopeOf<D>): string;
-	/**
-	* Parses and validates a received body. Never throws: a body that is not an accepted message
-	* comes back as `ok: false` so the caller decides what happens to it. O(body size).
-	*/
-	decode(body: string): DecodeResult<EnvelopeOf<D>>;
-}
-/** Options for {@link createMessageRegistry}. */
-interface MessageRegistryOptions {
-	/** Time source for `occurredAt`; defaults to the system clock. */
-	clock?: Clock;
-	/** Id source; defaults to `crypto.randomUUID`. */
-	newId?: () => string;
-	/**
-	* The shape of an Organization id, checked for `organization` messages on the way in and out.
-	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
-	*/
-	organizationIdSchema?: z4.ZodType<string>;
-}
-/**
-* Builds a registry from the message definitions a service knows. Two definitions with the same
-* type are a mistake and throw.
-*/
-declare function createMessageRegistry<const D extends AnyDefinition>(definitions: readonly D[], options?: MessageRegistryOptions): MessageRegistry<D>;
 /** The `area.reason` codes the queue adapters throw. */
 declare const QUEUE_ERROR_CODES: {
 	/** An envelope failed validation before sending. */
@@ -2198,119 +2477,6 @@ declare class QueueError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-/** Opaque handle for one delivery of a message; pass it back to acknowledge or change visibility. */
-type Receipt = string;
-/** The largest batch SQS takes or gives. */
-declare const MAX_BATCH_SIZE = 10;
-/** The longest long-poll wait SQS allows, in seconds. */
-declare const MAX_WAIT_SECONDS = 20;
-/** The longest visibility timeout SQS allows, in seconds (12 hours). */
-declare const MAX_VISIBILITY_SECONDS = 43200;
-/** A message that arrived and passed validation. */
-interface ValidDelivery<E> {
-	kind: "message";
-	/** The validated envelope. */
-	envelope: E;
-	/** Handle for acknowledging this delivery. */
-	receipt: Receipt;
-	/** How many times the queue has handed this message out, this delivery included (1 on the first). */
-	receiveCount: number;
-}
-/**
-* A message that arrived but is not one this service accepts: not JSON, an unknown type, a
-* different version, a wrong scope or a payload that fails its schema. It is handed to the caller
-* rather than dropped, so it can be logged, reported and left to reach the dead-letter queue. It
-* carries no body: only the reason, field paths and the envelope id when one could be read.
-*/
-interface InvalidDelivery {
-	kind: "invalid";
-	/** Why it was rejected. */
-	reason: InvalidReason;
-	/** Field paths and codes of what failed; never values. */
-	issues: string[];
-	/** The envelope's id, when the body had one. */
-	messageId?: string;
-	/** Handle for acknowledging, or delaying, this delivery. */
-	receipt: Receipt;
-	/** How many times the queue has handed this message out. */
-	receiveCount: number;
-}
-/** One thing {@link Queue.receive} returns. */
-type Delivery<E> = ValidDelivery<E> | InvalidDelivery;
-/** What {@link Queue.receive} is asked for. */
-interface ReceiveOptions {
-	/** How many messages at most, 1 to 10. */
-	maxMessages: number;
-	/** How long the messages stay hidden from other receivers, in seconds, 0 to 43200. */
-	visibilityTimeoutSeconds: number;
-	/** How long to wait for a message when the queue is empty (long poll), in seconds, 0 to 20. */
-	waitSeconds: number;
-	/** Ends the wait early; the call then returns an empty list. */
-	signal?: AbortSignal;
-}
-/** What {@link Queue.publishBatch} reports for one message that was not accepted. */
-interface BatchFailure {
-	/** The envelope id. */
-	id: string;
-	/** The queue's error code, such as `InternalError` or `ServiceUnavailable`. */
-	code: string;
-	/** True when the failure is the sender's fault (retrying the same message will not help). */
-	senderFault: boolean;
-}
-/** The outcome of a batch publish: which envelope ids were accepted and which were not. */
-interface BatchResult {
-	/** Ids of the envelopes the queue accepted, in input order. */
-	sent: string[];
-	/** The ones it did not; the caller retries these (the same envelope, so the id is stable). */
-	failed: BatchFailure[];
-}
-/**
-* A queue of typed messages. Delivery is at-least-once and unordered: a message can be handed out
-* more than once (a consumer that is slow, crashes, or a duplicate in the queue itself) and two
-* messages can arrive in either order, so a handler must be idempotent (see
-* {@link createConsumer}). An envelope is validated against the registry on the way in and on the
-* way out. The queue holds the message until it is acknowledged; after the queue's
-* `maxReceiveCount` deliveries it moves to the dead-letter queue instead of being delivered again.
-*/
-interface Queue<E extends AnyEnvelope = AnyEnvelope> {
-	/**
-	* Sends one message. Resolves when the queue has accepted it. Throws a QueueError: invalid
-	* message, message too large, or unavailable (after the adapter's bounded, jittered retries).
-	* A retry after an `unavailable` error can leave two copies in the queue with the same envelope
-	* id; the idempotent consumer drops the second. O(message size).
-	*/
-	publish(envelope: E): Promise<void>;
-	/**
-	* Sends up to 10 messages (and up to 256 KiB in total) in one call. Everything is validated
-	* before anything is sent. A message the queue refuses comes back in `failed`; the call throws
-	* only when the whole request fails. O(total size).
-	*/
-	publishBatch(envelopes: readonly E[]): Promise<BatchResult>;
-	/**
-	* Receives up to `maxMessages` messages and hides them for `visibilityTimeoutSeconds`. With
-	* `waitSeconds` above 0 it waits that long for a message when the queue is empty. Messages that
-	* are not valid come back as `kind: 'invalid'`. O(batch size).
-	*/
-	receive(options: ReceiveOptions): Promise<Delivery<E>[]>;
-	/**
-	* Removes the message for good. Safe to call twice and for a delivery that was already
-	* redelivered: it resolves either way.
-	*/
-	acknowledge(receipt: Receipt): Promise<void>;
-	/**
-	* Hides the message for `seconds` more from now (a lease extension, or a delay before retry).
-	* Throws a QueueError `queue.receipt_invalid` when the message is no longer in flight.
-	*/
-	extendVisibility(receipt: Receipt, seconds: number): Promise<void>;
-	/** Makes the message visible again at once, so another receive gets it. Same errors as extendVisibility. */
-	release(receipt: Receipt): Promise<void>;
-}
-/** Throws the QueueError for a `receive` call whose numbers are out of range. */
-declare function assertReceiveOptions(options: ReceiveOptions): void;
-/** Throws the QueueError for a visibility timeout outside 0 to 43200 whole seconds. */
-declare function assertVisibility(seconds: number): void;
-/** Throws the QueueError for a batch of 0 or more than 10 messages. */
-declare function assertBatchCount(count: number): void;
 /** Identifies one message for one consumer: what "already processed" is recorded against. */
 interface ConsumedKey {
 	/** The consumer's name, so two consumers of different queues in one service do not collide. */
@@ -3264,4 +3430,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
+export { AUDIT_DENIED_METADATA_KEYS, AUDIT_ERROR_CODES, AUDIT_LIMITS, AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuditEntry, AuditEntryInput, AuditError, AuditErrorCode, AuditRecordedEnvelope, AuditRecorder, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueAuditRecorderOptions, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, auditActorSchema, auditEntrySchema, auditEventPayloadSchema, auditMetadataSchema, auditRecordedMessage, auditSubjectSchema, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createQueueAuditRecorder, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, parseAuditEntry, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };

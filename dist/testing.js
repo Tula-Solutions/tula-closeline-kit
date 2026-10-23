@@ -1,4 +1,5 @@
 import {
+  parseAuditEntry2,
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
   DEFAULT_LLM_TIMEOUT_MS2,
@@ -63,7 +64,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-0f87wa1m.js";
+} from "./shared/chunk-mnvbt65g.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -93,7 +94,7 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-hff6jkfx.js";
+} from "./shared/chunk-q819sn0x.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -159,6 +160,28 @@ function createMemoryErrorReporter() {
   };
 }
 
+// src/audit/memory.ts
+function createMemoryAuditRecorder(options = {}) {
+  const clock = options.clock ?? systemClock2;
+  const stored = new Map;
+  return {
+    async record(input) {
+      const entry = parseAuditEntry2(input);
+      const key = `${entry.organizationId}\x00${entry.id}`;
+      const duplicate = stored.has(key);
+      if (!duplicate) {
+        stored.set(key, structuredClone({ ...entry, occurredAt: entry.occurredAt ?? clock.now().toISOString() }));
+      }
+      options.logger?.info("audit entry recorded", {
+        eventId: entry.id,
+        action: entry.action,
+        metadataKeys: Object.keys(entry.metadata ?? {}).length,
+        duplicate
+      });
+    },
+    entries: () => [...stored.values()].map((entry) => structuredClone(entry))
+  };
+}
 // src/auth/testing.ts
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { formatId } from "tula-closeline-contract";
@@ -3400,6 +3423,7 @@ export {
   DEFAULT_TEST_USER_ID,
   MEMORY_MESSAGING_AUTH_TOKEN,
   MEMORY_MESSAGING_WEBHOOK_URL,
+  createMemoryAuditRecorder,
   createMemoryCalendar,
   createMemoryContactGuard,
   createMemoryErrorReporter,
