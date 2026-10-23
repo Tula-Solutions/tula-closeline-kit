@@ -1,3 +1,46 @@
+import { ContactDenialCode as ContactDenialCode2, SuppressionReason as SuppressionReason2 } from "tula-closeline-contract";
+import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
+/**
+* What a calling service gives the guard: the Contact Check body without `caller`, which the
+* guard fills in with the service's own name. There is no field that waives the check (ADR 0003).
+*/
+type ContactGuardRequest = Omit<ContactCheckRequest, "caller">;
+/** The answer of a Contact Check: an allowance with its basis, or a denial with a `consent.*` code. */
+type ContactGuardResult = ContactCheckResult;
+/**
+* The question every channel asks before it contacts a Prospect: may I contact this Prospect, or
+* this address, on this channel now, for this purpose (ADR 0003, ADR 0021)? It never throws and it
+* fails closed: anything but a clear allowance is a denial, and a check that could not be answered
+* is a denial with `consent.unavailable`. Only `allowed: true` permits a contact.
+*/
+interface ContactGuard {
+	/** Asks the check; resolves with an allowance or a denial and never rejects. */
+	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
+}
+/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
+type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
+/** What the behaviour suite needs from a {@link ContactGuard} under test. */
+interface ContactGuardSubject {
+	/** The guard under test, with nothing preset: an unknown target is denied. */
+	guard: ContactGuard;
+	/** Makes the check answer allowed for `target` on `channel`. */
+	allow(target: ContactTarget, channel: ContactGuardRequest["channel"]): void;
+	/** Makes the check answer denied with `code` for `target` on `channel`. */
+	deny(target: ContactTarget, channel: ContactGuardRequest["channel"], code: Exclude<ContactDenialCode2, "consent.unavailable">, suppressionReason?: SuppressionReason2): void;
+	/** Makes the check unreachable, as if core did not answer. */
+	makeUnavailable(): void;
+	/** The requests that reached the check, in order. */
+	reached(): readonly ContactGuardRequest[];
+	/** Removes what the subject created. */
+	close(): Promise<void>;
+}
+/**
+* The behaviour every {@link ContactGuard} must show: it answers what the check answers, an
+* unknown target is denied, and anything that is not a clear answer is a denial with
+* `consent.unavailable`; it never throws and never allows by default. Run it against the memory
+* adapter and the HTTP adapter.
+*/
+declare function contactGuardBehaviour(name: string, make: () => Promise<ContactGuardSubject>): void;
 import { z } from "zod";
 /** A source of the current time, so code under test never reads the real clock. */
 interface Clock {
@@ -892,4 +935,4 @@ interface VectorStoreSubject {
 * in an integration test against a scratch namespace in a dev account).
 */
 declare function vectorStoreBehaviour(name: string, make: () => Promise<VectorStoreSubject>, skip?: boolean): void;
-export { ObjectStoreSubject, QueueSubject, StoreSubject, TranscriberSubject, VectorStoreSubject, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, transcriberBehaviour, vectorStoreBehaviour };
+export { ContactGuardSubject, ObjectStoreSubject, QueueSubject, StoreSubject, TranscriberSubject, VectorStoreSubject, contactGuardBehaviour, objectStoreBehaviour, processedStoreBehaviour, queueBehaviour, transcriberBehaviour, vectorStoreBehaviour };

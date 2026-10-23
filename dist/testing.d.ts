@@ -132,6 +132,49 @@ declare const DEFAULT_TEST_ORGANIZATION_ID: Id_1tn<"org">;
 declare const DEFAULT_TEST_USER_ID: Id_1tn<"usr">;
 /** Signs a valid access token for tests, with knobs to break one thing at a time. */
 declare function mintTestToken(options: MintTokenOptions): Promise<string>;
+import { ContactCheckResult as ContactCheckResult2, ContactDenialCode, SuppressionReason } from "tula-closeline-contract";
+import { ContactCheckRequest, ContactCheckResult } from "tula-closeline-contract";
+/**
+* What a calling service gives the guard: the Contact Check body without `caller`, which the
+* guard fills in with the service's own name. There is no field that waives the check (ADR 0003).
+*/
+type ContactGuardRequest = Omit<ContactCheckRequest, "caller">;
+/** The answer of a Contact Check: an allowance with its basis, or a denial with a `consent.*` code. */
+type ContactGuardResult = ContactCheckResult;
+/**
+* The question every channel asks before it contacts a Prospect: may I contact this Prospect, or
+* this address, on this channel now, for this purpose (ADR 0003, ADR 0021)? It never throws and it
+* fails closed: anything but a clear allowance is a denial, and a check that could not be answered
+* is a denial with `consent.unavailable`. Only `allowed: true` permits a contact.
+*/
+interface ContactGuard {
+	/** Asks the check; resolves with an allowance or a denial and never rejects. */
+	check(request: ContactGuardRequest): Promise<ContactGuardResult>;
+}
+type Basis = Extract<ContactCheckResult2, {
+	allowed: true;
+}>["basis"];
+/** Who a preset is about: an Organization and exactly one of a Prospect id or an address. */
+type ContactTarget = Pick<ContactGuardRequest, "organizationId" | "prospectId" | "email" | "phone" | "linkedinUrl">;
+/** A {@link ContactGuard} that tests configure, and that records what it was asked. */
+interface MemoryContactGuard extends ContactGuard {
+	/** Every valid request the guard answered, in order. */
+	readonly calls: readonly ContactGuardRequest[];
+	/** Allows contact with `target` on `channel` for any purpose. */
+	allow(target: ContactTarget, channel: ContactGuardRequest["channel"], basis?: Basis): MemoryContactGuard;
+	/** Denies contact with `target` on `channel` with `code`; a suppressed denial needs a reason. */
+	deny(target: ContactTarget, channel: ContactGuardRequest["channel"], code?: Exclude<ContactDenialCode, "consent.unavailable">, suppressionReason?: SuppressionReason): MemoryContactGuard;
+	/** Makes every check answer as if core could not be reached (or, with `false`, restores it). */
+	setUnavailable(unavailable?: boolean): MemoryContactGuard;
+	/** Forgets every preset and call. */
+	reset(): void;
+}
+/**
+* Builds a {@link ContactGuard} for tests. A target nobody presets is denied with
+* `consent.missing`, as core denies an unknown Prospect. It validates requests as the HTTP guard
+* does: an invalid one is denied with `consent.unavailable` and is not recorded. Not for production.
+*/
+declare function createMemoryContactGuard(): MemoryContactGuard;
 import { z as z2 } from "zod";
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
 type MessageScope = "organization" | "global";
@@ -1055,4 +1098,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
