@@ -253,7 +253,7 @@ describe('twilio telephony: inbound, Disclosure, bridge, record, fork, hang up',
     }
     expect(await h.telephony.answerCall(request)).toEqual({ ringing: 2 })
     expect(await h.telephony.answerCall(request)).toEqual({ ringing: 2 })
-    expect(h.seen.filter((s) => s.method === 'POST')).toHaveLength(1)
+    expect(h.seen.filter((s) => s.method === 'POST')).toHaveLength(2)
     expect(await code(h.telephony.answerCall({ ...request, organizationId: otherOrg }))).toBe(
       'telephony.not_found'
     )
@@ -1033,5 +1033,38 @@ describe('twilio telephony: review round 1 regressions', () => {
     expect(
       telephony.verifyWebhook({ url: 'https://h.example:8443/p', body: 'A=1', signature })
     ).toBe(false)
+  })
+})
+
+describe('twilio telephony: answerCall retry', () => {
+  const request = { organizationId: org, providerCallId: CALL_SID, callId, ringIdentities: [rep] }
+  const isHold = (s: Seen) => s.method === 'POST' && s.url.endsWith(`/Calls/${CALL_SID}.json`)
+
+  test('a retry after a failed hold update re-sends the hold', async () => {
+    let fail = true
+    const h = harness(
+      (s) => {
+        if (isHold(s) && fail) {
+          return json(400, { code: 21220, message: 'bad' })
+        }
+        return happy(s)
+      },
+      { defaultTimeoutMs: 5000 }
+    )
+    await expect(h.telephony.answerCall(request)).rejects.toThrow()
+    fail = false
+    expect(await h.telephony.answerCall(request)).toEqual({ ringing: 1 })
+    expect(h.seen.filter((s) => isHold(s) && s.form.get('Twiml')?.includes('<Pause'))).toHaveLength(
+      2
+    )
+  })
+
+  test('a retry after the Disclosure played does not replace the call TwiML', async () => {
+    const h = harness(happy)
+    await h.telephony.answerCall(request)
+    await h.telephony.playDisclosure({ organizationId: org, providerCallId: CALL_SID, ...wording })
+    const before = h.seen.filter(isHold).length
+    await h.telephony.answerCall(request)
+    expect(h.seen.filter(isHold)).toHaveLength(before)
   })
 })

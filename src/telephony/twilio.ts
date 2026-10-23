@@ -560,6 +560,11 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         if (known.organizationId !== organizationId) {
           throw notFound()
         }
+        // A retry must reach the same end state: until a Disclosure has played, hold again (the
+        // update is idempotent), as the first attempt may have claimed the call and then failed.
+        if (known.disclosure === null) {
+          await updateCall(providerCallId, { Twiml: hold() }, deadline)
+        }
         return { ringing: known.ringIdentities.length }
       }
       if (!(await callIsUp(providerCallId, deadline))) {

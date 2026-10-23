@@ -2251,6 +2251,9 @@ function createTwilioTelephony(options) {
         if (known.organizationId !== organizationId) {
           throw notFound();
         }
+        if (known.disclosure === null) {
+          await updateCall(providerCallId, { Twiml: hold() }, deadline);
+        }
         return { ringing: known.ringIdentities.length };
       }
       if (!await callIsUp(providerCallId, deadline)) {
