@@ -5,7 +5,7 @@ import {
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-mjkmsg3r.js";
+} from "./shared/chunk-5cxd570z.js";
 import {
   systemSleep2,
   MAX_BATCH_SIZE2,
@@ -14,7 +14,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-h070fpj8.js";
+} from "./shared/chunk-xfecgbam.js";
 
 // src/queue/aws.ts
 import {
