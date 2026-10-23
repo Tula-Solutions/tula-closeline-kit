@@ -62,6 +62,13 @@ Other scripts are in `package.json`.
   1,000 such vectors mean 2.7 ms, each with a median and best-batch p95 budget in
   `bench/stores.bench.ts`, about five times what it measures.
 
+- `TtsStream` (`src/tts/`) carries every audio chunk of a live call. `write` is O(text length)
+  (bounded by `maxTextChars`, at most 20,000) and each chunk read is O(1): the port adds one
+  generator step, one chunk object and two signal checks, and holds no audio beyond the chunk being
+  read. A real adapter adds the vendor's network time. Budgets in `bench/tts.bench.ts`, about five
+  times the memory adapter's measured numbers: a chunk pull mean 0.0015 ms and open to first chunk
+  mean 0.012 ms, each with a median and best-batch p95 budget as above.
+
 - `prepareFields` / `redactFields` (`src/redact.ts`) copy the fields of every log line. O(fields +
   objects walked + text emitted), bounded in counts by 5,000 shared objects and 20,000 shared nested
   values plus 50 objects and 200 values per top-level field, and 200 Errors scrubbed per entry plus 2 per top-level field (the rest are `[truncated]` unread), and in text by 1 MiB of UTF-16 code

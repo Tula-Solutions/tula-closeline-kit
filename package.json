@@ -1,7 +1,7 @@
 {
   "name": "tula-closeline-kit",
-  "version": "0.17.0",
-  "description": "Closeline shared runtime helpers: token verification, queue, object storage, vector store, transcriber, streaming transcriber, language model, calendar and telephony ports and adapters (Twilio included), logging, test fixtures",
+  "version": "0.18.0",
+  "description": "Closeline shared runtime helpers: token verification, queue, object storage, vector store, transcriber, streaming transcriber, language model, calendar, text-to-speech and telephony ports and adapters (Twilio included), logging, test fixtures",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.2",
@@ -44,7 +44,7 @@
     "precommit:dist": "bunup && git add dist",
     "verify": "bun run check && bun run typecheck && bun run test:coverage && bun run bench && bun run dist:check && bun run shared:check",
     "verify:changed": "biome check --changed --no-errors-on-unmatched src scripts && bun run typecheck && bun run test",
-    "bench": "bun run bench/verify.bench.ts && bun run bench/reporting.bench.ts && bun run bench/queue.bench.ts && bun run bench/internal.bench.ts && bun run bench/stores.bench.ts && bun run bench/redact.bench.ts && bun run bench/storage-stream.bench.ts",
+    "bench": "bun run bench/verify.bench.ts && bun run bench/reporting.bench.ts && bun run bench/queue.bench.ts && bun run bench/internal.bench.ts && bun run bench/stores.bench.ts && bun run bench/redact.bench.ts && bun run bench/storage-stream.bench.ts && bun run bench/tts.bench.ts",
     "test:integration": "QUEUE_TEST_ENDPOINT=http://127.0.0.1:9324 STORAGE_TEST_ENDPOINT=http://127.0.0.1:9090 bun test ./src/queue/aws.integration.ts ./src/storage/aws.integration.ts"
   },
   "devDependencies": {

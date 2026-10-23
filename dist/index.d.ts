@@ -2641,6 +2641,182 @@ declare function checkTranscriptionResult(result: unknown, context?: ResultConte
 * usually better.
 */
 declare function waitForTranscription(transcriber: Transcriber, organizationId: string, clientReference: string, options?: WaitOptions): Promise<TranscriptionResult | undefined>;
+/**
+* One piece of synthesised speech, in order. The audio is held in a private field, so it is not in
+* `JSON.stringify`, a spread, `String()`, a log line or a console dump; only the sequence number
+* and the byte count are. Read the bytes with {@link TtsAudioChunk.audio}.
+*/
+declare class TtsAudioChunk {
+	private;
+	/** The position in the stream, from 0, rising by 1 with no gaps. */
+	readonly sequence: number;
+	/** The size of the audio in bytes. */
+	readonly byteLength: number;
+	constructor(sequence: number, audio: Uint8Array);
+	/** The audio bytes in the format the stream was opened with; not copied, so do not change them. */
+	get audio(): Uint8Array;
+	/** The metadata, for `JSON.stringify`. */
+	toJSON(): {
+		sequence: number;
+		byteLength: number;
+	};
+	/** A readable label without the audio. */
+	toString(): string;
+}
+/** The `area.reason` codes the text-to-speech port and adapters throw. */
+declare const TTS_ERROR_CODES: {
+	/** The Organization id, voice, format, limits, text or retry policy are not acceptable. Nothing was sent to the vendor. */
+	readonly invalidRequest: "tts.invalid_request";
+	/** The text written to one stream passed its maximum length. The text was not taken. */
+	readonly textTooLarge: "tts.text_too_large";
+	/** The stream was used after it was finished, cancelled or closed. */
+	readonly closed: "tts.closed";
+	/** The overall deadline or the time to the first chunk passed; the underlying request was aborted. */
+	readonly timeout: "tts.timeout";
+	/** The caller's own AbortSignal fired; the underlying request was aborted. */
+	readonly aborted: "tts.aborted";
+	/** The vendor refused for a reason a retry cannot fix (credentials, quota, terms, an unknown voice). */
+	readonly rejected: "tts.rejected";
+	/** The vendor could not be reached, was throttled or failed. Retried only before the first chunk. */
+	readonly unavailable: "tts.unavailable";
+	/** The vendor sent something this adapter cannot use. */
+	readonly badResponse: "tts.bad_response";
+};
+/** One of {@link TTS_ERROR_CODES}'s values. */
+type TtsErrorCode = (typeof TTS_ERROR_CODES)[keyof typeof TTS_ERROR_CODES];
+/**
+* What a text-to-speech adapter throws. Its message and details never hold the text, audio, a
+* credential or a vendor URL; they describe fields, counts and codes only.
+*/
+declare class TtsError extends AppError {
+	readonly code: TtsErrorCode;
+	constructor(code: TtsErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+import { OrganizationId as OrganizationId8 } from "tula-closeline-contract";
+/** The default overall deadline of one stream, from `open` to the last chunk, in milliseconds. */
+declare const DEFAULT_TTS_TIMEOUT_MS = 3e4;
+/** The longest overall deadline a caller may allow, in milliseconds. */
+declare const MAX_TTS_TIMEOUT_MS = 12e4;
+/** The default time from the first text to the first audio chunk, in milliseconds. */
+declare const DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS = 2e3;
+/** The longest time to the first chunk a caller may allow, in milliseconds. */
+declare const MAX_TTS_FIRST_CHUNK_TIMEOUT_MS = 3e4;
+/** The default most characters one stream may be given in all. */
+declare const DEFAULT_TTS_MAX_TEXT_CHARS = 5e3;
+/** The largest text length a caller may allow one stream. */
+declare const MAX_TTS_MAX_TEXT_CHARS = 2e4;
+/** The most bytes one {@link TtsAudioChunk} may hold. */
+declare const MAX_TTS_AUDIO_CHUNK_BYTES = 65536;
+/** How an adapter retries a retryable vendor error (`tts.unavailable`) before the first chunk. */
+interface TtsRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 1. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 50. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 250. */
+	maxDelayMs?: number;
+}
+/** The retry policy with its defaults filled in. */
+interface ResolvedTtsRetryPolicy {
+	/** The most retries after the first attempt. */
+	maxRetries: number;
+	/** The base pause, in ms. */
+	baseDelayMs: number;
+	/** The longest pause before jitter, in ms. */
+	maxDelayMs: number;
+}
+/** The policy used when a request names none: one retry after 50 ms (a live call cannot wait long). */
+declare const DEFAULT_TTS_RETRY_POLICY: ResolvedTtsRetryPolicy;
+/**
+* The pause before retry `retry` (from 1): the base doubled each time up to the maximum, then
+* scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
+*/
+declare function ttsRetryDelayMs(retry: number, policy: ResolvedTtsRetryPolicy, random?: () => number): number;
+/** What opening a stream states: whose it is, the voice and format, and the limits that bound it. */
+interface TtsOpenRequest {
+	/** The Organization the stream is for; it scopes metering and error context. */
+	organizationId: OrganizationId8;
+	/** A stock voice style of the vendor, 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. Voice cloning is out of scope. */
+	voice: string;
+	/** How the audio is encoded: `pcm_mulaw` for telephony, `pcm_s16le` otherwise. */
+	encoding: AudioEncoding;
+	/** The sample rate of the audio, in Hz. */
+	sampleRate: SampleRate;
+	/**
+	* The most time the whole stream may take from `open`, retries included, in ms, 1 to
+	* {@link MAX_TTS_TIMEOUT_MS}; default {@link DEFAULT_TTS_TIMEOUT_MS}. When it passes, the vendor
+	* request is aborted and iteration fails with `tts.timeout`.
+	*/
+	timeoutMs?: number;
+	/**
+	* The most time from the first text being written (and the stream being read) to the first
+	* chunk, per attempt, in ms, 1 to {@link MAX_TTS_FIRST_CHUNK_TIMEOUT_MS}; default
+	* {@link DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS}. When it passes, iteration fails with `tts.timeout`.
+	*/
+	firstChunkTimeoutMs?: number;
+	/**
+	* The most characters all `write` calls of this stream may add up to, 1 to
+	* {@link MAX_TTS_MAX_TEXT_CHARS}; default {@link DEFAULT_TTS_MAX_TEXT_CHARS}. A write that would
+	* pass it fails with `tts.text_too_large` and adds nothing.
+	*/
+	maxTextChars?: number;
+	/** Retries of `tts.unavailable` before the first chunk; the defaults when absent. */
+	retry?: TtsRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and iteration fails with `tts.aborted`. */
+	signal?: AbortSignal;
+}
+/**
+* One text-to-speech request in flight: text goes in with {@link TtsStream.write}, audio chunks
+* come out in order by iterating the stream. Iterate it once.
+*
+* The consumer pulls: the next chunk is produced only when the loop asks for it, so a slow
+* consumer holds at most one chunk and the text it was given (bounded by `maxTextChars`), never a
+* growing queue. Leaving the loop early (`break`) cancels the stream.
+*/
+interface TtsStream extends AsyncIterable<TtsAudioChunk> {
+	/**
+	* Adds text to speak, in order. Empty text is ignored. Throws `tts.text_too_large` when the
+	* stream's total would pass its maximum, `tts.closed` after `finish`, `cancel` or `close`, and
+	* `tts.timeout` or `tts.aborted` once the deadline or the caller's signal has fired. Synchronous
+	* and O(text length); it never waits for the vendor.
+	*/
+	write(text: string): void;
+	/** Says no more text is coming, so the stream ends after the last chunk. Idempotent. */
+	finish(): void;
+	/**
+	* Stops now: the vendor request is aborted, no further chunk is delivered (a pending read ends
+	* as done) and unspoken text is dropped. Idempotent, and a no-op once the stream has ended or
+	* is closed. This is barge-in.
+	*/
+	cancel(): void;
+	/**
+	* Cancels and releases everything the stream holds (timer, listeners, buffered text, the vendor
+	* connection). Idempotent. Any later `write`, `finish` or read fails with `tts.closed`.
+	*/
+	close(): Promise<void>;
+}
+/**
+* A text-to-speech engine behind a vendor (Cartesia Sonic first, stock voice styles only). It is
+* on the live call path, so it is built for latency: text streams in as the model writes it and
+* audio streams out as the vendor makes it.
+*
+* Every stream has an overall deadline and a time-to-first-chunk limit that abort the vendor
+* request. A retryable vendor error (`tts.unavailable`) is retried with a bounded, jittered pause
+* only before the first chunk has been delivered; once a chunk is out the failure is thrown from
+* the iteration, never retried, so the listener never hears a repeat. Failures are `TtsError`s
+* with `tts.*` codes; `tts.unavailable`, `tts.rejected` and `tts.bad_response` are also given to
+* the ErrorReporter (metadata only).
+*
+* The text and the audio are tenant data: they are never logged, reported or put in an error, and
+* do not appear in the string, JSON or inspect form of any object the port returns.
+*/
+interface TtsPort {
+	/** Opens a stream. An unacceptable request throws `tts.invalid_request` here; nothing is sent to the vendor until text is written. */
+	open(request: TtsOpenRequest): TtsStream;
+}
 /** The `area.reason` codes the vector store port and adapters throw. */
 declare const VECTOR_ERROR_CODES: {
 	/** An Organization id, vector id, attribute, filter, batch or `topK` is not acceptable. */
@@ -2773,4 +2949,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };
+export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };

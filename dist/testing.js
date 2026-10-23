@@ -36,6 +36,16 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
+  TtsAudioChunk2,
+  DEFAULT_TTS_TIMEOUT_MS2,
+  MAX_TTS_TIMEOUT_MS2,
+  DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2,
+  MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2,
+  DEFAULT_TTS_MAX_TEXT_CHARS2,
+  MAX_TTS_MAX_TEXT_CHARS2,
+  MAX_TTS_AUDIO_CHUNK_BYTES2,
+  DEFAULT_TTS_RETRY_POLICY2,
+  ttsRetryDelayMs2,
   VECTOR_ERROR_CODES2,
   VectorError2,
   MAX_UPSERT_BATCH2,
@@ -44,7 +54,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-t8q2xehd.js";
+} from "./shared/chunk-fg37gjeb.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -69,8 +79,10 @@ import {
   DEFAULT_TRANSCRIBER_LIST_LIMIT2,
   MAX_TRANSCRIBER_LIST_LIMIT2,
   MAX_VENDOR_ID_LENGTH2,
-  checkTranscriptionResult2
-} from "./shared/chunk-w4kmnw1c.js";
+  checkTranscriptionResult2,
+  TTS_ERROR_CODES2,
+  TtsError2
+} from "./shared/chunk-0dy266jn.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -2444,6 +2456,462 @@ function createMemoryTranscriber(options = {}) {
     }
   };
 }
+// src/tts/deadline.ts
+function startTtsDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new TtsError2(TTS_ERROR_CODES2.timeout, "The stream took too long", {
+          details: { phase: "overall", timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new TtsError2(TTS_ERROR_CODES2.aborted, "The stream was cancelled");
+      }
+    },
+    cancel() {
+      controller.abort();
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+function watchFirstChunk(signals, firstChunkTimeoutMs) {
+  const own = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    own.abort();
+  }, firstChunkTimeoutMs);
+  return {
+    signal: AbortSignal.any([own.signal, ...signals]),
+    check() {
+      if (timedOut) {
+        throw new TtsError2(TTS_ERROR_CODES2.timeout, "The first audio chunk took too long", {
+          details: { phase: "first_chunk", firstChunkTimeoutMs }
+        });
+      }
+    },
+    stop() {
+      clearTimeout(timer);
+    }
+  };
+}
+function isRetryableTtsError(error) {
+  return error instanceof TtsError2 && error.code === TTS_ERROR_CODES2.unavailable;
+}
+async function withTtsRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableTtsError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const delayMs = ttsRetryDelayMs2(n, options.policy, options.random);
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/tts/validate.ts
+import { organizationIdSchema as organizationIdSchema4 } from "tula-closeline-contract";
+var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
+var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
+var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
+function invalid5(what) {
+  throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn4(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function resolveTtsRetryPolicy(policy) {
+  if (policy !== undefined && (typeof policy !== "object" || policy === null)) {
+    invalid5("retry");
+  }
+  const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn4(maxRetries, 0, 5)) {
+    invalid5("retry.maxRetries");
+  }
+  if (!integerIn4(baseDelayMs, 1, 60000)) {
+    invalid5("retry.baseDelayMs");
+  }
+  if (!integerIn4(maxDelayMs, baseDelayMs, 60000)) {
+    invalid5("retry.maxDelayMs");
+  }
+  return { maxRetries, baseDelayMs, maxDelayMs };
+}
+function checkOpenRequest2(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid5("request");
+  }
+  if (!organizationIdSchema4.safeParse(request.organizationId).success) {
+    invalid5("organizationId");
+  }
+  if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
+    invalid5("voice");
+  }
+  if (!ENCODINGS2.includes(request.encoding)) {
+    invalid5("encoding");
+  }
+  if (!SAMPLE_RATES2.includes(request.sampleRate)) {
+    invalid5("sampleRate");
+  }
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
+  if (!integerIn4(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
+    invalid5("timeoutMs");
+  }
+  const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
+  if (!integerIn4(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
+    invalid5("firstChunkTimeoutMs");
+  }
+  const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
+  if (!integerIn4(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
+    invalid5("maxTextChars");
+  }
+  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
+    invalid5("signal");
+  }
+  return {
+    timeoutMs,
+    firstChunkTimeoutMs,
+    maxTextChars,
+    retry: resolveTtsRetryPolicy(request.retry)
+  };
+}
+
+// src/tts/memory.ts
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+
+class MemoryTtsStream {
+  #host;
+  #deadline;
+  #state = "open";
+  #chars = 0;
+  #wake;
+  #iterator;
+  constructor(host) {
+    this.#host = host;
+    this.#deadline = startTtsDeadline(host.checked.timeoutMs, host.request.signal);
+  }
+  write(text) {
+    this.#assertOpen();
+    this.#deadline.check();
+    if (typeof text !== "string") {
+      invalid5("text");
+    }
+    if (text.length === 0) {
+      return;
+    }
+    const max = this.#host.checked.maxTextChars;
+    if (this.#chars + text.length > max) {
+      throw new TtsError2(TTS_ERROR_CODES2.textTooLarge, "The text is over the length limit", {
+        details: { maxTextChars: max }
+      });
+    }
+    this.#chars += text.length;
+    this.#wake?.();
+  }
+  finish() {
+    if (this.#state === "closed") {
+      throw closedError("The stream is closed");
+    }
+    if (this.#state !== "open") {
+      return;
+    }
+    this.#state = "finished";
+    this.#wake?.();
+  }
+  cancel() {
+    if (this.#state === "closed" || this.#state === "cancelled") {
+      return;
+    }
+    this.#state = "cancelled";
+    this.#deadline.cancel();
+    this.#deadline.stop();
+    this.#wake?.();
+  }
+  async close() {
+    if (this.#state === "closed") {
+      return;
+    }
+    this.#state = "closed";
+    this.#deadline.cancel();
+    this.#deadline.stop();
+    this.#wake?.();
+    this.#host.released();
+  }
+  [Symbol.asyncIterator]() {
+    if (this.#iterator === undefined) {
+      const inner = this.#produce();
+      const self = this;
+      this.#iterator = {
+        next() {
+          if (self.#state === "closed") {
+            return Promise.reject(closedError("The stream is closed"));
+          }
+          return inner.next();
+        },
+        return() {
+          self.cancel();
+          return inner.return(undefined);
+        }
+      };
+    }
+    return this.#iterator;
+  }
+  toJSON() {
+    return { state: this.#state, chars: this.#chars };
+  }
+  toString() {
+    return `MemoryTtsStream(${this.#state}, ${this.#chars} chars)`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+  #assertOpen() {
+    if (this.#state === "closed") {
+      throw closedError("The stream is closed");
+    }
+    if (this.#state === "cancelled") {
+      throw closedError("The stream was cancelled");
+    }
+    if (this.#state === "ended") {
+      throw closedError("The stream has ended");
+    }
+    if (this.#state === "finished") {
+      throw closedError("The stream was finished");
+    }
+  }
+  #stopped() {
+    return this.#state === "cancelled" || this.#state === "closed";
+  }
+  async#waitUntil(ready) {
+    while (!ready() && !this.#stopped()) {
+      this.#deadline.check();
+      await new Promise((resolve) => {
+        const done = () => {
+          this.#deadline.signal.removeEventListener("abort", done);
+          resolve();
+        };
+        this.#wake = done;
+        this.#deadline.signal.addEventListener("abort", done, { once: true });
+      });
+      this.#wake = undefined;
+    }
+  }
+  async* #produce() {
+    const host = this.#host;
+    const deadline = this.#deadline;
+    let entry;
+    try {
+      await this.#waitUntil(() => this.#chars > 0 || this.#state === "finished");
+      if (this.#stopped()) {
+        return;
+      }
+      deadline.check();
+      if (this.#chars === 0) {
+        return;
+      }
+      const started = await withTtsRetry(async () => {
+        const attempt = host.vendorRequest(this.#chars);
+        entry = attempt.entry;
+        const watch = watchFirstChunk([deadline.signal], host.checked.firstChunkTimeoutMs);
+        deadline.signal.addEventListener("abort", () => markAborted(attempt.entry), {
+          once: true
+        });
+        try {
+          if (attempt.speech.hang) {
+            await new Promise((resolve) => watch.signal.addEventListener("abort", () => resolve(), { once: true }));
+          } else if ((attempt.speech.firstChunkDelayMs ?? 0) > 0) {
+            await host.sleep(attempt.speech.firstChunkDelayMs ?? 0, watch.signal);
+          }
+          if (this.#stopped()) {
+            return;
+          }
+          deadline.check();
+          watch.check();
+          return attempt;
+        } catch (error) {
+          if (error instanceof TtsError2 && (error.code === TTS_ERROR_CODES2.timeout || error.code === TTS_ERROR_CODES2.aborted)) {
+            markAborted(attempt.entry);
+          } else if (attempt.entry.view.outcome === "pending") {
+            attempt.entry.view.outcome = "failed";
+          }
+          throw error;
+        } finally {
+          watch.stop();
+        }
+      }, {
+        policy: host.checked.retry,
+        deadline,
+        sleep: host.sleep,
+        ...host.options.random === undefined ? {} : { random: host.options.random },
+        onRetry: (retry, delayMs) => host.options.logger?.warn("A speech request is retrying", {
+          voice: host.request.voice,
+          retry,
+          delayMs
+        })
+      });
+      if (started === undefined || this.#stopped()) {
+        return;
+      }
+      const { speech } = started;
+      const chunks = speech.chunks;
+      for (let i = 0;i < chunks.length; i++) {
+        if (i > 0) {
+          if (speech.failAfterChunks === i) {
+            throw new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor stream broke");
+          }
+          if ((speech.chunkDelayMs ?? 0) > 0) {
+            await host.sleep(speech.chunkDelayMs ?? 0, deadline.signal);
+          }
+          if (this.#stopped()) {
+            return;
+          }
+          deadline.check();
+        }
+        yield new TtsAudioChunk2(i, chunks[i]);
+        if (this.#stopped()) {
+          return;
+        }
+      }
+      if (speech.failAfterChunks === chunks.length) {
+        throw new TtsError2(TTS_ERROR_CODES2.unavailable, "The vendor stream broke");
+      }
+      started.entry.view.outcome = "ok";
+      await this.#waitUntil(() => this.#state === "finished");
+      deadline.check();
+    } catch (error) {
+      if (this.#stopped()) {
+        return;
+      }
+      if (entry?.view.outcome === "pending") {
+        entry.view.outcome = "failed";
+      }
+      host.report(error);
+      throw error;
+    } finally {
+      if (this.#state === "open" || this.#state === "finished") {
+        this.#state = "ended";
+      }
+      deadline.stop();
+      this.#chars = 0;
+    }
+  }
+}
+function closedError(message) {
+  return new TtsError2(TTS_ERROR_CODES2.closed, message);
+}
+function markAborted(entry) {
+  if (entry.view.outcome === "pending") {
+    entry.view.aborted = true;
+    entry.view.outcome = "aborted";
+  }
+}
+function createMemoryTts(options = {}) {
+  const sleep = options.sleep ?? systemSleep2;
+  const scripts = [];
+  const failures = [];
+  const requests = [];
+  let open = 0;
+  return {
+    open(request) {
+      const checked = checkOpenRequest2(request);
+      open += 1;
+      let released = false;
+      return new MemoryTtsStream({
+        options,
+        sleep,
+        request,
+        checked,
+        vendorRequest(chars) {
+          const entry = {
+            view: {
+              organizationId: request.organizationId,
+              voice: request.voice,
+              chars,
+              aborted: false,
+              outcome: "pending"
+            }
+          };
+          requests.push(entry);
+          const code = failures.shift();
+          if (code !== undefined) {
+            entry.view.outcome = "failed";
+            throw new TtsError2(code, "The vendor failed");
+          }
+          const speech = scripts.shift();
+          if (speech === undefined) {
+            entry.view.outcome = "failed";
+            throw new TtsError2(TTS_ERROR_CODES2.badResponse, "The vendor sent nothing usable");
+          }
+          return { speech, entry };
+        },
+        report(error) {
+          if (!(error instanceof TtsError2) || error.code !== TTS_ERROR_CODES2.unavailable && error.code !== TTS_ERROR_CODES2.rejected && error.code !== TTS_ERROR_CODES2.badResponse) {
+            return;
+          }
+          try {
+            options.reporter?.capture(error, {
+              organizationId: request.organizationId,
+              tags: { feature: "tts" }
+            });
+          } catch {}
+        },
+        released() {
+          if (!released) {
+            released = true;
+            open -= 1;
+          }
+        }
+      });
+    },
+    speak(speech) {
+      const scripted = Array.isArray(speech) ? { chunks: speech } : speech;
+      if (typeof scripted !== "object" || scripted === null || !Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
+        invalid5("speech chunks");
+      }
+      const failAfter = scripted.failAfterChunks;
+      if (failAfter !== undefined && (!Number.isInteger(failAfter) || failAfter < 1 || failAfter > scripted.chunks.length)) {
+        invalid5("speech failAfterChunks");
+      }
+      scripts.push({ ...scripted });
+    },
+    failNext(code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        failures.push(code);
+      }
+    },
+    requests() {
+      return requests.map((entry) => ({ ...entry.view }));
+    },
+    openStreams() {
+      return open;
+    }
+  };
+}
 // src/vector/validate.ts
 var VECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 var ATTRIBUTE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
@@ -2731,6 +3199,7 @@ export {
   createMemoryStreamingTranscribe,
   createMemoryTelephony,
   createMemoryTranscriber,
+  createMemoryTts,
   createMemoryVectorStore,
   createTestDeps,
   createTestJwks,

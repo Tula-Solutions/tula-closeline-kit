@@ -6,8 +6,10 @@ import {
   LLM_ERROR_CODES2,
   LlmError2,
   MAX_WEBHOOK_BODY_BYTES2,
-  checkTranscriptionResult2
-} from "./shared/chunk-w4kmnw1c.js";
+  checkTranscriptionResult2,
+  TTS_ERROR_CODES2,
+  TtsError2
+} from "./shared/chunk-0dy266jn.js";
 import {
   MAX_MESSAGE_BYTES2
 } from "./shared/chunk-mjkmsg3r.js";
@@ -3108,13 +3110,379 @@ function transcriberBehaviour(name, make, skip = false) {
     });
   });
 }
-// src/vector/behaviour.ts
+// src/tts/behaviour.ts
 import { afterEach as afterEach10, describe as describe10, expect as expect10, test as test10 } from "bun:test";
-function vectorStoreBehaviour(name, make, skip = false) {
+import { inspect as inspect2 } from "node:util";
+var SECRET_TEXT2 = "zebra confidential pricing";
+var SECRET_AUDIO = "AUDIO-MARKER-PAYLOAD";
+var retry = { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 2 };
+function audio2(n, marker = "piece") {
+  return new TextEncoder().encode(`${marker}-${n}`);
+}
+async function collect(stream) {
+  const out = [];
+  for await (const chunk of stream) {
+    out.push(chunk);
+  }
+  return out;
+}
+async function codeOf(run) {
+  try {
+    await run();
+  } catch (error) {
+    if (error instanceof TtsError2) {
+      return error.code;
+    }
+    throw error;
+  }
+  return "no error";
+}
+function ttsBehaviour(name, make, skip = false) {
   const run = skip ? describe10.skip : describe10;
+  run(`TTS behaviour: ${name}`, () => {
+    const made = [];
+    afterEach10(async () => {
+      await Promise.all(made.splice(0).map((subject) => subject.close()));
+    });
+    async function subject() {
+      const next = await make();
+      made.push(next);
+      return next;
+    }
+    function open(s, overrides = {}) {
+      return s.port.open({
+        organizationId: s.organizations.a,
+        voice: s.voice,
+        encoding: "pcm_s16le",
+        sampleRate: 24000,
+        retry,
+        ...overrides
+      });
+    }
+    test10("chunks come out in order, with their sequence, as text goes in", async () => {
+      const s = await subject();
+      const pieces = [audio2(0), audio2(1), audio2(2)];
+      s.speak(pieces);
+      const stream = open(s);
+      stream.write("Hello, ");
+      stream.write("this is a call.");
+      const reading = collect(stream);
+      stream.write(" One more sentence.");
+      stream.finish();
+      const chunks = await reading;
+      expect10(chunks.map((c) => c.sequence)).toEqual([0, 1, 2]);
+      expect10(chunks.map((c) => [...c.audio])).toEqual(pieces.map((p) => [...p]));
+      expect10(chunks.map((c) => c.byteLength)).toEqual(pieces.map((p) => p.byteLength));
+      expect10(s.vendorRequests()).toBe(1);
+    });
+    test10("a stream finished without text ends empty and sends nothing to the vendor", async () => {
+      const s = await subject();
+      const stream = open(s);
+      stream.write("");
+      stream.finish();
+      expect10(await collect(stream)).toEqual([]);
+      expect10(s.vendorRequests()).toBe(0);
+    });
+    test10("finish is idempotent and a write after it fails with tts.closed", async () => {
+      const s = await subject();
+      s.speak([audio2(0)]);
+      const stream = open(s);
+      stream.write("hi");
+      stream.finish();
+      stream.finish();
+      expect10(await codeOf(() => stream.write("more"))).toBe(TTS_ERROR_CODES2.closed);
+      expect10((await collect(stream)).length).toBe(1);
+    });
+    test10("a cancel mid-stream stops further chunks and can be repeated", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1), audio2(2), audio2(3), audio2(4)], { chunkDelayMs: 5 });
+      const stream = open(s);
+      stream.write("a long reply that the prospect interrupts");
+      const iterator = stream[Symbol.asyncIterator]();
+      expect10((await iterator.next()).value?.sequence).toBe(0);
+      expect10((await iterator.next()).value?.sequence).toBe(1);
+      stream.cancel();
+      stream.cancel();
+      expect10((await iterator.next()).done).toBe(true);
+      expect10((await iterator.next()).done).toBe(true);
+      expect10(s.abortedRequests()).toBe(1);
+      expect10(await codeOf(() => stream.write("more"))).toBe(TTS_ERROR_CODES2.closed);
+      stream.finish();
+      await stream.close();
+    });
+    test10("a read pending at cancel ends as done", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1)], { chunkDelayMs: 5000 });
+      const stream = open(s);
+      stream.write("hello");
+      const iterator = stream[Symbol.asyncIterator]();
+      expect10((await iterator.next()).done).toBe(false);
+      const pending = iterator.next();
+      stream.cancel();
+      expect10((await pending).done).toBe(true);
+    });
+    test10("a cancel before any text sends nothing to the vendor", async () => {
+      const s = await subject();
+      const stream = open(s);
+      const reading = collect(stream);
+      stream.cancel();
+      expect10(await reading).toEqual([]);
+      expect10(s.vendorRequests()).toBe(0);
+    });
+    test10("leaving the loop early cancels the stream", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1), audio2(2)], { chunkDelayMs: 5 });
+      const stream = open(s);
+      stream.write("hello");
+      for await (const chunk of stream) {
+        expect10(chunk.sequence).toBe(0);
+        break;
+      }
+      expect10(s.abortedRequests()).toBe(1);
+      expect10(await codeOf(() => stream.write("more"))).toBe(TTS_ERROR_CODES2.closed);
+    });
+    test10("a vendor error before the first chunk is retried and no audio repeats", async () => {
+      const s = await subject();
+      s.failNext("retryable", 1);
+      s.speak([audio2(0), audio2(1)]);
+      const stream = open(s);
+      stream.write("hello");
+      stream.finish();
+      const chunks = await collect(stream);
+      expect10(chunks.map((c) => c.sequence)).toEqual([0, 1]);
+      expect10(s.vendorRequests()).toBe(2);
+    });
+    test10("retries are bounded: tts.unavailable after the policy, reported without text", async () => {
+      const s = await subject();
+      s.failNext("retryable", 5);
+      const stream = open(s, { retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 2 } });
+      stream.write(SECRET_TEXT2);
+      stream.finish();
+      expect10(await codeOf(() => collect(stream))).toBe(TTS_ERROR_CODES2.unavailable);
+      expect10(s.vendorRequests()).toBe(3);
+      expect10(JSON.stringify(s.reporter.captured)).not.toContain(SECRET_TEXT2);
+      expect10(s.reporter.captured.length).toBeGreaterThan(0);
+    });
+    test10("a refusal is tts.rejected and is not retried", async () => {
+      const s = await subject();
+      s.failNext("fatal", 1);
+      const stream = open(s);
+      stream.write("hello");
+      stream.finish();
+      expect10(await codeOf(() => collect(stream))).toBe(TTS_ERROR_CODES2.rejected);
+      expect10(s.vendorRequests()).toBe(1);
+    });
+    test10("a vendor error after the first chunk is thrown, never retried, never repeated", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1), audio2(2)], { failAfterChunks: 2 });
+      s.speak([audio2(7), audio2(8)]);
+      const stream = open(s);
+      stream.write("hello");
+      stream.finish();
+      const heard = [];
+      let code = "no error";
+      try {
+        for await (const chunk of stream) {
+          heard.push(chunk.sequence);
+        }
+      } catch (error) {
+        code = error instanceof TtsError2 ? error.code : String(error);
+      }
+      expect10(heard).toEqual([0, 1]);
+      expect10(code).toBe(TTS_ERROR_CODES2.unavailable);
+      expect10(s.vendorRequests()).toBe(1);
+    });
+    test10("text over the limit is tts.text_too_large and adds nothing", async () => {
+      const s = await subject();
+      s.speak([audio2(0)]);
+      const stream = open(s, { maxTextChars: 10 });
+      stream.write("12345");
+      expect10(await codeOf(() => stream.write("678901"))).toBe(TTS_ERROR_CODES2.textTooLarge);
+      stream.write("67890");
+      expect10(await codeOf(() => stream.write("1"))).toBe(TTS_ERROR_CODES2.textTooLarge);
+      stream.finish();
+      expect10((await collect(stream)).length).toBe(1);
+    });
+    test10("a first chunk that never comes is tts.timeout and aborts the vendor request", async () => {
+      const s = await subject();
+      s.hang();
+      const stream = open(s, { firstChunkTimeoutMs: 30 });
+      stream.write("hello");
+      let error;
+      try {
+        await collect(stream);
+      } catch (caught) {
+        error = caught;
+      }
+      expect10(error).toBeInstanceOf(TtsError2);
+      expect10(error.code).toBe(TTS_ERROR_CODES2.timeout);
+      expect10(error.details).toMatchObject({ phase: "first_chunk" });
+      expect10(s.abortedRequests()).toBe(1);
+    });
+    test10("the overall deadline is tts.timeout and aborts the vendor request", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1), audio2(2)], { chunkDelayMs: 500 });
+      const stream = open(s, { timeoutMs: 60 });
+      stream.write("hello");
+      let error;
+      try {
+        await collect(stream);
+      } catch (caught) {
+        error = caught;
+      }
+      expect10(error.code).toBe(TTS_ERROR_CODES2.timeout);
+      expect10(error.details).toMatchObject({ phase: "overall" });
+      expect10(s.abortedRequests()).toBe(1);
+    });
+    test10("the caller's signal is tts.aborted and aborts the vendor request", async () => {
+      const s = await subject();
+      s.speak([audio2(0), audio2(1)], { chunkDelayMs: 500 });
+      const controller = new AbortController;
+      const stream = open(s, { signal: controller.signal });
+      stream.write("hello");
+      const iterator = stream[Symbol.asyncIterator]();
+      await iterator.next();
+      const pending = iterator.next();
+      controller.abort();
+      expect10(await codeOf(() => pending)).toBe(TTS_ERROR_CODES2.aborted);
+      expect10(s.abortedRequests()).toBe(1);
+    });
+    test10("a signal that already fired sends nothing to the vendor", async () => {
+      const s = await subject();
+      const stream = open(s, { signal: AbortSignal.abort() });
+      expect10(await codeOf(() => stream.write("hello"))).toBe(TTS_ERROR_CODES2.aborted);
+      expect10(await codeOf(() => collect(stream))).toBe(TTS_ERROR_CODES2.aborted);
+      expect10(s.vendorRequests()).toBe(0);
+    });
+    test10("close releases the stream, aborts a pending request and is idempotent", async () => {
+      const s = await subject();
+      s.hang();
+      const before = s.openStreams();
+      const stream = open(s, { firstChunkTimeoutMs: 1e4 });
+      expect10(s.openStreams()).toBe(before + 1);
+      stream.write("hello");
+      const reading = collect(stream);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await stream.close();
+      await stream.close();
+      expect10(await reading).toEqual([]);
+      expect10(s.openStreams()).toBe(before);
+      expect10(s.abortedRequests()).toBe(1);
+    });
+    test10("using a closed stream fails clearly with tts.closed", async () => {
+      const s = await subject();
+      const stream = open(s);
+      await stream.close();
+      expect10(await codeOf(() => stream.write("hello"))).toBe(TTS_ERROR_CODES2.closed);
+      expect10(await codeOf(() => stream.finish())).toBe(TTS_ERROR_CODES2.closed);
+      expect10(await codeOf(() => collect(stream))).toBe(TTS_ERROR_CODES2.closed);
+      stream.cancel();
+      expect10(s.vendorRequests()).toBe(0);
+    });
+    describe10("a bad request is tts.invalid_request and nothing reaches the vendor", () => {
+      const cases = [
+        ["organizationId", () => ({ organizationId: "nope" })],
+        ["voice (empty)", () => ({ voice: "" })],
+        ["voice (characters)", () => ({ voice: "a b/c" })],
+        ["encoding", () => ({ encoding: "mp3" })],
+        ["sampleRate", () => ({ sampleRate: 44100 })],
+        ["timeoutMs (zero)", () => ({ timeoutMs: 0 })],
+        ["timeoutMs (huge)", () => ({ timeoutMs: 10 ** 9 })],
+        ["firstChunkTimeoutMs", () => ({ firstChunkTimeoutMs: 1.5 })],
+        ["maxTextChars (zero)", () => ({ maxTextChars: 0 })],
+        ["maxTextChars (huge)", () => ({ maxTextChars: 10 ** 9 })],
+        ["retry.maxRetries", () => ({ retry: { maxRetries: 99 } })],
+        ["retry that is not an object", () => ({ retry: 5 })],
+        ["retry.maxDelayMs below base", () => ({ retry: { baseDelayMs: 10, maxDelayMs: 5 } })],
+        ["signal", () => ({ signal: {} })]
+      ];
+      test10.each(cases)("%s", async (_name, overrides) => {
+        const s = await subject();
+        const before = s.openStreams();
+        expect10(await codeOf(() => open(s, overrides(s)))).toBe(TTS_ERROR_CODES2.invalidRequest);
+        expect10(s.vendorRequests()).toBe(0);
+        expect10(s.openStreams()).toBe(before);
+      });
+      test10("text that is not a string", async () => {
+        const s = await subject();
+        const stream = open(s);
+        expect10(await codeOf(() => stream.write(42))).toBe(TTS_ERROR_CODES2.invalidRequest);
+        await stream.close();
+      });
+    });
+    test10("neither the text nor the audio reaches a log, a report, an error or any printed form", async () => {
+      const s = await subject();
+      const marked = [audio2(0, SECRET_AUDIO), audio2(1, SECRET_AUDIO)];
+      const base64 = marked.map((m) => Buffer.from(m).toString("base64"));
+      const forms = [];
+      const record = (value) => {
+        forms.push(String(value), inspect2(value, { depth: 6 }));
+        try {
+          forms.push(JSON.stringify(value) ?? "");
+        } catch {}
+      };
+      s.failNext("retryable", 1);
+      s.speak(marked);
+      const stream = open(s);
+      record(stream);
+      stream.write(SECRET_TEXT2);
+      stream.write(` ${SECRET_TEXT2}`);
+      stream.finish();
+      record(stream);
+      for await (const chunk of stream) {
+        record(chunk);
+        record({ chunk });
+        record([chunk]);
+        record({ ...chunk });
+        expect10(Buffer.from(chunk.audio).toString()).toContain(SECRET_AUDIO);
+      }
+      s.failNext("fatal", 1);
+      const failing = open(s, { maxTextChars: 40 });
+      failing.write(SECRET_TEXT2);
+      try {
+        await collect(failing);
+      } catch (error) {
+        record(error);
+        forms.push(error.message);
+        forms.push(JSON.stringify(error.details ?? {}));
+      }
+      try {
+        failing.write(`${SECRET_TEXT2} ${SECRET_TEXT2}`);
+      } catch (error) {
+        record(error);
+        forms.push(error.message);
+      }
+      s.speak(marked, { failAfterChunks: 1 });
+      const breaking = open(s);
+      breaking.write(SECRET_TEXT2);
+      try {
+        await collect(breaking);
+      } catch (error) {
+        record(error);
+      }
+      const everything = [
+        ...forms,
+        ...s.logs(),
+        JSON.stringify(s.reporter.captured),
+        inspect2(s.reporter.captured, { depth: 8 })
+      ].join(`
+`);
+      expect10(everything).not.toContain(SECRET_TEXT2);
+      expect10(everything).not.toContain(SECRET_AUDIO);
+      for (const encoded of base64) {
+        expect10(everything).not.toContain(encoded);
+      }
+      expect10(everything).not.toContain(`[${[...marked[0] ?? []].join(",")}`);
+    });
+  });
+}
+// src/vector/behaviour.ts
+import { afterEach as afterEach11, describe as describe11, expect as expect11, test as test11 } from "bun:test";
+function vectorStoreBehaviour(name, make, skip = false) {
+  const run = skip ? describe11.skip : describe11;
   run(`VectorStore behaviour: ${name}`, () => {
     const open = [];
-    afterEach10(async () => {
+    afterEach11(async () => {
       await Promise.all(open.splice(0).map((subject) => subject.close()));
     });
     async function subject() {
@@ -3137,64 +3505,64 @@ function vectorStoreBehaviour(name, make, skip = false) {
         { id: "z", vector: vec(s, 0, 0, 1) }
       ]);
     }
-    test10("a search returns the closest vectors first, with cosine scores and attributes", async () => {
+    test11("a search returns the closest vectors first, with cosine scores and attributes", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const hits = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 4 });
-      expect10(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
-      expect10(hits[0]?.score).toBeCloseTo(1, 4);
-      expect10(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
-      expect10(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
-      expect10(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
+      expect11(ids(hits).slice(0, 2)).toEqual(["x", "xy"]);
+      expect11(hits[0]?.score).toBeCloseTo(1, 4);
+      expect11(hits[1]?.score).toBeCloseTo(Math.SQRT1_2, 4);
+      expect11(hits[0]?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+      expect11(hits.find((hit) => hit.id === "z")?.attributes).toEqual({});
     });
-    test10("a score does not depend on the length of either vector", async () => {
+    test11("a score does not depend on the length of either vector", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "long", vector: vec(s, 50, 0, 0) }]);
       const [hit] = await s.store.search(a, { vector: vec(s, 0.001, 0, 0), topK: 1 });
-      expect10(hit?.id).toBe("long");
-      expect10(hit?.score).toBeCloseTo(1, 4);
+      expect11(hit?.id).toBe("long");
+      expect11(hit?.score).toBeCloseTo(1, 4);
     });
-    test10("topK bounds the results", async () => {
+    test11("topK bounds the results", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      expect10(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
-      expect10(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
-      expect10(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
+      expect11(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 2 })).toHaveLength(2);
+      expect11(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 100 })).toHaveLength(4);
+      expect11(await s.store.search(s.organizations.b, { vector: vec(s, 1), topK: 5 })).toEqual([]);
     });
-    test10.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
+    test11.each([[0], [-1], [101], [1.5], [Number.NaN], ["5"]])("a topK of %p is refused", async (topK) => {
       const s = await subject();
-      await expect10(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
+      await expect11(s.store.search(s.organizations.a, { vector: vec(s, 1), topK })).rejects.toMatchObject(invalid);
     });
-    test10("a filter keeps vectors whose attributes equal every entry", async () => {
+    test11("a filter keeps vectors whose attributes equal every entry", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       const search = async (filter) => ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10, filter })).sort();
-      expect10(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
-      expect10(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
-      expect10(await search({ final: true })).toEqual(["xy"]);
-      expect10(await search({ page: 1 })).toEqual(["x", "xy"]);
-      expect10(await search({ document_id: "nope" })).toEqual([]);
-      expect10(await search({ page: "1" })).toEqual([]);
+      expect11(await search({ document_id: "doc_1" })).toEqual(["x", "y"]);
+      expect11(await search({ document_id: "doc_1", page: 2 })).toEqual(["y"]);
+      expect11(await search({ final: true })).toEqual(["xy"]);
+      expect11(await search({ page: 1 })).toEqual(["x", "xy"]);
+      expect11(await search({ document_id: "nope" })).toEqual([]);
+      expect11(await search({ page: "1" })).toEqual([]);
     });
-    test10("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
+    test11("a vector of the wrong length is a non-retryable dimension error and writes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const code = { code: "vector.dimension_mismatch" };
       const short = Array.from({ length: s.store.dimensions - 1 }, () => 1);
       const long = Array.from({ length: s.store.dimensions + 1 }, () => 1);
-      await expect10(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
-      await expect10(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
-      await expect10(s.store.upsert(a, [
+      await expect11(s.store.search(a, { vector: short, topK: 1 })).rejects.toMatchObject(code);
+      await expect11(s.store.search(a, { vector: long, topK: 1 })).rejects.toMatchObject(code);
+      await expect11(s.store.upsert(a, [
         { id: "fine", vector: vec(s, 1) },
         { id: "short", vector: short }
       ])).rejects.toMatchObject(code);
-      expect10(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      expect11(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test10.each([
+    test11.each([
       ["NaN", (n) => Array.from({ length: n }, (_, i) => i === 0 ? Number.NaN : 1)],
       [
         "Infinity",
@@ -3213,10 +3581,10 @@ function vectorStoreBehaviour(name, make, skip = false) {
       const s = await subject();
       const { a } = s.organizations;
       const vector = build(s.store.dimensions);
-      await expect10(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
-      await expect10(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(a, [{ id: "v", vector }])).rejects.toMatchObject(invalid);
+      await expect11(s.store.search(a, { vector, topK: 1 })).rejects.toMatchObject(invalid);
     });
-    test10.each([
+    test11.each([
       ["an empty id", ""],
       ["a slash", "a/b"],
       ["a leading dot", ".x"],
@@ -3225,24 +3593,24 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("an id with %s is refused", async (_label, id) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect10(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect10(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(a, [{ id, vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect11(s.store.delete(a, [id])).rejects.toMatchObject(invalid);
     });
-    test10("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
+    test11("a batch of 0 or 501 records, or one with a repeated id, is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect10(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(a, [])).rejects.toMatchObject(invalid);
       const many = Array.from({ length: 501 }, (_, i) => ({ id: `v${i}`, vector: vec(s, 1) }));
-      await expect10(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
-      await expect10(s.store.upsert(a, [
+      await expect11(s.store.upsert(a, many)).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(a, [
         { id: "same", vector: vec(s, 1) },
         { id: "same", vector: vec(s, 0, 1) }
       ])).rejects.toMatchObject(invalid);
-      await expect10(s.store.delete(a, [])).rejects.toMatchObject(invalid);
-      await expect10(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
-      expect10(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+      await expect11(s.store.delete(a, [])).rejects.toMatchObject(invalid);
+      await expect11(s.store.delete(a, Array.from({ length: 501 }, (_, i) => `v${i}`))).rejects.toMatchObject(invalid);
+      expect11(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
     });
-    test10.each([
+    test11.each([
       ["the reserved name id", { id: "x" }],
       ["the reserved name vector", { vector: "x" }],
       ["a name starting with a dollar sign", { $dist: "x" }],
@@ -3259,11 +3627,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
     ])("attributes with %s are refused", async (_label, attributes) => {
       const s = await subject();
       const { a } = s.organizations;
-      await expect10(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
-      await expect10(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
-      await expect10(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes }])).rejects.toMatchObject(invalid);
+      await expect11(s.store.search(a, { vector: vec(s, 1), topK: 1, filter: attributes })).rejects.toMatchObject(invalid);
+      await expect11(s.store.deleteByFilter(a, attributes)).rejects.toMatchObject(invalid);
     });
-    test10("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
+    test11("storing an id again replaces its vector and attributes, and doing it twice changes nothing", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await s.store.upsert(a, [{ id: "v", vector: vec(s, 1), attributes: { n: 1 } }]);
@@ -3271,72 +3639,72 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.upsert(a, replacement);
       await s.store.upsert(a, replacement);
       const hits = await s.store.search(a, { vector: vec(s, 0, 1), topK: 10 });
-      expect10(ids(hits)).toEqual(["v"]);
-      expect10(hits[0]?.score).toBeCloseTo(1, 4);
-      expect10(hits[0]?.attributes).toEqual({ n: 2 });
+      expect11(ids(hits)).toEqual(["v"]);
+      expect11(hits[0]?.score).toBeCloseTo(1, 4);
+      expect11(hits[0]?.attributes).toEqual({ n: 2 });
     });
-    describe10("setAttributes", () => {
+    describe11("setAttributes", () => {
       const query = (s) => ({ vector: vec(s, 1, 1, 0), topK: 10 });
-      test10("merges the attributes, leaves the others and the vector as they were", async () => {
+      test11("merges the attributes, leaves the others and the vector as they were", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const before = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "xy"], { outcome: "won", seq: 2 });
         const after = await s.store.search(a, query(s));
-        expect10(missing).toEqual([]);
-        expect10(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
+        expect11(missing).toEqual([]);
+        expect11(after.map((hit) => [hit.id, hit.score])).toEqual(before.map((hit) => [hit.id, hit.score]));
         const byId = Object.fromEntries(after.map((hit) => [hit.id, hit.attributes]));
-        expect10(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
-        expect10(byId.xy).toEqual({
+        expect11(byId.x).toEqual({ document_id: "doc_1", page: 1, outcome: "won", seq: 2 });
+        expect11(byId.xy).toEqual({
           document_id: "doc_2",
           page: 1,
           final: true,
           outcome: "won",
           seq: 2
         });
-        expect10(byId.y).toEqual({ document_id: "doc_1", page: 2 });
-        expect10(byId.z).toEqual({});
+        expect11(byId.y).toEqual({ document_id: "doc_1", page: 2 });
+        expect11(byId.z).toEqual({});
       });
-      test10("overwrites a value that exists and keeps the rest", async () => {
+      test11("overwrites a value that exists and keeps the rest", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { page: 9 });
         const hit = (await s.store.search(a, query(s))).find((item) => item.id === "x");
-        expect10(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
+        expect11(hit?.attributes).toEqual({ document_id: "doc_1", page: 9 });
       });
-      test10("reports ids it did not find, in order, and does not create them", async () => {
+      test11("reports ids it did not find, in order, and does not create them", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const missing = await s.store.setAttributes(a, ["nope", "x", "gone"], { outcome: "lost" });
-        expect10(missing).toEqual(["nope", "gone"]);
+        expect11(missing).toEqual(["nope", "gone"]);
         const all = await s.store.search(a, { vector: vec(s, 1), topK: 100 });
-        expect10(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
-        expect10(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
+        expect11(ids(all).sort()).toEqual(["x", "xy", "y", "z"]);
+        expect11(await s.store.setAttributes(s.organizations.b, ["x"], { n: 1 })).toEqual(["x"]);
       });
-      test10("an Organization with no vectors reports every id and creates nothing", async () => {
+      test11("an Organization with no vectors reports every id and creates nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
-        expect10(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
-        expect10(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
+        expect11(await s.store.setAttributes(a, ["x", "y"], { n: 1 })).toEqual(["x", "y"]);
+        expect11(await s.store.search(a, { vector: vec(s, 1), topK: 10 })).toEqual([]);
       });
-      test10("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
+      test11("more than the upsert maximum, none, or a repeated id is refused and records nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         const many = ["x", ...Array.from({ length: 500 }, (_, i) => `v${i}`)];
-        await expect10(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
-        await expect10(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect10(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
-        await expect10(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, many, { n: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, [], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, ["x", "x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, ["bad id"], { n: 1 })).rejects.toMatchObject(invalid);
         const atMax = Array.from({ length: 500 }, (_, i) => `v${i}`);
-        expect10(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
+        expect11(await s.store.setAttributes(a, atMax, { n: 1 })).toHaveLength(500);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect10(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect11(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test10("a second Organization's vectors with the same ids are untouched", async () => {
+      test11("a second Organization's vectors with the same ids are untouched", async () => {
         const s = await subject();
         const { a, b } = s.organizations;
         await seed(s, a);
@@ -3347,35 +3715,35 @@ function vectorStoreBehaviour(name, make, skip = false) {
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect10(other).toEqual([]);
+        expect11(other).toEqual([]);
         const mine = await s.store.search(a, {
           vector: vec(s, 1),
           topK: 10,
           filter: { outcome: "won" }
         });
-        expect10(ids(mine).sort()).toEqual(["x", "y"]);
+        expect11(ids(mine).sort()).toEqual(["x", "y"]);
       });
-      test10("repeating the call changes nothing", async () => {
+      test11("repeating the call changes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
         const once = await s.store.search(a, query(s));
         const missing = await s.store.setAttributes(a, ["x", "nope"], { outcome: "won" });
-        expect10(missing).toEqual(["nope"]);
-        expect10(await s.store.search(a, query(s))).toEqual(once);
+        expect11(missing).toEqual(["nope"]);
+        expect11(await s.store.search(a, query(s))).toEqual(once);
       });
-      test10("a filter on the changed attribute sees the new value and not the old", async () => {
+      test11("a filter on the changed attribute sees the new value and not the old", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
         await s.store.setAttributes(a, ["x"], { outcome: "open" });
         await s.store.setAttributes(a, ["x"], { outcome: "won" });
         const search = (outcome) => s.store.search(a, { vector: vec(s, 1), topK: 10, filter: { outcome } });
-        expect10(ids(await search("won"))).toEqual(["x"]);
-        expect10(await search("open")).toEqual([]);
+        expect11(ids(await search("won"))).toEqual(["x"]);
+        expect11(await search("open")).toEqual([]);
       });
-      test10.each([
+      test11.each([
         ["no entries", {}],
         ["the reserved name id", { id: "x" }],
         ["the reserved name vector", { vector: "x" }],
@@ -3392,11 +3760,11 @@ function vectorStoreBehaviour(name, make, skip = false) {
         const s = await subject();
         const { a } = s.organizations;
         await seed(s);
-        await expect10(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, ["x"], attributes)).rejects.toMatchObject(invalid);
         const x = (await s.store.search(a, { vector: vec(s, 1), topK: 1 }))[0];
-        expect10(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
+        expect11(x?.attributes).toEqual({ document_id: "doc_1", page: 1 });
       });
-      test10("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
+      test11("a merge that would give a vector more than 16 attributes is refused and writes nothing", async () => {
         const s = await subject();
         const { a } = s.organizations;
         await s.store.upsert(a, [
@@ -3407,47 +3775,47 @@ function vectorStoreBehaviour(name, make, skip = false) {
           },
           { id: "room", vector: vec(s, 0, 1), attributes: { k0: 1 } }
         ]);
-        await expect10(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes(a, ["room", "full"], { extra: 1 })).rejects.toMatchObject(invalid);
         const room = (await s.store.search(a, { vector: vec(s, 0, 1), topK: 2 })).find((hit) => hit.id === "room");
-        expect10(room?.attributes).toEqual({ k0: 1 });
-        expect10(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
+        expect11(room?.attributes).toEqual({ k0: 1 });
+        expect11(await s.store.setAttributes(a, ["full"], { k0: 2 })).toEqual([]);
       });
-      test10("an invalid Organization id is refused", async () => {
+      test11("an invalid Organization id is refused", async () => {
         const s = await subject();
-        await expect10(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
+        await expect11(s.store.setAttributes("not an org", ["x"], { n: 1 })).rejects.toMatchObject(invalid);
       });
     });
-    test10("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
+    test11("deleting by id removes those vectors, ignores unknown ids and can be repeated", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
       await s.store.delete(a, ["x", "missing"]);
       await s.store.delete(a, ["x", "missing"]);
-      expect10(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect11(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "y",
         "z"
       ]);
     });
-    test10("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
+    test11("deleting by filter removes the matching vectors only, and an empty filter is refused", async () => {
       const s = await subject();
       const { a } = s.organizations;
       await seed(s);
-      await expect10(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
+      await expect11(s.store.deleteByFilter(a, {})).rejects.toMatchObject(invalid);
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "doc_1" });
       await s.store.deleteByFilter(a, { document_id: "never" });
-      expect10(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
+      expect11(ids(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).sort()).toEqual([
         "xy",
         "z"
       ]);
     });
-    test10("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
+    test11("a second Organization cannot search, overwrite or delete the first one's vectors", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await seed(s, a);
-      expect10(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
-      expect10(await s.store.search(b, {
+      expect11(await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 })).toEqual([]);
+      expect11(await s.store.search(b, {
         vector: vec(s, 1, 0, 0),
         topK: 100,
         filter: { document_id: "doc_1" }
@@ -3458,34 +3826,34 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.delete(b, ["y", "xy"]);
       await s.store.deleteByFilter(b, { document_id: "doc_1" });
       const mine = await s.store.search(a, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect10(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
-      expect10(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
+      expect11(ids(mine).sort()).toEqual(["x", "xy", "y", "z"]);
+      expect11(mine.find((hit) => hit.id === "x")?.attributes).toEqual({
         document_id: "doc_1",
         page: 1
       });
       const theirs = await s.store.search(b, { vector: vec(s, 1, 0, 0), topK: 100 });
-      expect10(ids(theirs)).toEqual(["x"]);
-      expect10(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
+      expect11(ids(theirs)).toEqual(["x"]);
+      expect11(theirs[0]?.attributes).toEqual({ document_id: "b_doc" });
     });
-    test10("an Organization whose id starts with another id is a different Organization", async () => {
+    test11("an Organization whose id starts with another id is a different Organization", async () => {
       const s = await subject();
       const { a, aExtended } = s.organizations;
       await s.store.upsert(a, [{ id: "one", vector: vec(s, 1) }]);
       await s.store.upsert(aExtended, [{ id: "two", vector: vec(s, 1) }]);
-      expect10(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
-      expect10(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect11(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["one"]);
+      expect11(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
       await s.store.delete(a, ["two"]);
       await s.store.deleteByFilter(a, { n: 1 });
-      expect10(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
+      expect11(ids(await s.store.search(aExtended, { vector: vec(s, 1), topK: 10 }))).toEqual(["two"]);
     });
-    test10("an id of exactly 64 characters is accepted", async () => {
+    test11("an id of exactly 64 characters is accepted", async () => {
       const s = await subject();
       const { a } = s.organizations;
       const id = "x".repeat(64);
       await s.store.upsert(a, [{ id, vector: vec(s, 1) }]);
-      expect10(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
+      expect11(ids(await s.store.search(a, { vector: vec(s, 1), topK: 1 }))).toEqual([id]);
     });
-    test10("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
+    test11("deleting everything an Organization has leaves other Organizations alone and can be repeated", async () => {
       const s = await subject();
       const { a, b, aExtended } = s.organizations;
       await seed(s, a);
@@ -3494,23 +3862,23 @@ function vectorStoreBehaviour(name, make, skip = false) {
       await s.store.deleteAll(a);
       await s.store.deleteAll(a);
       await s.store.deleteAll(`${a.slice(0, -1)}9`);
-      expect10(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
-      expect10(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect10(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect11(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect11(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect11(await s.store.search(aExtended, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
       await s.store.upsert(a, [{ id: "again", vector: vec(s, 1) }]);
-      expect10(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
+      expect11(ids(await s.store.search(a, { vector: vec(s, 1), topK: 10 }))).toEqual(["again"]);
     });
-    test10("warming an Organization changes nothing and works with or without data", async () => {
+    test11("warming an Organization changes nothing and works with or without data", async () => {
       const s = await subject();
       const { a, b } = s.organizations;
       await s.store.warm(b);
       await seed(s, a);
       await s.store.warm(a);
       await s.store.warm(a);
-      expect10(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
-      expect10(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
+      expect11(await s.store.search(a, { vector: vec(s, 1, 1, 1), topK: 10 })).toHaveLength(4);
+      expect11(await s.store.search(b, { vector: vec(s, 1, 1, 1), topK: 10 })).toEqual([]);
     });
-    test10.each([
+    test11.each([
       ["empty", ""],
       ["a path", "org/../x"],
       ["a separator", "x/y"],
@@ -3519,12 +3887,12 @@ function vectorStoreBehaviour(name, make, skip = false) {
       ["too long", "x".repeat(65)]
     ])("an Organization id that is %s is refused by every operation", async (_label, id) => {
       const s = await subject();
-      await expect10(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
-      await expect10(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
-      await expect10(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
-      await expect10(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
-      await expect10(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
-      await expect10(s.store.warm(id)).rejects.toMatchObject(invalid);
+      await expect11(s.store.upsert(id, [{ id: "v", vector: vec(s, 1) }])).rejects.toMatchObject(invalid);
+      await expect11(s.store.search(id, { vector: vec(s, 1), topK: 1 })).rejects.toMatchObject(invalid);
+      await expect11(s.store.delete(id, ["v"])).rejects.toMatchObject(invalid);
+      await expect11(s.store.deleteByFilter(id, { n: 1 })).rejects.toMatchObject(invalid);
+      await expect11(s.store.deleteAll(id)).rejects.toMatchObject(invalid);
+      await expect11(s.store.warm(id)).rejects.toMatchObject(invalid);
     });
   });
 }
@@ -3538,5 +3906,6 @@ export {
   streamingTranscribeBehaviour,
   telephonyBehaviour,
   transcriberBehaviour,
+  ttsBehaviour,
   vectorStoreBehaviour
 };

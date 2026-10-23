@@ -955,6 +955,42 @@ for await (const event of llm.stream({ organizationId, tier: 'fast', messages })
   and `withLlmRetry` (`src/llm/deadline.ts`) and `checkCompleteRequest` / `parseModelOutput`
   (`src/llm/validate.ts`).
 
+## Text to speech (`TtsPort`)
+
+`TtsPort` (0.18.0) turns an agent's reply text into audio while the Call is live. It is
+vendor-neutral; the Cartesia adapter comes later. `TtsPort`, `TtsStream`, `TtsAudioChunk` and
+`TtsError` come from `tula-closeline-kit`; the memory adapter (`createMemoryTts`) from
+`tula-closeline-kit/testing`; `ttsBehaviour` from `tula-closeline-kit/testing/behaviour`.
+
+```ts
+const stream = tts.open({ organizationId, voice: 'stock-friendly', encoding: 'pcm_mulaw', sampleRate: 8000 })
+stream.write('Thanks for calling. ')   // synchronous, bounded; throws tts.text_too_large past the limit
+stream.write('How can I help?')
+stream.finish()                        // no more text; the audio ends when the vendor is done
+for await (const chunk of stream) play(chunk.audio)   // chunk.sequence counts from 0, in order
+// barge-in: stream.cancel()           // ends the pending read as done, no error, idempotent
+await stream.close()                   // release the stream; later use fails with tts.closed
+```
+
+- `open` is synchronous and validates first (`tts.invalid_request`): voice matches
+  `^[A-Za-z0-9_.:-]{1,128}$` (stock voices only), encoding is `pcm_s16le` or `pcm_mulaw`, sample rate
+  is 8000, 16000, 24000 or 48000.
+- Limits: `timeoutMs` for the whole stream (default 30 s, at most 120 s), `firstChunkTimeoutMs`
+  (default 2 s, at most 30 s), `maxTextChars` (default 5,000, at most 20,000), and no audio chunk
+  over 64 KiB. A caller `signal` aborts the stream. Nothing is unbounded.
+- Backpressure: the stream is pull-based, so the adapter reads from the vendor only as fast as the
+  caller reads chunks. `break` out of the loop cancels.
+- Codes (`TTS_ERROR_CODES`): `tts.invalid_request` 400, `tts.text_too_large` 413, `tts.closed` 409,
+  `tts.timeout` 504, `tts.aborted` 499, `tts.rejected` 502, `tts.unavailable` 503 (the only
+  retryable code) and `tts.bad_response` 502. Branch on the code, not the status.
+- `tts.unavailable` is retried with a bounded, jittered pause (default one retry, 50 ms to 250 ms),
+  only before the first chunk; once audio has played, a failure surfaces and is not retried.
+- Text and audio are never logged, reported or put in an error; a `TtsAudioChunk` prints and
+  serialises without its audio, and the stream never keeps the text.
+- Tests use `createMemoryTts()` (`speak`, `failNext`, `requests`, `openStreams`); an adapter passes
+  `ttsBehaviour`. An adapter reuses `startTtsDeadline`, `watchFirstChunk` and `withTtsRetry`
+  (`src/tts/deadline.ts`) and `checkOpenRequest` (`src/tts/validate.ts`).
+
 ## Calendar (`CalendarPort`)
 
 `CalendarPort` (0.17.0) is how core reads a Rep's busy times and writes Bookings to their calendar.
