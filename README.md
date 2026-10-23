@@ -1142,6 +1142,66 @@ the `organizationId` the grant sets (the voice service should not trust that par
 `events`/`takeEvents` are what the provider would send as webhooks (`webhookFor` signs one), and
 `operations` is the ordered log that shows the Disclosure came first.
 
+## Messaging (`MessagingPort`)
+
+The outbound agent and the inbound reply path send SMS and WhatsApp and read replies through the
+kit's `MessagingPort` (added in 0.19.0). The port types, `MessagingError`, the limits and
+`classifyMessageIntent` come from `tula-closeline-kit`; the memory adapter (`createMemoryMessaging`)
+from `tula-closeline-kit/testing`; the behaviour suite (`messagingBehaviour`) from
+`tula-closeline-kit/testing/behaviour`. The Twilio adapter (`createTwilioMessaging`) is exported
+from `tula-closeline-kit`.
+
+```ts
+send({ organizationId, prospectId, channel, purpose, to, content, idempotencyKey, timeoutMs?, retry?, signal? }): Promise<SentMessage>
+receive({ url, signature, body, contentType? }): Promise<InboundMessage | StatusEvent> // verifies the signature first
+```
+
+**Consent cannot be skipped (ADR 0003).** Every adapter takes a required `ContactGuard` and asks it
+on every `send`, about the Prospect and about the number (`to`), and both must allow, before
+anything reaches the vendor. The checks count against the send's deadline. Any denial (or a guard that is down)
+throws `messaging.consent_denied` with only the `consent.*` code in `details`, and the vendor is
+never called. There is no option or request field that skips it; an unknown field is refused as
+`messaging.invalid_request`. The `SentMessage` carries both checks' ids (`consentCheckId`, `numberConsentCheckId`) as proof.
+
+**Inbound.** `receive` returns an `InboundMessage` (from, to, body, channel, `intent`) or a
+`StatusEvent`. `intent` is `stop` for STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT (the whole
+text, ignoring case, punctuation, emoji and invisible characters, so "Stop." and "STOP ALL" count), `start` for START, UNSTOP and YES, `help` for HELP and INFO. The port does not
+revoke consent on STOP: the consumer does that through core, and must handle every webhook
+idempotently, keyed on `providerMessageId`, because Twilio redelivers. The numbers and the text of
+an `InboundMessage` are hidden from `toString`, `JSON.stringify` and `inspect`; read `from`, `to`
+and `body` explicitly.
+
+**Errors** branch on the code: `invalid_request`, `consent_denied`, `recipient_opted_out` (Twilio
+21610), `template_required` (63016, WhatsApp outside the 24 hour window), `timeout`, `aborted`,
+`rejected`, `unavailable` (the only retryable one, retried a bounded number of times with jitter),
+`bad_response` and `webhook_invalid`. Messages are fixed text; `details` hold field names, counts,
+the HTTP status and Twilio's numeric code, never a number, text or token.
+
+### Twilio adapter (`createTwilioMessaging`)
+
+The kit takes options, not env. A service reads these and passes them in:
+
+| Env a service reads | Option |
+| --- | --- |
+| `TWILIO_ACCOUNT_SID` | `accountSid` |
+| `TWILIO_AUTH_TOKEN` | `authToken` |
+| `TWILIO_MESSAGING_SERVICE_SID` | `messagingServiceSid` |
+| `TWILIO_WHATSAPP_FROM` | `whatsappFrom` |
+| `TWILIO_SMS_STATUS_CALLBACK_URL` | `statusCallbackUrl` |
+
+```ts
+const messaging = createTwilioMessaging({
+  accountSid, authToken, guard, messagingServiceSid, whatsappFrom, statusCallbackUrl, reporter, logger,
+})
+```
+
+SMS goes through the Messaging Service (or `fromNumber`); WhatsApp uses `whatsappFrom`, else the
+Messaging Service. The idempotency header is a sha256 of the account, the Organization and your
+key, so one key in two Organizations is two messages. A 429 or 5xx, a network error and an attempt
+over `attemptTimeoutMs` (default 5 s) are `unavailable` and retried; the send's `timeoutMs`
+(default 10 s) bounds all attempts. Webhook signatures are checked in constant time, with and
+without the default port in the URL. Tested against a stubbed `fetch` only.
+
 ## Vector store (`VectorStore`)
 
 Services index and search embeddings through the kit's `VectorStore` port (added in 0.8.0). The

@@ -12,6 +12,20 @@ import {
   calendarRetryDelayMs2,
   LLM_ERROR_CODES2,
   LlmError2,
+  MESSAGING_ERROR_CODES2,
+  MessagingError2,
+  isReportableMessagingError2,
+  DEFAULT_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGING_TIMEOUT_MS2,
+  MAX_MESSAGE_BODY_CHARS2,
+  MAX_TEMPLATE_VARIABLES2,
+  MAX_TEMPLATE_VARIABLE_CHARS2,
+  MAX_MESSAGING_WEBHOOK_BYTES2,
+  MESSAGING_CHANNELS2,
+  MESSAGING_PURPOSES2,
+  DEFAULT_MESSAGING_RETRY_POLICY2,
+  messagingRetryDelayMs2,
+  InboundMessage2,
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
@@ -36,7 +50,7 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-0dy266jn.js";
+} from "./shared/chunk-hff6jkfx.js";
 import {
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
@@ -59,16 +73,9 @@ import {
   scrubText2,
   redactFields,
   prepareFields,
-  shouldReportError2,
-  STREAMING_TRANSCRIBE_ERROR_CODES2,
-  StreamingTranscribeError2,
-  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_AUDIO_CHUNK_BYTES2,
-  MAX_REPLAY_AUDIO_BYTES2,
-  MAX_WORDS_PER_TURN2,
-  DEFAULT_RECONNECT_POLICY2,
-  reconnectDelayMs2,
+  signTwilioRequest2,
+  twilioUrlVariants,
+  sameText,
   TELEPHONY_ERROR_CODES2,
   TelephonyError2,
   invalid,
@@ -82,6 +89,25 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
+  startMessagingDeadline,
+  AttemptAborted,
+  raceAbort,
+  withMessagingRetry,
+  requireConsent,
+  invalid2,
+  checkSendRequest,
+  classifyMessageIntent2,
+  verifyAndParseWebhook,
+  shouldReportError2,
+  STREAMING_TRANSCRIBE_ERROR_CODES2,
+  StreamingTranscribeError2,
+  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_AUDIO_CHUNK_BYTES2,
+  MAX_REPLAY_AUDIO_BYTES2,
+  MAX_WORDS_PER_TURN2,
+  DEFAULT_RECONNECT_POLICY2,
+  reconnectDelayMs2,
   TtsAudioChunk2,
   DEFAULT_TTS_TIMEOUT_MS2,
   MAX_TTS_TIMEOUT_MS2,
@@ -101,7 +127,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-fg37gjeb.js";
+} from "./shared/chunk-0f87wa1m.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -1152,6 +1178,1024 @@ function createLogger(options) {
   };
   return wrap(options.destination ? pino(config, options.destination) : pino(config));
 }
+// src/messaging/twilio.ts
+import { createHash as createHash2 } from "node:crypto";
+import { e164PhoneSchema } from "tula-closeline-contract";
+
+// src/telephony/twilio.ts
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { SignJWT } from "jose";
+
+// src/telephony/twilio-http.ts
+var TWILIO_MAX_ATTEMPTS = 3;
+var TWILIO_RETRY_BASE_MS = 100;
+var TWILIO_RETRY_MAX_MS = 1000;
+var TWILIO_MAX_RESPONSE_BYTES = 1048576;
+var CALL_ENDED_CODES = new Set([21220, 21221, 21222, 21224]);
+function unavailable2(reason, details) {
+  return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, `The provider did not answer: ${reason}`, details === undefined ? {} : { details });
+}
+function mapTwilioFailure(status, body) {
+  const twilioCode = typeof body?.code === "number" ? body.code : undefined;
+  const details = {
+    status,
+    ...twilioCode === undefined ? {} : { twilioCode }
+  };
+  const fail = (code, message) => new TelephonyError2(code, message, { details });
+  if (twilioCode !== undefined && CALL_ENDED_CODES.has(twilioCode)) {
+    return fail(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
+  }
+  if (status === 404) {
+    return fail(TELEPHONY_ERROR_CODES2.notFound, "The provider has no such resource");
+  }
+  if (status === 429 || status >= 500) {
+    return fail(TELEPHONY_ERROR_CODES2.unavailable, "The provider is unavailable");
+  }
+  if (status === 401 || status === 403) {
+    return fail(TELEPHONY_ERROR_CODES2.rejected, "The provider refused the credentials");
+  }
+  return fail(TELEPHONY_ERROR_CODES2.rejected, "The provider refused the request");
+}
+function retryable(status) {
+  return status === 429 || status >= 500;
+}
+function guardBody(response, timer, signal, timedOut) {
+  const source = response.body;
+  if (source === null) {
+    clearTimeout(timer);
+    return response;
+  }
+  const reader = source.getReader();
+  const aborted = new Promise((_, reject) => {
+    const fail = () => reject(unavailable2(timedOut() ? "timed out" : "the request failed"));
+    if (signal.aborted) {
+      fail();
+    } else {
+      signal.addEventListener("abort", fail, { once: true });
+    }
+  });
+  aborted.catch(() => {
+    return;
+  });
+  const guarded = new ReadableStream({
+    async pull(controller) {
+      try {
+        const chunk = await Promise.race([reader.read(), aborted]);
+        if (chunk.done) {
+          clearTimeout(timer);
+          controller.close();
+        } else {
+          controller.enqueue(chunk.value);
+        }
+      } catch (error) {
+        clearTimeout(timer);
+        reader.cancel().catch(() => {
+          return;
+        });
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      return reader.cancel(reason);
+    }
+  });
+  return new Response(guarded, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+function createTwilioHttp(options) {
+  const maxAttempts = options.maxAttempts ?? TWILIO_MAX_ATTEMPTS;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new TypeError("maxAttempts must be an integer from 1 to 10");
+  }
+  async function send(request, mode, allow) {
+    const headers = {
+      Authorization: options.authorization,
+      Accept: mode === "json" ? "application/json" : "*/*"
+    };
+    let body;
+    if (request.form !== undefined) {
+      const params = new URLSearchParams;
+      for (const [name, value] of Object.entries(request.form)) {
+        for (const item of typeof value === "string" ? [value] : value) {
+          params.append(name, item);
+        }
+      }
+      body = params.toString();
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
+    if (request.idempotencyToken !== undefined) {
+      headers["I-Twilio-Idempotency-Token"] = request.idempotencyToken;
+    }
+    let last;
+    for (let attempt = 1;attempt <= maxAttempts; attempt++) {
+      const remaining = request.deadline - options.now();
+      if (remaining <= 0) {
+        throw last ?? unavailable2("timed out");
+      }
+      const controller = new AbortController;
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, remaining);
+      let keepTimer = false;
+      try {
+        const response = await options.fetch(`${options.baseUrl}${request.path}`, {
+          method: request.method,
+          headers,
+          ...body === undefined ? {} : { body },
+          redirect: mode === "stream" ? "follow" : "manual",
+          signal: controller.signal
+        });
+        const ok = response.status >= 200 && response.status < 300;
+        if (ok && mode === "stream") {
+          keepTimer = true;
+          return {
+            status: response.status,
+            json: null,
+            response: guardBody(response, timer, controller.signal, () => timedOut)
+          };
+        }
+        const json = await readJson(response, ok || allow.includes(response.status));
+        if (ok || allow.includes(response.status)) {
+          return { status: response.status, json };
+        }
+        response.body?.cancel().catch(() => {
+          return;
+        });
+        const failure = mapTwilioFailure(response.status, json);
+        if (!retryable(response.status)) {
+          throw failure;
+        }
+        last = failure;
+      } catch (error) {
+        if (error instanceof TelephonyError2 && error !== last) {
+          throw error;
+        }
+        if (timedOut) {
+          throw unavailable2("timed out");
+        }
+        if (!(error instanceof TelephonyError2)) {
+          last = unavailable2("the request failed");
+        }
+      } finally {
+        if (!keepTimer) {
+          clearTimeout(timer);
+        }
+      }
+      if (attempt < maxAttempts) {
+        const base = Math.min(TWILIO_RETRY_MAX_MS, TWILIO_RETRY_BASE_MS * 2 ** (attempt - 1));
+        const pause = Math.min(Math.floor(base * (0.5 + options.random())), Math.max(0, request.deadline - options.now()));
+        await options.sleep(pause);
+      }
+    }
+    throw last ?? unavailable2("the request failed");
+  }
+  return {
+    json: (request, opts) => send(request, "json", opts?.allow ?? []),
+    stream: (request) => send(request, "stream", [])
+  };
+}
+async function readJson(response, mustParse) {
+  if (response.status >= 300 && response.status < 400) {
+    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with a redirect", { details: { status: response.status } });
+  }
+  let text;
+  try {
+    text = await readBounded2(response);
+  } catch (error) {
+    if (error instanceof TelephonyError2) {
+      throw error;
+    }
+    throw unavailable2("the answer could not be read");
+  }
+  if (text.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    if (mustParse && response.status !== 204) {
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with something that is not JSON", { details: { status: response.status } });
+    }
+    return null;
+  }
+}
+async function readBounded2(response) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return "";
+  }
+  const chunks = [];
+  let total = 0;
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.length;
+    if (total > TWILIO_MAX_RESPONSE_BYTES) {
+      reader.cancel().catch(() => {
+        return;
+      });
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with more than this adapter reads");
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+// src/telephony/twilio.ts
+var TWILIO_REGIONS = ["us1", "ie1", "au1"];
+var TWILIO_DEFAULT_EDGES = {
+  us1: "ashburn",
+  ie1: "dublin",
+  au1: "sydney"
+};
+var EDGE = /^[a-z][a-z0-9-]{1,30}$/;
+function createMemoryTwilioStore() {
+  const calls = new Map;
+  const recordings = new Map;
+  const placements = new Map;
+  const chains = new Map;
+  return {
+    withCall: async (id, fn) => {
+      const previous = chains.get(id) ?? Promise.resolve();
+      const run = async () => fn(calls.get(id) ?? null);
+      const next = previous.then(run, run);
+      chains.set(id, next);
+      try {
+        return await next;
+      } finally {
+        if (chains.get(id) === next) {
+          chains.delete(id);
+        }
+      }
+    },
+    getCall: async (id) => calls.get(id) ?? null,
+    putCall: async (id, record) => {
+      calls.set(id, record);
+    },
+    claimCall: async (id, record) => {
+      const existing = calls.get(id);
+      if (existing) {
+        return existing;
+      }
+      calls.set(id, record);
+      return record;
+    },
+    getRecording: async (id) => {
+      const providerCallId = recordings.get(id);
+      return providerCallId === undefined ? null : { providerCallId };
+    },
+    putRecording: async (id, providerCallId) => {
+      recordings.set(id, providerCallId);
+    },
+    getPlacement: async (org, key) => placements.get(`${org}\x00${key}`) ?? null,
+    putPlacement: async (org, key, placement) => {
+      placements.set(`${org}\x00${key}`, placement);
+    }
+  };
+}
+var SID = {
+  account: /^AC[0-9a-f]{32}$/,
+  apiKey: /^SK[0-9a-f]{32}$/,
+  app: /^AP[0-9a-f]{32}$/
+};
+var LANGUAGE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$/;
+var HOLD_SECONDS = 3600;
+function estimateSpeechMs(text) {
+  const words = text.trim().split(/\s+/).length;
+  return Math.ceil(Math.max(words * 400 * 1.25, text.length * 90)) + 1000;
+}
+function escapeXml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function hold() {
+  return `<Response><Pause length="${HOLD_SECONDS}"/></Response>`;
+}
+function badResponse(what) {
+  return new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, `The provider answered without a usable ${what}`);
+}
+function unavailable3() {
+  return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, "The provider did not answer in time");
+}
+function notFound() {
+  return new TelephonyError2(TELEPHONY_ERROR_CODES2.notFound, "There is no such call or Recording");
+}
+function sid(json, prefix) {
+  const value = json?.sid;
+  if (typeof value !== "string" || !new RegExp(`^${prefix}[0-9a-zA-Z]{32}$`).test(value)) {
+    throw badResponse("id");
+  }
+  return value;
+}
+function withTag(url, organizationId, callId) {
+  const tagged = new URL(url);
+  tagged.searchParams.set("organizationId", organizationId);
+  if (callId !== null) {
+    tagged.searchParams.set("callId", callId);
+  }
+  return tagged.toString();
+}
+function twilioApiHost(region, edge) {
+  if (region === undefined) {
+    if (edge !== undefined) {
+      throw new TypeError("edge needs a region");
+    }
+    return "api.twilio.com";
+  }
+  if (!TWILIO_REGIONS.includes(region)) {
+    throw new TypeError("region is not one of us1, ie1, au1");
+  }
+  const chosen = edge ?? TWILIO_DEFAULT_EDGES[region];
+  if (!EDGE.test(chosen)) {
+    throw new TypeError("edge is not acceptable");
+  }
+  return `api.${chosen}.${region}.twilio.com`;
+}
+function createTwilioTelephony(options) {
+  if (!SID.account.test(options.accountSid)) {
+    throw new TypeError("accountSid is not an Account SID");
+  }
+  if (!SID.apiKey.test(options.apiKeySid)) {
+    throw new TypeError("apiKeySid is not an API key SID");
+  }
+  if (typeof options.apiKeySecret !== "string" || options.apiKeySecret.length < 16) {
+    throw new TypeError("apiKeySecret must be at least 16 characters");
+  }
+  if (!SID.app.test(options.twimlAppSid)) {
+    throw new TypeError("twimlAppSid is not a TwiML App SID");
+  }
+  if (options.authToken !== undefined && (typeof options.authToken !== "string" || options.authToken.length < 16)) {
+    throw new TypeError("authToken must be at least 16 characters");
+  }
+  const language = options.disclosureLanguage ?? "en-US";
+  if (!LANGUAGE.test(language)) {
+    throw new TypeError("disclosureLanguage is not a language tag");
+  }
+  for (const url of [options.statusCallbackUrl, options.recordingStatusCallbackUrl]) {
+    if (url !== undefined) {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw new TypeError("a callback URL is not a URL");
+      }
+      const plainOk = options.environment === "local" && parsed.protocol === "http:";
+      if (parsed.protocol !== "https:" && !plainOk || parsed.username || parsed.password) {
+        throw new TypeError("a callback URL must be https without credentials");
+      }
+    }
+  }
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TELEPHONY_TIMEOUT_MS2;
+  resolveTimeout(undefined, defaultTimeoutMs);
+  const { accountSid, apiKeySid, apiKeySecret, twimlAppSid } = options;
+  const environment = options.environment ?? "prod";
+  const clock = options.clock ?? systemClock2;
+  const nowMs = options.nowMs ?? Date.now;
+  const sleep = options.sleep ?? systemSleep2;
+  const random = options.random ?? Math.random;
+  if (options.store === undefined && environment !== "local" && environment !== "dev") {
+    throw new TypeError("a durable store is required outside the local and dev environments");
+  }
+  const store = options.store ?? createMemoryTwilioStore();
+  const authToken = options.authToken;
+  const base = `/2010-04-01/Accounts/${accountSid}`;
+  const http = createTwilioHttp({
+    baseUrl: `https://${twilioApiHost(options.region, options.edge)}`,
+    authorization: `Basic ${Buffer.from(`${apiKeySid}:${apiKeySecret}`).toString("base64")}`,
+    fetch: options.fetch ?? ((input, init) => fetch(input, init)),
+    sleep,
+    random,
+    now: nowMs,
+    ...options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }
+  });
+  function deadlineFor(opts) {
+    return nowMs() + resolveTimeout(opts, defaultTimeoutMs);
+  }
+  function token(...parts) {
+    return createHash("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
+  }
+  async function patchCall(providerCallId, patch) {
+    await store.withCall(providerCallId, async (current) => {
+      if (current === null) {
+        throw notFound();
+      }
+      await store.putCall(providerCallId, { ...current, ...patch });
+    });
+  }
+  async function holdUnlessDisclosing(providerCallId, deadline) {
+    await store.withCall(providerCallId, async (fresh) => {
+      if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
+        await updateCall(providerCallId, { Twiml: hold() }, deadline);
+      }
+    });
+  }
+  async function ownedCall(organizationId, providerCallId) {
+    const record = await store.getCall(providerCallId);
+    if (!record || record.organizationId !== organizationId) {
+      throw notFound();
+    }
+    return record;
+  }
+  function refOf(request) {
+    return {
+      organizationId: checkOrganizationId(request.organizationId),
+      providerCallId: checkProviderId(request.providerCallId, "providerCallId")
+    };
+  }
+  async function updateCall(providerCallId, form, deadline) {
+    await http.json({
+      method: "POST",
+      path: `${base}/Calls/${providerCallId}.json`,
+      form,
+      deadline
+    });
+  }
+  async function callIsUp(providerCallId, deadline) {
+    const { json } = await http.json({
+      method: "GET",
+      path: `${base}/Calls/${providerCallId}.json`,
+      deadline
+    });
+    const status = json?.status;
+    if (typeof status !== "string") {
+      throw badResponse("status");
+    }
+    return status === "in-progress";
+  }
+  function callEnded() {
+    return new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
+  }
+  return {
+    async placeCall(request, opts) {
+      const organizationId = checkOrganizationId(request.organizationId);
+      const callId = checkCallId(request.callId);
+      const key = checkProviderId(request.idempotencyKey, "idempotencyKey");
+      const from = checkNumber(request.from, "from");
+      const to = checkNumber(request.to, "to");
+      const deadline = deadlineFor(opts);
+      const fingerprint = createHmac("sha256", apiKeySecret).update(`${from}\x00${to}`).digest("hex");
+      const earlier = await store.getPlacement(organizationId, key);
+      if (earlier) {
+        if (earlier.fingerprint !== fingerprint) {
+          invalid("idempotencyKey");
+        }
+        return { providerCallId: earlier.providerCallId, created: false };
+      }
+      const form = { To: to, From: from, Twiml: hold() };
+      if (options.statusCallbackUrl !== undefined) {
+        form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId);
+        form.StatusCallbackMethod = "POST";
+        form.StatusCallbackEvent = ["initiated", "ringing", "answered", "completed"];
+      }
+      const { json } = await http.json({
+        method: "POST",
+        path: `${base}/Calls.json`,
+        form,
+        idempotencyToken: token("call", organizationId, key),
+        deadline
+      });
+      const providerCallId = sid(json, "CA");
+      await store.putCall(providerCallId, {
+        organizationId,
+        callId,
+        direction: "outbound",
+        disclosure: null,
+        bridgedTo: null,
+        ringIdentities: [],
+        recordingId: null,
+        streamId: null
+      });
+      await store.putPlacement(organizationId, key, { providerCallId, fingerprint });
+      return { providerCallId, created: true };
+    },
+    async answerCall(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      const callId = checkCallId(request.callId);
+      const identities = checkRingIdentities(request.ringIdentities);
+      const deadline = deadlineFor(opts);
+      const known = await store.getCall(providerCallId);
+      if (known) {
+        if (known.organizationId !== organizationId) {
+          throw notFound();
+        }
+        if (known.direction === "inbound" && known.callId === callId && known.disclosure === null && known.disclosureStarted !== true) {
+          await holdUnlessDisclosing(providerCallId, deadline);
+        }
+        return { ringing: known.ringIdentities.length };
+      }
+      if (!await callIsUp(providerCallId, deadline)) {
+        throw callEnded();
+      }
+      const claimed = await store.claimCall(providerCallId, {
+        organizationId,
+        callId,
+        direction: "inbound",
+        disclosure: null,
+        bridgedTo: null,
+        ringIdentities: identities,
+        recordingId: null,
+        streamId: null
+      });
+      if (claimed.organizationId !== organizationId) {
+        throw notFound();
+      }
+      await holdUnlessDisclosing(providerCallId, deadline);
+      return { ringing: claimed.ringIdentities.length };
+    },
+    async playDisclosure(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      checkDisclosure(request.wordingVersion, request.text, request.aiAssisted);
+      const deadline = deadlineFor(opts);
+      const record = await ownedCall(organizationId, providerCallId);
+      const earlier = record.disclosure;
+      if (earlier && earlier.wordingVersion === request.wordingVersion) {
+        return earlier;
+      }
+      const waitMs = estimateSpeechMs(request.text);
+      if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
+        throw unavailable3();
+      }
+      await store.withCall(providerCallId, async (fresh) => {
+        if (fresh === null) {
+          throw notFound();
+        }
+        await store.putCall(providerCallId, { ...fresh, disclosureStarted: true });
+        await updateCall(providerCallId, {
+          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
+        }, deadline);
+      });
+      if (options.disclosureDone) {
+        await options.disclosureDone({ organizationId, providerCallId, deadline });
+      } else {
+        await sleep(waitMs);
+      }
+      if (nowMs() > deadline) {
+        throw unavailable3();
+      }
+      if (!await callIsUp(providerCallId, deadline)) {
+        throw callEnded();
+      }
+      const played = {
+        wordingVersion: request.wordingVersion,
+        aiAssisted: request.aiAssisted,
+        playedAt: clock.now().toISOString()
+      };
+      await patchCall(providerCallId, { disclosure: played, bridgedTo: null });
+      return played;
+    },
+    async bridge(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      const rep = checkIdentity(request.repIdentity);
+      const deadline = deadlineFor(opts);
+      const record = await ownedCall(organizationId, providerCallId);
+      requireDisclosure(record.disclosure);
+      if (record.bridgedTo === rep) {
+        return;
+      }
+      await updateCall(providerCallId, {
+        Twiml: `<Response><Dial answerOnBridge="true"><Client><Identity>${escapeXml(rep)}</Identity><Parameter name="organizationId" value="${escapeXml(organizationId)}"/></Client></Dial></Response>`
+      }, deadline);
+      await patchCall(providerCallId, { bridgedTo: rep });
+    },
+    async startRecording(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      const deadline = deadlineFor(opts);
+      const record = await ownedCall(organizationId, providerCallId);
+      requireDisclosure(record.disclosure);
+      if (record.recordingId !== null) {
+        return { recordingId: record.recordingId, channels: 2 };
+      }
+      const form = {
+        RecordingChannels: "dual",
+        RecordingTrack: "both"
+      };
+      if (options.recordingStatusCallbackUrl !== undefined) {
+        form.RecordingStatusCallback = withTag(options.recordingStatusCallbackUrl, organizationId, record.callId);
+        form.RecordingStatusCallbackMethod = "POST";
+        form.RecordingStatusCallbackEvent = ["completed"];
+      }
+      const { json } = await http.json({
+        method: "POST",
+        path: `${base}/Calls/${providerCallId}/Recordings.json`,
+        form,
+        idempotencyToken: token("recording", providerCallId),
+        deadline
+      });
+      const recordingId = sid(json, "RE");
+      await store.putRecording(recordingId, providerCallId);
+      await patchCall(providerCallId, { recordingId });
+      return { recordingId, channels: 2 };
+    },
+    async forkTracks(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      const destination = checkDestinationUrl(request.destinationUrl, environment === "local");
+      const deadline = deadlineFor(opts);
+      const record = await ownedCall(organizationId, providerCallId);
+      requireDisclosure(record.disclosure, true);
+      if (record.streamId !== null) {
+        return { streamId: record.streamId, tracks: ["rep", "prospect"] };
+      }
+      const { json } = await http.json({
+        method: "POST",
+        path: `${base}/Calls/${providerCallId}/Streams.json`,
+        form: { Url: destination, Track: "both_tracks" },
+        idempotencyToken: token("stream", providerCallId),
+        deadline
+      });
+      const streamId = sid(json, "MZ");
+      await patchCall(providerCallId, { streamId });
+      return { streamId, tracks: ["rep", "prospect"] };
+    },
+    async hangUp(request, opts) {
+      const { organizationId, providerCallId } = refOf(request);
+      if (request.by !== undefined && request.by !== "rep" && request.by !== "system") {
+        invalid("by");
+      }
+      const deadline = deadlineFor(opts);
+      await ownedCall(organizationId, providerCallId);
+      try {
+        await updateCall(providerCallId, { Status: "completed" }, deadline);
+      } catch (error) {
+        if (error instanceof TelephonyError2 && error.code === TELEPHONY_ERROR_CODES2.callEnded) {
+          return;
+        }
+        throw error;
+      }
+    },
+    async fetchRecording(request, opts) {
+      const organizationId = checkOrganizationId(request.organizationId);
+      const recordingId = checkProviderId(request.recordingId, "recordingId");
+      const deadline = deadlineFor(opts);
+      const owner = await store.getRecording(recordingId);
+      if (!owner) {
+        throw notFound();
+      }
+      await ownedCall(organizationId, owner.providerCallId);
+      const { json } = await http.json({
+        method: "GET",
+        path: `${base}/Recordings/${recordingId}.json`,
+        deadline
+      });
+      const status = json?.status;
+      if (status === "in-progress" || status === "paused" || status === "processing") {
+        throw new TelephonyError2(TELEPHONY_ERROR_CODES2.recordingNotReady, "The Recording is not finished yet");
+      }
+      if (status !== "completed") {
+        throw notFound();
+      }
+      if (json?.channels !== 2) {
+        throw badResponse("channel count");
+      }
+      const { response } = await http.stream({
+        method: "GET",
+        path: `${base}/Recordings/${recordingId}.wav?RequestedChannels=2`,
+        deadline
+      });
+      if (!response?.body) {
+        throw badResponse("body");
+      }
+      const length = Number(response.headers.get("content-length"));
+      return {
+        body: response.body,
+        contentType: response.headers.get("content-type")?.split(";")[0]?.trim() || "audio/wav",
+        sizeBytes: Number.isSafeInteger(length) && length > 0 ? length : null,
+        channels: 2
+      };
+    },
+    async deleteRecording(request, opts) {
+      const organizationId = checkOrganizationId(request.organizationId);
+      const recordingId = checkProviderId(request.recordingId, "recordingId");
+      const deadline = deadlineFor(opts);
+      const owner = await store.getRecording(recordingId);
+      if (!owner) {
+        return { existed: false };
+      }
+      const record = await store.getCall(owner.providerCallId);
+      if (!record || record.organizationId !== organizationId) {
+        return { existed: false };
+      }
+      const answer = await http.json({ method: "DELETE", path: `${base}/Recordings/${recordingId}.json`, deadline }, { allow: [404] });
+      return { existed: answer.status !== 404 };
+    },
+    verifyWebhook(request) {
+      try {
+        if (authToken === undefined || typeof request?.url !== "string" || typeof request.body !== "string" || typeof request.signature !== "string" || request.signature.length === 0 || request.signature.length > 256 || Buffer.byteLength(request.body, "utf8") > MAX_WEBHOOK_BODY_BYTES2) {
+          return false;
+        }
+        let entries = [];
+        let hashed = null;
+        try {
+          hashed = new URL(request.url).searchParams.get("bodySHA256");
+        } catch {
+          return false;
+        }
+        if (hashed !== null) {
+          const actual = createHash("sha256").update(request.body, "utf8").digest("hex");
+          if (!sameText(actual, hashed.toLowerCase())) {
+            return false;
+          }
+        } else if (request.body.length > 0) {
+          entries = [...new URLSearchParams(request.body).entries()];
+        }
+        let matched = false;
+        for (const url of twilioUrlVariants(request.url)) {
+          const expected = signTwilioRequest2(authToken, url, entries);
+          matched = sameText(expected, request.signature) || matched;
+        }
+        return matched;
+      } catch {
+        return false;
+      }
+    },
+    async mintBrowserToken(request, opts) {
+      resolveTimeout(opts, defaultTimeoutMs);
+      const organizationId = checkOrganizationId(request.organizationId);
+      const identity = checkIdentity(request.identity);
+      const ttl = request.ttlSeconds ?? 900;
+      if (!Number.isInteger(ttl) || ttl < 60 || ttl > 3600) {
+        invalid("ttlSeconds");
+      }
+      const issuedAt = Math.floor(clock.now().getTime() / 1000);
+      const jwt = await new SignJWT({
+        grants: {
+          identity,
+          voice: {
+            incoming: { allow: true },
+            outgoing: { application_sid: twimlAppSid, params: { organizationId } }
+          }
+        }
+      }).setProtectedHeader({ alg: "HS256", typ: "JWT", cty: "twilio-fpa;v=1" }).setIssuer(apiKeySid).setSubject(accountSid).setJti(`${apiKeySid}-${randomBytes(12).toString("hex")}`).setIssuedAt(issuedAt).setExpirationTime(issuedAt + ttl).sign(new TextEncoder().encode(apiKeySecret));
+      return {
+        token: jwt,
+        identity: request.identity,
+        ttlSeconds: ttl,
+        expiresAt: new Date((issuedAt + ttl) * 1000).toISOString()
+      };
+    }
+  };
+}
+
+// src/messaging/twilio.ts
+var ACCOUNT_SID = /^AC[0-9a-fA-F]{32}$/;
+var SERVICE_SID = /^MG[0-9a-fA-F]{32}$/;
+var MESSAGE_SID = /^(SM|MM)[0-9a-fA-F]{32}$/;
+var MAX_RESPONSE_BYTES = 65536;
+var DEFAULT_ATTEMPT_TIMEOUT_MS = 5000;
+var OPTED_OUT = 21610;
+var TEMPLATE_REQUIRED = 63016;
+var QUEUED = new Set(["queued", "accepted", "scheduled", "sending"]);
+var SENT = new Set(["sent", "delivered"]);
+function unavailable4(phase, status) {
+  return new MessagingError2(MESSAGING_ERROR_CODES2.unavailable, "The messaging provider is unavailable", {
+    details: { phase, ...status === undefined ? {} : { status } }
+  });
+}
+function badResponse2(reason, status) {
+  return new MessagingError2(MESSAGING_ERROR_CODES2.badResponse, "The messaging provider sent an unusable answer", { details: { reason, ...status === undefined ? {} : { status } } });
+}
+async function readBounded3(response) {
+  const body = response.body;
+  if (body === null) {
+    return "";
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder;
+  let total = 0;
+  let text = "";
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {
+        return;
+      });
+      throw badResponse2("too_large");
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+function parseJson2(text) {
+  try {
+    const value = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function fail4xx(status, json) {
+  const rawCode = json?.code;
+  const twilioCode = typeof rawCode === "number" && Number.isInteger(rawCode) ? rawCode : undefined;
+  if (twilioCode === OPTED_OUT) {
+    return new MessagingError2(MESSAGING_ERROR_CODES2.recipientOptedOut, "The recipient has opted out of this sender", { details: { status, twilioCode } });
+  }
+  if (twilioCode === TEMPLATE_REQUIRED) {
+    return new MessagingError2(MESSAGING_ERROR_CODES2.templateRequired, "Only a template can start this conversation", { details: { status, twilioCode } });
+  }
+  return new MessagingError2(MESSAGING_ERROR_CODES2.rejected, "The messaging provider refused the request", { details: { status, ...twilioCode === undefined ? {} : { twilioCode } } });
+}
+function createTwilioMessaging(options) {
+  if (typeof options.accountSid !== "string" || !ACCOUNT_SID.test(options.accountSid)) {
+    throw new TypeError("accountSid is not an Account SID");
+  }
+  if (typeof options.authToken !== "string" || options.authToken.length < 16) {
+    throw new TypeError("authToken must be at least 16 characters");
+  }
+  if (options.guard === undefined || typeof options.guard.check !== "function") {
+    throw new TypeError("a ContactGuard is required");
+  }
+  if (options.messagingServiceSid !== undefined && !SERVICE_SID.test(options.messagingServiceSid)) {
+    throw new TypeError("messagingServiceSid is not a Messaging Service SID");
+  }
+  for (const number of [options.fromNumber, options.whatsappFrom]) {
+    if (number !== undefined && !e164PhoneSchema.safeParse(number).success) {
+      throw new TypeError("a sender number is not E.164");
+    }
+  }
+  if (options.messagingServiceSid !== undefined && options.fromNumber !== undefined) {
+    throw new TypeError("give messagingServiceSid or fromNumber, not both");
+  }
+  if (options.statusCallbackUrl !== undefined) {
+    let parsed;
+    try {
+      parsed = new URL(options.statusCallbackUrl);
+    } catch {
+      throw new TypeError("statusCallbackUrl is not a URL");
+    }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      throw new TypeError("statusCallbackUrl must be https without credentials");
+    }
+  }
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
+  if (!Number.isInteger(attemptTimeoutMs) || attemptTimeoutMs < 1 || attemptTimeoutMs > 60000) {
+    throw new TypeError("attemptTimeoutMs must be 1 to 60000");
+  }
+  const { accountSid, authToken, guard } = options;
+  const clock = options.clock ?? systemClock2;
+  const sleep = options.sleep ?? systemSleep2;
+  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const url = `https://${twilioApiHost(options.region, options.edge)}/2010-04-01/Accounts/${accountSid}/Messages.json`;
+  const authorization = `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`;
+  function form(request) {
+    const whatsapp = request.channel === "whatsapp";
+    const params = new URLSearchParams;
+    params.set("To", whatsapp ? `whatsapp:${request.to}` : request.to);
+    if (whatsapp && options.whatsappFrom !== undefined) {
+      params.set("From", `whatsapp:${options.whatsappFrom}`);
+    } else if (options.messagingServiceSid !== undefined) {
+      params.set("MessagingServiceSid", options.messagingServiceSid);
+    } else if (!whatsapp && options.fromNumber !== undefined) {
+      params.set("From", options.fromNumber);
+    } else {
+      invalid2("channel");
+    }
+    if (request.content.kind === "text") {
+      params.set("Body", request.content.body);
+    } else {
+      params.set("ContentSid", request.content.templateId);
+      if (request.content.variables !== undefined) {
+        params.set("ContentVariables", JSON.stringify(request.content.variables));
+      }
+    }
+    if (options.statusCallbackUrl !== undefined) {
+      params.set("StatusCallback", options.statusCallbackUrl);
+    }
+    return params;
+  }
+  function idempotencyToken(request) {
+    return createHash2("sha256").update([accountSid, request.organizationId, request.idempotencyKey].join("\x00")).digest("hex");
+  }
+  async function attempt(params, token, overall) {
+    const own = new AbortController;
+    let attemptTimedOut = false;
+    const timer = setTimeout(() => {
+      attemptTimedOut = true;
+      own.abort();
+    }, attemptTimeoutMs);
+    timer.unref?.();
+    const signal = AbortSignal.any([overall, own.signal]);
+    try {
+      const response = await raceAbort(doFetch(url, {
+        method: "POST",
+        redirect: "manual",
+        signal,
+        headers: {
+          authorization,
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+          "i-twilio-idempotency-token": token
+        },
+        body: params
+      }), signal);
+      const status = response.status;
+      const text = await raceAbort(readBounded3(response), signal);
+      if (status === 429 || status >= 500) {
+        throw unavailable4("http", status);
+      }
+      if (status >= 400) {
+        throw fail4xx(status, parseJson2(text));
+      }
+      if (status < 200 || status >= 300) {
+        throw badResponse2("status", status);
+      }
+      const json = parseJson2(text);
+      const sid = json?.sid;
+      const state = json?.status;
+      if (typeof sid !== "string" || !MESSAGE_SID.test(sid) || typeof state !== "string") {
+        throw badResponse2("shape", status);
+      }
+      if (QUEUED.has(state)) {
+        return { providerMessageId: sid, status: "queued" };
+      }
+      if (SENT.has(state)) {
+        return { providerMessageId: sid, status: "sent" };
+      }
+      throw badResponse2("state", status);
+    } catch (error) {
+      if (error instanceof MessagingError2) {
+        throw error;
+      }
+      if (error instanceof AttemptAborted && !attemptTimedOut) {
+        throw error;
+      }
+      throw unavailable4(attemptTimedOut ? "attempt_timeout" : "network");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function report(error, request) {
+    if (!isReportableMessagingError2(error)) {
+      return;
+    }
+    try {
+      options.reporter?.capture(error, {
+        organizationId: request.organizationId,
+        tags: { feature: "messaging" }
+      });
+    } catch {}
+  }
+  return {
+    async send(request) {
+      const checked = checkSendRequest(request);
+      const body = form(checked);
+      const token = idempotencyToken(checked);
+      const text = body.toString();
+      const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal);
+      try {
+        const { consentCheckId, numberConsentCheckId } = await requireConsent(guard, checked, deadline);
+        const answer = await withMessagingRetry(async () => {
+          try {
+            return await attempt(text, token, deadline.signal);
+          } catch (error) {
+            if (error instanceof AttemptAborted) {
+              deadline.check();
+              throw unavailable4("attempt_timeout");
+            }
+            throw error;
+          }
+        }, {
+          policy: checked.retry,
+          deadline,
+          sleep,
+          ...options.random === undefined ? {} : { random: options.random },
+          onRetry: (retry, delayMs) => options.logger?.warn("Messaging send retried", {
+            feature: "messaging",
+            channel: checked.channel,
+            retry,
+            delayMs
+          })
+        });
+        return {
+          consentCheckId,
+          numberConsentCheckId,
+          providerMessageId: answer.providerMessageId,
+          channel: checked.channel,
+          status: answer.status,
+          idempotencyKey: checked.idempotencyKey
+        };
+      } catch (error) {
+        report(error, checked);
+        throw error;
+      } finally {
+        deadline.stop();
+      }
+    },
+    async receive(request) {
+      return verifyAndParseWebhook(request, authToken, clock);
+    }
+  };
+}
 // src/queue/store.ts
 function keyOf(key) {
   return JSON.stringify([key.consumer, key.organizationId, key.messageId]);
@@ -1770,798 +2814,6 @@ function createErrorReporter(options) {
   }
   return reporter;
 }
-// src/telephony/twilio.ts
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { SignJWT } from "jose";
-
-// src/telephony/twilio-http.ts
-var TWILIO_MAX_ATTEMPTS = 3;
-var TWILIO_RETRY_BASE_MS = 100;
-var TWILIO_RETRY_MAX_MS = 1000;
-var TWILIO_MAX_RESPONSE_BYTES = 1048576;
-var CALL_ENDED_CODES = new Set([21220, 21221, 21222, 21224]);
-function unavailable2(reason, details) {
-  return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, `The provider did not answer: ${reason}`, details === undefined ? {} : { details });
-}
-function mapTwilioFailure(status, body) {
-  const twilioCode = typeof body?.code === "number" ? body.code : undefined;
-  const details = {
-    status,
-    ...twilioCode === undefined ? {} : { twilioCode }
-  };
-  const fail = (code, message) => new TelephonyError2(code, message, { details });
-  if (twilioCode !== undefined && CALL_ENDED_CODES.has(twilioCode)) {
-    return fail(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
-  }
-  if (status === 404) {
-    return fail(TELEPHONY_ERROR_CODES2.notFound, "The provider has no such resource");
-  }
-  if (status === 429 || status >= 500) {
-    return fail(TELEPHONY_ERROR_CODES2.unavailable, "The provider is unavailable");
-  }
-  if (status === 401 || status === 403) {
-    return fail(TELEPHONY_ERROR_CODES2.rejected, "The provider refused the credentials");
-  }
-  return fail(TELEPHONY_ERROR_CODES2.rejected, "The provider refused the request");
-}
-function retryable(status) {
-  return status === 429 || status >= 500;
-}
-function guardBody(response, timer, signal, timedOut) {
-  const source = response.body;
-  if (source === null) {
-    clearTimeout(timer);
-    return response;
-  }
-  const reader = source.getReader();
-  const aborted = new Promise((_, reject) => {
-    const fail = () => reject(unavailable2(timedOut() ? "timed out" : "the request failed"));
-    if (signal.aborted) {
-      fail();
-    } else {
-      signal.addEventListener("abort", fail, { once: true });
-    }
-  });
-  aborted.catch(() => {
-    return;
-  });
-  const guarded = new ReadableStream({
-    async pull(controller) {
-      try {
-        const chunk = await Promise.race([reader.read(), aborted]);
-        if (chunk.done) {
-          clearTimeout(timer);
-          controller.close();
-        } else {
-          controller.enqueue(chunk.value);
-        }
-      } catch (error) {
-        clearTimeout(timer);
-        reader.cancel().catch(() => {
-          return;
-        });
-        controller.error(error);
-      }
-    },
-    cancel(reason) {
-      clearTimeout(timer);
-      return reader.cancel(reason);
-    }
-  });
-  return new Response(guarded, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers
-  });
-}
-function createTwilioHttp(options) {
-  const maxAttempts = options.maxAttempts ?? TWILIO_MAX_ATTEMPTS;
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
-    throw new TypeError("maxAttempts must be an integer from 1 to 10");
-  }
-  async function send(request, mode, allow) {
-    const headers = {
-      Authorization: options.authorization,
-      Accept: mode === "json" ? "application/json" : "*/*"
-    };
-    let body;
-    if (request.form !== undefined) {
-      const params = new URLSearchParams;
-      for (const [name, value] of Object.entries(request.form)) {
-        for (const item of typeof value === "string" ? [value] : value) {
-          params.append(name, item);
-        }
-      }
-      body = params.toString();
-      headers["Content-Type"] = "application/x-www-form-urlencoded";
-    }
-    if (request.idempotencyToken !== undefined) {
-      headers["I-Twilio-Idempotency-Token"] = request.idempotencyToken;
-    }
-    let last;
-    for (let attempt = 1;attempt <= maxAttempts; attempt++) {
-      const remaining = request.deadline - options.now();
-      if (remaining <= 0) {
-        throw last ?? unavailable2("timed out");
-      }
-      const controller = new AbortController;
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, remaining);
-      let keepTimer = false;
-      try {
-        const response = await options.fetch(`${options.baseUrl}${request.path}`, {
-          method: request.method,
-          headers,
-          ...body === undefined ? {} : { body },
-          redirect: mode === "stream" ? "follow" : "manual",
-          signal: controller.signal
-        });
-        const ok = response.status >= 200 && response.status < 300;
-        if (ok && mode === "stream") {
-          keepTimer = true;
-          return {
-            status: response.status,
-            json: null,
-            response: guardBody(response, timer, controller.signal, () => timedOut)
-          };
-        }
-        const json = await readJson(response, ok || allow.includes(response.status));
-        if (ok || allow.includes(response.status)) {
-          return { status: response.status, json };
-        }
-        response.body?.cancel().catch(() => {
-          return;
-        });
-        const failure = mapTwilioFailure(response.status, json);
-        if (!retryable(response.status)) {
-          throw failure;
-        }
-        last = failure;
-      } catch (error) {
-        if (error instanceof TelephonyError2 && error !== last) {
-          throw error;
-        }
-        if (timedOut) {
-          throw unavailable2("timed out");
-        }
-        if (!(error instanceof TelephonyError2)) {
-          last = unavailable2("the request failed");
-        }
-      } finally {
-        if (!keepTimer) {
-          clearTimeout(timer);
-        }
-      }
-      if (attempt < maxAttempts) {
-        const base = Math.min(TWILIO_RETRY_MAX_MS, TWILIO_RETRY_BASE_MS * 2 ** (attempt - 1));
-        const pause = Math.min(Math.floor(base * (0.5 + options.random())), Math.max(0, request.deadline - options.now()));
-        await options.sleep(pause);
-      }
-    }
-    throw last ?? unavailable2("the request failed");
-  }
-  return {
-    json: (request, opts) => send(request, "json", opts?.allow ?? []),
-    stream: (request) => send(request, "stream", [])
-  };
-}
-async function readJson(response, mustParse) {
-  if (response.status >= 300 && response.status < 400) {
-    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with a redirect", { details: { status: response.status } });
-  }
-  let text;
-  try {
-    text = await readBounded2(response);
-  } catch (error) {
-    if (error instanceof TelephonyError2) {
-      throw error;
-    }
-    throw unavailable2("the answer could not be read");
-  }
-  if (text.length === 0) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    if (mustParse && response.status !== 204) {
-      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with something that is not JSON", { details: { status: response.status } });
-    }
-    return null;
-  }
-}
-async function readBounded2(response) {
-  const reader = response.body?.getReader();
-  if (!reader) {
-    return "";
-  }
-  const chunks = [];
-  let total = 0;
-  for (;; ) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    total += value.length;
-    if (total > TWILIO_MAX_RESPONSE_BYTES) {
-      reader.cancel().catch(() => {
-        return;
-      });
-      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, "The provider answered with more than this adapter reads");
-    }
-    chunks.push(value);
-  }
-  return new TextDecoder().decode(Buffer.concat(chunks));
-}
-
-// src/telephony/twilio.ts
-var TWILIO_REGIONS = ["us1", "ie1", "au1"];
-var TWILIO_DEFAULT_EDGES = {
-  us1: "ashburn",
-  ie1: "dublin",
-  au1: "sydney"
-};
-var EDGE = /^[a-z][a-z0-9-]{1,30}$/;
-function createMemoryTwilioStore() {
-  const calls = new Map;
-  const recordings = new Map;
-  const placements = new Map;
-  const chains = new Map;
-  return {
-    withCall: async (id, fn) => {
-      const previous = chains.get(id) ?? Promise.resolve();
-      const run = async () => fn(calls.get(id) ?? null);
-      const next = previous.then(run, run);
-      chains.set(id, next);
-      try {
-        return await next;
-      } finally {
-        if (chains.get(id) === next) {
-          chains.delete(id);
-        }
-      }
-    },
-    getCall: async (id) => calls.get(id) ?? null,
-    putCall: async (id, record) => {
-      calls.set(id, record);
-    },
-    claimCall: async (id, record) => {
-      const existing = calls.get(id);
-      if (existing) {
-        return existing;
-      }
-      calls.set(id, record);
-      return record;
-    },
-    getRecording: async (id) => {
-      const providerCallId = recordings.get(id);
-      return providerCallId === undefined ? null : { providerCallId };
-    },
-    putRecording: async (id, providerCallId) => {
-      recordings.set(id, providerCallId);
-    },
-    getPlacement: async (org, key) => placements.get(`${org}\x00${key}`) ?? null,
-    putPlacement: async (org, key, placement) => {
-      placements.set(`${org}\x00${key}`, placement);
-    }
-  };
-}
-var SID = {
-  account: /^AC[0-9a-f]{32}$/,
-  apiKey: /^SK[0-9a-f]{32}$/,
-  app: /^AP[0-9a-f]{32}$/
-};
-var LANGUAGE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$/;
-var HOLD_SECONDS = 3600;
-function estimateSpeechMs(text) {
-  const words = text.trim().split(/\s+/).length;
-  return Math.ceil(Math.max(words * 400 * 1.25, text.length * 90)) + 1000;
-}
-function escapeXml(text) {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
-function hold() {
-  return `<Response><Pause length="${HOLD_SECONDS}"/></Response>`;
-}
-function badResponse(what) {
-  return new TelephonyError2(TELEPHONY_ERROR_CODES2.badResponse, `The provider answered without a usable ${what}`);
-}
-function unavailable3() {
-  return new TelephonyError2(TELEPHONY_ERROR_CODES2.unavailable, "The provider did not answer in time");
-}
-function notFound() {
-  return new TelephonyError2(TELEPHONY_ERROR_CODES2.notFound, "There is no such call or Recording");
-}
-function sid(json, prefix) {
-  const value = json?.sid;
-  if (typeof value !== "string" || !new RegExp(`^${prefix}[0-9a-zA-Z]{32}$`).test(value)) {
-    throw badResponse("id");
-  }
-  return value;
-}
-function withTag(url, organizationId, callId) {
-  const tagged = new URL(url);
-  tagged.searchParams.set("organizationId", organizationId);
-  if (callId !== null) {
-    tagged.searchParams.set("callId", callId);
-  }
-  return tagged.toString();
-}
-function twilioApiHost(region, edge) {
-  if (region === undefined) {
-    if (edge !== undefined) {
-      throw new TypeError("edge needs a region");
-    }
-    return "api.twilio.com";
-  }
-  if (!TWILIO_REGIONS.includes(region)) {
-    throw new TypeError("region is not one of us1, ie1, au1");
-  }
-  const chosen = edge ?? TWILIO_DEFAULT_EDGES[region];
-  if (!EDGE.test(chosen)) {
-    throw new TypeError("edge is not acceptable");
-  }
-  return `api.${chosen}.${region}.twilio.com`;
-}
-function signTwilioRequest(authToken, url, params = {}) {
-  const pairs = Array.isArray(params) ? [...params] : Object.entries(params);
-  const text = pairs.sort(([a, av], [b, bv]) => a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0).reduce((acc, [name, value]) => acc + name + value, url);
-  return createHmac("sha1", authToken).update(text, "utf8").digest("base64");
-}
-function urlVariants(url) {
-  const variants = [url];
-  try {
-    const parsed = new URL(url);
-    if (parsed.username || parsed.password) {
-      return variants;
-    }
-    const standard = parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "";
-    if (standard === "" || parsed.port !== "" && parsed.port !== standard) {
-      return variants;
-    }
-    const rest = `${parsed.pathname}${parsed.search}`;
-    const bare = `${parsed.protocol}//${parsed.hostname}${rest}`;
-    const withPort = `${parsed.protocol}//${parsed.hostname}:${standard}${rest}`;
-    for (const variant of [bare, withPort]) {
-      if (!variants.includes(variant)) {
-        variants.push(variant);
-      }
-    }
-  } catch {}
-  return variants;
-}
-function sameText(a, b) {
-  const left = Buffer.from(a, "utf8");
-  const right = Buffer.from(b, "utf8");
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-function createTwilioTelephony(options) {
-  if (!SID.account.test(options.accountSid)) {
-    throw new TypeError("accountSid is not an Account SID");
-  }
-  if (!SID.apiKey.test(options.apiKeySid)) {
-    throw new TypeError("apiKeySid is not an API key SID");
-  }
-  if (typeof options.apiKeySecret !== "string" || options.apiKeySecret.length < 16) {
-    throw new TypeError("apiKeySecret must be at least 16 characters");
-  }
-  if (!SID.app.test(options.twimlAppSid)) {
-    throw new TypeError("twimlAppSid is not a TwiML App SID");
-  }
-  if (options.authToken !== undefined && (typeof options.authToken !== "string" || options.authToken.length < 16)) {
-    throw new TypeError("authToken must be at least 16 characters");
-  }
-  const language = options.disclosureLanguage ?? "en-US";
-  if (!LANGUAGE.test(language)) {
-    throw new TypeError("disclosureLanguage is not a language tag");
-  }
-  for (const url of [options.statusCallbackUrl, options.recordingStatusCallbackUrl]) {
-    if (url !== undefined) {
-      let parsed;
-      try {
-        parsed = new URL(url);
-      } catch {
-        throw new TypeError("a callback URL is not a URL");
-      }
-      const plainOk = options.environment === "local" && parsed.protocol === "http:";
-      if (parsed.protocol !== "https:" && !plainOk || parsed.username || parsed.password) {
-        throw new TypeError("a callback URL must be https without credentials");
-      }
-    }
-  }
-  const defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TELEPHONY_TIMEOUT_MS2;
-  resolveTimeout(undefined, defaultTimeoutMs);
-  const { accountSid, apiKeySid, apiKeySecret, twimlAppSid } = options;
-  const environment = options.environment ?? "prod";
-  const clock = options.clock ?? systemClock2;
-  const nowMs = options.nowMs ?? Date.now;
-  const sleep = options.sleep ?? systemSleep2;
-  const random = options.random ?? Math.random;
-  if (options.store === undefined && environment !== "local" && environment !== "dev") {
-    throw new TypeError("a durable store is required outside the local and dev environments");
-  }
-  const store = options.store ?? createMemoryTwilioStore();
-  const authToken = options.authToken;
-  const base = `/2010-04-01/Accounts/${accountSid}`;
-  const http = createTwilioHttp({
-    baseUrl: `https://${twilioApiHost(options.region, options.edge)}`,
-    authorization: `Basic ${Buffer.from(`${apiKeySid}:${apiKeySecret}`).toString("base64")}`,
-    fetch: options.fetch ?? ((input, init) => fetch(input, init)),
-    sleep,
-    random,
-    now: nowMs,
-    ...options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }
-  });
-  function deadlineFor(opts) {
-    return nowMs() + resolveTimeout(opts, defaultTimeoutMs);
-  }
-  function token(...parts) {
-    return createHash("sha256").update([accountSid, ...parts].join("\x00")).digest("hex");
-  }
-  async function patchCall(providerCallId, patch) {
-    await store.withCall(providerCallId, async (current) => {
-      if (current === null) {
-        throw notFound();
-      }
-      await store.putCall(providerCallId, { ...current, ...patch });
-    });
-  }
-  async function holdUnlessDisclosing(providerCallId, deadline) {
-    await store.withCall(providerCallId, async (fresh) => {
-      if (fresh !== null && fresh.disclosure === null && fresh.disclosureStarted !== true) {
-        await updateCall(providerCallId, { Twiml: hold() }, deadline);
-      }
-    });
-  }
-  async function ownedCall(organizationId, providerCallId) {
-    const record = await store.getCall(providerCallId);
-    if (!record || record.organizationId !== organizationId) {
-      throw notFound();
-    }
-    return record;
-  }
-  function refOf(request) {
-    return {
-      organizationId: checkOrganizationId(request.organizationId),
-      providerCallId: checkProviderId(request.providerCallId, "providerCallId")
-    };
-  }
-  async function updateCall(providerCallId, form, deadline) {
-    await http.json({
-      method: "POST",
-      path: `${base}/Calls/${providerCallId}.json`,
-      form,
-      deadline
-    });
-  }
-  async function callIsUp(providerCallId, deadline) {
-    const { json } = await http.json({
-      method: "GET",
-      path: `${base}/Calls/${providerCallId}.json`,
-      deadline
-    });
-    const status = json?.status;
-    if (typeof status !== "string") {
-      throw badResponse("status");
-    }
-    return status === "in-progress";
-  }
-  function callEnded() {
-    return new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
-  }
-  return {
-    async placeCall(request, opts) {
-      const organizationId = checkOrganizationId(request.organizationId);
-      const callId = checkCallId(request.callId);
-      const key = checkProviderId(request.idempotencyKey, "idempotencyKey");
-      const from = checkNumber(request.from, "from");
-      const to = checkNumber(request.to, "to");
-      const deadline = deadlineFor(opts);
-      const fingerprint = createHmac("sha256", apiKeySecret).update(`${from}\x00${to}`).digest("hex");
-      const earlier = await store.getPlacement(organizationId, key);
-      if (earlier) {
-        if (earlier.fingerprint !== fingerprint) {
-          invalid("idempotencyKey");
-        }
-        return { providerCallId: earlier.providerCallId, created: false };
-      }
-      const form = { To: to, From: from, Twiml: hold() };
-      if (options.statusCallbackUrl !== undefined) {
-        form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId);
-        form.StatusCallbackMethod = "POST";
-        form.StatusCallbackEvent = ["initiated", "ringing", "answered", "completed"];
-      }
-      const { json } = await http.json({
-        method: "POST",
-        path: `${base}/Calls.json`,
-        form,
-        idempotencyToken: token("call", organizationId, key),
-        deadline
-      });
-      const providerCallId = sid(json, "CA");
-      await store.putCall(providerCallId, {
-        organizationId,
-        callId,
-        direction: "outbound",
-        disclosure: null,
-        bridgedTo: null,
-        ringIdentities: [],
-        recordingId: null,
-        streamId: null
-      });
-      await store.putPlacement(organizationId, key, { providerCallId, fingerprint });
-      return { providerCallId, created: true };
-    },
-    async answerCall(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      const callId = checkCallId(request.callId);
-      const identities = checkRingIdentities(request.ringIdentities);
-      const deadline = deadlineFor(opts);
-      const known = await store.getCall(providerCallId);
-      if (known) {
-        if (known.organizationId !== organizationId) {
-          throw notFound();
-        }
-        if (known.direction === "inbound" && known.callId === callId && known.disclosure === null && known.disclosureStarted !== true) {
-          await holdUnlessDisclosing(providerCallId, deadline);
-        }
-        return { ringing: known.ringIdentities.length };
-      }
-      if (!await callIsUp(providerCallId, deadline)) {
-        throw callEnded();
-      }
-      const claimed = await store.claimCall(providerCallId, {
-        organizationId,
-        callId,
-        direction: "inbound",
-        disclosure: null,
-        bridgedTo: null,
-        ringIdentities: identities,
-        recordingId: null,
-        streamId: null
-      });
-      if (claimed.organizationId !== organizationId) {
-        throw notFound();
-      }
-      await holdUnlessDisclosing(providerCallId, deadline);
-      return { ringing: claimed.ringIdentities.length };
-    },
-    async playDisclosure(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      checkDisclosure(request.wordingVersion, request.text, request.aiAssisted);
-      const deadline = deadlineFor(opts);
-      const record = await ownedCall(organizationId, providerCallId);
-      const earlier = record.disclosure;
-      if (earlier && earlier.wordingVersion === request.wordingVersion) {
-        return earlier;
-      }
-      const waitMs = estimateSpeechMs(request.text);
-      if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
-        throw unavailable3();
-      }
-      await store.withCall(providerCallId, async (fresh) => {
-        if (fresh === null) {
-          throw notFound();
-        }
-        await store.putCall(providerCallId, { ...fresh, disclosureStarted: true });
-        await updateCall(providerCallId, {
-          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
-        }, deadline);
-      });
-      if (options.disclosureDone) {
-        await options.disclosureDone({ organizationId, providerCallId, deadline });
-      } else {
-        await sleep(waitMs);
-      }
-      if (nowMs() > deadline) {
-        throw unavailable3();
-      }
-      if (!await callIsUp(providerCallId, deadline)) {
-        throw callEnded();
-      }
-      const played = {
-        wordingVersion: request.wordingVersion,
-        aiAssisted: request.aiAssisted,
-        playedAt: clock.now().toISOString()
-      };
-      await patchCall(providerCallId, { disclosure: played, bridgedTo: null });
-      return played;
-    },
-    async bridge(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      const rep = checkIdentity(request.repIdentity);
-      const deadline = deadlineFor(opts);
-      const record = await ownedCall(organizationId, providerCallId);
-      requireDisclosure(record.disclosure);
-      if (record.bridgedTo === rep) {
-        return;
-      }
-      await updateCall(providerCallId, {
-        Twiml: `<Response><Dial answerOnBridge="true"><Client><Identity>${escapeXml(rep)}</Identity><Parameter name="organizationId" value="${escapeXml(organizationId)}"/></Client></Dial></Response>`
-      }, deadline);
-      await patchCall(providerCallId, { bridgedTo: rep });
-    },
-    async startRecording(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      const deadline = deadlineFor(opts);
-      const record = await ownedCall(organizationId, providerCallId);
-      requireDisclosure(record.disclosure);
-      if (record.recordingId !== null) {
-        return { recordingId: record.recordingId, channels: 2 };
-      }
-      const form = {
-        RecordingChannels: "dual",
-        RecordingTrack: "both"
-      };
-      if (options.recordingStatusCallbackUrl !== undefined) {
-        form.RecordingStatusCallback = withTag(options.recordingStatusCallbackUrl, organizationId, record.callId);
-        form.RecordingStatusCallbackMethod = "POST";
-        form.RecordingStatusCallbackEvent = ["completed"];
-      }
-      const { json } = await http.json({
-        method: "POST",
-        path: `${base}/Calls/${providerCallId}/Recordings.json`,
-        form,
-        idempotencyToken: token("recording", providerCallId),
-        deadline
-      });
-      const recordingId = sid(json, "RE");
-      await store.putRecording(recordingId, providerCallId);
-      await patchCall(providerCallId, { recordingId });
-      return { recordingId, channels: 2 };
-    },
-    async forkTracks(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      const destination = checkDestinationUrl(request.destinationUrl, environment === "local");
-      const deadline = deadlineFor(opts);
-      const record = await ownedCall(organizationId, providerCallId);
-      requireDisclosure(record.disclosure, true);
-      if (record.streamId !== null) {
-        return { streamId: record.streamId, tracks: ["rep", "prospect"] };
-      }
-      const { json } = await http.json({
-        method: "POST",
-        path: `${base}/Calls/${providerCallId}/Streams.json`,
-        form: { Url: destination, Track: "both_tracks" },
-        idempotencyToken: token("stream", providerCallId),
-        deadline
-      });
-      const streamId = sid(json, "MZ");
-      await patchCall(providerCallId, { streamId });
-      return { streamId, tracks: ["rep", "prospect"] };
-    },
-    async hangUp(request, opts) {
-      const { organizationId, providerCallId } = refOf(request);
-      if (request.by !== undefined && request.by !== "rep" && request.by !== "system") {
-        invalid("by");
-      }
-      const deadline = deadlineFor(opts);
-      await ownedCall(organizationId, providerCallId);
-      try {
-        await updateCall(providerCallId, { Status: "completed" }, deadline);
-      } catch (error) {
-        if (error instanceof TelephonyError2 && error.code === TELEPHONY_ERROR_CODES2.callEnded) {
-          return;
-        }
-        throw error;
-      }
-    },
-    async fetchRecording(request, opts) {
-      const organizationId = checkOrganizationId(request.organizationId);
-      const recordingId = checkProviderId(request.recordingId, "recordingId");
-      const deadline = deadlineFor(opts);
-      const owner = await store.getRecording(recordingId);
-      if (!owner) {
-        throw notFound();
-      }
-      await ownedCall(organizationId, owner.providerCallId);
-      const { json } = await http.json({
-        method: "GET",
-        path: `${base}/Recordings/${recordingId}.json`,
-        deadline
-      });
-      const status = json?.status;
-      if (status === "in-progress" || status === "paused" || status === "processing") {
-        throw new TelephonyError2(TELEPHONY_ERROR_CODES2.recordingNotReady, "The Recording is not finished yet");
-      }
-      if (status !== "completed") {
-        throw notFound();
-      }
-      if (json?.channels !== 2) {
-        throw badResponse("channel count");
-      }
-      const { response } = await http.stream({
-        method: "GET",
-        path: `${base}/Recordings/${recordingId}.wav?RequestedChannels=2`,
-        deadline
-      });
-      if (!response?.body) {
-        throw badResponse("body");
-      }
-      const length = Number(response.headers.get("content-length"));
-      return {
-        body: response.body,
-        contentType: response.headers.get("content-type")?.split(";")[0]?.trim() || "audio/wav",
-        sizeBytes: Number.isSafeInteger(length) && length > 0 ? length : null,
-        channels: 2
-      };
-    },
-    async deleteRecording(request, opts) {
-      const organizationId = checkOrganizationId(request.organizationId);
-      const recordingId = checkProviderId(request.recordingId, "recordingId");
-      const deadline = deadlineFor(opts);
-      const owner = await store.getRecording(recordingId);
-      if (!owner) {
-        return { existed: false };
-      }
-      const record = await store.getCall(owner.providerCallId);
-      if (!record || record.organizationId !== organizationId) {
-        return { existed: false };
-      }
-      const answer = await http.json({ method: "DELETE", path: `${base}/Recordings/${recordingId}.json`, deadline }, { allow: [404] });
-      return { existed: answer.status !== 404 };
-    },
-    verifyWebhook(request) {
-      try {
-        if (authToken === undefined || typeof request?.url !== "string" || typeof request.body !== "string" || typeof request.signature !== "string" || request.signature.length === 0 || request.signature.length > 256 || Buffer.byteLength(request.body, "utf8") > MAX_WEBHOOK_BODY_BYTES2) {
-          return false;
-        }
-        let entries = [];
-        let hashed = null;
-        try {
-          hashed = new URL(request.url).searchParams.get("bodySHA256");
-        } catch {
-          return false;
-        }
-        if (hashed !== null) {
-          const actual = createHash("sha256").update(request.body, "utf8").digest("hex");
-          if (!sameText(actual, hashed.toLowerCase())) {
-            return false;
-          }
-        } else if (request.body.length > 0) {
-          entries = [...new URLSearchParams(request.body).entries()];
-        }
-        let matched = false;
-        for (const url of urlVariants(request.url)) {
-          const expected = signTwilioRequest(authToken, url, entries);
-          matched = sameText(expected, request.signature) || matched;
-        }
-        return matched;
-      } catch {
-        return false;
-      }
-    },
-    async mintBrowserToken(request, opts) {
-      resolveTimeout(opts, defaultTimeoutMs);
-      const organizationId = checkOrganizationId(request.organizationId);
-      const identity = checkIdentity(request.identity);
-      const ttl = request.ttlSeconds ?? 900;
-      if (!Number.isInteger(ttl) || ttl < 60 || ttl > 3600) {
-        invalid("ttlSeconds");
-      }
-      const issuedAt = Math.floor(clock.now().getTime() / 1000);
-      const jwt = await new SignJWT({
-        grants: {
-          identity,
-          voice: {
-            incoming: { allow: true },
-            outgoing: { application_sid: twimlAppSid, params: { organizationId } }
-          }
-        }
-      }).setProtectedHeader({ alg: "HS256", typ: "JWT", cty: "twilio-fpa;v=1" }).setIssuer(apiKeySid).setSubject(accountSid).setJti(`${apiKeySid}-${randomBytes(12).toString("hex")}`).setIssuedAt(issuedAt).setExpirationTime(issuedAt + ttl).sign(new TextEncoder().encode(apiKeySecret));
-      return {
-        token: jwt,
-        identity: request.identity,
-        ttlSeconds: ttl,
-        expiresAt: new Date((issuedAt + ttl) * 1000).toISOString()
-      };
-    }
-  };
-}
 
 // src/index.ts
 var PACKAGE = "tula-closeline-kit";
@@ -2582,6 +2834,8 @@ export {
   DEFAULT_LLM_RETRY_POLICY2 as DEFAULT_LLM_RETRY_POLICY,
   DEFAULT_LLM_TIMEOUT_MS2 as DEFAULT_LLM_TIMEOUT_MS,
   DEFAULT_MAX_OBJECT_BYTES2 as DEFAULT_MAX_OBJECT_BYTES,
+  DEFAULT_MESSAGING_RETRY_POLICY2 as DEFAULT_MESSAGING_RETRY_POLICY,
+  DEFAULT_MESSAGING_TIMEOUT_MS2 as DEFAULT_MESSAGING_TIMEOUT_MS,
   DEFAULT_PRESIGN_SECONDS2 as DEFAULT_PRESIGN_SECONDS,
   DEFAULT_RECONNECT_POLICY2 as DEFAULT_RECONNECT_POLICY,
   DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2 as DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS,
@@ -2605,6 +2859,7 @@ export {
   INTERNAL_MAX_REQUEST_BYTES,
   INTERNAL_RETRY_STATUSES,
   INVALID_REASONS2 as INVALID_REASONS,
+  InboundMessage2 as InboundMessage,
   InternalCallError,
   LLM_ERROR_CODES2 as LLM_ERROR_CODES,
   LlmError2 as LlmError,
@@ -2633,7 +2888,10 @@ export {
   MAX_LLM_MAX_OUTPUT_TOKENS2 as MAX_LLM_MAX_OUTPUT_TOKENS,
   MAX_LLM_MESSAGES2 as MAX_LLM_MESSAGES,
   MAX_LLM_TIMEOUT_MS2 as MAX_LLM_TIMEOUT_MS,
+  MAX_MESSAGE_BODY_CHARS2 as MAX_MESSAGE_BODY_CHARS,
   MAX_MESSAGE_BYTES2 as MAX_MESSAGE_BYTES,
+  MAX_MESSAGING_TIMEOUT_MS2 as MAX_MESSAGING_TIMEOUT_MS,
+  MAX_MESSAGING_WEBHOOK_BYTES2 as MAX_MESSAGING_WEBHOOK_BYTES,
   MAX_OBJECT_BYTES_LIMIT2 as MAX_OBJECT_BYTES_LIMIT,
   MAX_PRESIGN_SECONDS2 as MAX_PRESIGN_SECONDS,
   MAX_REPLAY_AUDIO_BYTES2 as MAX_REPLAY_AUDIO_BYTES,
@@ -2643,6 +2901,8 @@ export {
   MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2 as MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS,
   MAX_STREAM_BYTES_LIMIT2 as MAX_STREAM_BYTES_LIMIT,
   MAX_TELEPHONY_TIMEOUT_MS2 as MAX_TELEPHONY_TIMEOUT_MS,
+  MAX_TEMPLATE_VARIABLES2 as MAX_TEMPLATE_VARIABLES,
+  MAX_TEMPLATE_VARIABLE_CHARS2 as MAX_TEMPLATE_VARIABLE_CHARS,
   MAX_TOKEN_LENGTH,
   MAX_TOP_K2 as MAX_TOP_K,
   MAX_TRANSCRIBER_LIST_LIMIT2 as MAX_TRANSCRIBER_LIST_LIMIT,
@@ -2661,7 +2921,11 @@ export {
   MAX_WAIT_SECONDS2 as MAX_WAIT_SECONDS,
   MAX_WEBHOOK_BODY_BYTES2 as MAX_WEBHOOK_BODY_BYTES,
   MAX_WORDS_PER_TURN2 as MAX_WORDS_PER_TURN,
+  MESSAGING_CHANNELS2 as MESSAGING_CHANNELS,
+  MESSAGING_ERROR_CODES2 as MESSAGING_ERROR_CODES,
+  MESSAGING_PURPOSES2 as MESSAGING_PURPOSES,
   MODEL_TIERS2 as MODEL_TIERS,
+  MessagingError2 as MessagingError,
   PACKAGE,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
@@ -2689,6 +2953,7 @@ export {
   assertVisibility2 as assertVisibility,
   calendarRetryDelayMs2 as calendarRetryDelayMs,
   checkTranscriptionResult2 as checkTranscriptionResult,
+  classifyMessageIntent2 as classifyMessageIntent,
   createAuthMiddleware,
   createErrorReporter,
   createFixedClock2 as createFixedClock,
@@ -2702,6 +2967,7 @@ export {
   createRemoteKeySet,
   createStaticKeySet,
   createTokenVerifier,
+  createTwilioMessaging,
   createTwilioTelephony,
   cutText2 as cutText,
   defineMessage2 as defineMessage,
@@ -2711,14 +2977,16 @@ export {
   estimateTokens2 as estimateTokens,
   isAppError2 as isAppError,
   isContactGuardRequest2 as isContactGuardRequest,
+  isReportableMessagingError2 as isReportableMessagingError,
   isSentryDsn,
   llmRetryDelayMs2 as llmRetryDelayMs,
+  messagingRetryDelayMs2 as messagingRetryDelayMs,
   reconnectDelayMs2 as reconnectDelayMs,
   requireSentryDsn,
   scrubText2 as scrubText,
   sentryDsnSchema,
   shouldReportError2 as shouldReportError,
-  signTwilioRequest,
+  signTwilioRequest2 as signTwilioRequest,
   systemClock2 as systemClock,
   systemSleep2 as systemSleep,
   toErrorBody2 as toErrorBody,

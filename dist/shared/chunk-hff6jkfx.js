@@ -122,6 +122,116 @@ class LlmError2 extends AppError2 {
   }
 }
 
+// src/messaging/errors.ts
+var MESSAGING_ERROR_CODES2 = {
+  invalidRequest: "messaging.invalid_request",
+  consentDenied: "messaging.consent_denied",
+  recipientOptedOut: "messaging.recipient_opted_out",
+  templateRequired: "messaging.template_required",
+  timeout: "messaging.timeout",
+  aborted: "messaging.aborted",
+  rejected: "messaging.rejected",
+  unavailable: "messaging.unavailable",
+  badResponse: "messaging.bad_response",
+  webhookInvalid: "messaging.webhook_invalid"
+};
+var STATUS3 = {
+  "messaging.invalid_request": 400,
+  "messaging.consent_denied": 403,
+  "messaging.recipient_opted_out": 409,
+  "messaging.template_required": 409,
+  "messaging.timeout": 504,
+  "messaging.aborted": 499,
+  "messaging.rejected": 502,
+  "messaging.unavailable": 503,
+  "messaging.bad_response": 502,
+  "messaging.webhook_invalid": 401
+};
+
+class MessagingError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS3[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "MessagingError";
+  }
+}
+function isReportableMessagingError2(error) {
+  return error instanceof MessagingError2 && (error.code === MESSAGING_ERROR_CODES2.unavailable || error.code === MESSAGING_ERROR_CODES2.rejected || error.code === MESSAGING_ERROR_CODES2.badResponse);
+}
+
+// src/messaging/port.ts
+var DEFAULT_MESSAGING_TIMEOUT_MS2 = 1e4;
+var MAX_MESSAGING_TIMEOUT_MS2 = 60000;
+var MAX_MESSAGE_BODY_CHARS2 = 1600;
+var MAX_TEMPLATE_VARIABLES2 = 20;
+var MAX_TEMPLATE_VARIABLE_CHARS2 = 1024;
+var MAX_MESSAGING_WEBHOOK_BYTES2 = 262144;
+var MESSAGING_CHANNELS2 = ["sms", "whatsapp"];
+var MESSAGING_PURPOSES2 = ["agent_initiated", "reply"];
+var DEFAULT_MESSAGING_RETRY_POLICY2 = {
+  maxRetries: 2,
+  baseDelayMs: 200,
+  maxDelayMs: 2000
+};
+function messagingRetryDelayMs2(retry, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
+}
+var INSPECT2 = Symbol.for("nodejs.util.inspect.custom");
+
+class InboundMessage2 {
+  kind = "message";
+  channel;
+  providerMessageId;
+  receivedAt;
+  intent;
+  mediaCount;
+  #from;
+  #to;
+  #body;
+  constructor(fields) {
+    this.channel = fields.channel;
+    this.providerMessageId = fields.providerMessageId;
+    this.receivedAt = fields.receivedAt;
+    this.intent = fields.intent;
+    this.mediaCount = fields.mediaCount;
+    this.#from = fields.from;
+    this.#to = fields.to;
+    this.#body = fields.body;
+  }
+  get from() {
+    return this.#from;
+  }
+  get to() {
+    return this.#to;
+  }
+  get body() {
+    return this.#body;
+  }
+  toJSON() {
+    return {
+      kind: this.kind,
+      channel: this.channel,
+      providerMessageId: this.providerMessageId,
+      receivedAt: this.receivedAt,
+      intent: this.intent,
+      mediaCount: this.mediaCount,
+      bodyChars: this.#body.length
+    };
+  }
+  toString() {
+    return `InboundMessage(${this.channel}, ${this.intent}, ${this.#body.length} chars)`;
+  }
+  [INSPECT2]() {
+    return this.toString();
+  }
+}
+
 // src/telephony/port.ts
 var DEFAULT_TELEPHONY_TIMEOUT_MS2 = 1e4;
 var MAX_TELEPHONY_TIMEOUT_MS2 = 60000;
@@ -137,7 +247,7 @@ var TRANSCRIBER_ERROR_CODES2 = {
   unavailable: "transcriber.unavailable",
   badResponse: "transcriber.bad_response"
 };
-var STATUS3 = {
+var STATUS4 = {
   "transcriber.invalid_request": 400,
   "transcriber.conflict": 409,
   "transcriber.rejected": 500,
@@ -149,7 +259,7 @@ class TranscriberError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS3[code],
+      status: STATUS4[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -275,7 +385,7 @@ var TTS_ERROR_CODES2 = {
   unavailable: "tts.unavailable",
   badResponse: "tts.bad_response"
 };
-var STATUS4 = {
+var STATUS5 = {
   "tts.invalid_request": 400,
   "tts.text_too_large": 413,
   "tts.closed": 409,
@@ -290,7 +400,7 @@ class TtsError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS4[code],
+      status: STATUS5[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -299,4 +409,4 @@ class TtsError2 extends AppError2 {
   }
 }
 
-export { CalendarConnection2, CALENDAR_ERROR_CODES2, CalendarError2, DEFAULT_CALENDAR_TIMEOUT_MS2, MAX_CALENDAR_TIMEOUT_MS2, MAX_BUSY_RANGE_MS2, MAX_BUSY_INTERVALS2, MAX_EVENT_DURATION_MS2, MAX_EVENT_ATTENDEES2, DEFAULT_CALENDAR_RETRY_POLICY2, calendarRetryDelayMs2, LLM_ERROR_CODES2, LlmError2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2, TTS_ERROR_CODES2, TtsError2 };
+export { CalendarConnection2, CALENDAR_ERROR_CODES2, CalendarError2, DEFAULT_CALENDAR_TIMEOUT_MS2, MAX_CALENDAR_TIMEOUT_MS2, MAX_BUSY_RANGE_MS2, MAX_BUSY_INTERVALS2, MAX_EVENT_DURATION_MS2, MAX_EVENT_ATTENDEES2, DEFAULT_CALENDAR_RETRY_POLICY2, calendarRetryDelayMs2, LLM_ERROR_CODES2, LlmError2, MESSAGING_ERROR_CODES2, MessagingError2, isReportableMessagingError2, DEFAULT_MESSAGING_TIMEOUT_MS2, MAX_MESSAGING_TIMEOUT_MS2, MAX_MESSAGE_BODY_CHARS2, MAX_TEMPLATE_VARIABLES2, MAX_TEMPLATE_VARIABLE_CHARS2, MAX_MESSAGING_WEBHOOK_BYTES2, MESSAGING_CHANNELS2, MESSAGING_PURPOSES2, DEFAULT_MESSAGING_RETRY_POLICY2, messagingRetryDelayMs2, InboundMessage2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2, TTS_ERROR_CODES2, TtsError2 };

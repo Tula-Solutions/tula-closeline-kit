@@ -69,6 +69,15 @@ Other scripts are in `package.json`.
   times the memory adapter's measured numbers: a chunk pull mean 0.0015 ms and open to first chunk
   mean 0.012 ms, each with a median and best-batch p95 budget as above.
 
+- `MessagingPort.send` (`src/messaging/`) is on every outbound text. It validates a small request
+  strictly (O(body length), at most 1,600 characters and 20 template variables), asks the Contact
+  Check once, then makes one HTTP call; the memory adapter adds one sha256 and one map insert, and
+  `receive` verifies one HMAC-SHA1 over the URL and form (O(form size), at most 256 KiB) and
+  classifies the STOP keywords with one set lookup. Consent cannot be skipped (ADR 0003): there is
+  no option for it and an unknown request field is refused. Budgets in `bench/messaging.bench.ts`,
+  about five times what it measures: a send mean 0.035 ms (two Contact Checks), a webhook mean 0.023 ms and the keyword
+  classification mean 0.02 ms (a floor, with median and tail 0.02 ms too), each with a median and best-batch p95 budget as above.
+
 - `prepareFields` / `redactFields` (`src/redact.ts`) copy the fields of every log line. O(fields +
   objects walked + text emitted), bounded in counts by 5,000 shared objects and 20,000 shared nested
   values plus 50 objects and 200 values per top-level field, and 200 Errors scrubbed per entry plus 2 per top-level field (the rest are `[truncated]` unread), and in text by 1 MiB of UTF-16 code

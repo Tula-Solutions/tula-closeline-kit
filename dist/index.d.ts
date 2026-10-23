@@ -1035,6 +1035,991 @@ declare const DEFAULT_LLM_RETRY_POLICY: ResolvedLlmRetryPolicy;
 * scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
 */
 declare function llmRetryDelayMs(retry: number, policy: ResolvedLlmRetryPolicy, random?: () => number): number;
+/** The `area.reason` codes the messaging port and adapters throw. */
+declare const MESSAGING_ERROR_CODES: {
+	/** The Organization, Prospect, number, content, key, limits or retry policy are not acceptable. Nothing was sent. */
+	readonly invalidRequest: "messaging.invalid_request";
+	/** The Contact Check did not allow the message (ADR 0003); `details.code` is the `consent.*` code. Nothing was sent. */
+	readonly consentDenied: "messaging.consent_denied";
+	/** The provider says the recipient texted STOP to this sender, so it will not deliver. Not retryable. */
+	readonly recipientOptedOut: "messaging.recipient_opted_out";
+	/** A WhatsApp free-form message is outside the 24 hour window; only a template can start the conversation. */
+	readonly templateRequired: "messaging.template_required";
+	/** The overall deadline passed; the underlying request was aborted. */
+	readonly timeout: "messaging.timeout";
+	/** The caller's own AbortSignal fired; the underlying request was aborted. */
+	readonly aborted: "messaging.aborted";
+	/** The provider refused for a reason a retry cannot fix (credentials, quota, a bad number). */
+	readonly rejected: "messaging.rejected";
+	/** The provider could not be reached, was throttled or failed. The only retryable code. */
+	readonly unavailable: "messaging.unavailable";
+	/** The provider sent something this adapter cannot use. */
+	readonly badResponse: "messaging.bad_response";
+	/** A webhook has a wrong, missing or unverifiable signature, or a body that is not a message event. */
+	readonly webhookInvalid: "messaging.webhook_invalid";
+};
+/** One of {@link MESSAGING_ERROR_CODES}'s values. */
+type MessagingErrorCode = (typeof MESSAGING_ERROR_CODES)[keyof typeof MESSAGING_ERROR_CODES];
+/**
+* What a messaging adapter throws. Its message is fixed text and its details hold only field
+* names, counts, codes, an HTTP status and the provider's numeric error code: never a message
+* body, a phone number, a URL, a signature or a credential.
+*/
+declare class MessagingError extends AppError {
+	readonly code: MessagingErrorCode;
+	constructor(code: MessagingErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** True for the errors that mean the provider or an adapter failed, which are given to the ErrorReporter. */
+declare function isReportableMessagingError(error: unknown): error is MessagingError;
+import { ContactCheckId, OrganizationId as OrganizationId6, ProspectId } from "tula-closeline-contract";
+/** The default overall deadline of one send, retries included, in milliseconds. */
+declare const DEFAULT_MESSAGING_TIMEOUT_MS = 1e4;
+/** The longest overall deadline a caller may allow, in milliseconds. */
+declare const MAX_MESSAGING_TIMEOUT_MS = 6e4;
+/** The most characters of a text message body (Twilio's limit). */
+declare const MAX_MESSAGE_BODY_CHARS = 1600;
+/** The most variables one template message may carry. */
+declare const MAX_TEMPLATE_VARIABLES = 20;
+/** The most characters of one template variable value. */
+declare const MAX_TEMPLATE_VARIABLE_CHARS = 1024;
+/** The most bytes of a webhook body {@link MessagingPort.receive} reads; a longer body is refused. */
+declare const MAX_MESSAGING_WEBHOOK_BYTES = 262144;
+/** The channels a message can be sent on. */
+declare const MESSAGING_CHANNELS: readonly ["sms", "whatsapp"];
+/** One of {@link MESSAGING_CHANNELS}. */
+type MessagingChannel = (typeof MESSAGING_CHANNELS)[number];
+/** Why a message is sent; the Contact Check decides on it. A Rep's own message is not sent through this port. */
+declare const MESSAGING_PURPOSES: readonly ["agent_initiated", "reply"];
+/** One of {@link MESSAGING_PURPOSES}. */
+type MessagingPurpose = (typeof MESSAGING_PURPOSES)[number];
+/** How an adapter retries a retryable provider error (`messaging.unavailable`). */
+interface MessagingRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** The retry policy with its defaults filled in. */
+interface ResolvedMessagingRetryPolicy {
+	/** The most retries after the first attempt. */
+	maxRetries: number;
+	/** The base pause, in ms. */
+	baseDelayMs: number;
+	/** The longest pause before jitter, in ms. */
+	maxDelayMs: number;
+}
+/** The policy used when a request names none: two retries after about 200 ms and 400 ms. */
+declare const DEFAULT_MESSAGING_RETRY_POLICY: ResolvedMessagingRetryPolicy;
+/**
+* The pause before retry `retry` (from 1): the base doubled each time up to the maximum, then
+* scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
+*/
+declare function messagingRetryDelayMs(retry: number, policy: ResolvedMessagingRetryPolicy, random?: () => number): number;
+/** What a message says: free text, or an approved template (WhatsApp only). */
+type MessageContent = {
+	/** Free text. */
+	kind: "text";
+	/** The text, 1 to {@link MAX_MESSAGE_BODY_CHARS} characters. Tenant data: never logged. */
+	body: string;
+} | {
+	/** An approved template; the only way to start a WhatsApp conversation outside the 24 hour window. */
+	kind: "template";
+	/** The template's Twilio Content SID: `HX` and 32 hex digits. */
+	templateId: string;
+	/** The template's variables by name or position, at most {@link MAX_TEMPLATE_VARIABLES}. Tenant data: never logged. */
+	variables?: Readonly<Record<string, string>>;
+};
+/**
+* One message to send. There is no field that skips or replaces the Contact Check: the adapter
+* asks its `ContactGuard` about (`organizationId`, `prospectId`, `channel`, `purpose`) and again
+* about (`organizationId`, `to`, `channel`, `purpose`) on every call, both must allow, and an
+* unknown field is refused. So a number that was suppressed or never consented is not texted even
+* when the Prospect is allowed, and `to` need not be proven to belong to the Prospect.
+*/
+interface SendMessageRequest {
+	/** The Organization the message is sent for. */
+	organizationId: OrganizationId6;
+	/** The Prospect the message is for; one Contact Check is about this Prospect, one about `to`. */
+	prospectId: ProspectId;
+	/** SMS or WhatsApp. */
+	channel: MessagingChannel;
+	/** Why it is sent. */
+	purpose: MessagingPurpose;
+	/** The recipient's number, E.164. Never logged. */
+	to: string;
+	/** What to say. */
+	content: MessageContent;
+	/**
+	* Makes a retry, or a repeat of this call, send one message only: 1 to 200 characters of
+	* `A-Z a-z 0-9 _ . : -`, unique per message you mean to send. The Twilio adapter sends a keyed
+	* hash of it (with the Organization) as `I-Twilio-Idempotency-Token`; the memory adapter
+	* returns the first result for a repeat and refuses the same key with other content.
+	*/
+	idempotencyKey: string;
+	/** The most time the whole send may take, retries included, in ms, 1 to 60000; default 10000. */
+	timeoutMs?: number;
+	/** Retries of `messaging.unavailable`; the defaults when absent. */
+	retry?: MessagingRetryPolicy;
+	/** The caller's own cancellation. When it fires the provider request is aborted and the send fails with `messaging.aborted`. */
+	signal?: AbortSignal;
+}
+/** What a send returns: the provider accepted the message. Delivery is reported later as a status event. */
+interface SentMessage {
+	/** The id of the Contact Check about the Prospect that allowed this message: proof of consent (ADR 0003). */
+	consentCheckId: ContactCheckId;
+	/** The id of the Contact Check about the number (`to`) that allowed this message. */
+	numberConsentCheckId: ContactCheckId;
+	/** The provider's id for the message; a status event names the same id. */
+	providerMessageId: string;
+	/** The channel it went on. */
+	channel: MessagingChannel;
+	/** `queued` when the provider has taken it, `sent` when it has already left the provider. */
+	status: "queued" | "sent";
+	/** The key the send was made with. */
+	idempotencyKey: string;
+}
+/** What a recipient's text means to the sender, from Twilio's standard English keywords. */
+type MessageIntent = "stop" | "start" | "help" | "message";
+/** The fields of an {@link InboundMessage}. */
+interface InboundMessageFields {
+	/** The channel it arrived on. */
+	channel: MessagingChannel;
+	/** The sender's number, E.164 (any `whatsapp:` prefix removed). */
+	from: string;
+	/** Our number, E.164. */
+	to: string;
+	/** The provider's id for the message. */
+	providerMessageId: string;
+	/** The text. May be empty when only media was sent. */
+	body: string;
+	/** When the adapter received it, ISO 8601. */
+	receivedAt: string;
+	/** What the text means; see {@link classifyMessageIntent}. */
+	intent: MessageIntent;
+	/** How many media items came with it (they are not fetched). */
+	mediaCount: number;
+}
+/**
+* A message the recipient sent. Its `body`, `from` and `to` are tenant data: they are read
+* properties of the class (not own enumerable ones), so `String()`, `JSON.stringify`, a spread
+* and `util.inspect` show the channel, intent and id, and the length of the text, never the text
+* or the numbers.
+*/
+declare class InboundMessage {
+	private;
+	readonly kind: "message";
+	readonly channel: MessagingChannel;
+	readonly providerMessageId: string;
+	readonly receivedAt: string;
+	readonly intent: MessageIntent;
+	readonly mediaCount: number;
+	constructor(fields: InboundMessageFields);
+	/** The sender's number, E.164. */
+	get from(): string;
+	/** Our number, E.164. */
+	get to(): string;
+	/** The text the recipient sent. */
+	get body(): string;
+	/** The metadata for `JSON.stringify`: no text and no numbers. */
+	toJSON(): Record<string, unknown>;
+	/** A readable label without the text or the numbers. */
+	toString(): string;
+}
+/** The state of a message the provider reports on. */
+type MessageDeliveryStatus = "queued" | "sent" | "delivered" | "undelivered" | "failed" | "read";
+/** The provider reporting how a message it took is doing. Carries no text and no numbers. */
+interface StatusEvent {
+	/** Tells a status event from a message. */
+	kind: "status";
+	/** The id a send returned. */
+	providerMessageId: string;
+	/** The state. */
+	status: MessageDeliveryStatus;
+	/** The provider's numeric error code, present on `failed` and `undelivered`. */
+	errorCode?: number;
+}
+/** What a verified webhook carries: a message from a recipient, or a status report. */
+type InboundEvent = InboundMessage | StatusEvent;
+/** A webhook as the HTTP route received it. */
+interface MessagingWebhookRequest {
+	/** The full URL the provider called, as the provider saw it (a proxy may have rewritten it). */
+	url: string;
+	/** The `X-Twilio-Signature` header, or null/undefined when the request had none. */
+	signature: string | null | undefined;
+	/** The raw form body, unparsed, at most {@link MAX_MESSAGING_WEBHOOK_BYTES} bytes. */
+	body: string;
+	/** The `Content-Type` header, when known; if given it must be a form. */
+	contentType?: string | null | undefined;
+}
+/**
+* SMS and WhatsApp messaging behind a vendor (Twilio first), with the consent proof built in.
+*
+* **Consent (ADR 0003).** Every adapter is built with a `ContactGuard` and has no way to run
+* without one. `send` asks it first, every time, about the Prospect and about the number; only two
+* `allowed: true` answers let a request reach the vendor, and asking counts against the send's
+* deadline. Any denial, including `consent.unavailable`, throws `messaging.consent_denied` with the
+* `consent.*` code in `details.code`, and the vendor is not called. A sent message returns the
+* Prospect check's id as `consentCheckId` and the number check's as `numberConsentCheckId`.
+*
+* **STOP.** `receive` reports a recipient's STOP as an `InboundMessage` with `intent: 'stop'`
+* (the whole text, ignoring case, spaces, punctuation, emoji and invisible characters, is one of Twilio's keywords). The port does not
+* revoke consent, because the kit has no way to write to core: the consumer must withdraw the
+* Prospect's consent through core when it sees `intent: 'stop'`. Twilio also blocks further sends
+* to that number by itself, which shows as `messaging.recipient_opted_out`.
+*
+* Every send has an overall deadline that aborts the vendor request. `messaging.unavailable` is
+* retried with a bounded, jittered pause and the same idempotency key, so a retry never texts
+* twice. `rejected`, `unavailable` and `bad_response` are also given to the ErrorReporter
+* (metadata only). The message text, the numbers and the credentials are tenant data or secrets:
+* they are never logged, reported or put in an error.
+*
+* Webhooks can arrive more than once: the consumer must handle them idempotently, keyed on
+* `providerMessageId` (with the status for a status event).
+*/
+interface MessagingPort {
+	/**
+	* Sends one message once the Contact Check allows it. An unacceptable request throws
+	* `messaging.invalid_request` and a denial `messaging.consent_denied`; neither reaches the vendor.
+	*/
+	send(request: SendMessageRequest): Promise<SentMessage>;
+	/**
+	* Verifies a webhook by its signature, in constant time, and parses it. A missing or wrong
+	* signature, a body over {@link MAX_MESSAGING_WEBHOOK_BYTES}, a body that is not a form or not a
+	* message or status event, is `messaging.webhook_invalid`. Verify before using anything in it.
+	*/
+	receive(request: MessagingWebhookRequest): Promise<InboundEvent>;
+}
+import { Region as Region3 } from "tula-closeline-contract";
+/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
+interface ErrorContext {
+	/** The request's id, for finding the log lines. */
+	requestId?: string;
+	/** The Organization the request was for, so one customer's errors can be filtered. */
+	organizationId?: string;
+	/** HTTP method of the failed request. */
+	method?: string;
+	/** Request path without its query string. */
+	path?: string;
+	/** HTTP status the service answered with. */
+	status?: number;
+	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
+	tags?: Record<string, string>;
+}
+/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
+interface ErrorReporter {
+	/**
+	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
+	* and never waits for the network.
+	*/
+	capture(error: unknown, context?: ErrorContext): void;
+	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
+	flush(timeoutMs: number): Promise<boolean>;
+	/**
+	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
+	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
+	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
+	*/
+	close(timeoutMs: number): Promise<boolean>;
+}
+/** Options for createErrorReporter. */
+interface ErrorReporterOptions {
+	/** The Sentry DSN of this Region's project; no DSN gives a reporter that sends nothing. */
+	dsn?: string | undefined;
+	/** Service name, sent as the `service` tag. */
+	service: string;
+	/** The `ENVIRONMENT` the service runs in, sent as the `environment` tag. */
+	environment: Environment;
+	/** The Region this deployment serves, sent as the `region` tag. */
+	region: Region3;
+	/** The git SHA of the running build, sent as the event's release. */
+	release?: string | undefined;
+	/** Where the reporter says that it is off or that a send failed; errors themselves never go here. */
+	logger: Logger;
+}
+/**
+* True for an error worth reporting: any unknown error, and an AppError with status 500 or above.
+* An AppError below 500 is an expected outcome (bad input, expired token) and is never sent.
+*/
+declare function shouldReportError(error: unknown): boolean;
+/**
+* Signs a webhook the way Twilio does (`X-Twilio-Signature`): HMAC-SHA1 with the Auth Token over
+* the URL followed by each form field's name and value in sorted order, in base64. For tests and
+* for simulating Twilio; the adapters themselves only verify.
+*/
+declare function signTwilioRequest(authToken: string, url: string, params?: Readonly<Record<string, string>> | readonly (readonly [string, string])[]): string;
+import { CallId, MembershipId, OrganizationId as OrganizationId7, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+/** The longest key, in bytes. */
+declare const MAX_KEY_BYTES = 512;
+/** The most `/`-separated segments a key can have. */
+declare const MAX_KEY_SEGMENTS = 16;
+/** The default largest object, in bytes (25 MiB). */
+declare const DEFAULT_MAX_OBJECT_BYTES: number;
+/** The largest `maxObjectBytes` a store can be configured with (100 MiB): bodies are held in memory. */
+declare const MAX_OBJECT_BYTES_LIMIT: number;
+/** The default page size of {@link ObjectStore.list}. */
+declare const DEFAULT_LIST_LIMIT = 100;
+/** The largest page size of {@link ObjectStore.list}. */
+declare const MAX_LIST_LIMIT = 1e3;
+/** The content type stored when the caller gives none. */
+declare const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+/** The largest `maxBytes` of a streamed put (2 GiB); streamed bodies are never held whole in memory. */
+declare const MAX_STREAM_BYTES_LIMIT: number;
+/** The longest a presigned read may stay valid, in seconds (15 minutes). */
+declare const MAX_PRESIGN_SECONDS = 900;
+/** How long a presigned read stays valid when the caller gives no expiry, in seconds (5 minutes). */
+declare const DEFAULT_PRESIGN_SECONDS = 300;
+/** The longest a source stream may stay silent before a streamed put gives up, in ms. */
+declare const STREAM_IDLE_TIMEOUT_MS = 3e4;
+/** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
+type ByteStream = AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>;
+/** What a listing says about one object. */
+interface ObjectEntry {
+	/** The key, relative to the Organization. */
+	key: string;
+	/** The size in bytes. */
+	size: number;
+	/** When the object was last written. */
+	lastModified: Date;
+}
+/** What {@link ObjectStore.head} says about one object. */
+interface ObjectInfo extends ObjectEntry {
+	/**
+	* The content type as the store holds it, which is what the writer gave except that a store may
+	* normalise insignificant whitespace in the parameters (`text/plain; charset=utf-8` can come back
+	* as `text/plain;charset=utf-8`). Never compare it as a raw string, and never use it to decide
+	* behaviour: it is informational and untrusted.
+	*/
+	contentType: string;
+}
+/** An object with its body. */
+interface StoredObject extends ObjectInfo {
+	/** The bytes. A copy: changing it does not change the store. */
+	body: Uint8Array;
+}
+/** Options of {@link ObjectStore.put}. */
+interface PutOptions {
+	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
+	contentType?: string;
+}
+/** Options of {@link ObjectStore.putStream}. */
+interface PutStreamOptions extends PutOptions {
+	/** The most bytes the stream may hold, 1 to 2 GiB; one byte more aborts the write. Required. */
+	maxBytes: number;
+	/** Aborts the write (and cleans up what it started) when it fires. */
+	signal?: AbortSignal;
+	/** How long the source may stay silent, in ms, 10 to 600000; default 30000. */
+	idleTimeoutMs?: number;
+}
+/** What a finished streamed put reports. */
+interface PutStreamResult {
+	/** The bytes written. */
+	size: number;
+	/** The SHA-256 of the content, lower-case hex, computed while streaming. */
+	sha256: string;
+}
+/** An object whose body is read as a stream, so it is never held whole in memory. */
+interface ObjectStream extends ObjectInfo {
+	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
+	body: ReadableStream<Uint8Array>;
+}
+/** Options of {@link ObjectStore.presignGet}. */
+interface PresignOptions {
+	/** How long the URL works, a whole number of seconds from 1 to 900; default 300. */
+	expiresInSeconds?: number;
+}
+/** Options of {@link ObjectStore.list}. */
+interface ListOptions {
+	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
+	prefix?: string;
+	/** The `nextCursor` of the previous page. */
+	cursor?: string;
+	/** Page size, 1 to 1000; default 100. */
+	limit?: number;
+}
+/** One page of a listing. */
+interface ListPage {
+	/** Objects in ascending key order. */
+	items: ObjectEntry[];
+	/** Pass as `cursor` for the next page; absent on the last one. */
+	nextCursor?: string;
+}
+/**
+* Object storage scoped by Organization. Every call takes the Organization id first and can reach
+* only that Organization's objects: the adapter derives the real location from the validated id,
+* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
+* id that starts with another id) can name another Organization's data. Keys are relative to the
+* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
+* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
+* keeps the content type as given (returned as the store holds it, see {@link ObjectInfo}) and never looks at the content. Bodies are held in memory, so an
+* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
+* {@link StorageError}; only `storage.unavailable` is worth retrying.
+*/
+interface ObjectStore {
+	/**
+	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
+	* same object. O(object size).
+	*/
+	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
+	/**
+	* Writes an object from a stream with a hard limit, for objects too large to hold (a 500 MB
+	* recording). Memory stays bounded by a few parts, not by the object: the S3 adapter uploads in
+	* parts of 8 MiB, two at a time. The limit is checked while streaming: when `maxBytes` is
+	* exceeded, the source stalls for 30 s, the source fails or `signal` fires, the write is aborted,
+	* its incomplete parts are aborted (the bucket must also expire incomplete multipart uploads), and
+	* nothing becomes readable under the key; an object already there is left as it was. Returns the
+	* size and the SHA-256 of the content. Objects written this way can be larger than
+	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
+	* `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
+	* completing request timed out or its answer was lost) means the content under the key is
+	* unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
+	* `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
+	* create or a part request that timed out client-side but reached the store can leave an
+	* incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
+	* uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
+	* Idempotent: the same stream twice leaves the same object. O(object
+	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
+	*/
+	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
+	/**
+	* Reads an object as a stream, or returns `undefined` when there is none. Not limited by
+	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
+	*/
+	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
+	/**
+	* Returns a short-lived URL that reads one object with a plain GET and no credentials, so the
+	* playbook can hand a Recording to the transcriber as `audio.url` without the service re-sending
+	* 500 MB. The URL is for the Organization's own object only (the same key under another
+	* Organization is another location), expires after `expiresInSeconds` (1 to 900, default 300), and
+	* is not checked against the object: a URL for a missing key is returned and answers 404. It is
+	* **a bearer credential**: never log it, never put it in an error or a stored field, never show it
+	* to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
+	* because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
+	* would only widen the window in which a leaked URL reads a customer's call. Signing makes no
+	* request; O(1). **The URL lives for the shorter of `expiresInSeconds` and the remaining life of
+	* the credentials that signed it** (a task-role session adds `X-Amz-Security-Token` and may end
+	* sooner), so mint it immediately before `submit`, and mint a new one for a retry. Sign with the
+	* service's own role holding only `s3:GetObject` on its prefix, never long-lived user keys. No
+	* response content-type or content-disposition overrides are offered. The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
+	* back, which a transcriber accepts only in `local`.
+	*/
+	presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>;
+	/** Reads an object, or returns `undefined` when there is none. O(object size). */
+	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
+	/**
+	* Reads an object's metadata, or returns `undefined` when there is none. O(1). On S3 a HEAD of a
+	* bucket that does not exist also reads as `undefined`, because a HEAD response carries no error
+	* body to tell the two apart; `get`, `put`, `delete` and `list` do report a missing bucket as
+	* `storage.rejected`.
+	*/
+	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
+	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
+	delete(organizationId: string, key: string): Promise<void>;
+	/**
+	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
+	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
+	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
+	*/
+	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
+}
+/** The default time any telephony operation may take, in milliseconds. */
+declare const DEFAULT_TELEPHONY_TIMEOUT_MS = 1e4;
+/** The longest time a caller may allow one telephony operation, in milliseconds. */
+declare const MAX_TELEPHONY_TIMEOUT_MS = 6e4;
+/** The longest Disclosure text, in characters. */
+declare const MAX_DISCLOSURE_TEXT_LENGTH = 1e3;
+/** The most browser legs one inbound call may ring at once. */
+declare const MAX_RING_LEGS = 50;
+/** The most bytes of a webhook body {@link TelephonyPort.verifyWebhook} reads; a longer body is refused. */
+declare const MAX_WEBHOOK_BODY_BYTES = 262144;
+/** Options every operation of {@link TelephonyPort} accepts. */
+interface TelephonyOptions {
+	/**
+	* The most time the operation may take, in ms, 1 to {@link MAX_TELEPHONY_TIMEOUT_MS}; default
+	* {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. When it passes the operation throws
+	* `telephony.unavailable` and, as far as the adapter can tell, changed nothing.
+	*/
+	timeoutMs?: number;
+}
+/** Which Organization a provider call belongs to and which provider call it is. */
+interface ProviderCallRef {
+	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
+	organizationId: OrganizationId7;
+	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
+	providerCallId: string;
+}
+/** The call a service asks the provider to place to a Prospect. */
+interface PlaceCallRequest {
+	/** The Organization. */
+	organizationId: OrganizationId7;
+	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
+	callId: CallId;
+	/**
+	* Required. The same key places exactly one provider call: a repeat returns the first one with
+	* `created: false`. 1 to 128 of letters, digits, `.`, `_`, `:` and `-`.
+	*/
+	idempotencyKey: string;
+	/** The Line's number the Prospect sees, in E.164. */
+	from: string;
+	/** The Prospect's number, in E.164. Tenant data: never logged. */
+	to: string;
+}
+/** What {@link TelephonyPort.placeCall} reports. */
+interface PlacedCall {
+	/** The provider's id of the leg to the Prospect. */
+	providerCallId: string;
+	/** True when this call placed it; false when the same idempotency key had already placed it. */
+	created: boolean;
+}
+/** An inbound call the provider has received, to be answered. */
+interface AnswerCallRequest extends ProviderCallRef {
+	/** Our id of the Call. */
+	callId: CallId;
+	/** The Reps' browser legs to ring, 1 to {@link MAX_RING_LEGS}; the first to answer is bridged. */
+	ringIdentities: MembershipId[];
+}
+/** What {@link TelephonyPort.answerCall} reports. */
+interface AnsweredCall {
+	/** How many browser legs are ringing. */
+	ringing: number;
+}
+/** The Disclosure to play to a connected call, before anything else happens on it. */
+interface PlayDisclosureRequest extends ProviderCallRef {
+	/** The version of the wording, 1 or more; the Call stores it (ADR 0003). */
+	wordingVersion: number;
+	/** The words spoken, 1 to {@link MAX_DISCLOSURE_TEXT_LENGTH} characters. Never logged. */
+	text: string;
+	/** Whether the wording also says an AI takes part. Forking tracks to an AI needs `true`. */
+	aiAssisted: boolean;
+}
+/** What {@link TelephonyPort.playDisclosure} reports once the wording has finished playing. */
+interface DisclosurePlayed {
+	/** The wording version that played. */
+	wordingVersion: number;
+	/** Whether it said an AI takes part. */
+	aiAssisted: boolean;
+	/** When it finished playing, as an ISO 8601 UTC time. */
+	playedAt: string;
+}
+/** A Rep's browser leg to join to a call. */
+interface BridgeRequest extends ProviderCallRef {
+	/** The Rep whose browser leg joins; if another leg is joined, it moves to this one. */
+	repIdentity: MembershipId;
+}
+/** What {@link TelephonyPort.startRecording} reports. */
+interface StartedRecording {
+	/** The provider's id of the Recording: opaque, same shape as a provider call id. */
+	recordingId: string;
+	/** Always 2: channel 0 is the Prospect, channel 1 is the Rep. */
+	channels: 2;
+}
+/** Where to fork the two audio tracks of a call. */
+interface ForkTracksRequest extends ProviderCallRef {
+	/** A `wss:` URL (`ws:` only for an adapter in `local`) the provider streams to; built by the service, never from a user. */
+	destinationUrl: string;
+}
+/** What {@link TelephonyPort.forkTracks} reports. */
+interface ForkedTracks {
+	/** The provider's id of the stream. */
+	streamId: string;
+	/** The two tracks sent: the Rep's and the Prospect's, separately. */
+	tracks: readonly ["rep", "prospect"];
+}
+/** Who asks to hang up. */
+interface HangUpRequest extends ProviderCallRef {
+	/** Who ends the call, for the event that follows; default `system`. */
+	by?: "rep" | "system";
+}
+/** Names a provider-side Recording. */
+interface RecordingRef {
+	/** The Organization. */
+	organizationId: OrganizationId7;
+	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
+	recordingId: string;
+}
+/** A provider-side Recording, opened for reading. */
+interface FetchedRecording {
+	/** The audio, two channels. The caller must read or cancel it. */
+	body: ByteStream;
+	/** The media type, such as `audio/wav`. */
+	contentType: string;
+	/** The size in bytes when the provider says it, otherwise null. */
+	sizeBytes: number | null;
+	/** Always 2. */
+	channels: 2;
+}
+/** A webhook request as the provider sent it, to be checked before anything is read from it. */
+interface WebhookRequest {
+	/** The full URL the provider called, as the provider saw it. */
+	url: string;
+	/** The raw body, unparsed, at most {@link MAX_WEBHOOK_BODY_BYTES} bytes. */
+	body: string;
+	/** The signature header, or null/undefined when the request had none. */
+	signature: string | null | undefined;
+}
+/** What {@link TelephonyPort.mintBrowserToken} is asked for. */
+interface BrowserTokenRequest {
+	/** The Organization. */
+	organizationId: OrganizationId7;
+	/** The Rep the token is for: the only identity it carries besides the Organization. */
+	identity: MembershipId;
+	/** How long it lives, in seconds, 60 to 3600; default 900. */
+	ttlSeconds?: number;
+}
+/** What a provider tells us about a call, in the shape every adapter's webhooks are turned into. */
+type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "completed" | "recording_ready";
+/** One thing that happened on a provider call. Carries no number, text or audio. */
+interface TelephonyEvent {
+	/** The provider's id of this event: webhooks are idempotent by it. */
+	eventId: string;
+	/** The Organization. */
+	organizationId: OrganizationId7;
+	/** The provider call. */
+	providerCallId: string;
+	/** What happened. */
+	type: TelephonyEventType;
+	/** When, as an ISO 8601 UTC time. */
+	at: string;
+	/** With `failed` (and `no_answer`, `busy`): why, as the contract names it. */
+	failureReason?: VoiceCallFailureReason;
+	/** With `completed`: who hung up. */
+	endedBy?: "rep" | "prospect" | "system";
+	/** With `recording_ready`: the Recording. */
+	recordingId?: string;
+}
+/**
+* Telephony behind a vendor (Twilio first, ADR to follow), scoped by Organization. Every call
+* carries the Organization and reaches only that Organization's provider calls and Recordings; a
+* real adapter must tag each provider call with it. Every operation is bounded by a timeout
+* ({@link TelephonyOptions.timeoutMs}), every outbound request an adapter makes has its own
+* timeout and a bounded, jittered retry, and only `telephony.unavailable` is worth retrying after
+* that. Mutating operations are idempotent: repeating one leaves the same result.
+*
+* **The Disclosure cannot be skipped (ADR 0003).** There is no option, flag or setting that
+* skips the Disclosure or the Recording. An adapter refuses `bridge`, `startRecording` and
+* `forkTracks` on a call whose Disclosure has not played, with `telephony.disclosure_required`,
+* and `forkTracks` (audio to an AI) also needs a Disclosure that said so (`aiAssisted: true`).
+* Every recording has two channels. These checks are the adapter's second line of defence; the
+* voice service's state machine is the first.
+*
+* Nothing here logs, returns in an error or reports a phone number, a Disclosure text, a token, a
+* signature, a secret or audio. Provider events arrive as webhooks the service verifies with
+* {@link TelephonyPort.verifyWebhook} and turns into {@link TelephonyEvent}s.
+*/
+interface TelephonyPort {
+	/**
+	* Places a call from a Line's number to a Prospect and returns at once with the provider's id;
+	* progress arrives as events. Idempotent by `(organizationId, idempotencyKey)`; the same key
+	* with another `to` or `from` is `telephony.invalid_request`. O(1).
+	*/
+	placeCall(request: PlaceCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
+	/**
+	* Answers an inbound call and rings the given browser legs. Repeating it for a call already
+	* answered returns the same count. O(legs).
+	*/
+	answerCall(request: AnswerCallRequest, options?: TelephonyOptions): Promise<AnsweredCall>;
+	/**
+	* Plays the Disclosure into a connected call and resolves when it has finished playing. Nobody
+	* else hears the call meanwhile. A call the Prospect has left is `telephony.call_ended`. Idempotent
+	* per wording version: a Disclosure that has already played is reported again, not replayed. A
+	* later version plays again and replaces the earlier one, including its `aiAssisted`.
+	*/
+	playDisclosure(request: PlayDisclosureRequest, options?: TelephonyOptions): Promise<DisclosurePlayed>;
+	/**
+	* Joins a Rep's browser leg to the call, or moves the call to another Rep's leg. Needs a played
+	* Disclosure. Repeating it for the same Rep changes nothing.
+	*/
+	bridge(request: BridgeRequest, options?: TelephonyOptions): Promise<void>;
+	/**
+	* Starts the dual-channel Recording (Prospect and Rep apart). Needs a played Disclosure. There is
+	* no single-channel or unrecorded mode. Repeating it returns the first Recording.
+	*/
+	startRecording(request: ProviderCallRef, options?: TelephonyOptions): Promise<StartedRecording>;
+	/**
+	* Forks the call's two audio tracks, the Rep's and the Prospect's separately, to a socket
+	* (used by the Copilot). Needs a played Disclosure that said an AI takes part. Repeating it
+	* returns the first stream.
+	*/
+	forkTracks(request: ForkTracksRequest, options?: TelephonyOptions): Promise<ForkedTracks>;
+	/** Ends the call. Idempotent: a call that has ended already resolves without error. */
+	hangUp(request: HangUpRequest, options?: TelephonyOptions): Promise<void>;
+	/**
+	* Opens the provider's copy of a Recording as a stream, once the call has ended and the Recording
+	* is finished (before that, `telephony.recording_not_ready`). The timeout covers opening it. A
+	* Recording deleted or never made is `telephony.not_found`. O(1) to open.
+	*/
+	fetchRecording(request: RecordingRef, options?: TelephonyOptions): Promise<FetchedRecording>;
+	/**
+	* Deletes the provider's copy of a Recording and resolves with whether it existed. Idempotent:
+	* deleting again, or an id never issued, resolves with `existed: false`.
+	*/
+	deleteRecording(request: RecordingRef, options?: TelephonyOptions): Promise<{
+		existed: boolean;
+	}>;
+	/**
+	* Whether `request` really came from the provider, by its signature, compared in constant time.
+	* A missing, malformed, wrong-length or wrong signature, or a body over
+	* {@link MAX_WEBHOOK_BODY_BYTES}, is `false`; it never throws. It does no I/O (a local
+	* computation on the body), so it needs no timeout and runs inside a webhook's budget. Check it
+	* before reading anything from the body.
+	*/
+	verifyWebhook(request: WebhookRequest): boolean;
+	/**
+	* Mints a short-lived token the browser registers the Softphone with. It is issued for the Rep's
+	* identity in the Organization (a real adapter binds both at the provider; the token text need
+	* not show them), expires at `expiresAt`, and is a credential: never logged or
+	* stored.
+	*/
+	mintBrowserToken(request: BrowserTokenRequest, options?: TelephonyOptions): Promise<SoftphoneToken>;
+}
+/** The `area.reason` codes the telephony port and adapters throw. */
+declare const TELEPHONY_ERROR_CODES: {
+	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
+	readonly invalidRequest: "telephony.invalid_request";
+	/** The provider has no call or Recording with that id for this Organization (or it was deleted). */
+	readonly notFound: "telephony.not_found";
+	/** The provider call has already ended, so the operation cannot apply. */
+	readonly callEnded: "telephony.call_ended";
+	/** The Disclosure has not played on this call, so it cannot be bridged, recorded or forked (ADR 0003). */
+	readonly disclosureRequired: "telephony.disclosure_required";
+	/** The Recording is not finished yet; try again shortly. */
+	readonly recordingNotReady: "telephony.recording_not_ready";
+	/** The provider refused the operation for a reason a retry cannot fix (credentials, quota, number). */
+	readonly rejected: "telephony.rejected";
+	/** The provider did not answer in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "telephony.unavailable";
+	/** The provider answered with something this adapter cannot use. */
+	readonly badResponse: "telephony.bad_response";
+};
+/** One of {@link TELEPHONY_ERROR_CODES}'s values. */
+type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
+/**
+* What a telephony adapter throws. Its message never holds a phone number, a token, a signature,
+* a secret, a Disclosure text or audio: those are tenant data or credentials.
+*/
+declare class TelephonyError extends AppError {
+	readonly code: TelephonyErrorCode;
+	constructor(code: TelephonyErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+/** The HTTP client the adapter uses: `fetch`, injected for tests. */
+type TwilioFetch = (input: string, init: RequestInit) => Promise<Response>;
+/** The Twilio regions this adapter knows, as Twilio names them in a host (`api.dublin.ie1.twilio.com`). */
+declare const TWILIO_REGIONS: readonly ["us1", "ie1", "au1"];
+/** One of {@link TWILIO_REGIONS}. */
+type TwilioRegion = (typeof TWILIO_REGIONS)[number];
+/** The edge Twilio serves each region from by default. */
+declare const TWILIO_DEFAULT_EDGES: Readonly<Record<TwilioRegion, string>>;
+/** What the adapter remembers about one provider call, since Twilio has no tag to hold it. */
+interface TwilioCallRecord {
+	/** The Organization the call belongs to. */
+	organizationId: string;
+	/** Our Call id, when known. */
+	callId: string | null;
+	/** Placed by us, or received. */
+	direction: "outbound" | "inbound";
+	/** The Disclosure that has played on the call, or null. */
+	disclosure: DisclosurePlayed | null;
+	/** The Rep whose browser leg the call is bridged to, or null. */
+	bridgedTo: string | null;
+	/** True once a Disclosure has started to play, so the hold is never sent over it. */
+	disclosureStarted?: boolean;
+	/** The Reps the inbound call was meant to ring. */
+	ringIdentities: readonly string[];
+	/** The Recording started on the call, or null. */
+	recordingId: string | null;
+	/** The stream forked from the call, or null. */
+	streamId: string | null;
+}
+/** What the adapter remembers about a placement, to answer a repeated idempotency key. */
+interface TwilioPlacement {
+	/** The provider call the key placed. */
+	providerCallId: string;
+	/** A keyed hash of the numbers; a repeat with other numbers is refused. Never the numbers. */
+	fingerprint: string;
+}
+/**
+* Where the adapter keeps the Organization of each provider call, the state of its Disclosure and
+* its idempotency keys. Twilio holds none of it, and the port promises that one Organization never
+* reaches another's calls, so a production service must pass a durable store (Postgres, in its own
+* schema). Omitting it (in process memory) is allowed only in the `local` and `dev` environments. A store that has lost
+* a call fails closed: the call is `telephony.not_found`, or its Disclosure counts as not played.
+*/
+interface TwilioStore {
+	/** Returns the record of a provider call, or null. */
+	getCall(providerCallId: string): Promise<TwilioCallRecord | null>;
+	/** Creates or replaces the record of a provider call. */
+	putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>;
+	/**
+	* Runs `fn` with the current record (null when there is none) while no other `withCall` for the
+	* same call runs, until `fn` settles, including any Twilio request it makes. Inside `fn` use
+	* `getCall`/`putCall`, never `withCall` again for that call. A durable store holds a row lock
+	* (`SELECT ... FOR UPDATE`) for the duration; the memory store chains promises per call.
+	*/
+	withCall<T>(providerCallId: string, fn: (record: TwilioCallRecord | null) => Promise<T>): Promise<T>;
+	/**
+	* Atomically creates the record when none exists and returns the record that now stands, which
+	* is the caller's own when it won and the earlier one when it lost.
+	*/
+	claimCall(providerCallId: string, record: TwilioCallRecord): Promise<TwilioCallRecord>;
+	/** Returns the provider call a Recording belongs to, or null. */
+	getRecording(recordingId: string): Promise<{
+		providerCallId: string;
+	} | null>;
+	/** Remembers which provider call a Recording belongs to. */
+	putRecording(recordingId: string, providerCallId: string): Promise<void>;
+	/** Returns the placement an idempotency key made, or null. */
+	getPlacement(organizationId: string, key: string): Promise<TwilioPlacement | null>;
+	/** Remembers a placement. */
+	putPlacement(organizationId: string, key: string, placement: TwilioPlacement): Promise<void>;
+}
+/** Creates the in-process {@link TwilioStore}, for tests and local runs. */
+declare function createMemoryTwilioStore(): TwilioStore;
+/** What {@link TwilioOptions.disclosureDone} is told about the Disclosure it waits for. */
+interface DisclosureWait {
+	/** The Organization. */
+	organizationId: string;
+	/** The provider call. */
+	providerCallId: string;
+	/** When the wait must give up, as ms since the epoch. */
+	deadline: number;
+}
+/** Options for {@link createTwilioTelephony}. */
+interface TwilioOptions {
+	/** The Account SID (`AC` and 32 hex digits). */
+	accountSid: string;
+	/** An API key's SID (`SK` and 32 hex digits): signs requests and Softphone tokens. */
+	apiKeySid: string;
+	/** The API key's secret. A credential: never logged or put in an error. */
+	apiKeySecret: string;
+	/**
+	* The Auth Token, used only to check webhook signatures. Twilio signs webhooks with it and not
+	* with an API key's secret. Without it `verifyWebhook` is always false.
+	*/
+	authToken?: string;
+	/** The TwiML App's SID (`AP` and 32 hex digits) the Softphone dials out through. */
+	twimlAppSid: string;
+	/**
+	* The Twilio region, such as `ie1` for Ireland. Needs API keys made in that region. Default is
+	* the US default host `api.twilio.com`.
+	*/
+	region?: TwilioRegion;
+	/** The edge, such as `dublin`; default is the region's own edge. Needs `region`. */
+	edge?: string;
+	/** The `ENVIRONMENT`; a `ws:` fork destination is accepted only in `local`; default `prod`. */
+	environment?: Environment;
+	/** Where Twilio reports call progress; the adapter adds `organizationId` and `callId` to the query. */
+	statusCallbackUrl?: string;
+	/** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
+	recordingStatusCallbackUrl?: string;
+	/** The store of per-call state; required outside `local` and `dev`, where it is in memory. */
+	store?: TwilioStore;
+	/** The `fetch` to use; the global one by default. */
+	fetch?: TwilioFetch;
+	/** Waits between retries; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for retry jitter; `Math.random` by default. */
+	random?: () => number;
+	/** The clock for token and Disclosure times; the system clock by default. */
+	clock?: Clock;
+	/** The wall clock in ms for deadlines; `Date.now` by default. */
+	nowMs?: () => number;
+	/** The timeout of an operation that names none, in ms; default {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. */
+	defaultTimeoutMs?: number;
+	/** The most attempts per request, the first included; default 3. */
+	maxAttempts?: number;
+	/** The language the Disclosure is spoken in, such as `en-US`; default `en-US`. */
+	disclosureLanguage?: string;
+	/**
+	* Resolves when the Disclosure has finished playing. Twilio has no "finished speaking" event on
+	* a REST update, so by default the adapter waits for an estimate of how long the wording takes
+	* (see {@link estimateSpeechMs}). A service with a webhook for it passes a hook that waits for
+	* that instead; the hook must throw `telephony.unavailable` if the deadline passes.
+	*/
+	disclosureDone?: (wait: DisclosureWait) => Promise<void>;
+}
+/**
+* How long a Disclosure takes to speak, in ms: 0.4 s a word, a quarter more for safety, and a
+* second for the call to start speaking. It deliberately errs long: waiting too long delays the
+* Rep a moment, but bridging too early would let the Rep talk over the Disclosure.
+*/
+declare function estimateSpeechMs(text: string): number;
+/** The host Twilio's REST API is called on for a region and edge. */
+declare function twilioApiHost(region?: TwilioRegion, edge?: string): string;
+/**
+* Creates the {@link TelephonyPort} on Twilio: Programmable Voice over REST and TwiML, a Voice SDK
+* access token, dual-channel Recordings and a Media Streams fork. Every request has a timeout and
+* a bounded, jittered retry on network errors, 429 and 5xx (never on another 4xx); an operation
+* as a whole is bounded by its `timeoutMs`. Nothing is logged, and no number, Disclosure text,
+* token, signature, secret or Recording URL is put in an error.
+*
+* The Disclosure rules are the shared ones (`requireDisclosure`): the adapter refuses to bridge,
+* record or fork a call whose Disclosure it has not seen play. The Disclosure state lives in the
+* {@link TwilioStore}.
+*/
+declare function createTwilioTelephony(options: TwilioOptions): TelephonyPort;
+/** Options for {@link createTwilioMessaging}. The kit takes options, not environment variables. */
+interface TwilioMessagingOptions {
+	/** The Account SID (`AC` and 32 hex digits). */
+	accountSid: string;
+	/** The Auth Token, at least 16 characters: signs the REST calls and verifies webhooks. Never logged. */
+	authToken: string;
+	/** The Contact Check every send asks first. Required: there is no adapter without one (ADR 0003). */
+	guard: ContactGuard;
+	/** The Messaging Service SID (`MG` and 32 hex digits) SMS goes through; or give `fromNumber`, not both. */
+	messagingServiceSid?: string;
+	/** The number SMS is sent from, E.164; or give `messagingServiceSid`, not both. */
+	fromNumber?: string;
+	/** The approved WhatsApp sender, E.164 without the `whatsapp:` prefix. WhatsApp falls back to `messagingServiceSid`. */
+	whatsappFrom?: string;
+	/** An https URL Twilio reports delivery status to, without credentials. */
+	statusCallbackUrl?: string;
+	/** Twilio region for data residency; the global host if absent. */
+	region?: TwilioRegion;
+	/** Twilio edge, with `region`. */
+	edge?: string;
+	/** The HTTP client; the global `fetch` by default. For tests. */
+	fetch?: TwilioFetch;
+	/** The time limit of one HTTP attempt, in ms, 1 to 60000; default 5000. The send's own deadline still applies. */
+	attemptTimeoutMs?: number;
+	/** Receives the errors that mean the provider failed; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where retries are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** The time source for `receivedAt`; the system clock by default. */
+	clock?: Clock;
+	/** Pauses between retries; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/**
+* Creates the {@link MessagingPort} on Twilio's Programmable Messaging REST API (SMS and WhatsApp).
+*
+* Every send asks the `guard` first and reaches Twilio only when it allows. Each attempt has its
+* own time limit and the whole send an overall deadline that aborts the request; a network error,
+* 429 and 5xx are retried a bounded number of times with jitter and the same
+* `I-Twilio-Idempotency-Token`, any other 4xx never. Twilio's 21610 (the recipient texted STOP) is
+* `messaging.recipient_opted_out` and 63016 (a WhatsApp free-form message outside the 24 hour
+* window) `messaging.template_required`. Nothing is logged but retry metadata, and no message
+* text, number, URL, signature or credential is put in an error, a log line or a report.
+*/
+declare function createTwilioMessaging(options: TwilioMessagingOptions): MessagingPort;
+/**
+* What a recipient's text means, from Twilio's standard English keywords: the whole text, ignoring
+* case, spaces, punctuation, emoji and invisible characters, so "Stop.", "stop!" and "STOP ALL"
+* all opt out. STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT opt out; START, UNSTOP and YES opt
+* back in; HELP and INFO ask for help. A sentence that merely contains one is a message. It fails
+* toward opting out. `start` is only a hint: it must never re-grant consent without the consent
+* flow, and only plain ASCII letters count for it and for `help`.
+*/
+declare function classifyMessageIntent(body: string): MessageIntent;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
 import { z as z4 } from "zod";
@@ -1388,58 +2373,6 @@ declare function createMemoryProcessedStore(options: {
 	clock: Clock;
 	newToken?: () => string;
 }): ProcessedStore;
-import { Region as Region3 } from "tula-closeline-contract";
-/** What a service knows about the failed request; the only fields an ErrorReporter sends. */
-interface ErrorContext {
-	/** The request's id, for finding the log lines. */
-	requestId?: string;
-	/** The Organization the request was for, so one customer's errors can be filtered. */
-	organizationId?: string;
-	/** HTTP method of the failed request. */
-	method?: string;
-	/** Request path without its query string. */
-	path?: string;
-	/** HTTP status the service answered with. */
-	status?: number;
-	/** Extra low-cardinality labels, such as `{ feature: 'import' }`; never values from a customer. */
-	tags?: Record<string, string>;
-}
-/** The one way a service reports an unexpected error. No service imports an error tracker itself. */
-interface ErrorReporter {
-	/**
-	* Reports an error if `shouldReportError` says it is unexpected. Returns at once, never throws
-	* and never waits for the network.
-	*/
-	capture(error: unknown, context?: ErrorContext): void;
-	/** Waits up to `timeoutMs` for reported errors to be delivered; true if all were. Call it on shutdown. */
-	flush(timeoutMs: number): Promise<boolean>;
-	/**
-	* Delivers what is pending (up to `timeoutMs`; true if all was) and then releases what the
-	* reporter holds, such as the process listeners of an error tracker. After it, `capture` does
-	* nothing and `flush` resolves false. Call it once on shutdown, after the last `capture`.
-	*/
-	close(timeoutMs: number): Promise<boolean>;
-}
-/** Options for createErrorReporter. */
-interface ErrorReporterOptions {
-	/** The Sentry DSN of this Region's project; no DSN gives a reporter that sends nothing. */
-	dsn?: string | undefined;
-	/** Service name, sent as the `service` tag. */
-	service: string;
-	/** The `ENVIRONMENT` the service runs in, sent as the `environment` tag. */
-	environment: Environment;
-	/** The Region this deployment serves, sent as the `region` tag. */
-	region: Region3;
-	/** The git SHA of the running build, sent as the event's release. */
-	release?: string | undefined;
-	/** Where the reporter says that it is off or that a send failed; errors themselves never go here. */
-	logger: Logger;
-}
-/**
-* True for an error worth reporting: any unknown error, and an AppError with status 500 or above.
-* An AppError below 500 is an expected outcome (bad input, expired token) and is never sent.
-*/
-declare function shouldReportError(error: unknown): boolean;
 /**
 * Picks the error reporter for a service: the Sentry adapter when a DSN is given, otherwise the
 * no-op one, so `local` and tests run without Sentry. The DSN is per Region (ADR 0001): give each
@@ -1490,179 +2423,6 @@ declare class StorageError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-/** The longest key, in bytes. */
-declare const MAX_KEY_BYTES = 512;
-/** The most `/`-separated segments a key can have. */
-declare const MAX_KEY_SEGMENTS = 16;
-/** The default largest object, in bytes (25 MiB). */
-declare const DEFAULT_MAX_OBJECT_BYTES: number;
-/** The largest `maxObjectBytes` a store can be configured with (100 MiB): bodies are held in memory. */
-declare const MAX_OBJECT_BYTES_LIMIT: number;
-/** The default page size of {@link ObjectStore.list}. */
-declare const DEFAULT_LIST_LIMIT = 100;
-/** The largest page size of {@link ObjectStore.list}. */
-declare const MAX_LIST_LIMIT = 1e3;
-/** The content type stored when the caller gives none. */
-declare const DEFAULT_CONTENT_TYPE = "application/octet-stream";
-/** The largest `maxBytes` of a streamed put (2 GiB); streamed bodies are never held whole in memory. */
-declare const MAX_STREAM_BYTES_LIMIT: number;
-/** The longest a presigned read may stay valid, in seconds (15 minutes). */
-declare const MAX_PRESIGN_SECONDS = 900;
-/** How long a presigned read stays valid when the caller gives no expiry, in seconds (5 minutes). */
-declare const DEFAULT_PRESIGN_SECONDS = 300;
-/** The longest a source stream may stay silent before a streamed put gives up, in ms. */
-declare const STREAM_IDLE_TIMEOUT_MS = 3e4;
-/** The bytes of a streamed put: a web stream or any async iterable of byte chunks. */
-type ByteStream = AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>;
-/** What a listing says about one object. */
-interface ObjectEntry {
-	/** The key, relative to the Organization. */
-	key: string;
-	/** The size in bytes. */
-	size: number;
-	/** When the object was last written. */
-	lastModified: Date;
-}
-/** What {@link ObjectStore.head} says about one object. */
-interface ObjectInfo extends ObjectEntry {
-	/**
-	* The content type as the store holds it, which is what the writer gave except that a store may
-	* normalise insignificant whitespace in the parameters (`text/plain; charset=utf-8` can come back
-	* as `text/plain;charset=utf-8`). Never compare it as a raw string, and never use it to decide
-	* behaviour: it is informational and untrusted.
-	*/
-	contentType: string;
-}
-/** An object with its body. */
-interface StoredObject extends ObjectInfo {
-	/** The bytes. A copy: changing it does not change the store. */
-	body: Uint8Array;
-}
-/** Options of {@link ObjectStore.put}. */
-interface PutOptions {
-	/** A `type/subtype` media type with optional parameters; default `application/octet-stream`. */
-	contentType?: string;
-}
-/** Options of {@link ObjectStore.putStream}. */
-interface PutStreamOptions extends PutOptions {
-	/** The most bytes the stream may hold, 1 to 2 GiB; one byte more aborts the write. Required. */
-	maxBytes: number;
-	/** Aborts the write (and cleans up what it started) when it fires. */
-	signal?: AbortSignal;
-	/** How long the source may stay silent, in ms, 10 to 600000; default 30000. */
-	idleTimeoutMs?: number;
-}
-/** What a finished streamed put reports. */
-interface PutStreamResult {
-	/** The bytes written. */
-	size: number;
-	/** The SHA-256 of the content, lower-case hex, computed while streaming. */
-	sha256: string;
-}
-/** An object whose body is read as a stream, so it is never held whole in memory. */
-interface ObjectStream extends ObjectInfo {
-	/** The bytes, once. Cancel it if you stop reading, so the connection is released. */
-	body: ReadableStream<Uint8Array>;
-}
-/** Options of {@link ObjectStore.presignGet}. */
-interface PresignOptions {
-	/** How long the URL works, a whole number of seconds from 1 to 900; default 300. */
-	expiresInSeconds?: number;
-}
-/** Options of {@link ObjectStore.list}. */
-interface ListOptions {
-	/** Only keys that start with this, such as `documents/` or `documents/ab`; default all. */
-	prefix?: string;
-	/** The `nextCursor` of the previous page. */
-	cursor?: string;
-	/** Page size, 1 to 1000; default 100. */
-	limit?: number;
-}
-/** One page of a listing. */
-interface ListPage {
-	/** Objects in ascending key order. */
-	items: ObjectEntry[];
-	/** Pass as `cursor` for the next page; absent on the last one. */
-	nextCursor?: string;
-}
-/**
-* Object storage scoped by Organization. Every call takes the Organization id first and can reach
-* only that Organization's objects: the adapter derives the real location from the validated id,
-* never from a string the caller built, so no key (`..`, a leading slash, an encoded separator, an
-* id that starts with another id) can name another Organization's data. Keys are relative to the
-* Organization and made of `/`-separated segments of letters, digits, `.`, `_` and `-`, none
-* starting with `.`, at most 512 bytes and 16 segments. Content is untrusted bytes: the store
-* keeps the content type as given (returned as the store holds it, see {@link ObjectInfo}) and never looks at the content. Bodies are held in memory, so an
-* object is at most `maxObjectBytes` (25 MiB by default, 100 MiB at most). Throws
-* {@link StorageError}; only `storage.unavailable` is worth retrying.
-*/
-interface ObjectStore {
-	/**
-	* Writes an object, replacing one with the same key. Idempotent: the same call twice leaves the
-	* same object. O(object size).
-	*/
-	put(organizationId: string, key: string, body: Uint8Array, options?: PutOptions): Promise<void>;
-	/**
-	* Writes an object from a stream with a hard limit, for objects too large to hold (a 500 MB
-	* recording). Memory stays bounded by a few parts, not by the object: the S3 adapter uploads in
-	* parts of 8 MiB, two at a time. The limit is checked while streaming: when `maxBytes` is
-	* exceeded, the source stalls for 30 s, the source fails or `signal` fires, the write is aborted,
-	* its incomplete parts are aborted (the bucket must also expire incomplete multipart uploads), and
-	* nothing becomes readable under the key; an object already there is left as it was. Returns the
-	* size and the SHA-256 of the content. Objects written this way can be larger than
-	* `maxObjectBytes`: read them with {@link ObjectStore.getStream}, because `get` refuses them with
-	* `storage.object_too_large`. **Residual cases:** a throw after the last part was sent (the
-	* completing request timed out or its answer was lost) means the content under the key is
-	* unknown: the store may have finished. Retry the write (it is idempotent), or `head` and
-	* `delete` before relying on the key being absent. Aborting the upload is best-effort, and a
-	* create or a part request that timed out client-side but reached the store can leave an
-	* incomplete upload that only the bucket's lifecycle rule removes: abort incomplete multipart
-	* uploads one day after initiation (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation: 1`).
-	* Idempotent: the same stream twice leaves the same object. O(object
-	* size) time, O(part size) memory on S3 (the memory adapter, for tests, holds the object).
-	*/
-	putStream(organizationId: string, key: string, body: ByteStream, options: PutStreamOptions): Promise<PutStreamResult>;
-	/**
-	* Reads an object as a stream, or returns `undefined` when there is none. Not limited by
-	* `maxObjectBytes`. The caller must read or cancel the body. O(1) to open.
-	*/
-	getStream(organizationId: string, key: string): Promise<ObjectStream | undefined>;
-	/**
-	* Returns a short-lived URL that reads one object with a plain GET and no credentials, so the
-	* playbook can hand a Recording to the transcriber as `audio.url` without the service re-sending
-	* 500 MB. The URL is for the Organization's own object only (the same key under another
-	* Organization is another location), expires after `expiresInSeconds` (1 to 900, default 300), and
-	* is not checked against the object: a URL for a missing key is returned and answers 404. It is
-	* **a bearer credential**: never log it, never put it in an error or a stored field, never show it
-	* to a user, hand it only to the vendor, and sign a new one for a retry. 15 minutes is the cap
-	* because a vendor fetches within seconds to minutes of being told, and a longer-lived URL
-	* would only widen the window in which a leaked URL reads a customer's call. Signing makes no
-	* request; O(1). **The URL lives for the shorter of `expiresInSeconds` and the remaining life of
-	* the credentials that signed it** (a task-role session adds `X-Amz-Security-Token` and may end
-	* sooner), so mint it immediately before `submit`, and mint a new one for a retry. Sign with the
-	* service's own role holding only `s3:GetObject` on its prefix, never long-lived user keys. No
-	* response content-type or content-disposition overrides are offered. The memory adapter returns an `http:` URL that its own `resolvePresigned` reads
-	* back, which a transcriber accepts only in `local`.
-	*/
-	presignGet(organizationId: string, key: string, options?: PresignOptions): Promise<string>;
-	/** Reads an object, or returns `undefined` when there is none. O(object size). */
-	get(organizationId: string, key: string): Promise<StoredObject | undefined>;
-	/**
-	* Reads an object's metadata, or returns `undefined` when there is none. O(1). On S3 a HEAD of a
-	* bucket that does not exist also reads as `undefined`, because a HEAD response carries no error
-	* body to tell the two apart; `get`, `put`, `delete` and `list` do report a missing bucket as
-	* `storage.rejected`.
-	*/
-	head(organizationId: string, key: string): Promise<ObjectInfo | undefined>;
-	/** Deletes an object. Resolves when it is gone, including when it never existed. O(1). */
-	delete(organizationId: string, key: string): Promise<void>;
-	/**
-	* Lists one page of the Organization's objects in key order. The page is at most `limit` items
-	* (1000 at most), so a listing is never unbounded: follow `nextCursor` for more. Memory adapter
-	* O(n log n) in the Organization's n objects; S3 adapter one request, O(limit).
-	*/
-	list(organizationId: string, options?: ListOptions): Promise<ListPage>;
-}
 /** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
 declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
 	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
@@ -1691,7 +2451,7 @@ declare class StreamingTranscribeError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { CallId, OrganizationId as OrganizationId6 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId8 } from "tula-closeline-contract";
 /** The default time opening a stream may take, in milliseconds. */
 declare const DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS = 1e4;
 /** The longest time a caller may allow opening a stream, in milliseconds. */
@@ -1784,9 +2544,9 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId6;
+	organizationId: OrganizationId8;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
-	callId: CallId;
+	callId: CallId2;
 	/** The side of the Call this stream carries. */
 	track: StreamTrack;
 	/** How the audio sent is encoded. */
@@ -1866,451 +2626,6 @@ declare const DEFAULT_RECONNECT_POLICY: ResolvedReconnectPolicy;
 * maximum, then scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
 */
 declare function reconnectDelayMs(attempt: number, policy: ResolvedReconnectPolicy, random?: () => number): number;
-/** The `area.reason` codes the telephony port and adapters throw. */
-declare const TELEPHONY_ERROR_CODES: {
-	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
-	readonly invalidRequest: "telephony.invalid_request";
-	/** The provider has no call or Recording with that id for this Organization (or it was deleted). */
-	readonly notFound: "telephony.not_found";
-	/** The provider call has already ended, so the operation cannot apply. */
-	readonly callEnded: "telephony.call_ended";
-	/** The Disclosure has not played on this call, so it cannot be bridged, recorded or forked (ADR 0003). */
-	readonly disclosureRequired: "telephony.disclosure_required";
-	/** The Recording is not finished yet; try again shortly. */
-	readonly recordingNotReady: "telephony.recording_not_ready";
-	/** The provider refused the operation for a reason a retry cannot fix (credentials, quota, number). */
-	readonly rejected: "telephony.rejected";
-	/** The provider did not answer in time or at all, after the bounded retries. The only retryable code. */
-	readonly unavailable: "telephony.unavailable";
-	/** The provider answered with something this adapter cannot use. */
-	readonly badResponse: "telephony.bad_response";
-};
-/** One of {@link TELEPHONY_ERROR_CODES}'s values. */
-type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
-/**
-* What a telephony adapter throws. Its message never holds a phone number, a token, a signature,
-* a secret, a Disclosure text or audio: those are tenant data or credentials.
-*/
-declare class TelephonyError extends AppError {
-	readonly code: TelephonyErrorCode;
-	constructor(code: TelephonyErrorCode, message: string, options?: {
-		cause?: unknown;
-		details?: Record<string, unknown>;
-	});
-}
-import { CallId as CallId2, MembershipId, OrganizationId as OrganizationId7, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
-/** The default time any telephony operation may take, in milliseconds. */
-declare const DEFAULT_TELEPHONY_TIMEOUT_MS = 1e4;
-/** The longest time a caller may allow one telephony operation, in milliseconds. */
-declare const MAX_TELEPHONY_TIMEOUT_MS = 6e4;
-/** The longest Disclosure text, in characters. */
-declare const MAX_DISCLOSURE_TEXT_LENGTH = 1e3;
-/** The most browser legs one inbound call may ring at once. */
-declare const MAX_RING_LEGS = 50;
-/** The most bytes of a webhook body {@link TelephonyPort.verifyWebhook} reads; a longer body is refused. */
-declare const MAX_WEBHOOK_BODY_BYTES = 262144;
-/** Options every operation of {@link TelephonyPort} accepts. */
-interface TelephonyOptions {
-	/**
-	* The most time the operation may take, in ms, 1 to {@link MAX_TELEPHONY_TIMEOUT_MS}; default
-	* {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. When it passes the operation throws
-	* `telephony.unavailable` and, as far as the adapter can tell, changed nothing.
-	*/
-	timeoutMs?: number;
-}
-/** Which Organization a provider call belongs to and which provider call it is. */
-interface ProviderCallRef {
-	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId7;
-	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
-	providerCallId: string;
-}
-/** The call a service asks the provider to place to a Prospect. */
-interface PlaceCallRequest {
-	/** The Organization. */
-	organizationId: OrganizationId7;
-	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
-	callId: CallId2;
-	/**
-	* Required. The same key places exactly one provider call: a repeat returns the first one with
-	* `created: false`. 1 to 128 of letters, digits, `.`, `_`, `:` and `-`.
-	*/
-	idempotencyKey: string;
-	/** The Line's number the Prospect sees, in E.164. */
-	from: string;
-	/** The Prospect's number, in E.164. Tenant data: never logged. */
-	to: string;
-}
-/** What {@link TelephonyPort.placeCall} reports. */
-interface PlacedCall {
-	/** The provider's id of the leg to the Prospect. */
-	providerCallId: string;
-	/** True when this call placed it; false when the same idempotency key had already placed it. */
-	created: boolean;
-}
-/** An inbound call the provider has received, to be answered. */
-interface AnswerCallRequest extends ProviderCallRef {
-	/** Our id of the Call. */
-	callId: CallId2;
-	/** The Reps' browser legs to ring, 1 to {@link MAX_RING_LEGS}; the first to answer is bridged. */
-	ringIdentities: MembershipId[];
-}
-/** What {@link TelephonyPort.answerCall} reports. */
-interface AnsweredCall {
-	/** How many browser legs are ringing. */
-	ringing: number;
-}
-/** The Disclosure to play to a connected call, before anything else happens on it. */
-interface PlayDisclosureRequest extends ProviderCallRef {
-	/** The version of the wording, 1 or more; the Call stores it (ADR 0003). */
-	wordingVersion: number;
-	/** The words spoken, 1 to {@link MAX_DISCLOSURE_TEXT_LENGTH} characters. Never logged. */
-	text: string;
-	/** Whether the wording also says an AI takes part. Forking tracks to an AI needs `true`. */
-	aiAssisted: boolean;
-}
-/** What {@link TelephonyPort.playDisclosure} reports once the wording has finished playing. */
-interface DisclosurePlayed {
-	/** The wording version that played. */
-	wordingVersion: number;
-	/** Whether it said an AI takes part. */
-	aiAssisted: boolean;
-	/** When it finished playing, as an ISO 8601 UTC time. */
-	playedAt: string;
-}
-/** A Rep's browser leg to join to a call. */
-interface BridgeRequest extends ProviderCallRef {
-	/** The Rep whose browser leg joins; if another leg is joined, it moves to this one. */
-	repIdentity: MembershipId;
-}
-/** What {@link TelephonyPort.startRecording} reports. */
-interface StartedRecording {
-	/** The provider's id of the Recording: opaque, same shape as a provider call id. */
-	recordingId: string;
-	/** Always 2: channel 0 is the Prospect, channel 1 is the Rep. */
-	channels: 2;
-}
-/** Where to fork the two audio tracks of a call. */
-interface ForkTracksRequest extends ProviderCallRef {
-	/** A `wss:` URL (`ws:` only for an adapter in `local`) the provider streams to; built by the service, never from a user. */
-	destinationUrl: string;
-}
-/** What {@link TelephonyPort.forkTracks} reports. */
-interface ForkedTracks {
-	/** The provider's id of the stream. */
-	streamId: string;
-	/** The two tracks sent: the Rep's and the Prospect's, separately. */
-	tracks: readonly ["rep", "prospect"];
-}
-/** Who asks to hang up. */
-interface HangUpRequest extends ProviderCallRef {
-	/** Who ends the call, for the event that follows; default `system`. */
-	by?: "rep" | "system";
-}
-/** Names a provider-side Recording. */
-interface RecordingRef {
-	/** The Organization. */
-	organizationId: OrganizationId7;
-	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
-	recordingId: string;
-}
-/** A provider-side Recording, opened for reading. */
-interface FetchedRecording {
-	/** The audio, two channels. The caller must read or cancel it. */
-	body: ByteStream;
-	/** The media type, such as `audio/wav`. */
-	contentType: string;
-	/** The size in bytes when the provider says it, otherwise null. */
-	sizeBytes: number | null;
-	/** Always 2. */
-	channels: 2;
-}
-/** A webhook request as the provider sent it, to be checked before anything is read from it. */
-interface WebhookRequest {
-	/** The full URL the provider called, as the provider saw it. */
-	url: string;
-	/** The raw body, unparsed, at most {@link MAX_WEBHOOK_BODY_BYTES} bytes. */
-	body: string;
-	/** The signature header, or null/undefined when the request had none. */
-	signature: string | null | undefined;
-}
-/** What {@link TelephonyPort.mintBrowserToken} is asked for. */
-interface BrowserTokenRequest {
-	/** The Organization. */
-	organizationId: OrganizationId7;
-	/** The Rep the token is for: the only identity it carries besides the Organization. */
-	identity: MembershipId;
-	/** How long it lives, in seconds, 60 to 3600; default 900. */
-	ttlSeconds?: number;
-}
-/** What a provider tells us about a call, in the shape every adapter's webhooks are turned into. */
-type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "completed" | "recording_ready";
-/** One thing that happened on a provider call. Carries no number, text or audio. */
-interface TelephonyEvent {
-	/** The provider's id of this event: webhooks are idempotent by it. */
-	eventId: string;
-	/** The Organization. */
-	organizationId: OrganizationId7;
-	/** The provider call. */
-	providerCallId: string;
-	/** What happened. */
-	type: TelephonyEventType;
-	/** When, as an ISO 8601 UTC time. */
-	at: string;
-	/** With `failed` (and `no_answer`, `busy`): why, as the contract names it. */
-	failureReason?: VoiceCallFailureReason;
-	/** With `completed`: who hung up. */
-	endedBy?: "rep" | "prospect" | "system";
-	/** With `recording_ready`: the Recording. */
-	recordingId?: string;
-}
-/**
-* Telephony behind a vendor (Twilio first, ADR to follow), scoped by Organization. Every call
-* carries the Organization and reaches only that Organization's provider calls and Recordings; a
-* real adapter must tag each provider call with it. Every operation is bounded by a timeout
-* ({@link TelephonyOptions.timeoutMs}), every outbound request an adapter makes has its own
-* timeout and a bounded, jittered retry, and only `telephony.unavailable` is worth retrying after
-* that. Mutating operations are idempotent: repeating one leaves the same result.
-*
-* **The Disclosure cannot be skipped (ADR 0003).** There is no option, flag or setting that
-* skips the Disclosure or the Recording. An adapter refuses `bridge`, `startRecording` and
-* `forkTracks` on a call whose Disclosure has not played, with `telephony.disclosure_required`,
-* and `forkTracks` (audio to an AI) also needs a Disclosure that said so (`aiAssisted: true`).
-* Every recording has two channels. These checks are the adapter's second line of defence; the
-* voice service's state machine is the first.
-*
-* Nothing here logs, returns in an error or reports a phone number, a Disclosure text, a token, a
-* signature, a secret or audio. Provider events arrive as webhooks the service verifies with
-* {@link TelephonyPort.verifyWebhook} and turns into {@link TelephonyEvent}s.
-*/
-interface TelephonyPort {
-	/**
-	* Places a call from a Line's number to a Prospect and returns at once with the provider's id;
-	* progress arrives as events. Idempotent by `(organizationId, idempotencyKey)`; the same key
-	* with another `to` or `from` is `telephony.invalid_request`. O(1).
-	*/
-	placeCall(request: PlaceCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
-	/**
-	* Answers an inbound call and rings the given browser legs. Repeating it for a call already
-	* answered returns the same count. O(legs).
-	*/
-	answerCall(request: AnswerCallRequest, options?: TelephonyOptions): Promise<AnsweredCall>;
-	/**
-	* Plays the Disclosure into a connected call and resolves when it has finished playing. Nobody
-	* else hears the call meanwhile. A call the Prospect has left is `telephony.call_ended`. Idempotent
-	* per wording version: a Disclosure that has already played is reported again, not replayed. A
-	* later version plays again and replaces the earlier one, including its `aiAssisted`.
-	*/
-	playDisclosure(request: PlayDisclosureRequest, options?: TelephonyOptions): Promise<DisclosurePlayed>;
-	/**
-	* Joins a Rep's browser leg to the call, or moves the call to another Rep's leg. Needs a played
-	* Disclosure. Repeating it for the same Rep changes nothing.
-	*/
-	bridge(request: BridgeRequest, options?: TelephonyOptions): Promise<void>;
-	/**
-	* Starts the dual-channel Recording (Prospect and Rep apart). Needs a played Disclosure. There is
-	* no single-channel or unrecorded mode. Repeating it returns the first Recording.
-	*/
-	startRecording(request: ProviderCallRef, options?: TelephonyOptions): Promise<StartedRecording>;
-	/**
-	* Forks the call's two audio tracks, the Rep's and the Prospect's separately, to a socket
-	* (used by the Copilot). Needs a played Disclosure that said an AI takes part. Repeating it
-	* returns the first stream.
-	*/
-	forkTracks(request: ForkTracksRequest, options?: TelephonyOptions): Promise<ForkedTracks>;
-	/** Ends the call. Idempotent: a call that has ended already resolves without error. */
-	hangUp(request: HangUpRequest, options?: TelephonyOptions): Promise<void>;
-	/**
-	* Opens the provider's copy of a Recording as a stream, once the call has ended and the Recording
-	* is finished (before that, `telephony.recording_not_ready`). The timeout covers opening it. A
-	* Recording deleted or never made is `telephony.not_found`. O(1) to open.
-	*/
-	fetchRecording(request: RecordingRef, options?: TelephonyOptions): Promise<FetchedRecording>;
-	/**
-	* Deletes the provider's copy of a Recording and resolves with whether it existed. Idempotent:
-	* deleting again, or an id never issued, resolves with `existed: false`.
-	*/
-	deleteRecording(request: RecordingRef, options?: TelephonyOptions): Promise<{
-		existed: boolean;
-	}>;
-	/**
-	* Whether `request` really came from the provider, by its signature, compared in constant time.
-	* A missing, malformed, wrong-length or wrong signature, or a body over
-	* {@link MAX_WEBHOOK_BODY_BYTES}, is `false`; it never throws. It does no I/O (a local
-	* computation on the body), so it needs no timeout and runs inside a webhook's budget. Check it
-	* before reading anything from the body.
-	*/
-	verifyWebhook(request: WebhookRequest): boolean;
-	/**
-	* Mints a short-lived token the browser registers the Softphone with. It is issued for the Rep's
-	* identity in the Organization (a real adapter binds both at the provider; the token text need
-	* not show them), expires at `expiresAt`, and is a credential: never logged or
-	* stored.
-	*/
-	mintBrowserToken(request: BrowserTokenRequest, options?: TelephonyOptions): Promise<SoftphoneToken>;
-}
-/** The HTTP client the adapter uses: `fetch`, injected for tests. */
-type TwilioFetch = (input: string, init: RequestInit) => Promise<Response>;
-/** The Twilio regions this adapter knows, as Twilio names them in a host (`api.dublin.ie1.twilio.com`). */
-declare const TWILIO_REGIONS: readonly ["us1", "ie1", "au1"];
-/** One of {@link TWILIO_REGIONS}. */
-type TwilioRegion = (typeof TWILIO_REGIONS)[number];
-/** The edge Twilio serves each region from by default. */
-declare const TWILIO_DEFAULT_EDGES: Readonly<Record<TwilioRegion, string>>;
-/** What the adapter remembers about one provider call, since Twilio has no tag to hold it. */
-interface TwilioCallRecord {
-	/** The Organization the call belongs to. */
-	organizationId: string;
-	/** Our Call id, when known. */
-	callId: string | null;
-	/** Placed by us, or received. */
-	direction: "outbound" | "inbound";
-	/** The Disclosure that has played on the call, or null. */
-	disclosure: DisclosurePlayed | null;
-	/** The Rep whose browser leg the call is bridged to, or null. */
-	bridgedTo: string | null;
-	/** True once a Disclosure has started to play, so the hold is never sent over it. */
-	disclosureStarted?: boolean;
-	/** The Reps the inbound call was meant to ring. */
-	ringIdentities: readonly string[];
-	/** The Recording started on the call, or null. */
-	recordingId: string | null;
-	/** The stream forked from the call, or null. */
-	streamId: string | null;
-}
-/** What the adapter remembers about a placement, to answer a repeated idempotency key. */
-interface TwilioPlacement {
-	/** The provider call the key placed. */
-	providerCallId: string;
-	/** A keyed hash of the numbers; a repeat with other numbers is refused. Never the numbers. */
-	fingerprint: string;
-}
-/**
-* Where the adapter keeps the Organization of each provider call, the state of its Disclosure and
-* its idempotency keys. Twilio holds none of it, and the port promises that one Organization never
-* reaches another's calls, so a production service must pass a durable store (Postgres, in its own
-* schema). Omitting it (in process memory) is allowed only in the `local` and `dev` environments. A store that has lost
-* a call fails closed: the call is `telephony.not_found`, or its Disclosure counts as not played.
-*/
-interface TwilioStore {
-	/** Returns the record of a provider call, or null. */
-	getCall(providerCallId: string): Promise<TwilioCallRecord | null>;
-	/** Creates or replaces the record of a provider call. */
-	putCall(providerCallId: string, record: TwilioCallRecord): Promise<void>;
-	/**
-	* Runs `fn` with the current record (null when there is none) while no other `withCall` for the
-	* same call runs, until `fn` settles, including any Twilio request it makes. Inside `fn` use
-	* `getCall`/`putCall`, never `withCall` again for that call. A durable store holds a row lock
-	* (`SELECT ... FOR UPDATE`) for the duration; the memory store chains promises per call.
-	*/
-	withCall<T>(providerCallId: string, fn: (record: TwilioCallRecord | null) => Promise<T>): Promise<T>;
-	/**
-	* Atomically creates the record when none exists and returns the record that now stands, which
-	* is the caller's own when it won and the earlier one when it lost.
-	*/
-	claimCall(providerCallId: string, record: TwilioCallRecord): Promise<TwilioCallRecord>;
-	/** Returns the provider call a Recording belongs to, or null. */
-	getRecording(recordingId: string): Promise<{
-		providerCallId: string;
-	} | null>;
-	/** Remembers which provider call a Recording belongs to. */
-	putRecording(recordingId: string, providerCallId: string): Promise<void>;
-	/** Returns the placement an idempotency key made, or null. */
-	getPlacement(organizationId: string, key: string): Promise<TwilioPlacement | null>;
-	/** Remembers a placement. */
-	putPlacement(organizationId: string, key: string, placement: TwilioPlacement): Promise<void>;
-}
-/** Creates the in-process {@link TwilioStore}, for tests and local runs. */
-declare function createMemoryTwilioStore(): TwilioStore;
-/** What {@link TwilioOptions.disclosureDone} is told about the Disclosure it waits for. */
-interface DisclosureWait {
-	/** The Organization. */
-	organizationId: string;
-	/** The provider call. */
-	providerCallId: string;
-	/** When the wait must give up, as ms since the epoch. */
-	deadline: number;
-}
-/** Options for {@link createTwilioTelephony}. */
-interface TwilioOptions {
-	/** The Account SID (`AC` and 32 hex digits). */
-	accountSid: string;
-	/** An API key's SID (`SK` and 32 hex digits): signs requests and Softphone tokens. */
-	apiKeySid: string;
-	/** The API key's secret. A credential: never logged or put in an error. */
-	apiKeySecret: string;
-	/**
-	* The Auth Token, used only to check webhook signatures. Twilio signs webhooks with it and not
-	* with an API key's secret. Without it `verifyWebhook` is always false.
-	*/
-	authToken?: string;
-	/** The TwiML App's SID (`AP` and 32 hex digits) the Softphone dials out through. */
-	twimlAppSid: string;
-	/**
-	* The Twilio region, such as `ie1` for Ireland. Needs API keys made in that region. Default is
-	* the US default host `api.twilio.com`.
-	*/
-	region?: TwilioRegion;
-	/** The edge, such as `dublin`; default is the region's own edge. Needs `region`. */
-	edge?: string;
-	/** The `ENVIRONMENT`; a `ws:` fork destination is accepted only in `local`; default `prod`. */
-	environment?: Environment;
-	/** Where Twilio reports call progress; the adapter adds `organizationId` and `callId` to the query. */
-	statusCallbackUrl?: string;
-	/** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
-	recordingStatusCallbackUrl?: string;
-	/** The store of per-call state; required outside `local` and `dev`, where it is in memory. */
-	store?: TwilioStore;
-	/** The `fetch` to use; the global one by default. */
-	fetch?: TwilioFetch;
-	/** Waits between retries; real time by default. */
-	sleep?: Sleep;
-	/** A number in `[0, 1)` for retry jitter; `Math.random` by default. */
-	random?: () => number;
-	/** The clock for token and Disclosure times; the system clock by default. */
-	clock?: Clock;
-	/** The wall clock in ms for deadlines; `Date.now` by default. */
-	nowMs?: () => number;
-	/** The timeout of an operation that names none, in ms; default {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. */
-	defaultTimeoutMs?: number;
-	/** The most attempts per request, the first included; default 3. */
-	maxAttempts?: number;
-	/** The language the Disclosure is spoken in, such as `en-US`; default `en-US`. */
-	disclosureLanguage?: string;
-	/**
-	* Resolves when the Disclosure has finished playing. Twilio has no "finished speaking" event on
-	* a REST update, so by default the adapter waits for an estimate of how long the wording takes
-	* (see {@link estimateSpeechMs}). A service with a webhook for it passes a hook that waits for
-	* that instead; the hook must throw `telephony.unavailable` if the deadline passes.
-	*/
-	disclosureDone?: (wait: DisclosureWait) => Promise<void>;
-}
-/**
-* How long a Disclosure takes to speak, in ms: 0.4 s a word, a quarter more for safety, and a
-* second for the call to start speaking. It deliberately errs long: waiting too long delays the
-* Rep a moment, but bridging too early would let the Rep talk over the Disclosure.
-*/
-declare function estimateSpeechMs(text: string): number;
-/** The host Twilio's REST API is called on for a region and edge. */
-declare function twilioApiHost(region?: TwilioRegion, edge?: string): string;
-/**
-* Signs a webhook the way Twilio does (`X-Twilio-Signature`): HMAC-SHA1 with the Auth Token over
-* the URL followed by each form field's name and value in sorted order, in base64. For tests and
-* for simulating Twilio; the adapter itself only verifies.
-*/
-declare function signTwilioRequest(authToken: string, url: string, params?: Readonly<Record<string, string>> | readonly (readonly [string, string])[]): string;
-/**
-* Creates the {@link TelephonyPort} on Twilio: Programmable Voice over REST and TwiML, a Voice SDK
-* access token, dual-channel Recordings and a Media Streams fork. Every request has a timeout and
-* a bounded, jittered retry on network errors, 429 and 5xx (never on another 4xx); an operation
-* as a whole is bounded by its `timeoutMs`. Nothing is logged, and no number, Disclosure text,
-* token, signature, secret or Recording URL is put in an error.
-*
-* The Disclosure rules are the shared ones (`requireDisclosure`): the adapter refuses to bridge,
-* record or fork a call whose Disclosure it has not seen play. The Disclosure state lives in the
-* {@link TwilioStore}.
-*/
-declare function createTwilioTelephony(options: TwilioOptions): TelephonyPort;
 /** The `area.reason` codes the transcriber port and adapters throw. */
 declare const TRANSCRIBER_ERROR_CODES: {
 	/** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
@@ -2695,7 +3010,7 @@ declare class TtsError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { OrganizationId as OrganizationId8 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId9 } from "tula-closeline-contract";
 /** The default overall deadline of one stream, from `open` to the last chunk, in milliseconds. */
 declare const DEFAULT_TTS_TIMEOUT_MS = 3e4;
 /** The longest overall deadline a caller may allow, in milliseconds. */
@@ -2738,7 +3053,7 @@ declare function ttsRetryDelayMs(retry: number, policy: ResolvedTtsRetryPolicy, 
 /** What opening a stream states: whose it is, the voice and format, and the limits that bound it. */
 interface TtsOpenRequest {
 	/** The Organization the stream is for; it scopes metering and error context. */
-	organizationId: OrganizationId8;
+	organizationId: OrganizationId9;
 	/** A stock voice style of the vendor, 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. Voice cloning is out of scope. */
 	voice: string;
 	/** How the audio is encoded: `pcm_mulaw` for telephony, `pcm_s16le` otherwise. */
@@ -2949,4 +3264,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };
+export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, BusyInterval, ByteStream, CALENDAR_ERROR_CODES, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, CalendarAttendee, CalendarBusyRequest, CalendarCallOptions, CalendarConnectRequest, CalendarConnection, CalendarConnectionInit, CalendarCreateRequest, CalendarDeleteRequest, CalendarError, CalendarErrorCode, CalendarEventChanges, CalendarEventCreated, CalendarEventInput, CalendarEventRef, CalendarGrant, CalendarPort, CalendarRequestBase, CalendarRetryPolicy, CalendarUpdateRequest, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CALENDAR_RETRY_POLICY, DEFAULT_CALENDAR_TIMEOUT_MS, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MESSAGING_RETRY_POLICY, DEFAULT_MESSAGING_TIMEOUT_MS, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS, DEFAULT_TTS_MAX_TEXT_CHARS, DEFAULT_TTS_RETRY_POLICY, DEFAULT_TTS_TIMEOUT_MS, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InboundEvent, InboundMessage, InboundMessageFields, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_BUSY_INTERVALS, MAX_BUSY_RANGE_MS, MAX_CALENDAR_TIMEOUT_MS, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_EVENT_ATTENDEES, MAX_EVENT_DURATION_MS, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_BYTES, MAX_MESSAGING_TIMEOUT_MS, MAX_MESSAGING_WEBHOOK_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TEMPLATE_VARIABLES, MAX_TEMPLATE_VARIABLE_CHARS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TTS_AUDIO_CHUNK_BYTES, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS, MAX_TTS_MAX_TEXT_CHARS, MAX_TTS_TIMEOUT_MS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MESSAGING_CHANNELS, MESSAGING_ERROR_CODES, MESSAGING_PURPOSES, MODEL_TIERS, MessageContent, MessageDefinition, MessageDeliveryStatus, MessageIntent, MessageRegistry, MessageRegistryOptions, MessageScope, MessagingChannel, MessagingError, MessagingErrorCode, MessagingPort, MessagingPurpose, MessagingRetryPolicy, MessagingWebhookRequest, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedCalendarRetryPolicy, ResolvedLlmRetryPolicy, ResolvedMessagingRetryPolicy, ResolvedReconnectPolicy, ResolvedTtsRetryPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, SendMessageRequest, SentMessage, Sleep, SpeakerMode, StartedRecording, StatusEvent, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TTS_ERROR_CODES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TtsAudioChunk, TtsError, TtsErrorCode, TtsOpenRequest, TtsPort, TtsRetryPolicy, TtsStream, TurnEvent, TwilioCallRecord, TwilioMessagingOptions, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, calendarRetryDelayMs, checkTranscriptionResult, classifyMessageIntent, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioMessaging, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isReportableMessagingError, isSentryDsn, llmRetryDelayMs, messagingRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, ttsRetryDelayMs, twilioApiHost, waitForTranscription, withCaller };

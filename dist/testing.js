@@ -15,14 +15,7 @@ import {
   llmRetryDelayMs2,
   scrubText2,
   prepareFields,
-  shouldReportError2,
-  STREAMING_TRANSCRIBE_ERROR_CODES2,
-  StreamingTranscribeError2,
-  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
-  MAX_AUDIO_CHUNK_BYTES2,
-  DEFAULT_RECONNECT_POLICY2,
-  reconnectDelayMs2,
+  signTwilioRequest2,
   TELEPHONY_ERROR_CODES2,
   TelephonyError2,
   invalid,
@@ -36,6 +29,22 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
+  startMessagingDeadline,
+  AttemptAborted,
+  raceAbort,
+  withMessagingRetry,
+  requireConsent,
+  invalid2,
+  checkSendRequest,
+  verifyAndParseWebhook,
+  shouldReportError2,
+  STREAMING_TRANSCRIBE_ERROR_CODES2,
+  StreamingTranscribeError2,
+  DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2,
+  MAX_AUDIO_CHUNK_BYTES2,
+  DEFAULT_RECONNECT_POLICY2,
+  reconnectDelayMs2,
   TtsAudioChunk2,
   DEFAULT_TTS_TIMEOUT_MS2,
   MAX_TTS_TIMEOUT_MS2,
@@ -54,7 +63,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-fg37gjeb.js";
+} from "./shared/chunk-0f87wa1m.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -69,6 +78,8 @@ import {
   calendarRetryDelayMs2,
   LLM_ERROR_CODES2,
   LlmError2,
+  MessagingError2,
+  isReportableMessagingError2,
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
   MAX_WEBHOOK_BODY_BYTES2,
   TRANSCRIBER_ERROR_CODES2,
@@ -82,7 +93,7 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-0dy266jn.js";
+} from "./shared/chunk-hff6jkfx.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -250,7 +261,7 @@ async function withCalendarRetry(attempt, options) {
 // src/calendar/validate.ts
 import { organizationIdSchema } from "tula-closeline-contract";
 import { z } from "zod";
-function invalid2(what) {
+function invalid3(what) {
   throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn(value, min, max) {
@@ -258,27 +269,27 @@ function integerIn(value, min, max) {
 }
 function checkOptions(options) {
   if (options !== undefined && (typeof options !== "object" || options === null)) {
-    invalid2("options");
+    invalid3("options");
   }
   const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
   if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
-    invalid2("timeoutMs");
+    invalid3("timeoutMs");
   }
   if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
-    invalid2("signal");
+    invalid3("signal");
   }
   const policy = options?.retry;
   const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
   if (!integerIn(maxRetries, 0, 5)) {
-    invalid2("retry.maxRetries");
+    invalid3("retry.maxRetries");
   }
   if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid2("retry.baseDelayMs");
+    invalid3("retry.baseDelayMs");
   }
   if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid2("retry.maxDelayMs");
+    invalid3("retry.maxDelayMs");
   }
   return {
     timeoutMs,
@@ -290,7 +301,7 @@ function parse(schema, value, what) {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
     const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
-    return invalid2(path ? `${what}.${path}` : what);
+    return invalid3(path ? `${what}.${path}` : what);
   }
   return parsed.data;
 }
@@ -332,18 +343,18 @@ var grantSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("refresh_token"), refreshToken: z.string().min(1).max(4096) })
 ]);
 function checkOrganizationId2(value) {
-  return organizationIdSchema.safeParse(value).success ? value : invalid2("organizationId");
+  return organizationIdSchema.safeParse(value).success ? value : invalid3("organizationId");
 }
 function checkBase(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid2("request");
+    return invalid3("request");
   }
   checkOrganizationId2(request.organizationId);
   if (!(request.connection instanceof CalendarConnection2)) {
-    return invalid2("connection");
+    return invalid3("connection");
   }
   if (request.connection.organizationId !== request.organizationId) {
-    return invalid2("connection");
+    return invalid3("connection");
   }
   return request.connection;
 }
@@ -360,13 +371,13 @@ function checkRange(from, to) {
   const fromMs = Date.parse(parse(instant, from, "from"));
   const toMs = Date.parse(parse(instant, to, "to"));
   if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
-    invalid2("range");
+    invalid3("range");
   }
   return { fromMs, toMs };
 }
 function checkEventTimes(startMs, endMs) {
   if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
-    invalid2("event.times");
+    invalid3("event.times");
   }
 }
 function checkEvent(value) {
@@ -411,7 +422,7 @@ function createMemoryCalendar(options = {}) {
   function account(connection) {
     const found = accounts.get(connection.connectionId);
     if (found === undefined || found.organizationId !== connection.organizationId) {
-      invalid2("connection");
+      invalid3("connection");
     }
     return found;
   }
@@ -481,7 +492,7 @@ function createMemoryCalendar(options = {}) {
     const seen = replays.get(key);
     if (seen !== undefined) {
       if (seen.fingerprint !== fingerprint) {
-        invalid2("requestId");
+        invalid3("requestId");
       }
       return { result: seen.result, first: false };
     }
@@ -791,7 +802,7 @@ async function withLlmRetry(attempt, options) {
 import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
 import { z as z2 } from "zod";
 var SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-function invalid3(what) {
+function invalid4(what) {
   throw new LlmError2(LLM_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn2(value, min, max) {
@@ -802,56 +813,56 @@ function resolveRetryPolicy(policy) {
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.maxDelayMs;
   if (!integerIn2(maxRetries, 0, 5)) {
-    invalid3("retry.maxRetries");
+    invalid4("retry.maxRetries");
   }
   if (!integerIn2(baseDelayMs, 1, 60000)) {
-    invalid3("retry.baseDelayMs");
+    invalid4("retry.baseDelayMs");
   }
   if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
-    invalid3("retry.maxDelayMs");
+    invalid4("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
 }
 function checkRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid3("request");
+    return invalid4("request");
   }
   if (!organizationIdSchema2.safeParse(request.organizationId).success) {
-    invalid3("organizationId");
+    invalid4("organizationId");
   }
   if (!MODEL_TIERS2.includes(request.tier)) {
-    invalid3("tier");
+    invalid4("tier");
   }
   if (request.system !== undefined && typeof request.system !== "string") {
-    invalid3("system");
+    invalid4("system");
   }
   const messages = request.messages;
   if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_LLM_MESSAGES2) {
-    invalid3("messages");
+    invalid4("messages");
   }
   for (const message of messages) {
     const m = message;
     if (typeof m !== "object" || m === null || m.role !== "user" && m.role !== "assistant" || typeof m.content !== "string" || m.content.length < 1) {
-      invalid3("messages");
+      invalid4("messages");
     }
   }
   if (messages.at(-1)?.role !== "user") {
-    invalid3("messages");
+    invalid4("messages");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS2;
   if (!integerIn2(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
-    invalid3("timeoutMs");
+    invalid4("timeoutMs");
   }
   const maxInputTokens = request.maxInputTokens ?? DEFAULT_LLM_MAX_INPUT_TOKENS2;
   if (!integerIn2(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
-    invalid3("maxInputTokens");
+    invalid4("maxInputTokens");
   }
   const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS2;
   if (!integerIn2(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
-    invalid3("maxOutputTokens");
+    invalid4("maxOutputTokens");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid3("signal");
+    invalid4("signal");
   }
   const retry = resolveRetryPolicy(request.retry);
   const inputTokens = estimateTokens2(request.system ?? "") + messages.reduce((sum, m) => sum + estimateTokens2(m.content), 0);
@@ -865,16 +876,16 @@ function checkRequest(request) {
 function checkCompleteRequest(request) {
   const checked = checkRequest(request);
   if (!(request.schema instanceof z2.ZodType)) {
-    invalid3("schema");
+    invalid4("schema");
   }
   if (typeof request.schemaName !== "string" || !SCHEMA_NAME.test(request.schemaName)) {
-    invalid3("schemaName");
+    invalid4("schemaName");
   }
   let jsonSchema;
   try {
     jsonSchema = z2.toJSONSchema(request.schema, { io: "input" });
   } catch {
-    return invalid3("schema");
+    return invalid4("schema");
   }
   return { checked, jsonSchema };
 }
@@ -1046,10 +1057,10 @@ function createMemoryLlm(options = {}) {
     reply(reply) {
       const scripted = typeof reply === "string" ? { text: reply } : reply;
       if (typeof scripted.text !== "string") {
-        invalid3("reply text");
+        invalid4("reply text");
       }
       if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
-        invalid3("reply chunks");
+        invalid4("reply chunks");
       }
       replies.push({ ...scripted });
     },
@@ -1063,6 +1074,204 @@ function createMemoryLlm(options = {}) {
     }
   };
   return port;
+}
+// src/messaging/memory.ts
+import { createHash, randomBytes } from "node:crypto";
+var MEMORY_MESSAGING_AUTH_TOKEN = "memory-messaging-auth-token-0123456789";
+var MEMORY_MESSAGING_WEBHOOK_URL = "https://messaging.memory.test/webhooks/messaging";
+function newSid(prefix) {
+  return `${prefix}${randomBytes(16).toString("hex")}`;
+}
+function failure(code) {
+  switch (code) {
+    case "messaging.unavailable":
+      return new MessagingError2(code, "The messaging provider is unavailable", {
+        details: { status: 503 }
+      });
+    case "messaging.rejected":
+      return new MessagingError2(code, "The messaging provider refused the request", {
+        details: { status: 400 }
+      });
+    case "messaging.bad_response":
+      return new MessagingError2(code, "The messaging provider sent an unusable answer");
+    case "messaging.recipient_opted_out":
+      return new MessagingError2(code, "The recipient has opted out of this sender", {
+        details: { twilioCode: 21610 }
+      });
+    case "messaging.template_required":
+      return new MessagingError2(code, "Only a template can start this conversation", {
+        details: { twilioCode: 63016 }
+      });
+  }
+}
+function createMemoryMessaging(options) {
+  const sleep = options.sleep ?? systemSleep2;
+  const clock = options.clock ?? systemClock2;
+  const views = [];
+  const bodies = [];
+  const script = [];
+  const stored = new Map;
+  function report(error, organizationId) {
+    if (!isReportableMessagingError2(error)) {
+      return;
+    }
+    try {
+      options.reporter?.capture(error, { organizationId, tags: { feature: "messaging" } });
+    } catch {}
+  }
+  async function vendor(request, signal) {
+    const view = {
+      organizationId: request.organizationId,
+      channel: request.channel,
+      contentKind: request.content.kind,
+      bodyChars: request.content.kind === "text" ? request.content.body.length : 0,
+      aborted: false,
+      outcome: "pending"
+    };
+    views.push(view);
+    const next = script.shift();
+    try {
+      if (next?.kind === "hang") {
+        await raceAbort(new Promise(() => {
+          return;
+        }), signal);
+      }
+      if (next?.kind === "fail") {
+        throw failure(next.code);
+      }
+      if (signal.aborted) {
+        throw new AttemptAborted;
+      }
+      view.outcome = "ok";
+      if (request.content.kind === "text") {
+        bodies.push(request.content.body);
+      }
+      return { providerMessageId: newSid("SM") };
+    } catch (error) {
+      if (error instanceof AttemptAborted) {
+        view.aborted = true;
+        view.outcome = "aborted";
+      } else {
+        view.outcome = "failed";
+      }
+      throw error;
+    }
+  }
+  return {
+    failNext(code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        script.push({ kind: "fail", code });
+      }
+    },
+    hangNext(times = 1) {
+      for (let i = 0;i < times; i++) {
+        script.push({ kind: "hang" });
+      }
+    },
+    requests() {
+      return views.map((view) => ({ ...view }));
+    },
+    sentBodies() {
+      return [...bodies];
+    },
+    inbound(fields) {
+      const channel = fields.channel ?? "sms";
+      const prefix = channel === "whatsapp" ? "whatsapp:" : "";
+      return this.signedWebhook({
+        MessageSid: fields.providerMessageId ?? newSid("SM"),
+        From: `${prefix}${fields.from}`,
+        To: `${prefix}${fields.to}`,
+        Body: fields.body,
+        NumMedia: String(fields.mediaCount ?? 0)
+      });
+    },
+    status(fields) {
+      return this.signedWebhook({
+        MessageSid: fields.providerMessageId,
+        MessageStatus: fields.status,
+        ...fields.errorCode === undefined ? {} : { ErrorCode: String(fields.errorCode) }
+      });
+    },
+    signedWebhook(fields) {
+      const body = new URLSearchParams(fields).toString();
+      return {
+        url: MEMORY_MESSAGING_WEBHOOK_URL,
+        signature: signTwilioRequest2(MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, fields),
+        body,
+        contentType: "application/x-www-form-urlencoded"
+      };
+    },
+    async receive(request) {
+      return verifyAndParseWebhook(request, MEMORY_MESSAGING_AUTH_TOKEN, clock);
+    },
+    async send(request) {
+      const checked = checkSendRequest(request);
+      const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal);
+      try {
+        const { consentCheckId, numberConsentCheckId } = await requireConsent(options.guard, checked, deadline);
+        const fingerprint = createHash("sha256").update(JSON.stringify([
+          checked.prospectId,
+          checked.channel,
+          checked.purpose,
+          checked.to,
+          checked.content
+        ])).digest("hex");
+        const key = `${checked.organizationId}|${checked.idempotencyKey}`;
+        const existing = stored.get(key);
+        if (existing !== undefined) {
+          if (existing.fingerprint !== fingerprint) {
+            return invalid2("idempotencyKey");
+          }
+          return existing.result;
+        }
+        const result = (async () => {
+          try {
+            const answer = await withMessagingRetry(async () => {
+              try {
+                return await vendor(checked, deadline.signal);
+              } catch (error) {
+                if (error instanceof AttemptAborted) {
+                  deadline.check();
+                }
+                throw error;
+              }
+            }, {
+              policy: checked.retry,
+              deadline,
+              sleep,
+              ...options.random === undefined ? {} : { random: options.random },
+              onRetry: (retry, delayMs) => options.logger?.warn("Messaging send retried", {
+                feature: "messaging",
+                channel: checked.channel,
+                retry,
+                delayMs
+              })
+            });
+            return {
+              consentCheckId,
+              numberConsentCheckId,
+              providerMessageId: answer.providerMessageId,
+              channel: checked.channel,
+              status: "queued",
+              idempotencyKey: checked.idempotencyKey
+            };
+          } catch (error) {
+            report(error, checked.organizationId);
+            throw error;
+          }
+        })();
+        stored.set(key, { fingerprint, result });
+        try {
+          return await result;
+        } catch (error) {
+          stored.delete(key);
+          throw error;
+        }
+      } finally {
+        deadline.stop();
+      }
+    }
+  };
 }
 // src/queue/memory.ts
 function bytesOf(body) {
@@ -1303,7 +1512,7 @@ function createTestRegistry(options = {}) {
   });
 }
 // src/storage/memory.ts
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash as createHash2, createHmac, randomBytes as randomBytes2, timingSafeEqual } from "node:crypto";
 function createMemoryObjectStore(options = {}) {
   const clock = options.clock ?? systemClock2;
   const check = createStorageValidator({
@@ -1311,7 +1520,7 @@ function createMemoryObjectStore(options = {}) {
     isOrganizationId: options.isOrganizationId
   });
   const organizations = new Map;
-  const secret = randomBytes(32);
+  const secret = randomBytes2(32);
   const sign = (org, name, expires) => createHmac("sha256", secret).update(`${org}
 ${name}
 ${expires}`).digest("hex");
@@ -1369,7 +1578,7 @@ ${expires}`).digest("hex");
       const name = check.key(key);
       const contentType = check.contentType(putOptions?.contentType);
       const maxBytes = checkStreamLimit(putOptions?.maxBytes);
-      const hash = createHash("sha256");
+      const hash = createHash2("sha256");
       const parts = [];
       let size = 0;
       for await (const chunk of readChunks(body, putOptions?.signal, checkIdleTimeout(putOptions?.idleTimeoutMs))) {
@@ -1471,7 +1680,7 @@ var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
 var TRACKS = ["rep", "prospect"];
-function invalid4(what) {
+function invalid5(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn3(value, min, max) {
@@ -1479,28 +1688,28 @@ function integerIn3(value, min, max) {
 }
 function checkOpenRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid4("request");
+    return invalid5("request");
   }
   if (!organizationIdSchema3.safeParse(request.organizationId).success) {
-    invalid4("organizationId");
+    invalid5("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
-    invalid4("callId");
+    invalid5("callId");
   }
   if (!TRACKS.includes(request.track)) {
-    invalid4("track");
+    invalid5("track");
   }
   if (!ENCODINGS.includes(request.encoding)) {
-    invalid4("encoding");
+    invalid5("encoding");
   }
   if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid4("sampleRate");
+    invalid5("sampleRate");
   }
   if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
-    invalid4("language");
+    invalid5("language");
   }
   if (typeof request.onEvent !== "function") {
-    invalid4("onEvent");
+    invalid5("onEvent");
   }
   return resolveReconnectPolicy(request.reconnect);
 }
@@ -1509,23 +1718,23 @@ function resolveReconnectPolicy(policy) {
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
   if (!integerIn3(maxAttempts, 0, 10)) {
-    invalid4("reconnect.maxAttempts");
+    invalid5("reconnect.maxAttempts");
   }
   if (!integerIn3(baseDelayMs, 1, 60000)) {
-    invalid4("reconnect.baseDelayMs");
+    invalid5("reconnect.baseDelayMs");
   }
   if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
-    invalid4("reconnect.maxDelayMs");
+    invalid5("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn3(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid4("timeoutMs");
+  return integerIn3(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid5("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
-    return invalid4("chunk");
+    return invalid5("chunk");
   }
   return chunk;
 }
@@ -1541,19 +1750,19 @@ function wordsOf(text, startMs) {
 }
 function checkScript(turns) {
   if (!Array.isArray(turns) || turns.length > 1000) {
-    invalid4("turns");
+    invalid5("turns");
   }
   let previous = 0;
   for (const turn of turns) {
     const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
     if (count < 1 || count > 200) {
-      invalid4("turn text");
+      invalid5("turn text");
     }
     if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
-      invalid4("afterBytes");
+      invalid5("afterBytes");
     }
     if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
-      invalid4("interims");
+      invalid5("interims");
     }
     previous = turn.afterBytes;
   }
@@ -1745,7 +1954,7 @@ function createMemoryStreamingTranscribe(options = {}) {
   return port;
 }
 // src/telephony/memory.ts
-import { createHmac as createHmac2, randomBytes as randomBytes2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+import { createHmac as createHmac2, randomBytes as randomBytes3, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
 var DEFAULT_SECRET = "memory-webhook-secret";
 var DEFAULT_TTL_SECONDS = 900;
 var FAKE_AUDIO = new TextEncoder().encode("RIFF....WAVEmemory-recording");
@@ -2070,7 +2279,7 @@ function createMemoryTelephony(options = {}) {
           invalid("ttlSeconds");
         }
         return {
-          token: `memtok.${randomBytes2(24).toString("base64url")}`,
+          token: `memtok.${randomBytes3(24).toString("base64url")}`,
           identity: request.identity,
           ttlSeconds: ttl,
           expiresAt: new Date(clock.now().getTime() + ttl * 1000).toISOString()
@@ -2152,7 +2361,7 @@ function createMemoryTelephony(options = {}) {
   return port;
 }
 // src/transcribe/memory.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 
 // src/transcribe/validate.ts
 var REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -2317,7 +2526,7 @@ function createMemoryTranscriber(options = {}) {
   const scripts = new Map;
   const failures = [];
   let acceptThenFail = 0;
-  const vendorIdOf = (org, reference) => `mem_${createHash2("sha256").update(`${org}\x00${reference}`).digest("hex").slice(0, 20)}`;
+  const vendorIdOf = (org, reference) => `mem_${createHash3("sha256").update(`${org}\x00${reference}`).digest("hex").slice(0, 20)}`;
   const scriptKey = (org, reference) => `${org}\x00${reference}`;
   function maybeFail(operation) {
     const at = failures.findIndex((entry) => entry.operation === operation);
@@ -2538,7 +2747,7 @@ import { organizationIdSchema as organizationIdSchema4 } from "tula-closeline-co
 var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
 var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
 var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
-function invalid5(what) {
+function invalid6(what) {
   throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn4(value, min, max) {
@@ -2546,52 +2755,52 @@ function integerIn4(value, min, max) {
 }
 function resolveTtsRetryPolicy(policy) {
   if (policy !== undefined && (typeof policy !== "object" || policy === null)) {
-    invalid5("retry");
+    invalid6("retry");
   }
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
   if (!integerIn4(maxRetries, 0, 5)) {
-    invalid5("retry.maxRetries");
+    invalid6("retry.maxRetries");
   }
   if (!integerIn4(baseDelayMs, 1, 60000)) {
-    invalid5("retry.baseDelayMs");
+    invalid6("retry.baseDelayMs");
   }
   if (!integerIn4(maxDelayMs, baseDelayMs, 60000)) {
-    invalid5("retry.maxDelayMs");
+    invalid6("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
 }
 function checkOpenRequest2(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid5("request");
+    return invalid6("request");
   }
   if (!organizationIdSchema4.safeParse(request.organizationId).success) {
-    invalid5("organizationId");
+    invalid6("organizationId");
   }
   if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
-    invalid5("voice");
+    invalid6("voice");
   }
   if (!ENCODINGS2.includes(request.encoding)) {
-    invalid5("encoding");
+    invalid6("encoding");
   }
   if (!SAMPLE_RATES2.includes(request.sampleRate)) {
-    invalid5("sampleRate");
+    invalid6("sampleRate");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
   if (!integerIn4(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
-    invalid5("timeoutMs");
+    invalid6("timeoutMs");
   }
   const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
   if (!integerIn4(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
-    invalid5("firstChunkTimeoutMs");
+    invalid6("firstChunkTimeoutMs");
   }
   const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
   if (!integerIn4(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
-    invalid5("maxTextChars");
+    invalid6("maxTextChars");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid5("signal");
+    invalid6("signal");
   }
   return {
     timeoutMs,
@@ -2619,7 +2828,7 @@ class MemoryTtsStream {
     this.#assertOpen();
     this.#deadline.check();
     if (typeof text !== "string") {
-      invalid5("text");
+      invalid6("text");
     }
     if (text.length === 0) {
       return;
@@ -2891,11 +3100,11 @@ function createMemoryTts(options = {}) {
     speak(speech) {
       const scripted = Array.isArray(speech) ? { chunks: speech } : speech;
       if (typeof scripted !== "object" || scripted === null || !Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
-        invalid5("speech chunks");
+        invalid6("speech chunks");
       }
       const failAfter = scripted.failAfterChunks;
       if (failAfter !== undefined && (!Number.isInteger(failAfter) || failAfter < 1 || failAfter > scripted.chunks.length)) {
-        invalid5("speech failAfterChunks");
+        invalid6("speech failAfterChunks");
       }
       scripts.push({ ...scripted });
     },
@@ -3189,11 +3398,14 @@ function createTestDeps(overrides = {}) {
 export {
   DEFAULT_TEST_ORGANIZATION_ID,
   DEFAULT_TEST_USER_ID,
+  MEMORY_MESSAGING_AUTH_TOKEN,
+  MEMORY_MESSAGING_WEBHOOK_URL,
   createMemoryCalendar,
   createMemoryContactGuard,
   createMemoryErrorReporter,
   createMemoryLlm,
   createMemoryLogger,
+  createMemoryMessaging,
   createMemoryObjectStore,
   createMemoryQueue,
   createMemoryStreamingTranscribe,
