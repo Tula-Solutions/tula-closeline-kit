@@ -86,4 +86,11 @@ describe('memory TTS adapter', () => {
       code: 'tts.closed',
     })
   })
+
+  test('speak refuses a script that is not an object with tts.invalid_request', () => {
+    const tts = createMemoryTts()
+    expect(() => tts.speak(null as never)).toThrow(
+      expect.objectContaining({ code: 'tts.invalid_request' })
+    )
+  })
 })

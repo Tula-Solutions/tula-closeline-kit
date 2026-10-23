@@ -40,6 +40,9 @@ export interface CheckedOpenRequest {
 
 /** Fills in the defaults of a retry policy and refuses a value out of range. */
 export function resolveTtsRetryPolicy(policy: TtsRetryPolicy | undefined): ResolvedTtsRetryPolicy {
+  if (policy !== undefined && (typeof policy !== 'object' || policy === null)) {
+    invalid('retry')
+  }
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY.maxRetries
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY.baseDelayMs
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY.maxDelayMs

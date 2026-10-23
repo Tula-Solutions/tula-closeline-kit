@@ -428,6 +428,8 @@ export function createMemoryTts(options: MemoryTtsOptions = {}): MemoryTts {
         ? { chunks: speech as readonly Uint8Array[] }
         : (speech as ScriptedSpeech)
       if (
+        typeof scripted !== 'object' ||
+        scripted === null ||
         !Array.isArray(scripted.chunks) ||
         scripted.chunks.some(
           (c) =>

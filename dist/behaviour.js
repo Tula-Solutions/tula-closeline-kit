@@ -3392,6 +3392,7 @@ function ttsBehaviour(name, make, skip = false) {
         ["maxTextChars (zero)", () => ({ maxTextChars: 0 })],
         ["maxTextChars (huge)", () => ({ maxTextChars: 10 ** 9 })],
         ["retry.maxRetries", () => ({ retry: { maxRetries: 99 } })],
+        ["retry that is not an object", () => ({ retry: 5 })],
         ["retry.maxDelayMs below base", () => ({ retry: { baseDelayMs: 10, maxDelayMs: 5 } })],
         ["signal", () => ({ signal: {} })]
       ];

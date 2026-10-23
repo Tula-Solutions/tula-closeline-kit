@@ -2545,6 +2545,9 @@ function integerIn4(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function resolveTtsRetryPolicy(policy) {
+  if (policy !== undefined && (typeof policy !== "object" || policy === null)) {
+    invalid5("retry");
+  }
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
@@ -2887,7 +2890,7 @@ function createMemoryTts(options = {}) {
     },
     speak(speech) {
       const scripted = Array.isArray(speech) ? { chunks: speech } : speech;
-      if (!Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
+      if (typeof scripted !== "object" || scripted === null || !Array.isArray(scripted.chunks) || scripted.chunks.some((c) => !(c instanceof Uint8Array) || c.byteLength < 1 || c.byteLength > MAX_TTS_AUDIO_CHUNK_BYTES2)) {
         invalid5("speech chunks");
       }
       const failAfter = scripted.failAfterChunks;
