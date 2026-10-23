@@ -21,6 +21,7 @@ declare const auditEntrySchema: z.ZodObject<{
 		id: z.ZodString;
 	}, z.core.$strict>;
 	instructionVersion: z.ZodOptional<z.ZodNumber>;
+	prospectId: z.ZodOptional<z.ZodNullable<z.core.$ZodBranded<z.ZodString, "prs", "out">>>;
 	requestId: z.ZodOptional<z.ZodString>;
 	occurredAt: z.ZodOptional<z.ZodISODateTime>;
 	metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
@@ -63,6 +64,7 @@ interface AuditSubject {
 }
 /** A valid entry for the suite; `id` is the event id. */
 declare function sampleAuditEntry(id: string, overrides?: Partial<AuditEntryInput>): {
+	prospectId?: string | null | undefined;
 	occurredAt?: string | undefined;
 	id: string;
 	organizationId: string;

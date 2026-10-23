@@ -1,6 +1,6 @@
 {
   "name": "tula-closeline-kit",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "description": "Closeline shared runtime helpers: token verification, queue, object storage, vector store, transcriber, streaming transcriber, language model, calendar, text-to-speech and telephony, messaging (SMS and WhatsApp) and audit recorder ports and adapters (Twilio included), logging, test fixtures",
   "private": true,
   "type": "module",

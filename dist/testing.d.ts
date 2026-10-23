@@ -90,6 +90,7 @@ declare const auditEntrySchema: z2.ZodObject<{
 		id: z2.ZodString;
 	}, z2.core.$strict>;
 	instructionVersion: z2.ZodOptional<z2.ZodNumber>;
+	prospectId: z2.ZodOptional<z2.ZodNullable<z2.core.$ZodBranded<z2.ZodString, "prs", "out">>>;
 	requestId: z2.ZodOptional<z2.ZodString>;
 	occurredAt: z2.ZodOptional<z2.ZodISODateTime>;
 	metadata: z2.ZodOptional<z2.ZodRecord<z2.ZodString, z2.ZodUnion<readonly [z2.ZodString, z2.ZodNumber, z2.ZodBoolean]>>>;
