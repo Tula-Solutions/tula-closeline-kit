@@ -245,7 +245,7 @@ export function createMemoryCalendar(options: MemoryCalendarOptions = {}): Memor
       return await withCalendarRetry(
         () => vendorRequest(kind, organizationId, deadline.signal, connection, effect),
         {
-          policy: checked.retry,
+          policy: kind === 'connect' ? { ...checked.retry, maxRetries: 0 } : checked.retry,
           deadline,
           sleep,
           ...(options.random === undefined ? {} : { random: options.random }),

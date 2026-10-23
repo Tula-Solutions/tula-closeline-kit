@@ -452,7 +452,7 @@ function createMemoryCalendar(options = {}) {
     const deadline = startCalendarDeadline(checked.timeoutMs, checked.signal);
     try {
       return await withCalendarRetry(() => vendorRequest(kind, organizationId, deadline.signal, connection, effect), {
-        policy: checked.retry,
+        policy: kind === "connect" ? { ...checked.retry, maxRetries: 0 } : checked.retry,
         deadline,
         sleep,
         ...options.random === undefined ? {} : { random: options.random },

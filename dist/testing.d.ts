@@ -338,7 +338,8 @@ interface CalendarDeleteRequest extends CalendarRequestBase {
 * Every call has a hard timeout (see {@link CalendarCallOptions}) that aborts the vendor request.
 * Retryable vendor errors (throttling, 5xx, connection loss) are retried with a bounded, jittered
 * pause inside the time limit; nothing else is. Retrying is safe because every write carries a
-* request id the vendor (or the adapter) uses to recognise a repeat. Failures are `CalendarError`s
+* request id the vendor (or the adapter) uses to recognise a repeat. `connect` is the exception:
+* an authorization code is single-use, so it is never retried; the caller retries with a new grant. Failures are `CalendarError`s
 * with `calendar.*` codes; `calendar.unavailable` and `calendar.rejected` are also given to the
 * ErrorReporter (metadata only).
 *

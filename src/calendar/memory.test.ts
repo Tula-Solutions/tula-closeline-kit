@@ -33,6 +33,16 @@ describe('memory calendar', () => {
     ).toEqual([])
   })
 
+  test('connect is not retried after a lost response (a grant is single-use)', async () => {
+    const calendar = createMemoryCalendar()
+    calendar.allowGrant('tok')
+    calendar.loseNextResponse()
+    await expect(calendar.connect({ organizationId: org, grant }, opts)).rejects.toMatchObject({
+      code: CALENDAR_ERROR_CODES.unavailable,
+    })
+    expect(calendar.requests().filter((r) => r.kind === 'connect')).toHaveLength(1)
+  })
+
   test('a connection the adapter never issued is calendar.invalid_request', async () => {
     const calendar = createMemoryCalendar()
     const forged = new CalendarConnection({
@@ -67,11 +77,20 @@ describe('memory calendar', () => {
     }
     const calendar = createMemoryCalendar({ logger })
     calendar.allowGrant('tok')
+    const connection = await calendar.connect({ organizationId: org, grant }, opts)
     calendar.failNext('calendar.unavailable', 1)
-    await calendar.connect({ organizationId: org, grant }, opts)
+    await calendar.busy(
+      {
+        organizationId: org,
+        connection,
+        from: '2026-03-02T00:00:00Z',
+        to: '2026-03-03T00:00:00Z',
+      },
+      opts
+    )
     expect(lines).toHaveLength(1)
     expect(JSON.parse(lines[0] ?? '{}').f).toEqual({
-      kind: 'connect',
+      kind: 'busy',
       retry: 1,
       delayMs: expect.any(Number),
     })

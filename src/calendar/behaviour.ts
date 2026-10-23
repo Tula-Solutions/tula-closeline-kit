@@ -482,6 +482,21 @@ export function calendarBehaviour(
       expect(again.eventId).toBe(made.eventId)
     })
 
+    test('connect is not retried, because a grant is single-use', async () => {
+      const s = await subject()
+      s.failNext('retryable', 1)
+      const before = s.vendorRequests()
+      expect(
+        await codeOf(
+          s.port.connect(
+            { organizationId: s.organizations.a, grant: s.acceptedGrant('secret-1') },
+            opts
+          )
+        )
+      ).toBe(CALENDAR_ERROR_CODES.unavailable)
+      expect(s.vendorRequests() - before).toBe(1)
+    })
+
     test('a fatal vendor failure is calendar.rejected, reported and not retried', async () => {
       const s = await subject()
       const c = await connect(s)
