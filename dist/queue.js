@@ -5,7 +5,7 @@ import {
   QUEUE_ERROR_CODES2,
   QueueError2,
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-5cxd570z.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   MAX_BATCH_SIZE2,
   MAX_WAIT_SECONDS2,
@@ -13,7 +13,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-c3b5jbxv.js";
+} from "./shared/chunk-3n6tvg2s.js";
 import {
   systemSleep2
 } from "./shared/chunk-hybwyj31.js";
