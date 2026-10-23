@@ -62,7 +62,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-zy1js6ey.js";
+} from "./shared/chunk-77fb749y.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,

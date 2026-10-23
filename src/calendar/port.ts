@@ -276,6 +276,8 @@ export interface CalendarPort {
   /**
    * Ends the grant at the vendor and makes the connection unusable (`calendar.revoked`). Revoking
    * a connection that is already revoked succeeds. Events already written stay on the calendar.
+   * Where a vendor has no per-grant revoke (Outlook), this only validates the request: the caller
+   * must delete the stored credential, which is what ends access.
    */
   revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>
 }

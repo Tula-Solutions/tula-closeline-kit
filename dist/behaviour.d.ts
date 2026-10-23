@@ -367,6 +367,8 @@ interface CalendarPort {
 	/**
 	* Ends the grant at the vendor and makes the connection unusable (`calendar.revoked`). Revoking
 	* a connection that is already revoked succeeds. Events already written stay on the calendar.
+	* Where a vendor has no per-grant revoke (Outlook), this only validates the request: the caller
+	* must delete the stored credential, which is what ends access.
 	*/
 	revoke(request: CalendarRequestBase, options?: CalendarCallOptions): Promise<void>;
 }
@@ -403,6 +405,8 @@ interface CalendarSubject {
 	abortedRequests(): number;
 	/** False when the vendor keeps no record of a delete request id, so a replay of a delete that worked reports `{deleted:false}` (the event is gone either way); true by default. */
 	remembersDeletes?: boolean;
+	/** False when the vendor has no way to revoke one grant, so `revoke` only validates and core deleting the credential ends access (Outlook); true by default. */
+	revokesAtVendor?: boolean;
 	/** Removes what the subject created. */
 	close(): Promise<void>;
 }
