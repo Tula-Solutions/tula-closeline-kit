@@ -2,6 +2,41 @@ import {
   AppError2
 } from "./chunk-tya44yhr.js";
 
+// src/llm/errors.ts
+var LLM_ERROR_CODES2 = {
+  invalidRequest: "llm.invalid_request",
+  inputTooLarge: "llm.input_too_large",
+  invalidOutput: "llm.invalid_output",
+  timeout: "llm.timeout",
+  aborted: "llm.aborted",
+  rejected: "llm.rejected",
+  unavailable: "llm.unavailable",
+  badResponse: "llm.bad_response"
+};
+var STATUS = {
+  "llm.invalid_request": 400,
+  "llm.input_too_large": 413,
+  "llm.invalid_output": 502,
+  "llm.timeout": 504,
+  "llm.aborted": 499,
+  "llm.rejected": 502,
+  "llm.unavailable": 503,
+  "llm.bad_response": 502
+};
+
+class LlmError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "LlmError";
+  }
+}
+
 // src/telephony/port.ts
 var DEFAULT_TELEPHONY_TIMEOUT_MS2 = 1e4;
 var MAX_TELEPHONY_TIMEOUT_MS2 = 60000;
@@ -17,7 +52,7 @@ var TRANSCRIBER_ERROR_CODES2 = {
   unavailable: "transcriber.unavailable",
   badResponse: "transcriber.bad_response"
 };
-var STATUS = {
+var STATUS2 = {
   "transcriber.invalid_request": 400,
   "transcriber.conflict": 409,
   "transcriber.rejected": 500,
@@ -29,7 +64,7 @@ class TranscriberError2 extends AppError2 {
   constructor(code, message, options = {}) {
     super({
       code,
-      status: STATUS[code],
+      status: STATUS2[code],
       message,
       ...options.cause === undefined ? {} : { cause: options.cause },
       ...options.details === undefined ? {} : { details: options.details }
@@ -144,4 +179,4 @@ function checkTranscriptionResult2(result, context) {
   return { status: "done", durationMs: raw.durationMs, turns };
 }
 
-export { DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2 };
+export { LLM_ERROR_CODES2, LlmError2, DEFAULT_TELEPHONY_TIMEOUT_MS2, MAX_TELEPHONY_TIMEOUT_MS2, MAX_DISCLOSURE_TEXT_LENGTH2, MAX_RING_LEGS2, MAX_WEBHOOK_BODY_BYTES2, TRANSCRIBER_ERROR_CODES2, TranscriberError2, MAX_CLIENT_REFERENCE_LENGTH2, MAX_AUDIO_URL_LENGTH2, MAX_SPEAKERS2, DEFAULT_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIBER_LIST_LIMIT2, MAX_TRANSCRIPT_TURNS2, MAX_TURN_TEXT2, MAX_VENDOR_ID_LENGTH2, MAX_TRANSCRIPT_RESPONSE_BYTES2, MAX_AUDIO_MS2, MAX_TRANSCRIPT_CHARS2, MAX_SPEAKER_LABEL2, MAX_CHANNELS2, TRANSCRIPTION_FAILURES2, checkTranscriptionResult2 };

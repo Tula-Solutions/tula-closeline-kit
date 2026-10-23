@@ -926,6 +926,35 @@ own speaker label, and what that bills (ADR 0018: per channel); the EU endpoint 
 how soon after a delete the vendor's copy is gone and whether it says so. None of this is
 verified here.
 
+## Language model (`LlmPort`)
+
+`LlmPort` (0.16.0) is the one way the Copilot and the Inbound Agent call a language model. Model
+choice is a tier (`fast` or `smart`) that an adapter maps to model ids; no vendor model is named
+in the port.
+
+```ts
+const { value, usage } = await llm.complete({
+  organizationId, tier: 'fast', system, messages,
+  schema: replySchema, schemaName: 'reply',   // Zod in, typed value out
+  timeoutMs: 4000, maxInputTokens: 6000, maxOutputTokens: 400,
+})
+for await (const event of llm.stream({ organizationId, tier: 'fast', messages })) { /* text, then done */ }
+```
+
+- Every call has a hard timeout (default 15 s, at most 120 s) that aborts the vendor request, and
+  input and output token budgets. A prompt over the input budget is `llm.input_too_large` and
+  never reaches the vendor.
+- Model output is untrusted: text that is not JSON, does not fit the schema or was cut off by the
+  output budget is `llm.invalid_output`, never a partial value. The error carries a reason and a
+  count, not the output.
+- `usage` (input and output tokens) comes back for metering. Retryable vendor errors
+  (`llm.unavailable`) are retried with a bounded, jittered pause inside the time limit; nothing else is.
+- Prompts and completions are never logged, reported or put in an error.
+- Tests use `createMemoryLlm()` (`reply`, `failNext`, `requests`); an adapter passes
+  `llmBehaviour` from `tula-closeline-kit/testing/behaviour`. An adapter reuses `startDeadline`
+  and `withLlmRetry` (`src/llm/deadline.ts`) and `checkCompleteRequest` / `parseModelOutput`
+  (`src/llm/validate.ts`).
+
 ## Telephony (`TelephonyPort`)
 
 The voice service places and answers calls, plays the Disclosure, bridges a Rep, records and

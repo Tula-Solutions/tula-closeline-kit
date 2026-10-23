@@ -1,6 +1,18 @@
 import {
   CONTACT_UNAVAILABLE2,
   isContactGuardRequest2,
+  DEFAULT_LLM_TIMEOUT_MS2,
+  MAX_LLM_TIMEOUT_MS2,
+  DEFAULT_LLM_MAX_INPUT_TOKENS2,
+  MAX_LLM_MAX_INPUT_TOKENS2,
+  DEFAULT_LLM_MAX_OUTPUT_TOKENS2,
+  MAX_LLM_MAX_OUTPUT_TOKENS2,
+  MAX_LLM_MESSAGES2,
+  MODEL_TIERS2,
+  ESTIMATED_CHARS_PER_TOKEN2,
+  estimateTokens2,
+  DEFAULT_LLM_RETRY_POLICY2,
+  llmRetryDelayMs2,
   scrubText2,
   prepareFields,
   shouldReportError2,
@@ -32,7 +44,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-hpv6bet7.js";
+} from "./shared/chunk-naaze3eg.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -56,6 +68,8 @@ import {
   createStorageValidator
 } from "./shared/chunk-d77yh0fk.js";
 import {
+  LLM_ERROR_CODES2,
+  LlmError2,
   DEFAULT_TELEPHONY_TIMEOUT_MS2,
   MAX_WEBHOOK_BODY_BYTES2,
   TRANSCRIBER_ERROR_CODES2,
@@ -67,7 +81,7 @@ import {
   MAX_TRANSCRIBER_LIST_LIMIT2,
   MAX_VENDOR_ID_LENGTH2,
   checkTranscriptionResult2
-} from "./shared/chunk-0xwm31t3.js";
+} from "./shared/chunk-4msy66ck.js";
 import {
   systemSleep2,
   assertReceiveOptions2,
@@ -218,6 +232,338 @@ function createMemoryContactGuard() {
     }
   };
   return guard;
+}
+// src/llm/deadline.ts
+function startDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new LlmError2(LLM_ERROR_CODES2.timeout, "The call took too long", {
+          details: { timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new LlmError2(LLM_ERROR_CODES2.aborted, "The call was cancelled");
+      }
+    },
+    cancel() {
+      controller.abort();
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+function isRetryableLlmError(error) {
+  return error instanceof LlmError2 && error.code === LLM_ERROR_CODES2.unavailable;
+}
+async function withLlmRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableLlmError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const delayMs = llmRetryDelayMs2(n, options.policy, options.random);
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/llm/validate.ts
+import { organizationIdSchema } from "tula-closeline-contract";
+import { z } from "zod";
+var SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+function invalid2(what) {
+  throw new LlmError2(LLM_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function resolveRetryPolicy(policy) {
+  const maxRetries = policy?.maxRetries ?? DEFAULT_LLM_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn(maxRetries, 0, 5)) {
+    invalid2("retry.maxRetries");
+  }
+  if (!integerIn(baseDelayMs, 1, 60000)) {
+    invalid2("retry.baseDelayMs");
+  }
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
+    invalid2("retry.maxDelayMs");
+  }
+  return { maxRetries, baseDelayMs, maxDelayMs };
+}
+function checkRequest(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid2("request");
+  }
+  if (!organizationIdSchema.safeParse(request.organizationId).success) {
+    invalid2("organizationId");
+  }
+  if (!MODEL_TIERS2.includes(request.tier)) {
+    invalid2("tier");
+  }
+  if (request.system !== undefined && typeof request.system !== "string") {
+    invalid2("system");
+  }
+  const messages = request.messages;
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_LLM_MESSAGES2) {
+    invalid2("messages");
+  }
+  for (const message of messages) {
+    const m = message;
+    if (typeof m !== "object" || m === null || m.role !== "user" && m.role !== "assistant" || typeof m.content !== "string" || m.content.length < 1) {
+      invalid2("messages");
+    }
+  }
+  if (messages.at(-1)?.role !== "user") {
+    invalid2("messages");
+  }
+  const timeoutMs = request.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS2;
+  if (!integerIn(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
+    invalid2("timeoutMs");
+  }
+  const maxInputTokens = request.maxInputTokens ?? DEFAULT_LLM_MAX_INPUT_TOKENS2;
+  if (!integerIn(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
+    invalid2("maxInputTokens");
+  }
+  const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS2;
+  if (!integerIn(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
+    invalid2("maxOutputTokens");
+  }
+  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
+    invalid2("signal");
+  }
+  const retry = resolveRetryPolicy(request.retry);
+  const inputTokens = estimateTokens2(request.system ?? "") + messages.reduce((sum, m) => sum + estimateTokens2(m.content), 0);
+  if (inputTokens > maxInputTokens) {
+    throw new LlmError2(LLM_ERROR_CODES2.inputTooLarge, "The prompt is over the input token budget", {
+      details: { maxInputTokens }
+    });
+  }
+  return { timeoutMs, maxInputTokens, maxOutputTokens, retry, inputTokens };
+}
+function checkCompleteRequest(request) {
+  const checked = checkRequest(request);
+  if (!(request.schema instanceof z.ZodType)) {
+    invalid2("schema");
+  }
+  if (typeof request.schemaName !== "string" || !SCHEMA_NAME.test(request.schemaName)) {
+    invalid2("schemaName");
+  }
+  let jsonSchema;
+  try {
+    jsonSchema = z.toJSONSchema(request.schema, { io: "input" });
+  } catch {
+    return invalid2("schema");
+  }
+  return { checked, jsonSchema };
+}
+function parseModelOutput(schema, text) {
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new LlmError2(LLM_ERROR_CODES2.invalidOutput, "The model did not answer in JSON", {
+      details: { reason: "not_json" }
+    });
+  }
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) {
+    throw new LlmError2(LLM_ERROR_CODES2.invalidOutput, "The model answer does not fit the schema", {
+      details: { reason: "schema", issues: parsed.error.issues.length }
+    });
+  }
+  return parsed.data;
+}
+
+// src/llm/memory.ts
+function createMemoryLlm(options = {}) {
+  const sleep = options.sleep ?? systemSleep2;
+  const replies = [];
+  const failures = [];
+  const requests = [];
+  function report(error, organizationId, tier) {
+    if (!(error instanceof LlmError2) || error.code !== LLM_ERROR_CODES2.unavailable && error.code !== LLM_ERROR_CODES2.rejected && error.code !== LLM_ERROR_CODES2.badResponse && error.code !== LLM_ERROR_CODES2.invalidOutput) {
+      return;
+    }
+    try {
+      options.reporter?.capture(error, { organizationId, tags: { feature: "llm", tier } });
+    } catch {}
+  }
+  async function vendorRequest(kind, base, signal) {
+    const entry = {
+      view: { kind, ...base, aborted: false, outcome: "pending" }
+    };
+    requests.push(entry);
+    signal.addEventListener("abort", () => {
+      if (entry.view.outcome === "pending") {
+        entry.view.aborted = true;
+        entry.view.outcome = "aborted";
+      }
+    }, { once: true });
+    const abortedError = () => new LlmError2(LLM_ERROR_CODES2.aborted, "The call was cancelled");
+    if (signal.aborted) {
+      throw abortedError();
+    }
+    const code = failures.shift();
+    if (code !== undefined) {
+      entry.view.outcome = "failed";
+      throw new LlmError2(code, "The vendor failed");
+    }
+    const next = replies.shift();
+    if (next === undefined) {
+      entry.view.outcome = "failed";
+      throw new LlmError2(LLM_ERROR_CODES2.badResponse, "The vendor sent nothing usable");
+    }
+    if (next.hang) {
+      await new Promise((resolve) => signal.addEventListener("abort", () => resolve()));
+    } else if ((next.delayMs ?? 0) > 0) {
+      await sleep(next.delayMs ?? 0, signal);
+    }
+    if (signal.aborted) {
+      throw abortedError();
+    }
+    if (kind === "complete") {
+      entry.view.outcome = "ok";
+    }
+    return { reply: next, entry };
+  }
+  const port = {
+    async complete(request) {
+      const { checked } = checkCompleteRequest(request);
+      const deadline = startDeadline(checked.timeoutMs, request.signal);
+      try {
+        const { reply } = await withLlmRetry(() => vendorRequest("complete", request, deadline.signal), {
+          policy: checked.retry,
+          deadline,
+          sleep,
+          ...options.random === undefined ? {} : { random: options.random },
+          onRetry: (retry, delayMs) => options.logger?.warn("A model call is retrying", {
+            tier: request.tier,
+            retry,
+            delayMs
+          })
+        });
+        const outputTokens = reply.outputTokens ?? estimateTokens2(reply.text);
+        if (outputTokens > checked.maxOutputTokens) {
+          throw new LlmError2(LLM_ERROR_CODES2.invalidOutput, "The model answer was cut off by the output token budget", { details: { reason: "truncated", maxOutputTokens: checked.maxOutputTokens } });
+        }
+        const value = parseModelOutput(request.schema, reply.text);
+        return {
+          value,
+          usage: { inputTokens: reply.inputTokens ?? checked.inputTokens, outputTokens }
+        };
+      } catch (error) {
+        report(error, request.organizationId, request.tier);
+        throw error;
+      } finally {
+        deadline.stop();
+      }
+    },
+    stream(request) {
+      const checked = checkRequest(request);
+      async function* run() {
+        const deadline = startDeadline(checked.timeoutMs, request.signal);
+        let entry;
+        try {
+          const started = await withLlmRetry(() => vendorRequest("stream", request, deadline.signal), {
+            policy: checked.retry,
+            deadline,
+            sleep,
+            ...options.random === undefined ? {} : { random: options.random },
+            onRetry: (retry, delayMs) => options.logger?.warn("A model call is retrying", {
+              tier: request.tier,
+              retry,
+              delayMs
+            })
+          });
+          const reply = started.reply;
+          entry = started.entry;
+          const cap = checked.maxOutputTokens * ESTIMATED_CHARS_PER_TOKEN2;
+          const truncated = reply.text.length > cap;
+          let remaining = cap;
+          const pieces = reply.chunks ?? reply.text.match(/\S+\s*/g) ?? [];
+          let delivered = 0;
+          let emittedChars = 0;
+          for (const piece of pieces) {
+            if (remaining <= 0) {
+              break;
+            }
+            if (reply.failAfterChunks !== undefined && delivered >= reply.failAfterChunks) {
+              throw new LlmError2(LLM_ERROR_CODES2.unavailable, "The vendor stream broke");
+            }
+            deadline.check();
+            const text = piece.slice(0, remaining);
+            remaining -= text.length;
+            emittedChars += text.length;
+            delivered += 1;
+            if (text.length > 0) {
+              yield { type: "text", text };
+            }
+          }
+          deadline.check();
+          if (entry !== undefined) {
+            entry.view.outcome = "ok";
+          }
+          const usage = {
+            inputTokens: reply.inputTokens ?? checked.inputTokens,
+            outputTokens: Math.min(reply.outputTokens ?? Math.ceil(emittedChars / ESTIMATED_CHARS_PER_TOKEN2), checked.maxOutputTokens)
+          };
+          yield { type: "done", stopReason: truncated ? "max_tokens" : "end", usage };
+        } catch (error) {
+          if (entry?.view.outcome === "pending") {
+            entry.view.outcome = "failed";
+          }
+          report(error, request.organizationId, request.tier);
+          throw error;
+        } finally {
+          deadline.cancel();
+          deadline.stop();
+        }
+      }
+      return run();
+    },
+    reply(reply) {
+      const scripted = typeof reply === "string" ? { text: reply } : reply;
+      if (typeof scripted.text !== "string") {
+        invalid2("reply text");
+      }
+      if (scripted.chunks !== undefined && scripted.chunks.join("") !== scripted.text) {
+        invalid2("reply chunks");
+      }
+      replies.push({ ...scripted });
+    },
+    failNext(code, times = 1) {
+      for (let i = 0;i < times; i++) {
+        failures.push(code);
+      }
+    },
+    requests() {
+      return requests.map((entry) => ({ ...entry.view }));
+    }
+  };
+  return port;
 }
 // src/queue/memory.ts
 function bytesOf(body) {
@@ -390,7 +736,7 @@ function createMemoryQueue(options) {
   };
 }
 // src/queue/testing.ts
-import { z } from "zod";
+import { z as z2 } from "zod";
 var SETTLE_ROUNDS = 8;
 function createVirtualTime() {
   const clock = createFixedClock2("2026-01-01T00:00:00.000Z");
@@ -443,17 +789,17 @@ var testPing = defineMessage2({
   type: "test.ping",
   version: 1,
   scope: "organization",
-  payload: z.object({ n: z.number().int() })
+  payload: z2.object({ n: z2.number().int() })
 });
 var testNote = defineMessage2({
   type: "test.note",
   version: 1,
   scope: "global",
-  payload: z.object({ text: z.string() })
+  payload: z2.object({ text: z2.string() })
 });
 function createTestRegistry(options = {}) {
   return createMessageRegistry2([testPing, testNote], {
-    organizationIdSchema: z.string().min(1).max(64),
+    organizationIdSchema: z2.string().min(1).max(64),
     ...options
   });
 }
@@ -621,41 +967,41 @@ ${expires}`).digest("hex");
   return store;
 }
 // src/streaming-transcribe/validate.ts
-import { callIdSchema, organizationIdSchema } from "tula-closeline-contract";
+import { callIdSchema, organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
 var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
 var SAMPLE_RATES = [8000, 16000, 24000, 48000];
 var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
 var TRACKS = ["rep", "prospect"];
-function invalid2(what) {
+function invalid3(what) {
   throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn(value, min, max) {
+function integerIn2(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function checkOpenRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid2("request");
+    return invalid3("request");
   }
-  if (!organizationIdSchema.safeParse(request.organizationId).success) {
-    invalid2("organizationId");
+  if (!organizationIdSchema2.safeParse(request.organizationId).success) {
+    invalid3("organizationId");
   }
   if (!callIdSchema.safeParse(request.callId).success) {
-    invalid2("callId");
+    invalid3("callId");
   }
   if (!TRACKS.includes(request.track)) {
-    invalid2("track");
+    invalid3("track");
   }
   if (!ENCODINGS.includes(request.encoding)) {
-    invalid2("encoding");
+    invalid3("encoding");
   }
   if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid2("sampleRate");
+    invalid3("sampleRate");
   }
   if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
-    invalid2("language");
+    invalid3("language");
   }
   if (typeof request.onEvent !== "function") {
-    invalid2("onEvent");
+    invalid3("onEvent");
   }
   return resolveReconnectPolicy(request.reconnect);
 }
@@ -663,24 +1009,24 @@ function resolveReconnectPolicy(policy) {
   const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
-  if (!integerIn(maxAttempts, 0, 10)) {
-    invalid2("reconnect.maxAttempts");
+  if (!integerIn2(maxAttempts, 0, 10)) {
+    invalid3("reconnect.maxAttempts");
   }
-  if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid2("reconnect.baseDelayMs");
+  if (!integerIn2(baseDelayMs, 1, 60000)) {
+    invalid3("reconnect.baseDelayMs");
   }
-  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid2("reconnect.maxDelayMs");
+  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
+    invalid3("reconnect.maxDelayMs");
   }
   return { maxAttempts, baseDelayMs, maxDelayMs };
 }
 function resolveTimeout2(options) {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
-  return integerIn(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid2("timeoutMs");
+  return integerIn2(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid3("timeoutMs");
 }
 function checkChunk(chunk) {
   if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
-    return invalid2("chunk");
+    return invalid3("chunk");
   }
   return chunk;
 }
@@ -696,19 +1042,19 @@ function wordsOf(text, startMs) {
 }
 function checkScript(turns) {
   if (!Array.isArray(turns) || turns.length > 1000) {
-    invalid2("turns");
+    invalid3("turns");
   }
   let previous = 0;
   for (const turn of turns) {
     const count = typeof turn?.text === "string" ? wordsOf(turn.text, 0).length : 0;
     if (count < 1 || count > 200) {
-      invalid2("turn text");
+      invalid3("turn text");
     }
     if (!Number.isInteger(turn.afterBytes) || turn.afterBytes < previous) {
-      invalid2("afterBytes");
+      invalid3("afterBytes");
     }
     if (turn.interims !== undefined && !(Number.isInteger(turn.interims) && turn.interims >= 0 && turn.interims < count)) {
-      invalid2("interims");
+      invalid3("interims");
     }
     previous = turn.afterBytes;
   }
@@ -1890,6 +2236,7 @@ export {
   DEFAULT_TEST_USER_ID,
   createMemoryContactGuard,
   createMemoryErrorReporter,
+  createMemoryLlm,
   createMemoryLogger,
   createMemoryObjectStore,
   createMemoryQueue,

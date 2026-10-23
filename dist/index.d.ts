@@ -537,9 +537,210 @@ declare class AppError extends Error {
 declare function isAppError(value: unknown): value is AppError;
 /** Builds the client-facing JSON body for an AppError, leaving out `details` when there are none. */
 declare function toErrorBody(error: AppError): ErrorBody;
+/** The `area.reason` codes the language model port and adapters throw. */
+declare const LLM_ERROR_CODES: {
+	/** The Organization id, tier, messages, schema, limits or retry policy are not acceptable. Nothing was sent to the vendor. */
+	readonly invalidRequest: "llm.invalid_request";
+	/** The prompt is longer than the request's input token budget. Nothing was sent to the vendor. */
+	readonly inputTooLarge: "llm.input_too_large";
+	/** The model's output is not valid for the schema, or was cut off by the output token budget. Never a partial value. */
+	readonly invalidOutput: "llm.invalid_output";
+	/** The time limit passed; the underlying request was aborted. */
+	readonly timeout: "llm.timeout";
+	/** The caller's own AbortSignal fired; the underlying request was aborted. */
+	readonly aborted: "llm.aborted";
+	/** The vendor refused for a reason a retry cannot fix (credentials, quota, terms, content policy). */
+	readonly rejected: "llm.rejected";
+	/** The vendor could not be reached, was throttled or failed, after the bounded retries. The only retryable code. */
+	readonly unavailable: "llm.unavailable";
+	/** The vendor sent something this adapter cannot use. */
+	readonly badResponse: "llm.bad_response";
+};
+/** One of {@link LLM_ERROR_CODES}'s values. */
+type LlmErrorCode = (typeof LLM_ERROR_CODES)[keyof typeof LLM_ERROR_CODES];
+/**
+* What a language model adapter throws. Its message and details never hold a prompt, a
+* completion, a credential or a vendor URL; model output is described by counts and codes only.
+*/
+declare class LlmError extends AppError {
+	readonly code: LlmErrorCode;
+	constructor(code: LlmErrorCode, message: string, options?: {
+		cause?: unknown;
+		details?: Record<string, unknown>;
+	});
+}
+import { OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+import { z as z3 } from "zod";
+/** The default time a call may take, in milliseconds. */
+declare const DEFAULT_LLM_TIMEOUT_MS = 15e3;
+/** The longest time a caller may allow a call, in milliseconds. */
+declare const MAX_LLM_TIMEOUT_MS = 12e4;
+/** The default input token budget. */
+declare const DEFAULT_LLM_MAX_INPUT_TOKENS = 16e3;
+/** The largest input token budget a caller may ask for. */
+declare const MAX_LLM_MAX_INPUT_TOKENS = 2e5;
+/** The default output token budget. */
+declare const DEFAULT_LLM_MAX_OUTPUT_TOKENS = 1024;
+/** The largest output token budget a caller may ask for. */
+declare const MAX_LLM_MAX_OUTPUT_TOKENS = 8192;
+/** The most messages one request may carry. */
+declare const MAX_LLM_MESSAGES = 100;
+/**
+* The model class a caller wants, never a vendor model id: `fast` for the live loop (low latency,
+* short answers) and `smart` for work that can wait longer for a better answer. An adapter maps
+* each tier to the model ids it uses.
+*/
+type ModelTier = "fast" | "smart";
+/** Every {@link ModelTier}. */
+declare const MODEL_TIERS: readonly ModelTier[];
+/** One turn of the conversation sent to the model. */
+interface LlmMessage {
+	/** Who said it. Instructions go in `system`, not here. */
+	role: "user" | "assistant";
+	/** The text. Tenant data: never logged. Prospect speech, Documents and web text are untrusted. */
+	content: string;
+}
+/** How an adapter retries a retryable vendor error (`llm.unavailable`) before giving up. */
+interface LlmRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 2. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 200. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 2000. */
+	maxDelayMs?: number;
+}
+/** What every call states: whose it is, which model class, and the limits that bound it. */
+interface LlmRequestBase {
+	/** The Organization the call is for; it scopes metering and error context. */
+	organizationId: OrganizationId3;
+	/** The model class. */
+	tier: ModelTier;
+	/** Instructions to the model. Tenant data: never logged. */
+	system?: string;
+	/** The conversation so far, 1 to {@link MAX_LLM_MESSAGES} messages, ending with a `user` message. */
+	messages: readonly LlmMessage[];
+	/**
+	* The most time the whole call may take, retries and streaming included, in ms, 1 to
+	* {@link MAX_LLM_TIMEOUT_MS}; default {@link DEFAULT_LLM_TIMEOUT_MS}. When it passes, the
+	* underlying vendor request is aborted and the call fails with `llm.timeout`.
+	*/
+	timeoutMs?: number;
+	/**
+	* The most tokens the prompt (system plus messages) may hold, 1 to
+	* {@link MAX_LLM_MAX_INPUT_TOKENS}; default {@link DEFAULT_LLM_MAX_INPUT_TOKENS}. A longer prompt
+	* fails with `llm.input_too_large` before any vendor call.
+	*/
+	maxInputTokens?: number;
+	/**
+	* The most tokens the model may write, 1 to {@link MAX_LLM_MAX_OUTPUT_TOKENS}; default
+	* {@link DEFAULT_LLM_MAX_OUTPUT_TOKENS}. It is passed to the vendor as the hard cap.
+	*/
+	maxOutputTokens?: number;
+	/** Retries of retryable vendor errors; the defaults when absent. */
+	retry?: LlmRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and the call fails with `llm.aborted`. */
+	signal?: AbortSignal;
+}
+/** A request for a value shaped by a schema. */
+interface LlmCompleteRequest<S extends z3.ZodType = z3.ZodType> extends LlmRequestBase {
+	/**
+	* The shape the model must answer in. It is sent to the vendor as a JSON Schema
+	* (`z.toJSONSchema`), and the model's output is checked against this schema again here, since
+	* model output is untrusted. It must be representable as JSON Schema.
+	*/
+	schema: S;
+	/** A name for the schema, 1 to 64 letters, digits, `_` or `-`; vendors use it as the tool name. */
+	schemaName: string;
+}
+/** A request for free text, delivered as it is written. */
+type LlmStreamRequest = LlmRequestBase;
+/** What a call used, for metering. */
+interface LlmUsage {
+	/** Tokens in the prompt. */
+	inputTokens: number;
+	/** Tokens the model wrote. */
+	outputTokens: number;
+}
+/** A structured answer. */
+interface LlmCompletion<T> {
+	/** The model's answer, parsed and valid for the schema. */
+	value: T;
+	/** The tokens the successful attempt used; a failed attempt that was retried is not counted. */
+	usage: LlmUsage;
+}
+/** A piece of text from the model. Tenant data: never logged. */
+interface LlmTextEvent {
+	/** Always `text`. */
+	type: "text";
+	/** The next piece, in order. Never empty. */
+	text: string;
+}
+/** The end of a stream: the last event of a stream that did not throw. */
+interface LlmDoneEvent {
+	/** Always `done`. */
+	type: "done";
+	/** Why the model stopped: it finished (`end`) or hit the output token budget (`max_tokens`). */
+	stopReason: "end" | "max_tokens";
+	/** The tokens used. */
+	usage: LlmUsage;
+}
+/** Everything a stream yields, in order: any number of `text`, then one `done`. */
+type LlmStreamEvent = LlmTextEvent | LlmDoneEvent;
+/**
+* A language model behind a vendor (Claude on Amazon Bedrock first), shared by the Copilot and
+* the Inbound Agent. Model choice is a {@link ModelTier}; the adapter maps it to model ids.
+*
+* Every call has a hard timeout and token budgets. Retryable vendor errors (throttling, 5xx,
+* connection loss) are retried with a bounded, jittered pause ({@link llmRetryDelayMs}) inside
+* the call's time limit; nothing else is retried, and a stream is retried only before its first
+* text. A call has no effects, so retrying it is always safe. Failures are `LlmError`s with
+* `llm.*` codes; `llm.unavailable`, `llm.rejected`, `llm.bad_response` and `llm.invalid_output`
+* are also given to the ErrorReporter (metadata only).
+*
+* **Model output is untrusted data.** `complete` returns only a value the schema accepts; text
+* that is not JSON, does not fit, or was cut off is `llm.invalid_output`, never a partial value.
+* What the model says is never an instruction to the caller.
+*
+* Nothing here logs, reports or puts in an error a prompt or a completion (tenant data).
+*/
+interface LlmPort {
+	/** Asks for one value shaped by `schema`. O(prompt + output tokens), one vendor call per attempt. */
+	complete<S extends z3.ZodType>(request: LlmCompleteRequest<S>): Promise<LlmCompletion<z3.output<S>>>;
+	/**
+	* Streams free text. An unacceptable request throws `llm.invalid_request` or
+	* `llm.input_too_large` from this call; every later failure is thrown from the iteration. The
+	* stream ends with one `done` event. Leaving the loop early (`break`) aborts the vendor
+	* request. The time limit covers the whole stream.
+	*/
+	stream(request: LlmStreamRequest): AsyncIterable<LlmStreamEvent>;
+}
+/** The characters one token is assumed to hold when estimating, low on purpose so the estimate runs high. */
+declare const ESTIMATED_CHARS_PER_TOKEN = 3;
+/**
+* A conservative token estimate for `text` (never below the real count for ordinary prose), used
+* for the input budget before a call and by the memory adapter. An adapter prefers the vendor's
+* own count for usage.
+*/
+declare function estimateTokens(text: string): number;
+/** The retry policy with its defaults filled in. */
+interface ResolvedLlmRetryPolicy {
+	/** The most retries after the first attempt. */
+	maxRetries: number;
+	/** The base pause, in ms. */
+	baseDelayMs: number;
+	/** The longest pause before jitter, in ms. */
+	maxDelayMs: number;
+}
+/** The policy used when a request names none: two retries, 200 ms doubling to 2 s. */
+declare const DEFAULT_LLM_RETRY_POLICY: ResolvedLlmRetryPolicy;
+/**
+* The pause before retry `retry` (from 1): the base doubled each time up to the maximum, then
+* scaled by a jitter between 0.5 and 1.5 from `random()` (a number in `[0, 1)`).
+*/
+declare function llmRetryDelayMs(retry: number, policy: ResolvedLlmRetryPolicy, random?: () => number): number;
 /** Decides whether a string is an Organization id this deployment accepts. */
 type OrganizationIdCheck = (value: string) => boolean;
-import { z as z3 } from "zod";
+import { z as z4 } from "zod";
 /** The largest message body SQS accepts, in bytes (256 KiB). Every adapter enforces it. */
 declare const MAX_MESSAGE_BYTES = 262144;
 /** `organization` messages belong to one Organization and carry its id; `global` ones never do. */
@@ -547,7 +748,7 @@ type MessageScope = "organization" | "global";
 /** What one kind of message is: its name, its current version, its scope and its payload schema. */
 interface MessageDefinition<
 	T extends string = string,
-	P extends z3.ZodType = z3.ZodType,
+	P extends z4.ZodType = z4.ZodType,
 	S extends MessageScope = MessageScope
 > {
 	readonly type: T;
@@ -567,12 +768,12 @@ interface PreviousVersion {
 	/** The older version number; must differ from the definition's own. */
 	version: number;
 	/** The payload schema of that version. */
-	payload: z3.ZodType;
+	payload: z4.ZodType;
 	/** Turns a validated old payload into the current payload's input. A throw makes the message invalid. */
 	upcast: (payload: unknown) => unknown;
 }
 /** A definition of any type, for code that accepts every kind. */
-type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
+type AnyDefinition = MessageDefinition<string, z4.ZodType, MessageScope>;
 /**
 * Declares a message type. `type` looks like `area.event_name` (`core.organization_created`);
 * `version` is a positive integer you raise when the payload changes incompatibly. A consumer
@@ -583,7 +784,7 @@ type AnyDefinition = MessageDefinition<string, z3.ZodType, MessageScope>;
 */
 declare function defineMessage<
 	const T extends string,
-	P extends z3.ZodType,
+	P extends z4.ZodType,
 	const S extends MessageScope
 >(definition: {
 	type: T;
@@ -616,7 +817,7 @@ type ScopeField<S> = S extends "organization" ? {
 	organizationId?: undefined;
 };
 /** The envelope of a definition, or the union of the envelopes of a union of definitions. */
-type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z3.output<P>> & ScopeField<S> : never;
+type EnvelopeOf<D> = D extends MessageDefinition<infer T, infer P, infer S> ? EnvelopeBase<T, z4.output<P>> & ScopeField<S> : never;
 /** The shape every envelope has, whatever its type. */
 interface AnyEnvelope {
 	id: string;
@@ -630,7 +831,7 @@ interface AnyEnvelope {
 /** What a publisher gives {@link MessageRegistry.create}; the registry adds the id and time. */
 type CreateInput<D> = D extends MessageDefinition<infer T, infer P, infer S> ? {
 	type: T;
-	payload: z3.input<P>;
+	payload: z4.input<P>;
 	traceId: string;
 	/** Keep a fixed id across retries of one logical event; defaults to a new UUID. */
 	id?: string;
@@ -679,7 +880,7 @@ interface MessageRegistryOptions {
 	* The shape of an Organization id, checked for `organization` messages on the way in and out.
 	* Defaults to the contract's `organizationIdSchema` (`org_` and 32 lower-case hex digits).
 	*/
-	organizationIdSchema?: z3.ZodType<string>;
+	organizationIdSchema?: z4.ZodType<string>;
 }
 /**
 * Builds a registry from the message definitions a service knows. Two definitions with the same
@@ -1193,7 +1394,7 @@ declare class StreamingTranscribeError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { CallId, OrganizationId as OrganizationId3 } from "tula-closeline-contract";
+import { CallId, OrganizationId as OrganizationId4 } from "tula-closeline-contract";
 /** The default time opening a stream may take, in milliseconds. */
 declare const DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS = 1e4;
 /** The longest time a caller may allow opening a stream, in milliseconds. */
@@ -1286,7 +1487,7 @@ type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEven
 /** The audio format and listener of one stream. */
 interface OpenStreamRequest {
 	/** The Organization. */
-	organizationId: OrganizationId3;
+	organizationId: OrganizationId4;
 	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
 	callId: CallId;
 	/** The side of the Call this stream carries. */
@@ -1400,7 +1601,7 @@ declare class TelephonyError extends AppError {
 		details?: Record<string, unknown>;
 	});
 }
-import { CallId as CallId2, MembershipId, OrganizationId as OrganizationId4, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { CallId as CallId2, MembershipId, OrganizationId as OrganizationId5, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** The default time any telephony operation may take, in milliseconds. */
 declare const DEFAULT_TELEPHONY_TIMEOUT_MS = 1e4;
 /** The longest time a caller may allow one telephony operation, in milliseconds. */
@@ -1423,14 +1624,14 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId5;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId5;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
 	callId: CallId2;
 	/**
@@ -1512,7 +1713,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId5;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -1539,7 +1740,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId5;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -1552,7 +1753,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId4;
+	organizationId: OrganizationId5;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -2275,4 +2476,4 @@ interface VectorStore {
 }
 /** This library's package name, so a consumer can report which shared libraries it resolved. */
 declare const PACKAGE = "tula-closeline-kit";
-export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, ListOptions, ListPage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedReconnectPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, isAppError, isContactGuardRequest, isSentryDsn, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };
+export { AnswerCallRequest, AnsweredCall, AnyDefinition, AnyEnvelope, AppError, AppErrorInit, AttributeValue, AudioEncoding, AudioReference, AuthEnv, AuthMiddlewareOptions, AuthVariables, BatchFailure, BatchResult, BridgeRequest, BrowserTokenRequest, ByteStream, CONTACT_GUARD_RETRY_DELAY_MS, CONTACT_GUARD_TIMEOUT_MS, CONTACT_UNAVAILABLE, ClaimResult, Clock, ClosedEvent, ConsumedKey, ContactGuard, ContactGuardRequest, ContactGuardResult, CreateInput, DEFAULT_CONTENT_TYPE, DEFAULT_LIST_LIMIT, DEFAULT_LLM_MAX_INPUT_TOKENS, DEFAULT_LLM_MAX_OUTPUT_TOKENS, DEFAULT_LLM_RETRY_POLICY, DEFAULT_LLM_TIMEOUT_MS, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_PRESIGN_SECONDS, DEFAULT_RECONNECT_POLICY, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS, DEFAULT_TELEPHONY_TIMEOUT_MS, DEFAULT_TRANSCRIBER_LIST_LIMIT, DecodeResult, Delivery, DisclosurePlayed, DisclosureWait, ENVIRONMENTS, ESTIMATED_CHARS_PER_TOKEN, EnvelopeBase, EnvelopeOf, Environment, ErrorBody, ErrorContext, ErrorReporter, ErrorReporterOptions, FailedEvent, FetchedRecording, FixedClock, ForkTracksRequest, ForkedTracks, HangUpRequest, HttpContactGuard, HttpContactGuardOptions, INTERNAL_CALL_FAILURES, INTERNAL_DEFAULT_IDLE_TIMEOUT_MS, INTERNAL_DEFAULT_MAX_FREE_SOCKETS, INTERNAL_DEFAULT_MAX_RESPONSE_BYTES, INTERNAL_DEFAULT_MAX_SOCKETS, INTERNAL_DEFAULT_RETRY, INTERNAL_DEFAULT_TIMEOUT_MS, INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_MAX_ATTEMPTS, INTERNAL_MAX_REQUEST_BYTES, INTERNAL_RETRY_STATUSES, INVALID_REASONS, InternalCallError, InternalCallFailure, InternalClient, InternalClientOptions, InternalMethod, InternalRequest, InternalResponse, InternalRetryPolicy, InvalidDelivery, InvalidReason, Jwks, KeySet, LLM_ERROR_CODES, ListOptions, ListPage, LlmCompleteRequest, LlmCompletion, LlmDoneEvent, LlmError, LlmErrorCode, LlmMessage, LlmPort, LlmRequestBase, LlmRetryPolicy, LlmStreamEvent, LlmStreamRequest, LlmTextEvent, LlmUsage, LogDestination, LogLevel, Logger, LoggerOptions, MAX_ATTRIBUTES, MAX_ATTRIBUTE_STRING, MAX_AUDIO_CHUNK_BYTES, MAX_AUDIO_MS, MAX_AUDIO_URL_LENGTH, MAX_BATCH_SIZE, MAX_CHANNELS, MAX_CLIENT_REFERENCE_LENGTH, MAX_DELETE_BATCH, MAX_DIMENSIONS, MAX_DISCLOSURE_TEXT_LENGTH, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KEY_BYTES, MAX_KEY_SEGMENTS, MAX_LIST_LIMIT, MAX_LLM_MAX_INPUT_TOKENS, MAX_LLM_MAX_OUTPUT_TOKENS, MAX_LLM_MESSAGES, MAX_LLM_TIMEOUT_MS, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES_LIMIT, MAX_PRESIGN_SECONDS, MAX_REPLAY_AUDIO_BYTES, MAX_RING_LEGS, MAX_SPEAKERS, MAX_SPEAKER_LABEL, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS, MAX_STREAM_BYTES_LIMIT, MAX_TELEPHONY_TIMEOUT_MS, MAX_TOKEN_LENGTH, MAX_TOP_K, MAX_TRANSCRIBER_LIST_LIMIT, MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_RESPONSE_BYTES, MAX_TRANSCRIPT_TURNS, MAX_TURN_TEXT, MAX_UPSERT_BATCH, MAX_VECTOR_ID_LENGTH, MAX_VENDOR_ID_LENGTH, MAX_VISIBILITY_SECONDS, MAX_WAIT_SECONDS, MAX_WEBHOOK_BODY_BYTES, MAX_WORDS_PER_TURN, MODEL_TIERS, MessageDefinition, MessageRegistry, MessageRegistryOptions, MessageScope, ModelTier, ObjectEntry, ObjectInfo, ObjectStore, ObjectStream, OpenStreamRequest, OrganizationIdCheck, PACKAGE, PlaceCallRequest, PlacedCall, PlayDisclosureRequest, PresignOptions, PreviousVersion, ProcessedStore, ProviderCallRef, PutOptions, PutStreamOptions, PutStreamResult, QUEUE_ERROR_CODES, Queue, QueueError, QueueErrorCode, Receipt, ReceiveOptions, ReconnectPolicy, ReconnectedEvent, ReconnectingEvent, RecordingRef, RemoteKeySet, RemoteKeySetOptions, ResolvedLlmRetryPolicy, ResolvedReconnectPolicy, ResultContext, STORAGE_ERROR_CODES, STREAMING_TRANSCRIBE_ERROR_CODES, STREAM_IDLE_TIMEOUT_MS, SampleRate, SearchHit, SearchQuery, Sleep, SpeakerMode, StartedRecording, StorageError, StorageErrorCode, StoredObject, StreamEvent, StreamTrack, StreamingTranscribeError, StreamingTranscribeErrorCode, StreamingTranscribeOptions, StreamingTranscribePort, Submission, TELEPHONY_ERROR_CODES, TRANSCRIBER_ERROR_CODES, TRANSCRIPTION_FAILURES, TWILIO_DEFAULT_EDGES, TWILIO_REGIONS, TelephonyError, TelephonyErrorCode, TelephonyEvent, TelephonyEventType, TelephonyOptions, TelephonyPort, TokenRejection, TokenVerificationError, TokenVerifier, TokenVerifierOptions, TranscribeRequest, TranscribeStream, TranscribedWord, Transcriber, TranscriberError, TranscriberErrorCode, TranscriptTurn, TranscriptionEntry, TranscriptionFailure, TranscriptionListOptions, TranscriptionPage, TranscriptionResult, TurnEvent, TwilioCallRecord, TwilioOptions, TwilioPlacement, TwilioRegion, TwilioStore, VECTOR_ERROR_CODES, ValidDelivery, VectorAttributes, VectorError, VectorErrorCode, VectorRecord, VectorStore, VendorIdHint, VerifiedToken, WaitOptions, WebhookRequest, accessTokenClaimsSchema, assertBatchCount, assertReceiveOptions, assertVisibility, checkTranscriptionResult, createAuthMiddleware, createErrorReporter, createFixedClock, createHttpContactGuard, createInternalClient, createLogger, createMemoryProcessedStore, createMemoryTwilioStore, createMessageRegistry, createNoopErrorReporter, createRemoteKeySet, createStaticKeySet, createTokenVerifier, createTwilioTelephony, cutText, defineMessage, dropHighSurrogate, environmentSchema, estimateSpeechMs, estimateTokens, isAppError, isContactGuardRequest, isSentryDsn, llmRetryDelayMs, reconnectDelayMs, requireSentryDsn, scrubText, sentryDsnSchema, shouldReportError, signTwilioRequest, systemClock, systemSleep, toErrorBody, twilioApiHost, waitForTranscription, withCaller };
