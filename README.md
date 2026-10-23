@@ -978,6 +978,23 @@ const llm = createBedrockLlm({ region: 'eu-west-1' }) // models: { fast, smart }
   `src/llm/bedrock.integration.ts` calls the real service when `BEDROCK_TEST_REGION` is set and
   AWS credentials are present; without it, it is skipped and says so.
 
+## Streaming transcription (`StreamingTranscribePort`, AssemblyAI)
+
+`createAssemblyAiStreamingTranscribe({ apiKey, region?, ... })` (added in 0.27.0) implements
+`StreamingTranscribePort` on AssemblyAI's streaming v3 WebSocket API with plain `WebSocket`, no
+vendor SDK. `region: 'eu'` selects `streaming.eu.assemblyai.com`; `baseUrl` overrides the host
+(`wss`, or `ws` to loopback). The key goes only in the `Authorization` header. Opening has a
+timeout and a bounded, jittered retry; a dropped connection is retried with the request's
+reconnect policy and the audio sent meanwhile is replayed (bounded), with word times and turn ids
+carrying on. A refused credential is `streaming_transcribe.rejected` and is not retried. Audio is
+sent in 50 to 500 ms frames; on `close` the last partial frame is padded with silence. The
+`formatTurns` option waits for the punctuated final, a little later. The shared behaviour suite runs
+against a fake vendor (`assemblyai.behaviour.test.ts`). `assemblyai.integration.ts` runs a real
+recording (`ASSEMBLYAI_TEST_API_KEY`, `ASSEMBLYAI_TEST_AUDIO` raw 16 kHz PCM, optional
+`ASSEMBLYAI_TEST_REGION=eu`) through `bun run test:integration`, prints the median final-turn
+delay, and is skipped with a message otherwise. The wire protocol is not yet checked against the
+live vendor.
+
 ## Text to speech (`TtsPort`)
 
 `TtsPort` (0.18.0) turns an agent's reply text into audio while the Call is live. It is

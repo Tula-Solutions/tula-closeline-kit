@@ -5,11 +5,11 @@ import {
 import {
   startDeadline,
   withLlmRetry,
-  invalid5,
+  invalid6,
   checkRequest,
   checkCompleteRequest,
   parseModelOutput
-} from "./shared/chunk-67y2hsjp.js";
+} from "./shared/chunk-qwe4ynpn.js";
 import {
   MODEL_TIERS2
 } from "./shared/chunk-g61vs8b5.js";
@@ -206,7 +206,7 @@ function createBedrockLlm(options) {
     async complete(request) {
       const { checked, jsonSchema } = checkCompleteRequest(request);
       if (jsonSchema.type !== "object") {
-        invalid5("schema");
+        invalid6("schema");
       }
       const { $schema: _dropped, ...schemaBody } = jsonSchema;
       const input = {

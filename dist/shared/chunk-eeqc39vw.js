@@ -2030,6 +2030,71 @@ function checkSendRequest(request) {
   };
 }
 
+// src/streaming-transcribe/validate.ts
+import { callIdSchema as callIdSchema2, organizationIdSchema as organizationIdSchema5 } from "tula-closeline-contract";
+var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
+var SAMPLE_RATES = [8000, 16000, 24000, 48000];
+var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
+var TRACKS = ["rep", "prospect"];
+function invalid4(what) {
+  throw new StreamingTranscribeError2(STREAMING_TRANSCRIBE_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn3(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function checkOpenRequest(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid4("request");
+  }
+  if (!organizationIdSchema5.safeParse(request.organizationId).success) {
+    invalid4("organizationId");
+  }
+  if (!callIdSchema2.safeParse(request.callId).success) {
+    invalid4("callId");
+  }
+  if (!TRACKS.includes(request.track)) {
+    invalid4("track");
+  }
+  if (!ENCODINGS.includes(request.encoding)) {
+    invalid4("encoding");
+  }
+  if (!SAMPLE_RATES.includes(request.sampleRate)) {
+    invalid4("sampleRate");
+  }
+  if (request.language !== undefined && !(typeof request.language === "string" && LANGUAGE.test(request.language))) {
+    invalid4("language");
+  }
+  if (typeof request.onEvent !== "function") {
+    invalid4("onEvent");
+  }
+  return resolveReconnectPolicy(request.reconnect);
+}
+function resolveReconnectPolicy(policy) {
+  const maxAttempts = policy?.maxAttempts ?? DEFAULT_RECONNECT_POLICY2.maxAttempts;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_RECONNECT_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_RECONNECT_POLICY2.maxDelayMs;
+  if (!integerIn3(maxAttempts, 0, 10)) {
+    invalid4("reconnect.maxAttempts");
+  }
+  if (!integerIn3(baseDelayMs, 1, 60000)) {
+    invalid4("reconnect.baseDelayMs");
+  }
+  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
+    invalid4("reconnect.maxDelayMs");
+  }
+  return { maxAttempts, baseDelayMs, maxDelayMs };
+}
+function resolveTimeout2(options) {
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2;
+  return integerIn3(timeoutMs, 1, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2) ? timeoutMs : invalid4("timeoutMs");
+}
+function checkChunk(chunk) {
+  if (!(chunk instanceof Uint8Array) || chunk.length < 1 || chunk.length > MAX_AUDIO_CHUNK_BYTES2) {
+    return invalid4("chunk");
+  }
+  return chunk;
+}
+
 // src/tts/deadline.ts
 function startTtsDeadline(timeoutMs, caller) {
   const controller = new AbortController;
@@ -2108,64 +2173,64 @@ async function withTtsRetry(attempt, options) {
 }
 
 // src/tts/validate.ts
-import { organizationIdSchema as organizationIdSchema5 } from "tula-closeline-contract";
+import { organizationIdSchema as organizationIdSchema6 } from "tula-closeline-contract";
 var VOICE = /^[A-Za-z0-9_.:-]{1,128}$/;
-var ENCODINGS = ["pcm_s16le", "pcm_mulaw"];
-var SAMPLE_RATES = [8000, 16000, 24000, 48000];
-function invalid4(what) {
+var ENCODINGS2 = ["pcm_s16le", "pcm_mulaw"];
+var SAMPLE_RATES2 = [8000, 16000, 24000, 48000];
+function invalid5(what) {
   throw new TtsError2(TTS_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
-function integerIn3(value, min, max) {
+function integerIn4(value, min, max) {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 function resolveTtsRetryPolicy(policy) {
   if (policy !== undefined && (typeof policy !== "object" || policy === null)) {
-    invalid4("retry");
+    invalid5("retry");
   }
   const maxRetries = policy?.maxRetries ?? DEFAULT_TTS_RETRY_POLICY2.maxRetries;
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_TTS_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn3(maxRetries, 0, 5)) {
-    invalid4("retry.maxRetries");
+  if (!integerIn4(maxRetries, 0, 5)) {
+    invalid5("retry.maxRetries");
   }
-  if (!integerIn3(baseDelayMs, 1, 60000)) {
-    invalid4("retry.baseDelayMs");
+  if (!integerIn4(baseDelayMs, 1, 60000)) {
+    invalid5("retry.baseDelayMs");
   }
-  if (!integerIn3(maxDelayMs, baseDelayMs, 60000)) {
-    invalid4("retry.maxDelayMs");
+  if (!integerIn4(maxDelayMs, baseDelayMs, 60000)) {
+    invalid5("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
 }
-function checkOpenRequest(request) {
+function checkOpenRequest2(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid4("request");
+    return invalid5("request");
   }
-  if (!organizationIdSchema5.safeParse(request.organizationId).success) {
-    invalid4("organizationId");
+  if (!organizationIdSchema6.safeParse(request.organizationId).success) {
+    invalid5("organizationId");
   }
   if (typeof request.voice !== "string" || !VOICE.test(request.voice)) {
-    invalid4("voice");
+    invalid5("voice");
   }
-  if (!ENCODINGS.includes(request.encoding)) {
-    invalid4("encoding");
+  if (!ENCODINGS2.includes(request.encoding)) {
+    invalid5("encoding");
   }
-  if (!SAMPLE_RATES.includes(request.sampleRate)) {
-    invalid4("sampleRate");
+  if (!SAMPLE_RATES2.includes(request.sampleRate)) {
+    invalid5("sampleRate");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_TTS_TIMEOUT_MS2;
-  if (!integerIn3(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
-    invalid4("timeoutMs");
+  if (!integerIn4(timeoutMs, 1, MAX_TTS_TIMEOUT_MS2)) {
+    invalid5("timeoutMs");
   }
   const firstChunkTimeoutMs = request.firstChunkTimeoutMs ?? DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2;
-  if (!integerIn3(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
-    invalid4("firstChunkTimeoutMs");
+  if (!integerIn4(firstChunkTimeoutMs, 1, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2)) {
+    invalid5("firstChunkTimeoutMs");
   }
   const maxTextChars = request.maxTextChars ?? DEFAULT_TTS_MAX_TEXT_CHARS2;
-  if (!integerIn3(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
-    invalid4("maxTextChars");
+  if (!integerIn4(maxTextChars, 1, MAX_TTS_MAX_TEXT_CHARS2)) {
+    invalid5("maxTextChars");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid4("signal");
+    invalid5("signal");
   }
   return {
     timeoutMs,
@@ -2175,4 +2240,4 @@ function checkOpenRequest(request) {
   };
 }
 
-export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, startCalendarDeadline, withCalendarRetry, invalid, checkOptions, checkOrganizationId, checkBase, checkGrant, checkRequestId, checkEventId, checkRange, checkEventTimes, checkEvent, checkChanges, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid2, checkOrganizationId2, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, requireConsent, invalid3, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, startTtsDeadline, watchFirstChunk, withTtsRetry, invalid4, checkOpenRequest, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, startCalendarDeadline, withCalendarRetry, invalid, checkOptions, checkOrganizationId, checkBase, checkGrant, checkRequestId, checkEventId, checkRange, checkEventTimes, checkEvent, checkChanges, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid2, checkOrganizationId2, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, requireConsent, invalid3, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, invalid4, checkOpenRequest, resolveTimeout2, checkChunk, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, startTtsDeadline, watchFirstChunk, withTtsRetry, invalid5, checkOpenRequest2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };

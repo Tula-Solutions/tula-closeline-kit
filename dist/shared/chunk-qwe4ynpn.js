@@ -78,7 +78,7 @@ async function withLlmRetry(attempt, options) {
 import { organizationIdSchema } from "tula-closeline-contract";
 import { z } from "zod";
 var SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-function invalid5(what) {
+function invalid6(what) {
   throw new LlmError2(LLM_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
 }
 function integerIn(value, min, max) {
@@ -89,56 +89,56 @@ function resolveRetryPolicy(policy) {
   const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.baseDelayMs;
   const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_LLM_RETRY_POLICY2.maxDelayMs;
   if (!integerIn(maxRetries, 0, 5)) {
-    invalid5("retry.maxRetries");
+    invalid6("retry.maxRetries");
   }
   if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid5("retry.baseDelayMs");
+    invalid6("retry.baseDelayMs");
   }
   if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid5("retry.maxDelayMs");
+    invalid6("retry.maxDelayMs");
   }
   return { maxRetries, baseDelayMs, maxDelayMs };
 }
 function checkRequest(request) {
   if (typeof request !== "object" || request === null) {
-    return invalid5("request");
+    return invalid6("request");
   }
   if (!organizationIdSchema.safeParse(request.organizationId).success) {
-    invalid5("organizationId");
+    invalid6("organizationId");
   }
   if (!MODEL_TIERS2.includes(request.tier)) {
-    invalid5("tier");
+    invalid6("tier");
   }
   if (request.system !== undefined && typeof request.system !== "string") {
-    invalid5("system");
+    invalid6("system");
   }
   const messages = request.messages;
   if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_LLM_MESSAGES2) {
-    invalid5("messages");
+    invalid6("messages");
   }
   for (const message of messages) {
     const m = message;
     if (typeof m !== "object" || m === null || m.role !== "user" && m.role !== "assistant" || typeof m.content !== "string" || m.content.length < 1) {
-      invalid5("messages");
+      invalid6("messages");
     }
   }
   if (messages.at(-1)?.role !== "user") {
-    invalid5("messages");
+    invalid6("messages");
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS2;
   if (!integerIn(timeoutMs, 1, MAX_LLM_TIMEOUT_MS2)) {
-    invalid5("timeoutMs");
+    invalid6("timeoutMs");
   }
   const maxInputTokens = request.maxInputTokens ?? DEFAULT_LLM_MAX_INPUT_TOKENS2;
   if (!integerIn(maxInputTokens, 1, MAX_LLM_MAX_INPUT_TOKENS2)) {
-    invalid5("maxInputTokens");
+    invalid6("maxInputTokens");
   }
   const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS2;
   if (!integerIn(maxOutputTokens, 1, MAX_LLM_MAX_OUTPUT_TOKENS2)) {
-    invalid5("maxOutputTokens");
+    invalid6("maxOutputTokens");
   }
   if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    invalid5("signal");
+    invalid6("signal");
   }
   const retry = resolveRetryPolicy(request.retry);
   const inputTokens = estimateTokens2(request.system ?? "") + messages.reduce((sum, m) => sum + estimateTokens2(m.content), 0);
@@ -152,16 +152,16 @@ function checkRequest(request) {
 function checkCompleteRequest(request) {
   const checked = checkRequest(request);
   if (!(request.schema instanceof z.ZodType)) {
-    invalid5("schema");
+    invalid6("schema");
   }
   if (typeof request.schemaName !== "string" || !SCHEMA_NAME.test(request.schemaName)) {
-    invalid5("schemaName");
+    invalid6("schemaName");
   }
   let jsonSchema;
   try {
     jsonSchema = z.toJSONSchema(request.schema, { io: "input" });
   } catch {
-    return invalid5("schema");
+    return invalid6("schema");
   }
   return { checked, jsonSchema };
 }
@@ -183,4 +183,4 @@ function parseModelOutput(schema, text) {
   return parsed.data;
 }
 
-export { startDeadline, withLlmRetry, invalid5, checkRequest, checkCompleteRequest, parseModelOutput };
+export { startDeadline, withLlmRetry, invalid6, checkRequest, checkCompleteRequest, parseModelOutput };
