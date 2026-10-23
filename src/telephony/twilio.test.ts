@@ -1067,4 +1067,40 @@ describe('twilio telephony: answerCall retry', () => {
     await h.telephony.answerCall(request)
     expect(h.seen.filter(isHold)).toHaveLength(before)
   })
+
+  test('a retry while the Disclosure is being spoken does not cut it off', async () => {
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness(happy, { disclosureDone: () => gate })
+    await h.telephony.answerCall(request)
+    const playing = h.telephony.playDisclosure({
+      organizationId: org,
+      providerCallId: CALL_SID,
+      ...wording,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const before = h.seen.filter(isHold).length
+    await h.telephony.answerCall(request)
+    expect(h.seen.filter(isHold)).toHaveLength(before)
+    release()
+    await playing
+  })
+
+  test('a retry on a call we placed, or with another call id, sends no hold', async () => {
+    const h = harness(happy)
+    const ref = await placed(h)
+    const before = h.seen.filter(isHold).length
+    await h.telephony.answerCall({ ...request, organizationId: ref.organizationId })
+    expect(h.seen.filter(isHold)).toHaveLength(before)
+    const inbound = harness(happy)
+    await inbound.telephony.answerCall(request)
+    const held = inbound.seen.filter(isHold).length
+    await inbound.telephony.answerCall({
+      ...request,
+      callId: callIdSchema.parse(`call_${'d'.repeat(32)}`),
+    })
+    expect(inbound.seen.filter(isHold)).toHaveLength(held)
+  })
 })

@@ -2251,7 +2251,7 @@ function createTwilioTelephony(options) {
         if (known.organizationId !== organizationId) {
           throw notFound();
         }
-        if (known.disclosure === null) {
+        if (known.direction === "inbound" && known.callId === callId && known.disclosure === null && known.disclosureStarted !== true) {
           await updateCall(providerCallId, { Twiml: hold() }, deadline);
         }
         return { ringing: known.ringIdentities.length };
@@ -2288,6 +2288,7 @@ function createTwilioTelephony(options) {
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
         throw unavailable3();
       }
+      await patchCall(providerCallId, { disclosureStarted: true });
       await updateCall(providerCallId, {
         Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
       }, deadline);

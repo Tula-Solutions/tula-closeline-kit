@@ -70,6 +70,8 @@ export interface TwilioCallRecord {
   disclosure: DisclosurePlayed | null
   /** The Rep whose browser leg the call is bridged to, or null. */
   bridgedTo: string | null
+  /** True once a Disclosure has started to play, so the hold is never sent over it. */
+  disclosureStarted?: boolean
   /** The Reps the inbound call was meant to ring. */
   ringIdentities: readonly string[]
   /** The Recording started on the call, or null. */
@@ -562,7 +564,12 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
         }
         // A retry must reach the same end state: until a Disclosure has played, hold again (the
         // update is idempotent), as the first attempt may have claimed the call and then failed.
-        if (known.disclosure === null) {
+        if (
+          known.direction === 'inbound' &&
+          known.callId === callId &&
+          known.disclosure === null &&
+          known.disclosureStarted !== true
+        ) {
           await updateCall(providerCallId, { Twiml: hold() }, deadline)
         }
         return { ringing: known.ringIdentities.length }
@@ -607,6 +614,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
         throw unavailable()
       }
+      await patchCall(providerCallId, { disclosureStarted: true })
       await updateCall(
         providerCallId,
         {
