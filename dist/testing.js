@@ -52,7 +52,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-f4h6mxbj.js";
+} from "./shared/chunk-ewk7hvaq.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -97,7 +97,7 @@ import {
   MAX_MESSAGE_BYTES2,
   defineMessage2,
   createMessageRegistry2
-} from "./shared/chunk-5cxd570z.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2
@@ -115,7 +115,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-c3b5jbxv.js";
+} from "./shared/chunk-3n6tvg2s.js";
 import {
   ESTIMATED_CHARS_PER_TOKEN2,
   estimateTokens2
