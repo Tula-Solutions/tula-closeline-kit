@@ -2065,6 +2065,180 @@ interface MemoryTranscriber extends Transcriber {
 * sends.
 */
 declare function createMemoryTranscriber(options?: MemoryTranscriberOptions): MemoryTranscriber;
+import { OrganizationId as OrganizationId11 } from "tula-closeline-contract";
+import { OrganizationId as OrganizationId10 } from "tula-closeline-contract";
+/**
+* One piece of synthesised speech, in order. The audio is held in a private field, so it is not in
+* `JSON.stringify`, a spread, `String()`, a log line or a console dump; only the sequence number
+* and the byte count are. Read the bytes with {@link TtsAudioChunk.audio}.
+*/
+declare class TtsAudioChunk {
+	private;
+	/** The position in the stream, from 0, rising by 1 with no gaps. */
+	readonly sequence: number;
+	/** The size of the audio in bytes. */
+	readonly byteLength: number;
+	constructor(sequence: number, audio: Uint8Array);
+	/** The audio bytes in the format the stream was opened with; not copied, so do not change them. */
+	get audio(): Uint8Array;
+	/** The metadata, for `JSON.stringify`. */
+	toJSON(): {
+		sequence: number;
+		byteLength: number;
+	};
+	/** A readable label without the audio. */
+	toString(): string;
+}
+/** How an adapter retries a retryable vendor error (`tts.unavailable`) before the first chunk. */
+interface TtsRetryPolicy {
+	/** The most retries after the first attempt, 0 to 5; 0 never retries. Default 1. */
+	maxRetries?: number;
+	/** The base of the pause before a retry, in ms, 1 to 60000; doubled each time and jittered. Default 50. */
+	baseDelayMs?: number;
+	/** The longest pause before a retry, in ms, before jitter, at least the base and at most 60000. Default 250. */
+	maxDelayMs?: number;
+}
+/** What opening a stream states: whose it is, the voice and format, and the limits that bound it. */
+interface TtsOpenRequest {
+	/** The Organization the stream is for; it scopes metering and error context. */
+	organizationId: OrganizationId10;
+	/** A stock voice style of the vendor, 1 to 128 characters of `A-Z a-z 0-9 _ . : -`. Voice cloning is out of scope. */
+	voice: string;
+	/** How the audio is encoded: `pcm_mulaw` for telephony, `pcm_s16le` otherwise. */
+	encoding: AudioEncoding;
+	/** The sample rate of the audio, in Hz. */
+	sampleRate: SampleRate;
+	/**
+	* The most time the whole stream may take from `open`, retries included, in ms, 1 to
+	* {@link MAX_TTS_TIMEOUT_MS}; default {@link DEFAULT_TTS_TIMEOUT_MS}. When it passes, the vendor
+	* request is aborted and iteration fails with `tts.timeout`.
+	*/
+	timeoutMs?: number;
+	/**
+	* The most time from the first text being written (and the stream being read) to the first
+	* chunk, per attempt, in ms, 1 to {@link MAX_TTS_FIRST_CHUNK_TIMEOUT_MS}; default
+	* {@link DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS}. When it passes, iteration fails with `tts.timeout`.
+	*/
+	firstChunkTimeoutMs?: number;
+	/**
+	* The most characters all `write` calls of this stream may add up to, 1 to
+	* {@link MAX_TTS_MAX_TEXT_CHARS}; default {@link DEFAULT_TTS_MAX_TEXT_CHARS}. A write that would
+	* pass it fails with `tts.text_too_large` and adds nothing.
+	*/
+	maxTextChars?: number;
+	/** Retries of `tts.unavailable` before the first chunk; the defaults when absent. */
+	retry?: TtsRetryPolicy;
+	/** The caller's own cancellation. When it fires the vendor request is aborted and iteration fails with `tts.aborted`. */
+	signal?: AbortSignal;
+}
+/**
+* One text-to-speech request in flight: text goes in with {@link TtsStream.write}, audio chunks
+* come out in order by iterating the stream. Iterate it once.
+*
+* The consumer pulls: the next chunk is produced only when the loop asks for it, so a slow
+* consumer holds at most one chunk and the text it was given (bounded by `maxTextChars`), never a
+* growing queue. Leaving the loop early (`break`) cancels the stream.
+*/
+interface TtsStream extends AsyncIterable<TtsAudioChunk> {
+	/**
+	* Adds text to speak, in order. Empty text is ignored. Throws `tts.text_too_large` when the
+	* stream's total would pass its maximum, `tts.closed` after `finish`, `cancel` or `close`, and
+	* `tts.timeout` or `tts.aborted` once the deadline or the caller's signal has fired. Synchronous
+	* and O(text length); it never waits for the vendor.
+	*/
+	write(text: string): void;
+	/** Says no more text is coming, so the stream ends after the last chunk. Idempotent. */
+	finish(): void;
+	/**
+	* Stops now: the vendor request is aborted, no further chunk is delivered (a pending read ends
+	* as done) and unspoken text is dropped. Idempotent, and a no-op once the stream has ended or
+	* is closed. This is barge-in.
+	*/
+	cancel(): void;
+	/**
+	* Cancels and releases everything the stream holds (timer, listeners, buffered text, the vendor
+	* connection). Idempotent. Any later `write`, `finish` or read fails with `tts.closed`.
+	*/
+	close(): Promise<void>;
+}
+/**
+* A text-to-speech engine behind a vendor (Cartesia Sonic first, stock voice styles only). It is
+* on the live call path, so it is built for latency: text streams in as the model writes it and
+* audio streams out as the vendor makes it.
+*
+* Every stream has an overall deadline and a time-to-first-chunk limit that abort the vendor
+* request. A retryable vendor error (`tts.unavailable`) is retried with a bounded, jittered pause
+* only before the first chunk has been delivered; once a chunk is out the failure is thrown from
+* the iteration, never retried, so the listener never hears a repeat. Failures are `TtsError`s
+* with `tts.*` codes; `tts.unavailable`, `tts.rejected` and `tts.bad_response` are also given to
+* the ErrorReporter (metadata only).
+*
+* The text and the audio are tenant data: they are never logged, reported or put in an error, and
+* do not appear in the string, JSON or inspect form of any object the port returns.
+*/
+interface TtsPort {
+	/** Opens a stream. An unacceptable request throws `tts.invalid_request` here; nothing is sent to the vendor until text is written. */
+	open(request: TtsOpenRequest): TtsStream;
+}
+/** What the scripted vendor does for the next stream whose first text arrives. */
+interface ScriptedSpeech {
+	/** The audio pieces it delivers, in order, each 1 to {@link MAX_TTS_AUDIO_CHUNK_BYTES} bytes. Tenant data: never logged. */
+	chunks: readonly Uint8Array[];
+	/** Time before the first chunk, in ms; default 0. */
+	firstChunkDelayMs?: number;
+	/** Time before each later chunk, in ms; default 0. */
+	chunkDelayMs?: number;
+	/** Never produces the first chunk; the attempt ends only when it is aborted or times out. */
+	hang?: boolean;
+	/** Fails with `tts.unavailable` (never retried) once this many chunks have been delivered, 1 to `chunks.length`. */
+	failAfterChunks?: number;
+}
+/** The codes the vendor can be made to fail with. */
+type ScriptedTtsFailure = "tts.unavailable" | "tts.rejected" | "tts.bad_response";
+/** What a test sees of one vendor request (never the text or the audio). */
+interface MemoryTtsRequestView {
+	/** The Organization. */
+	organizationId: OrganizationId11;
+	/** The voice asked for. */
+	voice: string;
+	/** The characters written when the request was made. */
+	chars: number;
+	/** True once the request's AbortSignal fired while it was still pending (a timeout, a cancel, a closed stream). */
+	aborted: boolean;
+	/** How it ended: still going, delivered everything, failed or aborted. */
+	outcome: "pending" | "ok" | "failed" | "aborted";
+}
+/** Options for {@link createMemoryTts}. */
+interface MemoryTtsOptions {
+	/** Receives the errors that mean the vendor failed; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where retries are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** Pauses between retries and models a vendor's delay; real time by default. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/** A {@link TtsPort} that plays scripted audio in the process, for tests. Not for production. */
+interface MemoryTts extends TtsPort {
+	/** Queues what the vendor says to the next stream request that reaches it; later requests take later scripts. */
+	speak(speech: ScriptedSpeech | readonly Uint8Array[]): void;
+	/** Makes the next `times` (default 1) vendor requests fail with `code`, before any script is used. */
+	failNext(code: ScriptedTtsFailure, times?: number): void;
+	/** Every vendor request so far, in order; a retry is a request of its own. */
+	requests(): MemoryTtsRequestView[];
+	/** How many streams have been opened and not yet closed. */
+	openStreams(): number;
+}
+/**
+* Builds a {@link TtsPort} for tests that plays scripted audio. It keeps the rules a real adapter
+* must: validation before any vendor call, a bounded text length, an overall deadline and a
+* first-chunk limit that abort the vendor request, chunks delivered in order and only as the
+* consumer pulls them, bounded jittered retries of `tts.unavailable` before the first chunk and
+* never after, an idempotent cancel, a close that releases everything, and no text or audio in
+* logs, reports, errors or any object it returns. Not for production.
+*/
+declare function createMemoryTts(options?: MemoryTtsOptions): MemoryTts;
 /** One attribute value. Attributes are flat: no arrays, no nesting, no null. */
 type AttributeValue = string | number | boolean;
 /**
@@ -2195,4 +2369,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

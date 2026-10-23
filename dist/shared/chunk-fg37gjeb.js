@@ -2,7 +2,7 @@ import {
   MAX_TELEPHONY_TIMEOUT_MS2,
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2
-} from "./chunk-w4kmnw1c.js";
+} from "./chunk-0dy266jn.js";
 import {
   AppError2,
   isAppError2
@@ -1170,6 +1170,50 @@ class TelephonyError2 extends AppError2 {
   }
 }
 
+// src/tts/audio.ts
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+
+class TtsAudioChunk2 {
+  sequence;
+  byteLength;
+  #audio;
+  constructor(sequence, audio) {
+    this.sequence = sequence;
+    this.byteLength = audio.byteLength;
+    this.#audio = audio;
+  }
+  get audio() {
+    return this.#audio;
+  }
+  toJSON() {
+    return { sequence: this.sequence, byteLength: this.byteLength };
+  }
+  toString() {
+    return `TtsAudioChunk(#${this.sequence}, ${this.byteLength} bytes)`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+}
+
+// src/tts/port.ts
+var DEFAULT_TTS_TIMEOUT_MS2 = 30000;
+var MAX_TTS_TIMEOUT_MS2 = 120000;
+var DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 2000;
+var MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 30000;
+var DEFAULT_TTS_MAX_TEXT_CHARS2 = 5000;
+var MAX_TTS_MAX_TEXT_CHARS2 = 20000;
+var MAX_TTS_AUDIO_CHUNK_BYTES2 = 65536;
+var DEFAULT_TTS_RETRY_POLICY2 = {
+  maxRetries: 1,
+  baseDelayMs: 50,
+  maxDelayMs: 250
+};
+function ttsRetryDelayMs2(retry, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
+}
+
 // src/vector/errors.ts
 var VECTOR_ERROR_CODES2 = {
   invalidRequest: "vector.invalid_request",
@@ -1286,4 +1330,4 @@ function requireDisclosure(played, needsAi = false) {
   return played;
 }
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
