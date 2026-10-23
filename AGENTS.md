@@ -75,8 +75,8 @@ Other scripts are in `package.json`.
   `receive` verifies one HMAC-SHA1 over the URL and form (O(form size), at most 256 KiB) and
   classifies the STOP keywords with one set lookup. Consent cannot be skipped (ADR 0003): there is
   no option for it and an unknown request field is refused. Budgets in `bench/messaging.bench.ts`,
-  about five times what it measures: a send mean 0.02 ms, a webhook mean 0.023 ms and the keyword
-  classification mean 0.02 ms (the floor), each with a median and best-batch p95 budget as above.
+  about five times what it measures: a send mean 0.035 ms (two Contact Checks), a webhook mean 0.023 ms and the keyword
+  classification mean 0.02 ms (a floor, with median and tail 0.02 ms too), each with a median and best-batch p95 budget as above.
 
 - `prepareFields` / `redactFields` (`src/redact.ts`) copy the fields of every log line. O(fields +
   objects walked + text emitted), bounded in counts by 5,000 shared objects and 20,000 shared nested

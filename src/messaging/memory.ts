@@ -254,74 +254,81 @@ export function createMemoryMessaging(options: MemoryMessagingOptions): MemoryMe
     },
     async send(request: SendMessageRequest): Promise<SentMessage> {
       const checked = checkSendRequest(request)
-      const consentCheckId = await requireConsent(options.guard, checked)
-      const fingerprint = createHash('sha256')
-        .update(
-          JSON.stringify([
-            checked.prospectId,
-            checked.channel,
-            checked.purpose,
-            checked.to,
-            checked.content,
-          ])
-        )
-        .digest('hex')
-      const key = `${checked.organizationId}|${checked.idempotencyKey}`
-      const existing = stored.get(key)
-      if (existing !== undefined) {
-        if (existing.fingerprint !== fingerprint) {
-          return invalid('idempotencyKey')
-        }
-        return existing.result
-      }
-      const result = (async (): Promise<SentMessage> => {
-        const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal)
-        try {
-          const answer = await withMessagingRetry(
-            async () => {
-              try {
-                return await vendor(checked, deadline.signal)
-              } catch (error) {
-                if (error instanceof AttemptAborted) {
-                  deadline.check()
-                }
-                throw error
-              }
-            },
-            {
-              policy: checked.retry,
-              deadline,
-              sleep,
-              ...(options.random === undefined ? {} : { random: options.random }),
-              onRetry: (retry, delayMs) =>
-                options.logger?.warn('Messaging send retried', {
-                  feature: 'messaging',
-                  channel: checked.channel,
-                  retry,
-                  delayMs,
-                }),
-            }
-          )
-          return {
-            consentCheckId,
-            providerMessageId: answer.providerMessageId,
-            channel: checked.channel,
-            status: 'queued',
-            idempotencyKey: checked.idempotencyKey,
-          }
-        } catch (error) {
-          report(error, checked.organizationId)
-          throw error
-        } finally {
-          deadline.stop()
-        }
-      })()
-      stored.set(key, { fingerprint, result })
+      const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal)
       try {
-        return await result
-      } catch (error) {
-        stored.delete(key)
-        throw error
+        const { consentCheckId, numberConsentCheckId } = await requireConsent(
+          options.guard,
+          checked,
+          deadline
+        )
+        const fingerprint = createHash('sha256')
+          .update(
+            JSON.stringify([
+              checked.prospectId,
+              checked.channel,
+              checked.purpose,
+              checked.to,
+              checked.content,
+            ])
+          )
+          .digest('hex')
+        const key = `${checked.organizationId}|${checked.idempotencyKey}`
+        const existing = stored.get(key)
+        if (existing !== undefined) {
+          if (existing.fingerprint !== fingerprint) {
+            return invalid('idempotencyKey')
+          }
+          return existing.result
+        }
+        const result = (async (): Promise<SentMessage> => {
+          try {
+            const answer = await withMessagingRetry(
+              async () => {
+                try {
+                  return await vendor(checked, deadline.signal)
+                } catch (error) {
+                  if (error instanceof AttemptAborted) {
+                    deadline.check()
+                  }
+                  throw error
+                }
+              },
+              {
+                policy: checked.retry,
+                deadline,
+                sleep,
+                ...(options.random === undefined ? {} : { random: options.random }),
+                onRetry: (retry, delayMs) =>
+                  options.logger?.warn('Messaging send retried', {
+                    feature: 'messaging',
+                    channel: checked.channel,
+                    retry,
+                    delayMs,
+                  }),
+              }
+            )
+            return {
+              consentCheckId,
+              numberConsentCheckId,
+              providerMessageId: answer.providerMessageId,
+              channel: checked.channel,
+              status: 'queued',
+              idempotencyKey: checked.idempotencyKey,
+            }
+          } catch (error) {
+            report(error, checked.organizationId)
+            throw error
+          }
+        })()
+        stored.set(key, { fingerprint, result })
+        try {
+          return await result
+        } catch (error) {
+          stored.delete(key)
+          throw error
+        }
+      } finally {
+        deadline.stop()
       }
     },
   }

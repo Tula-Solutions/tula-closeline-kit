@@ -33,16 +33,18 @@ interface Budget {
   tailMs: number
 }
 const BUDGETS = {
-  // Measured: mean 0.0035, median 0.0025, best-of-5 p95 0.0040 ms.
-  send: { meanMs: 0.02, medianMs: 0.013, tailMs: 0.02 },
-  // Measured: mean 0.0045, median 0.0035, best-of-5 p95 0.0049 ms.
+  // Measured: mean 0.0069, median 0.0050, best-of-5 p95 0.0082 ms (two Contact Checks per send).
+  send: { meanMs: 0.035, medianMs: 0.025, tailMs: 0.04 },
+  // Measured: mean 0.0053, median 0.0041, best-of-5 p95 0.0061 ms.
   webhook: { meanMs: 0.023, medianMs: 0.018, tailMs: 0.025 },
-  // Measured: mean 0.00005, median 0.00004, best-of-5 p95 0.00004 ms.
-  intent: { meanMs: 0.02, medianMs: 0.0003, tailMs: 0.0003 },
+  // Measured: mean 0.00029, median 0.00025, best-of-5 p95 0.00029 ms; the budget is a 0.02 ms floor.
+  intent: { meanMs: 0.02, medianMs: 0.02, tailMs: 0.02 },
 } satisfies Record<string, Budget>
 
 const guard = createMemoryContactGuard()
 guard.allow({ organizationId: ORG, prospectId: PROSPECT }, 'sms')
+guard.allow({ organizationId: ORG, phone: '+14155550142' }, 'sms')
+guard.allow({ organizationId: ORG, phone: '+14155550199' }, 'sms')
 const messaging = createMemoryMessaging({ guard })
 const inbound = messaging.inbound({
   from: '+14155550142',

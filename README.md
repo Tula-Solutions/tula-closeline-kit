@@ -1157,14 +1157,15 @@ receive({ url, signature, body, contentType? }): Promise<InboundMessage | Status
 ```
 
 **Consent cannot be skipped (ADR 0003).** Every adapter takes a required `ContactGuard` and asks it
-on every `send`, before anything else reaches the vendor. Any denial (or a guard that is down)
+on every `send`, about the Prospect and about the number (`to`), and both must allow, before
+anything reaches the vendor. The checks count against the send's deadline. Any denial (or a guard that is down)
 throws `messaging.consent_denied` with only the `consent.*` code in `details`, and the vendor is
 never called. There is no option or request field that skips it; an unknown field is refused as
-`messaging.invalid_request`. The `SentMessage` carries the check's id as proof.
+`messaging.invalid_request`. The `SentMessage` carries both checks' ids (`consentCheckId`, `numberConsentCheckId`) as proof.
 
 **Inbound.** `receive` returns an `InboundMessage` (from, to, body, channel, `intent`) or a
 `StatusEvent`. `intent` is `stop` for STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT (the whole
-text, any case), `start` for START, UNSTOP and YES, `help` for HELP and INFO. The port does not
+text, ignoring case, punctuation, emoji and invisible characters, so "Stop." and "STOP ALL" count), `start` for START, UNSTOP and YES, `help` for HELP and INFO. The port does not
 revoke consent on STOP: the consumer does that through core, and must handle every webhook
 idempotently, keyed on `providerMessageId`, because Twilio redelivers. The numbers and the text of
 an `InboundMessage` are hidden from `toString`, `JSON.stringify` and `inspect`; read `from`, `to`

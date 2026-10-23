@@ -33,20 +33,27 @@ const STATUS: Record<string, MessageDeliveryStatus> = {
   read: 'read',
 }
 
+const NOT_LETTER = /[^\p{L}\p{N}]+/gu
+
 /**
- * What a recipient's text means, from Twilio's standard English keywords: the whole text, trimmed
- * and case-insensitive. STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT opt out; START, UNSTOP
- * and YES opt back in; HELP and INFO ask for help. A sentence that merely contains one is a message.
+ * What a recipient's text means, from Twilio's standard English keywords: the whole text, ignoring
+ * case, spaces, punctuation, emoji and invisible characters, so "Stop.", "stop!" and "STOP ALL"
+ * all opt out. STOP, STOPALL, UNSUBSCRIBE, CANCEL, END and QUIT opt out; START, UNSTOP and YES opt
+ * back in; HELP and INFO ask for help. A sentence that merely contains one is a message. It fails
+ * toward opting out. `start` is only a hint: it must never re-grant consent without the consent
+ * flow, and only plain ASCII letters count for it and for `help`.
  */
 export function classifyMessageIntent(body: string): MessageIntent {
-  const word = body.trim().toUpperCase()
+  const letters = body.replace(NOT_LETTER, '')
+  const word = letters.toUpperCase()
   if (STOP.has(word)) {
     return 'stop'
   }
-  if (START.has(word)) {
+  const ascii = /^[A-Za-z]+$/.test(letters)
+  if (ascii && START.has(word)) {
     return 'start'
   }
-  if (HELP.has(word)) {
+  if (ascii && HELP.has(word)) {
     return 'help'
   }
   return 'message'

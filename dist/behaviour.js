@@ -882,6 +882,7 @@ function messagingBehaviour(name, make, skip = false) {
     }
     function allow(s, channel, org = s.organizations.a) {
       s.guard.allow({ organizationId: org, prospectId: s.prospect }, channel);
+      s.guard.allow({ organizationId: org, phone: s.recipient }, channel);
     }
     let counter = 0;
     function request(s, overrides = {}) {
@@ -908,10 +909,18 @@ function messagingBehaviour(name, make, skip = false) {
       expect4(sent.status).toBe("queued");
       expect4(sent.idempotencyKey).toBe("order-1");
       expect4(s.vendorCalls()).toBe(1);
+      expect4(sent.numberConsentCheckId).toMatch(/^chk_/);
+      expect4(sent.numberConsentCheckId).not.toBe(sent.consentCheckId);
       expect4(s.guard.calls).toEqual([
         {
           organizationId: s.organizations.a,
           prospectId: s.prospect,
+          channel: "sms",
+          purpose: "agent_initiated"
+        },
+        {
+          organizationId: s.organizations.a,
+          phone: s.recipient,
           channel: "sms",
           purpose: "agent_initiated"
         }
@@ -967,6 +976,46 @@ function messagingBehaviour(name, make, skip = false) {
       expect4(error?.details).toEqual({ code: "consent.unavailable" });
       expect4(s.vendorCalls()).toBe(0);
     });
+    for (const code of ["consent.missing", "consent.withdrawn", "consent.suppressed"]) {
+      test4(`a number denied with ${code} blocks the send though the Prospect is allowed`, async () => {
+        const s = await subject();
+        allow(s, "sms");
+        s.guard.deny({ organizationId: s.organizations.a, phone: s.recipient }, "sms", code);
+        const error = await errorOf(() => s.port.send(request(s)));
+        expect4(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
+        expect4(error?.details).toEqual({ code });
+        expect4(s.vendorCalls()).toBe(0);
+      });
+    }
+    test4("a number nobody preset is denied though the Prospect is allowed", async () => {
+      const s = await subject();
+      s.guard.allow({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms");
+      const error = await errorOf(() => s.port.send(request(s)));
+      expect4(error?.code).toBe(MESSAGING_ERROR_CODES2.consentDenied);
+      expect4(s.vendorCalls()).toBe(0);
+    });
+    test4("a Contact Check that never answers fails with messaging.timeout at the deadline", async () => {
+      const s = await subject();
+      allow(s, "sms");
+      s.guard.check = () => new Promise(() => {
+        return;
+      });
+      const started = Date.now();
+      expect4(await codeOf(() => s.port.send(request(s, { timeoutMs: 50 })))).toBe(MESSAGING_ERROR_CODES2.timeout);
+      expect4(Date.now() - started).toBeLessThan(500);
+      expect4(s.vendorCalls()).toBe(0);
+    });
+    test4("the caller signal ends a Contact Check that never answers with messaging.aborted", async () => {
+      const s = await subject();
+      allow(s, "sms");
+      s.guard.check = () => new Promise(() => {
+        return;
+      });
+      const controller = new AbortController;
+      setTimeout(() => controller.abort(), 20);
+      expect4(await codeOf(() => s.port.send(request(s, { signal: controller.signal })))).toBe(MESSAGING_ERROR_CODES2.aborted);
+      expect4(s.vendorCalls()).toBe(0);
+    });
     test4("consent for SMS does not cover WhatsApp, and the check is asked on every call", async () => {
       const s = await subject();
       allow(s, "sms");
@@ -974,7 +1023,7 @@ function messagingBehaviour(name, make, skip = false) {
       expect4(await codeOf(() => s.port.send(request(s, { channel: "whatsapp", content: { kind: "template", templateId: TEMPLATE } })))).toBe(MESSAGING_ERROR_CODES2.consentDenied);
       s.guard.deny({ organizationId: s.organizations.a, prospectId: s.prospect }, "sms", "consent.withdrawn");
       expect4(await codeOf(() => s.port.send(request(s)))).toBe(MESSAGING_ERROR_CODES2.consentDenied);
-      expect4(s.guard.calls.length).toBe(3);
+      expect4(s.guard.calls.length).toBe(4);
       expect4(s.vendorCalls()).toBe(1);
     });
     test4("consent in one Organization does not let a second Organization send", async () => {
@@ -1185,6 +1234,18 @@ function messagingBehaviour(name, make, skip = false) {
         ["Yes", "start"],
         ["HELP", "help"],
         ["info", "help"],
+        ["Stop.", "stop"],
+        ["stop!", "stop"],
+        ['  "STOP"  ', "stop"],
+        ["STOP ALL", "stop"],
+        ["stop all.", "stop"],
+        ["stop​", "stop"],
+        ["​STOP⁠", "stop"],
+        ["STOP \uD83D\uDC4D", "stop"],
+        ["Start.", "start"],
+        ["help!", "help"],
+        ["ſtart", "message"],
+        ["Kind", "message"],
         ["please stop texting me", "message"],
         ["stopping by tomorrow", "message"],
         ["no thanks", "message"],

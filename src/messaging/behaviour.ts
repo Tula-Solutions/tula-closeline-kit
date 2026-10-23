@@ -120,6 +120,7 @@ export function messagingBehaviour(
 
     function allow(s: MessagingSubject, channel: MessagingChannel, org = s.organizations.a): void {
       s.guard.allow({ organizationId: org, prospectId: s.prospect }, channel)
+      s.guard.allow({ organizationId: org, phone: s.recipient }, channel)
     }
 
     let counter = 0
@@ -148,10 +149,18 @@ export function messagingBehaviour(
       expect(sent.status).toBe('queued')
       expect(sent.idempotencyKey).toBe('order-1')
       expect(s.vendorCalls()).toBe(1)
+      expect(sent.numberConsentCheckId).toMatch(/^chk_/)
+      expect(sent.numberConsentCheckId).not.toBe(sent.consentCheckId)
       expect(s.guard.calls).toEqual([
         {
           organizationId: s.organizations.a,
           prospectId: s.prospect,
+          channel: 'sms',
+          purpose: 'agent_initiated',
+        },
+        {
+          organizationId: s.organizations.a,
+          phone: s.recipient,
           channel: 'sms',
           purpose: 'agent_initiated',
         },
@@ -217,6 +226,50 @@ export function messagingBehaviour(
       expect(s.vendorCalls()).toBe(0)
     })
 
+    for (const code of ['consent.missing', 'consent.withdrawn', 'consent.suppressed'] as const) {
+      test(`a number denied with ${code} blocks the send though the Prospect is allowed`, async () => {
+        const s = await subject()
+        allow(s, 'sms')
+        s.guard.deny({ organizationId: s.organizations.a, phone: s.recipient }, 'sms', code)
+        const error = await errorOf(() => s.port.send(request(s)))
+        expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
+        expect(error?.details).toEqual({ code })
+        expect(s.vendorCalls()).toBe(0)
+      })
+    }
+
+    test('a number nobody preset is denied though the Prospect is allowed', async () => {
+      const s = await subject()
+      s.guard.allow({ organizationId: s.organizations.a, prospectId: s.prospect }, 'sms')
+      const error = await errorOf(() => s.port.send(request(s)))
+      expect(error?.code).toBe(MESSAGING_ERROR_CODES.consentDenied)
+      expect(s.vendorCalls()).toBe(0)
+    })
+
+    test('a Contact Check that never answers fails with messaging.timeout at the deadline', async () => {
+      const s = await subject()
+      allow(s, 'sms')
+      s.guard.check = () => new Promise(() => undefined)
+      const started = Date.now()
+      expect(await codeOf(() => s.port.send(request(s, { timeoutMs: 50 })))).toBe(
+        MESSAGING_ERROR_CODES.timeout
+      )
+      expect(Date.now() - started).toBeLessThan(500)
+      expect(s.vendorCalls()).toBe(0)
+    })
+
+    test('the caller signal ends a Contact Check that never answers with messaging.aborted', async () => {
+      const s = await subject()
+      allow(s, 'sms')
+      s.guard.check = () => new Promise(() => undefined)
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(), 20)
+      expect(await codeOf(() => s.port.send(request(s, { signal: controller.signal })))).toBe(
+        MESSAGING_ERROR_CODES.aborted
+      )
+      expect(s.vendorCalls()).toBe(0)
+    })
+
     test('consent for SMS does not cover WhatsApp, and the check is asked on every call', async () => {
       const s = await subject()
       allow(s, 'sms')
@@ -234,7 +287,7 @@ export function messagingBehaviour(
         'consent.withdrawn'
       )
       expect(await codeOf(() => s.port.send(request(s)))).toBe(MESSAGING_ERROR_CODES.consentDenied)
-      expect(s.guard.calls.length).toBe(3)
+      expect(s.guard.calls.length).toBe(4)
       expect(s.vendorCalls()).toBe(1)
     })
 
@@ -491,6 +544,18 @@ export function messagingBehaviour(
         ['Yes', 'start'],
         ['HELP', 'help'],
         ['info', 'help'],
+        ['Stop.', 'stop'],
+        ['stop!', 'stop'],
+        ['  "STOP"  ', 'stop'],
+        ['STOP ALL', 'stop'],
+        ['stop all.', 'stop'],
+        ['stop\u200b', 'stop'],
+        ['\u200bSTOP\u2060', 'stop'],
+        ['STOP \u{1F44D}', 'stop'],
+        ['Start.', 'start'],
+        ['help!', 'help'],
+        ['\u017Ftart', 'message'],
+        ['\u212Aind', 'message'],
         ['please stop texting me', 'message'],
         ['stopping by tomorrow', 'message'],
         ['no thanks', 'message'],

@@ -89,11 +89,11 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
-  requireConsent,
   startMessagingDeadline,
   AttemptAborted,
   raceAbort,
   withMessagingRetry,
+  requireConsent,
   invalid2,
   checkSendRequest,
   classifyMessageIntent2,
@@ -127,7 +127,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-45znhssj.js";
+} from "./shared/chunk-0f87wa1m.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -2149,11 +2149,11 @@ function createTwilioMessaging(options) {
     async send(request) {
       const checked = checkSendRequest(request);
       const body = form(checked);
-      const consentCheckId = await requireConsent(guard, checked);
       const token = idempotencyToken(checked);
       const text = body.toString();
       const deadline = startMessagingDeadline(checked.timeoutMs, checked.signal);
       try {
+        const { consentCheckId, numberConsentCheckId } = await requireConsent(guard, checked, deadline);
         const answer = await withMessagingRetry(async () => {
           try {
             return await attempt(text, token, deadline.signal);
@@ -2178,6 +2178,7 @@ function createTwilioMessaging(options) {
         });
         return {
           consentCheckId,
+          numberConsentCheckId,
           providerMessageId: answer.providerMessageId,
           channel: checked.channel,
           status: answer.status,

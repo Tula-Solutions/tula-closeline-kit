@@ -1187,15 +1187,18 @@ var STATUS2 = {
   canceled: "failed",
   read: "read"
 };
+var NOT_LETTER = /[^\p{L}\p{N}]+/gu;
 function classifyMessageIntent2(body) {
-  const word = body.trim().toUpperCase();
+  const letters = body.replace(NOT_LETTER, "");
+  const word = letters.toUpperCase();
   if (STOP.has(word)) {
     return "stop";
   }
-  if (START.has(word)) {
+  const ascii = /^[A-Za-z]+$/.test(letters);
+  if (ascii && START.has(word)) {
     return "start";
   }
-  if (HELP.has(word)) {
+  if (ascii && HELP.has(word)) {
     return "help";
   }
   return "message";
@@ -1509,39 +1512,6 @@ function requireDisclosure(played, needsAi = false) {
   return played;
 }
 
-// src/messaging/consent.ts
-var DENIAL_CODES = [
-  "consent.missing",
-  "consent.withdrawn",
-  "consent.suppressed",
-  "consent.unavailable"
-];
-function denied(code) {
-  return new MessagingError2(MESSAGING_ERROR_CODES2.consentDenied, "The Contact Check did not allow this message", {
-    details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
-  });
-}
-async function requireConsent(guard, request) {
-  let result;
-  try {
-    result = await guard.check({
-      organizationId: request.organizationId,
-      prospectId: request.prospectId,
-      channel: request.channel,
-      purpose: request.purpose
-    });
-  } catch {
-    throw denied("consent.unavailable");
-  }
-  if (typeof result !== "object" || result === null || result.allowed !== true) {
-    throw denied(typeof result === "object" && result !== null && "code" in result ? String(result.code) : "consent.unavailable");
-  }
-  if (typeof result.checkId !== "string") {
-    throw denied("consent.unavailable");
-  }
-  return result.checkId;
-}
-
 // src/messaging/deadline.ts
 function startMessagingDeadline(timeoutMs, caller) {
   const controller = new AbortController;
@@ -1620,6 +1590,47 @@ async function withMessagingRetry(attempt, options) {
       await sleep(delayMs, options.deadline.signal);
     }
   }
+}
+
+// src/messaging/consent.ts
+var DENIAL_CODES = [
+  "consent.missing",
+  "consent.withdrawn",
+  "consent.suppressed",
+  "consent.unavailable"
+];
+function denied(code) {
+  return new MessagingError2(MESSAGING_ERROR_CODES2.consentDenied, "The Contact Check did not allow this message", {
+    details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
+  });
+}
+async function ask(guard, who, request, deadline) {
+  let result;
+  try {
+    result = await raceAbort(Promise.resolve().then(() => guard.check({
+      organizationId: request.organizationId,
+      ...who,
+      channel: request.channel,
+      purpose: request.purpose
+    })), deadline.signal);
+  } catch (error) {
+    if (error instanceof AttemptAborted) {
+      deadline.check();
+    }
+    throw denied("consent.unavailable");
+  }
+  if (typeof result !== "object" || result === null || result.allowed !== true) {
+    throw denied(typeof result === "object" && result !== null && "code" in result ? String(result.code) : "consent.unavailable");
+  }
+  if (typeof result.checkId !== "string") {
+    throw denied("consent.unavailable");
+  }
+  return result.checkId;
+}
+async function requireConsent(guard, request, deadline) {
+  const consentCheckId = await ask(guard, { prospectId: request.prospectId }, request, deadline);
+  const numberConsentCheckId = await ask(guard, { phone: request.to }, request, deadline);
+  return { consentCheckId, numberConsentCheckId };
 }
 
 // src/messaging/validate.ts
@@ -1770,4 +1781,4 @@ function checkSendRequest(request) {
   };
 }
 
-export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, requireConsent, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
+export { CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, DEFAULT_LLM_TIMEOUT_MS2, MAX_LLM_TIMEOUT_MS2, DEFAULT_LLM_MAX_INPUT_TOKENS2, MAX_LLM_MAX_INPUT_TOKENS2, DEFAULT_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MAX_OUTPUT_TOKENS2, MAX_LLM_MESSAGES2, MODEL_TIERS2, ESTIMATED_CHARS_PER_TOKEN2, estimateTokens2, DEFAULT_LLM_RETRY_POLICY2, llmRetryDelayMs2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid, checkOrganizationId, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, requireConsent, invalid2, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
