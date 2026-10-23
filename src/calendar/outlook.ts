@@ -733,6 +733,14 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
         const ref = eventRef(answer.json, answer.status)
         const madeAt = Date.parse(String(answer.json?.createdDateTime))
         if (Number.isNaN(madeAt) || madeAt >= startedAt - CREATED_SKEW_MS) {
+          // A replay inside the skew window looks new; a different title or time still shows.
+          if (
+            answer.json?.subject !== event.title ||
+            Date.parse(ref.start) !== startMs ||
+            Date.parse(ref.end) !== endMs
+          ) {
+            invalid('requestId')
+          }
           return { ...ref, created: true }
         }
         // Graph answered a repeated `transactionId` with the event an earlier attempt or call made.

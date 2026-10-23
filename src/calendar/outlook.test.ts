@@ -361,6 +361,19 @@ describe('Outlook calendar adapter', () => {
     ).toBe(CALENDAR_ERROR_CODES.invalidRequest)
   })
 
+  test('a replay inside the skew window with a different event is calendar.invalid_request', async () => {
+    const { h, base } = await connectedVia()
+    await h.port.createEvent({ ...base, requestId: 'req-1', event }, opts)
+    expect(
+      await codeOf(
+        h.port.createEvent(
+          { ...base, requestId: 'req-1', event: { ...event, title: 'Another meeting' } },
+          opts
+        )
+      )
+    ).toBe(CALENDAR_ERROR_CODES.invalidRequest)
+  })
+
   test('a lost create response is retried with the same transactionId and makes one event', async () => {
     const { h, fake, base } = await connectedVia()
     fake.fake.loseNext(1)
