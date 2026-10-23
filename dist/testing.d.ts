@@ -661,6 +661,369 @@ interface MemoryObjectStore extends ObjectStore {
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
+import { CallId as CallId2, MembershipId as MembershipId2, OrganizationId as OrganizationId2, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
+/** The `area.reason` codes the telephony port and adapters throw. */
+declare const TELEPHONY_ERROR_CODES: {
+	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
+	readonly invalidRequest: "telephony.invalid_request";
+	/** The provider has no call or Recording with that id for this Organization (or it was deleted). */
+	readonly notFound: "telephony.not_found";
+	/** The provider call has already ended, so the operation cannot apply. */
+	readonly callEnded: "telephony.call_ended";
+	/** The Disclosure has not played on this call, so it cannot be bridged, recorded or forked (ADR 0003). */
+	readonly disclosureRequired: "telephony.disclosure_required";
+	/** The Recording is not finished yet; try again shortly. */
+	readonly recordingNotReady: "telephony.recording_not_ready";
+	/** The provider refused the operation for a reason a retry cannot fix (credentials, quota, number). */
+	readonly rejected: "telephony.rejected";
+	/** The provider did not answer in time or at all, after the bounded retries. The only retryable code. */
+	readonly unavailable: "telephony.unavailable";
+	/** The provider answered with something this adapter cannot use. */
+	readonly badResponse: "telephony.bad_response";
+};
+/** One of {@link TELEPHONY_ERROR_CODES}'s values. */
+type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
+import { CallId, MembershipId, OrganizationId, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+/** Options every operation of {@link TelephonyPort} accepts. */
+interface TelephonyOptions {
+	/**
+	* The most time the operation may take, in ms, 1 to {@link MAX_TELEPHONY_TIMEOUT_MS}; default
+	* {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. When it passes the operation throws
+	* `telephony.unavailable` and, as far as the adapter can tell, changed nothing.
+	*/
+	timeoutMs?: number;
+}
+/** Which Organization a provider call belongs to and which provider call it is. */
+interface ProviderCallRef {
+	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
+	organizationId: OrganizationId;
+	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
+	providerCallId: string;
+}
+/** The call a service asks the provider to place to a Prospect. */
+interface PlaceCallRequest {
+	/** The Organization. */
+	organizationId: OrganizationId;
+	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
+	callId: CallId;
+	/**
+	* Required. The same key places exactly one provider call: a repeat returns the first one with
+	* `created: false`. 1 to 128 of letters, digits, `.`, `_`, `:` and `-`.
+	*/
+	idempotencyKey: string;
+	/** The Line's number the Prospect sees, in E.164. */
+	from: string;
+	/** The Prospect's number, in E.164. Tenant data: never logged. */
+	to: string;
+}
+/** What {@link TelephonyPort.placeCall} reports. */
+interface PlacedCall {
+	/** The provider's id of the leg to the Prospect. */
+	providerCallId: string;
+	/** True when this call placed it; false when the same idempotency key had already placed it. */
+	created: boolean;
+}
+/** An inbound call the provider has received, to be answered. */
+interface AnswerCallRequest extends ProviderCallRef {
+	/** Our id of the Call. */
+	callId: CallId;
+	/** The Reps' browser legs to ring, 1 to {@link MAX_RING_LEGS}; the first to answer is bridged. */
+	ringIdentities: MembershipId[];
+}
+/** What {@link TelephonyPort.answerCall} reports. */
+interface AnsweredCall {
+	/** How many browser legs are ringing. */
+	ringing: number;
+}
+/** The Disclosure to play to a connected call, before anything else happens on it. */
+interface PlayDisclosureRequest extends ProviderCallRef {
+	/** The version of the wording, 1 or more; the Call stores it (ADR 0003). */
+	wordingVersion: number;
+	/** The words spoken, 1 to {@link MAX_DISCLOSURE_TEXT_LENGTH} characters. Never logged. */
+	text: string;
+	/** Whether the wording also says an AI takes part. Forking tracks to an AI needs `true`. */
+	aiAssisted: boolean;
+}
+/** What {@link TelephonyPort.playDisclosure} reports once the wording has finished playing. */
+interface DisclosurePlayed {
+	/** The wording version that played. */
+	wordingVersion: number;
+	/** Whether it said an AI takes part. */
+	aiAssisted: boolean;
+	/** When it finished playing, as an ISO 8601 UTC time. */
+	playedAt: string;
+}
+/** A Rep's browser leg to join to a call. */
+interface BridgeRequest extends ProviderCallRef {
+	/** The Rep whose browser leg joins; if another leg is joined, it moves to this one. */
+	repIdentity: MembershipId;
+}
+/** What {@link TelephonyPort.startRecording} reports. */
+interface StartedRecording {
+	/** The provider's id of the Recording: opaque, same shape as a provider call id. */
+	recordingId: string;
+	/** Always 2: channel 0 is the Prospect, channel 1 is the Rep. */
+	channels: 2;
+}
+/** Where to fork the two audio tracks of a call. */
+interface ForkTracksRequest extends ProviderCallRef {
+	/** A `wss:` URL (`ws:` only for an adapter in `local`) the provider streams to; built by the service, never from a user. */
+	destinationUrl: string;
+}
+/** What {@link TelephonyPort.forkTracks} reports. */
+interface ForkedTracks {
+	/** The provider's id of the stream. */
+	streamId: string;
+	/** The two tracks sent: the Rep's and the Prospect's, separately. */
+	tracks: readonly ["rep", "prospect"];
+}
+/** Who asks to hang up. */
+interface HangUpRequest extends ProviderCallRef {
+	/** Who ends the call, for the event that follows; default `system`. */
+	by?: "rep" | "system";
+}
+/** Names a provider-side Recording. */
+interface RecordingRef {
+	/** The Organization. */
+	organizationId: OrganizationId;
+	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
+	recordingId: string;
+}
+/** A provider-side Recording, opened for reading. */
+interface FetchedRecording {
+	/** The audio, two channels. The caller must read or cancel it. */
+	body: ByteStream;
+	/** The media type, such as `audio/wav`. */
+	contentType: string;
+	/** The size in bytes when the provider says it, otherwise null. */
+	sizeBytes: number | null;
+	/** Always 2. */
+	channels: 2;
+}
+/** A webhook request as the provider sent it, to be checked before anything is read from it. */
+interface WebhookRequest {
+	/** The full URL the provider called, as the provider saw it. */
+	url: string;
+	/** The raw body, unparsed, at most {@link MAX_WEBHOOK_BODY_BYTES} bytes. */
+	body: string;
+	/** The signature header, or null/undefined when the request had none. */
+	signature: string | null | undefined;
+}
+/** What {@link TelephonyPort.mintBrowserToken} is asked for. */
+interface BrowserTokenRequest {
+	/** The Organization. */
+	organizationId: OrganizationId;
+	/** The Rep the token is for: the only identity it carries besides the Organization. */
+	identity: MembershipId;
+	/** How long it lives, in seconds, 60 to 3600; default 900. */
+	ttlSeconds?: number;
+}
+/** What a provider tells us about a call, in the shape every adapter's webhooks are turned into. */
+type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "completed" | "recording_ready";
+/** One thing that happened on a provider call. Carries no number, text or audio. */
+interface TelephonyEvent {
+	/** The provider's id of this event: webhooks are idempotent by it. */
+	eventId: string;
+	/** The Organization. */
+	organizationId: OrganizationId;
+	/** The provider call. */
+	providerCallId: string;
+	/** What happened. */
+	type: TelephonyEventType;
+	/** When, as an ISO 8601 UTC time. */
+	at: string;
+	/** With `failed` (and `no_answer`, `busy`): why, as the contract names it. */
+	failureReason?: VoiceCallFailureReason;
+	/** With `completed`: who hung up. */
+	endedBy?: "rep" | "prospect" | "system";
+	/** With `recording_ready`: the Recording. */
+	recordingId?: string;
+}
+/**
+* Telephony behind a vendor (Twilio first, ADR to follow), scoped by Organization. Every call
+* carries the Organization and reaches only that Organization's provider calls and Recordings; a
+* real adapter must tag each provider call with it. Every operation is bounded by a timeout
+* ({@link TelephonyOptions.timeoutMs}), every outbound request an adapter makes has its own
+* timeout and a bounded, jittered retry, and only `telephony.unavailable` is worth retrying after
+* that. Mutating operations are idempotent: repeating one leaves the same result.
+*
+* **The Disclosure cannot be skipped (ADR 0003).** There is no option, flag or setting that
+* skips the Disclosure or the Recording. An adapter refuses `bridge`, `startRecording` and
+* `forkTracks` on a call whose Disclosure has not played, with `telephony.disclosure_required`,
+* and `forkTracks` (audio to an AI) also needs a Disclosure that said so (`aiAssisted: true`).
+* Every recording has two channels. These checks are the adapter's second line of defence; the
+* voice service's state machine is the first.
+*
+* Nothing here logs, returns in an error or reports a phone number, a Disclosure text, a token, a
+* signature, a secret or audio. Provider events arrive as webhooks the service verifies with
+* {@link TelephonyPort.verifyWebhook} and turns into {@link TelephonyEvent}s.
+*/
+interface TelephonyPort {
+	/**
+	* Places a call from a Line's number to a Prospect and returns at once with the provider's id;
+	* progress arrives as events. Idempotent by `(organizationId, idempotencyKey)`; the same key
+	* with another `to` or `from` is `telephony.invalid_request`. O(1).
+	*/
+	placeCall(request: PlaceCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
+	/**
+	* Answers an inbound call and rings the given browser legs. Repeating it for a call already
+	* answered returns the same count. O(legs).
+	*/
+	answerCall(request: AnswerCallRequest, options?: TelephonyOptions): Promise<AnsweredCall>;
+	/**
+	* Plays the Disclosure into a connected call and resolves when it has finished playing. Nobody
+	* else hears the call meanwhile. A call the Prospect has left is `telephony.call_ended`. Idempotent
+	* per wording version: a Disclosure that has already played is reported again, not replayed. A
+	* later version plays again and replaces the earlier one, including its `aiAssisted`.
+	*/
+	playDisclosure(request: PlayDisclosureRequest, options?: TelephonyOptions): Promise<DisclosurePlayed>;
+	/**
+	* Joins a Rep's browser leg to the call, or moves the call to another Rep's leg. Needs a played
+	* Disclosure. Repeating it for the same Rep changes nothing.
+	*/
+	bridge(request: BridgeRequest, options?: TelephonyOptions): Promise<void>;
+	/**
+	* Starts the dual-channel Recording (Prospect and Rep apart). Needs a played Disclosure. There is
+	* no single-channel or unrecorded mode. Repeating it returns the first Recording.
+	*/
+	startRecording(request: ProviderCallRef, options?: TelephonyOptions): Promise<StartedRecording>;
+	/**
+	* Forks the call's two audio tracks, the Rep's and the Prospect's separately, to a socket
+	* (used by the Copilot). Needs a played Disclosure that said an AI takes part. Repeating it
+	* returns the first stream.
+	*/
+	forkTracks(request: ForkTracksRequest, options?: TelephonyOptions): Promise<ForkedTracks>;
+	/** Ends the call. Idempotent: a call that has ended already resolves without error. */
+	hangUp(request: HangUpRequest, options?: TelephonyOptions): Promise<void>;
+	/**
+	* Opens the provider's copy of a Recording as a stream, once the call has ended and the Recording
+	* is finished (before that, `telephony.recording_not_ready`). The timeout covers opening it. A
+	* Recording deleted or never made is `telephony.not_found`. O(1) to open.
+	*/
+	fetchRecording(request: RecordingRef, options?: TelephonyOptions): Promise<FetchedRecording>;
+	/**
+	* Deletes the provider's copy of a Recording and resolves with whether it existed. Idempotent:
+	* deleting again, or an id never issued, resolves with `existed: false`.
+	*/
+	deleteRecording(request: RecordingRef, options?: TelephonyOptions): Promise<{
+		existed: boolean;
+	}>;
+	/**
+	* Whether `request` really came from the provider, by its signature, compared in constant time.
+	* A missing, malformed, wrong-length or wrong signature, or a body over
+	* {@link MAX_WEBHOOK_BODY_BYTES}, is `false`; it never throws. It does no I/O (a local
+	* computation on the body), so it needs no timeout and runs inside a webhook's budget. Check it
+	* before reading anything from the body.
+	*/
+	verifyWebhook(request: WebhookRequest): boolean;
+	/**
+	* Mints a short-lived token the browser registers the Softphone with. It is issued for the Rep's
+	* identity in the Organization (a real adapter binds both at the provider; the token text need
+	* not show them), expires at `expiresAt`, and is a credential: never logged or
+	* stored.
+	*/
+	mintBrowserToken(request: BrowserTokenRequest, options?: TelephonyOptions): Promise<SoftphoneToken>;
+}
+/** What a scripted Prospect does when the memory provider dials their number. */
+type ScriptedProspect = {
+	kind: "answers";
+} | {
+	kind: "no_answer";
+} | {
+	kind: "busy";
+} | {
+	kind: "hangs_up";
+	when: "during_disclosure" | "after_bridge";
+} | {
+	kind: "carrier_failure";
+	reason?: Extract<VoiceCallFailureReason2, "carrier_dropped" | "carrier_rejected" | "provider_error">;
+	when?: "dial" | "after_bridge";
+};
+/** The operations a test can make fail or stall. */
+type TelephonyOperation = "placeCall" | "answerCall" | "playDisclosure" | "bridge" | "startRecording" | "forkTracks" | "hangUp" | "fetchRecording" | "deleteRecording" | "mintBrowserToken";
+/** Options for {@link createMemoryTelephony}. */
+interface MemoryTelephonyOptions {
+	/** The clock for event times and token expiry; the system clock by default. */
+	clock?: Clock;
+	/** The `ENVIRONMENT` to behave as: a `ws:` fork destination is accepted only in `local`; default `local`. */
+	environment?: Environment;
+	/** The secret webhooks are signed with, at least 16 characters; a fixed test value by default. */
+	webhookSecret?: string;
+	/** The timeout of an operation that names none, in ms; default {@link DEFAULT_TELEPHONY_TIMEOUT_MS}. */
+	defaultTimeoutMs?: number;
+	/** The bytes every Recording holds; a few bytes of fake audio by default. */
+	recordingAudio?: Uint8Array;
+}
+/** What a test sees of a provider call (never a number or a Disclosure text). */
+interface MemoryCallView {
+	/** The Organization. */
+	organizationId: OrganizationId2;
+	/** The provider's id. */
+	providerCallId: string;
+	/** Our Call id, when the call was placed or answered with one. */
+	callId: CallId2 | null;
+	/** Placed by us, or received. */
+	direction: "outbound" | "inbound";
+	/** `incoming` until answered, `connected` while up, `ended` after. */
+	state: "incoming" | "connected" | "ended";
+	/** The Disclosure that played, if one has. */
+	disclosure: DisclosurePlayed | null;
+	/** The Rep whose browser leg is joined, if any. */
+	bridgedTo: MembershipId2 | null;
+	/** The Recording, if started. */
+	recordingId: string | null;
+	/** The fork stream, if started. */
+	streamId: string | null;
+	/** Who ended it, when it has ended. */
+	endedBy: "rep" | "prospect" | "system" | null;
+}
+/** One operation the provider carried out, in order; the proof the Disclosure came first. */
+interface MemoryOperationRecord {
+	/** The operation. */
+	operation: TelephonyOperation | "prospectHangsUp";
+	/** The provider call it applied to, when it applied to one. */
+	providerCallId: string | null;
+}
+/** A webhook request that carries a signature. */
+interface SignedWebhook extends WebhookRequest {
+	/** The valid signature. */
+	signature: string;
+}
+/** A {@link TelephonyPort} that plays scripted Prospects in the process, for tests. Not for production. */
+interface MemoryTelephony extends TelephonyPort {
+	/** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
+	script(number: string, behaviour: ScriptedProspect): void;
+	/** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
+	receiveInbound(organizationId: OrganizationId2, from: string, to: string): string;
+	/** Has the Prospect on this call hang up now; a call that has ended is left alone. */
+	prospectHangsUp(organizationId: OrganizationId2, providerCallId: string): void;
+	/** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
+	failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void;
+	/** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
+	stallNext(operation: TelephonyOperation, times?: number): void;
+	/** Every event so far, in order. */
+	readonly events: readonly TelephonyEvent[];
+	/** Returns the events not yet taken, in order, and forgets them. */
+	takeEvents(): TelephonyEvent[];
+	/** Every operation carried out, in order; failed, refused and timed-out ones are not in it. */
+	readonly operations: readonly MemoryOperationRecord[];
+	/** The calls, for one Organization or all, in the order they were made. */
+	calls(organizationId?: string): MemoryCallView[];
+	/** The webhook the provider would send for `event`: a URL, the JSON body and its valid signature. */
+	webhookFor(event: TelephonyEvent): SignedWebhook;
+	/** The valid signature for a URL and body. */
+	sign(url: string, body: string): string;
+	/** How many Recordings the provider still holds. */
+	recordingCount(): number;
+}
+/**
+* Builds a {@link TelephonyPort} for tests, which plays scripted Prospects: one who answers (the
+* default), one who does not, one who is busy, one who hangs up and a carrier that fails. It keeps
+* the same rules a real adapter must: Organization scoping, idempotent placing, the Disclosure
+* before bridging, recording or forking, timeouts, and constant-time webhook verification. Events
+* a real provider would send as webhooks are collected in `events`. Not for production.
+*/
+declare function createMemoryTelephony(options?: MemoryTelephonyOptions): MemoryTelephony;
 /** The `area.reason` codes the transcriber port and adapters throw. */
 declare const TRANSCRIBER_ERROR_CODES: {
 	/** An Organization id, client reference, audio reference, option, prefix or cursor is not acceptable. */
@@ -1098,4 +1461,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryQueue, MemoryQueueOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, ScriptedProspect, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };

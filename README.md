@@ -926,6 +926,51 @@ own speaker label, and what that bills (ADR 0018: per channel); the EU endpoint 
 how soon after a delete the vendor's copy is gone and whether it says so. None of this is
 verified here.
 
+## Telephony (`TelephonyPort`)
+
+The voice service places and answers calls, plays the Disclosure, bridges a Rep, records and
+forks audio through the kit's `TelephonyPort` (added in 0.13.0). The port types, `TelephonyError`
+and the limits come from `tula-closeline-kit`; the memory adapter (`createMemoryTelephony`) from
+`tula-closeline-kit/testing`; the behaviour suite (`telephonyBehaviour`) from
+`tula-closeline-kit/testing/behaviour`. Ids, E.164 numbers, failure reasons and the
+`SoftphoneToken` are the voice contract's (v0.19.0). **There is no real adapter yet;** the Twilio
+adapter is a follow-up that has to pass `telephonyBehaviour`.
+
+```ts
+placeCall({ organizationId, callId, idempotencyKey, from, to }, opts?): Promise<{ providerCallId; created }> // dials the Prospect; same key, one call
+answerCall({ organizationId, providerCallId, callId, ringIdentities }, opts?): Promise<{ ringing }> // answers an inbound call, rings 1 to 50 browser legs
+playDisclosure({ organizationId, providerCallId, wordingVersion, text, aiAssisted }, opts?): Promise<DisclosurePlayed>
+bridge({ organizationId, providerCallId, repIdentity }, opts?): Promise<void> // joins or moves a Rep; needs the Disclosure
+startRecording({ organizationId, providerCallId }, opts?): Promise<{ recordingId; channels: 2 }> // needs the Disclosure
+forkTracks({ organizationId, providerCallId, destinationUrl }, opts?): Promise<ForkedTracks> // needs a Disclosure that named an AI
+hangUp({ organizationId, providerCallId, by? }, opts?): Promise<void> // idempotent
+fetchRecording({ organizationId, recordingId }, opts?): Promise<{ body: ByteStream; contentType; sizeBytes; channels }>
+deleteRecording({ organizationId, recordingId }, opts?): Promise<{ existed }> // idempotent
+verifyWebhook({ url, body, signature }): boolean // constant time; never throws; no I/O
+mintBrowserToken({ organizationId, identity, ttlSeconds? }, opts?): Promise<SoftphoneToken> // 60 to 3600 s
+```
+
+**The Disclosure cannot be skipped (ADR 0003).** No request has an option that omits the
+Disclosure or the Recording. The port itself refuses `bridge`, `startRecording` and `forkTracks`
+with `telephony.disclosure_required` until the Disclosure has played on that call, and `forkTracks`
+also needs one whose `aiAssisted` is true. A Recording always has two channels (Rep and Prospect).
+
+**Timeouts.** Every operation but `verifyWebhook` takes `{ timeoutMs }` (default 10 s, at most
+60 s) and gives up with `telephony.unavailable`. `verifyWebhook` does no I/O: it is O(body length)
+with a 256 KiB cap (`MAX_WEBHOOK_BODY_BYTES`), compares an HMAC in constant time on equal-length
+buffers, and returns false for a missing, empty, wrong-length or wrong signature.
+
+**Errors** branch on the code: `telephony.invalid_request`, `not_found` (also another
+Organization's call), `call_ended`, `disclosure_required`, `recording_not_ready`, `rejected`,
+`unavailable` (the only retryable one) and `bad_response`. Messages never hold a number, a
+Disclosure text or a token.
+
+**Scripting the memory adapter.** `script(number, ...)` makes the Prospect answer, not answer
+(`no_answer`), be busy, hang up (during the Disclosure or after the bridge) or the carrier fail.
+`failNext` and `stallNext` make the next call of an operation fail or hang until its timeout;
+`events`/`takeEvents` are what the provider would send as webhooks (`webhookFor` signs one), and
+`operations` is the ordered log that shows the Disclosure came first.
+
 ## Vector store (`VectorStore`)
 
 Services index and search embeddings through the kit's `VectorStore` port (added in 0.8.0). The
