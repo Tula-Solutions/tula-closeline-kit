@@ -661,7 +661,238 @@ interface MemoryObjectStore extends ObjectStore {
 * O(object size), head and delete O(1), list O(n log n) in the Organization's n objects.
 */
 declare function createMemoryObjectStore(options?: MemoryObjectStoreOptions): MemoryObjectStore;
-import { CallId as CallId2, MembershipId as MembershipId2, OrganizationId as OrganizationId2, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
+import { CallId as CallId2, OrganizationId as OrganizationId2 } from "tula-closeline-contract";
+/** The `area.reason` codes the streaming transcribe port and adapters throw or report. */
+declare const STREAMING_TRANSCRIBE_ERROR_CODES: {
+	/** An id, track, audio format, chunk, option or policy is not acceptable. Nothing was sent to the vendor. */
+	readonly invalidRequest: "streaming_transcribe.invalid_request";
+	/** A stream for this Call and track is already open. */
+	readonly conflict: "streaming_transcribe.conflict";
+	/** The stream has closed or failed, so audio can no longer be sent to it. */
+	readonly closed: "streaming_transcribe.closed";
+	/** The vendor refused the stream for a reason a retry cannot fix (credentials, quota, terms). */
+	readonly rejected: "streaming_transcribe.rejected";
+	/** The vendor could not be reached, or the stream could not be restored, after the bounded retries. */
+	readonly unavailable: "streaming_transcribe.unavailable";
+	/** The vendor sent something this adapter cannot use. */
+	readonly badResponse: "streaming_transcribe.bad_response";
+};
+/** One of {@link STREAMING_TRANSCRIBE_ERROR_CODES}'s values. */
+type StreamingTranscribeErrorCode = (typeof STREAMING_TRANSCRIBE_ERROR_CODES)[keyof typeof STREAMING_TRANSCRIBE_ERROR_CODES];
+import { CallId, OrganizationId } from "tula-closeline-contract";
+/** Which side of the Call a stream carries; the track tells the speaker, so no diarization is needed. */
+type StreamTrack = "rep" | "prospect";
+/** How the audio is encoded: 16-bit signed little-endian PCM, or 8-bit mu-law (telephony). */
+type AudioEncoding = "pcm_s16le" | "pcm_mulaw";
+/** The sample rates an adapter accepts, in Hz. */
+type SampleRate = 8000 | 16000 | 24000 | 48000;
+/** How an adapter retries a dropped stream. */
+interface ReconnectPolicy {
+	/** The most reconnect attempts after one drop, 0 to 10; 0 never reconnects. Default 5. */
+	maxAttempts?: number;
+	/** The base of the pause before an attempt, in ms, 1 to 60000; doubled each time and jittered. Default 250. */
+	baseDelayMs?: number;
+	/** The longest pause before an attempt, in ms, before jitter, at least the base and at most 60000. Default 5000. */
+	maxDelayMs?: number;
+}
+/** One word with its timing. */
+interface TranscribedWord {
+	/** The word as heard. Tenant data: never logged. */
+	text: string;
+	/** When it starts, in ms from the start of the stream's audio (continuous across reconnects). */
+	startMs: number;
+	/** When it ends, in ms from the start of the stream's audio; not before `startMs`. */
+	endMs: number;
+	/** How sure the vendor is, 0 to 1, when it says. */
+	confidence?: number;
+}
+/** The words heard so far in a turn, interim or settled. */
+interface TurnEvent {
+	/** Always `turn`. */
+	type: "turn";
+	/** Identifies the turn within the stream; the same for every event of one turn, never reused. */
+	turnId: string;
+	/** Counts the stream's turn events from 1, strictly increasing, so a consumer drops a late or repeated one. */
+	sequence: number;
+	/** False while the text may still change (an interim); true once it is settled (a final). */
+	isFinal: boolean;
+	/**
+	* True when the speaker has finished the turn. Only ever on a final. After it the turn is over
+	* and the next turn event has a new `turnId`. A final without it is a settled part of a turn
+	* still going.
+	*/
+	endOfTurn: boolean;
+	/** All the text of the turn so far, or of this settled part. Tenant data: never logged. */
+	text: string;
+	/** The words of `text` with timings, at most {@link MAX_WORDS_PER_TURN}. */
+	words: readonly TranscribedWord[];
+}
+/** The stream lost its connection and the adapter is trying again. Carries no text. */
+interface ReconnectingEvent {
+	/** Always `reconnecting`. */
+	type: "reconnecting";
+	/** Which attempt this is, from 1. */
+	attempt: number;
+	/** The pause before it, in ms. */
+	delayMs: number;
+}
+/** The stream is back after a drop; audio sent while it was down, up to the replay bound, is replayed. */
+interface ReconnectedEvent {
+	/** Always `reconnected`. */
+	type: "reconnected";
+	/** How many attempts it took. */
+	attempts: number;
+}
+/** The stream failed for good: the terminal event, with no `closed` after it. Carries no text. */
+interface FailedEvent {
+	/** Always `failed`. */
+	type: "failed";
+	/** Why, as an `area.reason` code from the streaming transcribe errors. */
+	code: string;
+	/** How many reconnect attempts were made. */
+	attempts: number;
+}
+/** The stream was closed by the caller: the terminal event. */
+interface ClosedEvent {
+	/** Always `closed`. */
+	type: "closed";
+}
+/** Everything a stream tells its listener, in order. */
+type StreamEvent = TurnEvent | ReconnectingEvent | ReconnectedEvent | FailedEvent | ClosedEvent;
+/** The audio format and listener of one stream. */
+interface OpenStreamRequest {
+	/** The Organization. */
+	organizationId: OrganizationId;
+	/** Our id of the Call; with the track it names the stream: a second live stream for both is `streaming_transcribe.conflict`. */
+	callId: CallId;
+	/** The side of the Call this stream carries. */
+	track: StreamTrack;
+	/** How the audio sent is encoded. */
+	encoding: AudioEncoding;
+	/** The sample rate of the audio sent, in Hz. */
+	sampleRate: SampleRate;
+	/** A BCP 47 tag such as `en` or `en-US`; the vendor's default when absent. */
+	language?: string;
+	/** How to retry a dropped stream; the defaults when absent. */
+	reconnect?: ReconnectPolicy;
+	/**
+	* Receives every event, one at a time and in order. It must return quickly and must not throw;
+	* if it does, the adapter reports the error (metadata only) and goes on. It may be called
+	* before `open` resolves.
+	*/
+	onEvent: (event: StreamEvent) => void;
+}
+/** Options of {@link StreamingTranscribePort.open}. */
+interface StreamingTranscribeOptions {
+	/** The most time opening may take, in ms, 1 to {@link MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS}; default {@link DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS}. */
+	timeoutMs?: number;
+}
+/** One open stream for one audio track. */
+interface TranscribeStream {
+	/** The adapter's id of this stream. */
+	readonly streamId: string;
+	/**
+	* Pushes audio, 1 to {@link MAX_AUDIO_CHUNK_BYTES} bytes, in order and in real time. Returns at
+	* once; while the connection is down the adapter holds up to {@link MAX_REPLAY_AUDIO_BYTES} and
+	* drops the oldest beyond that. On a stream that has closed or failed it throws
+	* `streaming_transcribe.closed`. The audio is never logged.
+	*/
+	sendAudio(chunk: Uint8Array): void;
+	/**
+	* Ends the stream: the vendor is asked to settle what it has (a last final turn may still
+	* arrive), then `closed` is the last event. Idempotent. A stream that already failed resolves
+	* without a further event. Bounded by the adapter's own timeout.
+	*/
+	close(): Promise<void>;
+}
+/**
+* Live speech-to-text behind a vendor (AssemblyAI first), scoped by Organization. One stream
+* carries one track of a Call, so the speaker is known without diarization.
+*
+* Per stream, the events arrive in order: `turn` events with an increasing `sequence`; within a
+* turn any number of interims, then a final; the final that ends the turn has `endOfTurn: true`.
+* A dropped connection is retried with a bounded, jittered pause ({@link reconnectDelayMs}) and
+* shown as `reconnecting` then `reconnected`; word times stay continuous. When the attempts run
+* out the stream ends with one `failed` event and the error is given to the
+* {@link ErrorReporter} (metadata only): it is never thrown at the caller, because nothing is
+* calling. Exactly one of `closed` or `failed` ends a stream, and nothing follows it.
+*
+* Nothing here logs, reports or puts in an error any audio or any transcript text (tenant data).
+*/
+interface StreamingTranscribePort {
+	/**
+	* Opens a stream and resolves once the vendor accepted it. Not idempotent: it opens one stream,
+	* and a second for the same Call and track while the first is live is
+	* `streaming_transcribe.conflict`. A vendor that cannot be reached is `unavailable` after the
+	* bounded retries. O(1).
+	*/
+	open(request: OpenStreamRequest, options?: StreamingTranscribeOptions): Promise<TranscribeStream>;
+}
+/** One turn a scripted speaker says once enough audio has been sent. */
+interface ScriptedTurn {
+	/** The words said, separated by spaces: 1 to 200 words. */
+	text: string;
+	/** The turn is spoken when the stream has been sent at least this many audio bytes in all. */
+	afterBytes: number;
+	/** How many interim events come before the final, 0 to the word count minus one; default 2 or fewer. */
+	interims?: number;
+	/** False for a settled part of a turn that goes on; default true. */
+	endOfTurn?: boolean;
+}
+/** What a test sees of a stream (never the audio or the text). */
+interface MemoryStreamView {
+	/** The adapter's id. */
+	streamId: string;
+	/** The Organization. */
+	organizationId: OrganizationId2;
+	/** The Call. */
+	callId: CallId2;
+	/** The track. */
+	track: StreamTrack;
+	/** Where it is now. */
+	state: "open" | "reconnecting" | "closed" | "failed";
+	/** How many audio bytes it has been sent. */
+	audioBytes: number;
+	/** How many times it dropped and came back. */
+	reconnects: number;
+}
+/** Options for {@link createMemoryStreamingTranscribe}. */
+interface MemoryStreamingTranscribeOptions {
+	/** Receives the unrecoverable-failure error; nothing if absent. */
+	reporter?: ErrorReporter;
+	/** Where reconnects and listener failures are noted (metadata only); nothing if absent. */
+	logger?: Logger;
+	/** Pauses before a reconnect attempt; real time by default, injected so tests do not wait. */
+	sleep?: Sleep;
+	/** A number in `[0, 1)` for the jitter; `Math.random` by default. */
+	random?: () => number;
+}
+/** A {@link StreamingTranscribePort} that plays scripted speakers in the process, for tests. Not for production. */
+interface MemoryStreamingTranscribe extends StreamingTranscribePort {
+	/** Sets the turns the speaker of a Call's track says; a later script replaces the earlier. */
+	script(organizationId: OrganizationId2, callId: CallId2, track: StreamTrack, turns: readonly ScriptedTurn[]): void;
+	/**
+	* Drops the connection of a stream as a vendor socket closing would, and resolves once the
+	* stream is back (`reconnected`) or has failed. Does nothing to a stream that is not open.
+	*/
+	dropConnection(streamId: string): Promise<void>;
+	/** Makes the next `times` (default 1) reconnect attempts of any stream fail. */
+	failReconnects(times?: number): void;
+	/** Makes the next `times` (default 1) opens throw a StreamingTranscribeError with `code`. */
+	failNextOpen(code: StreamingTranscribeErrorCode, times?: number): void;
+	/** The streams opened so far, in order. */
+	streams(): MemoryStreamView[];
+}
+/**
+* Builds a {@link StreamingTranscribePort} for tests that plays scripted speakers: once a stream
+* has been sent enough audio, its next scripted turn arrives as interim events (the first words,
+* growing), a final and, by default, the end-of-turn mark. It keeps the rules a real adapter
+* must: Organization scoping, one live stream per Call and track, bounded jittered reconnects
+* with continuous word times, one terminal event, and no audio or text in logs or reports. Not
+* for production.
+*/
+declare function createMemoryStreamingTranscribe(options?: MemoryStreamingTranscribeOptions): MemoryStreamingTranscribe;
+import { CallId as CallId4, MembershipId as MembershipId2, OrganizationId as OrganizationId4, VoiceCallFailureReason as VoiceCallFailureReason2 } from "tula-closeline-contract";
 /** The `area.reason` codes the telephony port and adapters throw. */
 declare const TELEPHONY_ERROR_CODES: {
 	/** An id, number, text, URL or option is not acceptable. Nothing was sent to the provider. */
@@ -683,7 +914,7 @@ declare const TELEPHONY_ERROR_CODES: {
 };
 /** One of {@link TELEPHONY_ERROR_CODES}'s values. */
 type TelephonyErrorCode = (typeof TELEPHONY_ERROR_CODES)[keyof typeof TELEPHONY_ERROR_CODES];
-import { CallId, MembershipId, OrganizationId, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
+import { CallId as CallId3, MembershipId, OrganizationId as OrganizationId3, SoftphoneToken, VoiceCallFailureReason } from "tula-closeline-contract";
 /** Options every operation of {@link TelephonyPort} accepts. */
 interface TelephonyOptions {
 	/**
@@ -696,16 +927,16 @@ interface TelephonyOptions {
 /** Which Organization a provider call belongs to and which provider call it is. */
 interface ProviderCallRef {
 	/** The Organization. A call or Recording of another Organization is `telephony.not_found`. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** The provider's id of the call leg to the Prospect: opaque, 1 to 128 of letters, digits, `.`, `_`, `:` and `-`. */
 	providerCallId: string;
 }
 /** The call a service asks the provider to place to a Prospect. */
 interface PlaceCallRequest {
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** Our id of the Call, kept by the adapter as a tag on the provider call; it never leaves the provider as speech. */
-	callId: CallId;
+	callId: CallId3;
 	/**
 	* Required. The same key places exactly one provider call: a repeat returns the first one with
 	* `created: false`. 1 to 128 of letters, digits, `.`, `_`, `:` and `-`.
@@ -726,7 +957,7 @@ interface PlacedCall {
 /** An inbound call the provider has received, to be answered. */
 interface AnswerCallRequest extends ProviderCallRef {
 	/** Our id of the Call. */
-	callId: CallId;
+	callId: CallId3;
 	/** The Reps' browser legs to ring, 1 to {@link MAX_RING_LEGS}; the first to answer is bridged. */
 	ringIdentities: MembershipId[];
 }
@@ -785,7 +1016,7 @@ interface HangUpRequest extends ProviderCallRef {
 /** Names a provider-side Recording. */
 interface RecordingRef {
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** The provider's id of the Recording, from {@link StartedRecording.recordingId}. */
 	recordingId: string;
 }
@@ -812,7 +1043,7 @@ interface WebhookRequest {
 /** What {@link TelephonyPort.mintBrowserToken} is asked for. */
 interface BrowserTokenRequest {
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** The Rep the token is for: the only identity it carries besides the Organization. */
 	identity: MembershipId;
 	/** How long it lives, in seconds, 60 to 3600; default 900. */
@@ -825,7 +1056,7 @@ interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
 	eventId: string;
 	/** The Organization. */
-	organizationId: OrganizationId;
+	organizationId: OrganizationId3;
 	/** The provider call. */
 	providerCallId: string;
 	/** What happened. */
@@ -957,11 +1188,11 @@ interface MemoryTelephonyOptions {
 /** What a test sees of a provider call (never a number or a Disclosure text). */
 interface MemoryCallView {
 	/** The Organization. */
-	organizationId: OrganizationId2;
+	organizationId: OrganizationId4;
 	/** The provider's id. */
 	providerCallId: string;
 	/** Our Call id, when the call was placed or answered with one. */
-	callId: CallId2 | null;
+	callId: CallId4 | null;
 	/** Placed by us, or received. */
 	direction: "outbound" | "inbound";
 	/** `incoming` until answered, `connected` while up, `ended` after. */
@@ -994,9 +1225,9 @@ interface MemoryTelephony extends TelephonyPort {
 	/** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
 	script(number: string, behaviour: ScriptedProspect): void;
 	/** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
-	receiveInbound(organizationId: OrganizationId2, from: string, to: string): string;
+	receiveInbound(organizationId: OrganizationId4, from: string, to: string): string;
 	/** Has the Prospect on this call hang up now; a call that has ended is left alone. */
-	prospectHangsUp(organizationId: OrganizationId2, providerCallId: string): void;
+	prospectHangsUp(organizationId: OrganizationId4, providerCallId: string): void;
 	/** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
 	failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void;
 	/** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
@@ -1461,4 +1692,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, ScriptedProspect, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
+export { CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryLogger, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryVectorStore, MemoryVectorStoreOptions, MintTokenOptions, ScriptedOutcome, ScriptedProspect, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLogger, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestToken, testNote, testOrganizationId, testPing, testUserId };
