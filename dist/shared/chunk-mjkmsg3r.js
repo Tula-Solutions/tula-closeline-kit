@@ -30,10 +30,6 @@ function createFixedClock2(start) {
   };
 }
 
-// src/queue/envelope.ts
-import { organizationIdSchema as contractOrganizationIdSchema } from "tula-closeline-contract";
-import { z } from "zod";
-
 // src/queue/errors.ts
 var QUEUE_ERROR_CODES2 = {
   invalidMessage: "queue.invalid_message",
@@ -70,6 +66,8 @@ class QueueError2 extends AppError2 {
 }
 
 // src/queue/envelope.ts
+import { organizationIdSchema as contractOrganizationIdSchema } from "tula-closeline-contract";
+import { z } from "zod";
 var MAX_MESSAGE_BYTES2 = 262144;
 var TYPE_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
 function defineMessage2(definition) {

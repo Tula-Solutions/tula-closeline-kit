@@ -82,7 +82,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-hpgsqwv7.js";
+} from "./shared/chunk-wrcc1eww.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -92,7 +92,7 @@ import {
   defineMessage2,
   INVALID_REASONS2,
   createMessageRegistry2
-} from "./shared/chunk-5cxd570z.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   AUDIT_ERROR_CODES2,
   AuditError2,
@@ -171,7 +171,7 @@ import {
   assertReceiveOptions2,
   assertVisibility2,
   assertBatchCount2
-} from "./shared/chunk-xfecgbam.js";
+} from "./shared/chunk-h070fpj8.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";

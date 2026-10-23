@@ -16,7 +16,7 @@ import {
 } from "./shared/chunk-q819sn0x.js";
 import {
   MAX_MESSAGE_BYTES2
-} from "./shared/chunk-5cxd570z.js";
+} from "./shared/chunk-mjkmsg3r.js";
 import {
   waitForTranscription2
 } from "./shared/chunk-83cpvtqk.js";
