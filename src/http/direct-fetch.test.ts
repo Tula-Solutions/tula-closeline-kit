@@ -14,6 +14,9 @@ const server = Bun.serve({
     if (path === '/hop') {
       return Response.redirect(`http://127.0.0.1:${other.port}/`, 302)
     }
+    if (path === '/start') {
+      return Response.redirect(new URL('/self', request.url).href, 302)
+    }
     if (path === '/none') {
       return new Response(null, { status: 204 })
     }
@@ -58,6 +61,14 @@ describe('directFetch', () => {
   test('follow drops the authorization header on a cross-origin redirect (fetch behaviour, pinned)', async () => {
     const cross = await directFetch(`${base}/hop`, { headers: { authorization: 'Bearer s' } })
     expect(await cross.json()).toEqual({ auth: null })
+  })
+
+  test('follow keeps the authorization header on a same-origin redirect', async () => {
+    const same = await directFetch(`${base}/start`, {
+      redirect: 'follow',
+      headers: { authorization: 'Bearer s' },
+    })
+    expect(await same.json()).toMatchObject({ auth: 'Bearer s' })
   })
 
   test('answers 204 with no body and honours an abort signal', async () => {
