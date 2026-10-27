@@ -1551,11 +1551,9 @@ interface HttpContactGuard extends ContactGuard {
 declare function createHttpContactGuard(options: HttpContactGuardOptions): HttpContactGuard;
 /**
 * `fetch` for adapters that send credentials, and it never uses a proxy named in the environment
-* (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms). Bun's `fetch` follows
-* them, and Bun 1.4.2 has no per-request opt-out (`proxy: false` arrived in 1.4.3), so this goes
-* through `node:http(s)` with `agent: false`, which reads no proxy variable. `proxy.test.ts` pins it.
-* It takes string, `URLSearchParams` or byte bodies, answers uncompressed (no `Accept-Encoding`),
-* and follows redirects itself only for `redirect: 'follow'`, dropping credentials on a new origin.
+* (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms): `proxy: false` is Bun's
+* per-request opt-out (Bun 1.4.3 and later). `proxy.test.ts` pins it for http and https.
+* Redirects, compression and credential stripping are `fetch`'s own; callers pass `redirect: 'manual'`.
 */
 declare function directFetch(input: string, init?: RequestInit): Promise<Response>;
 /** The `area.reason` codes the language model port and adapters throw. */

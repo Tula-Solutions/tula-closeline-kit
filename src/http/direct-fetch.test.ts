@@ -14,9 +14,6 @@ const server = Bun.serve({
     if (path === '/hop') {
       return Response.redirect(`http://127.0.0.1:${other.port}/`, 302)
     }
-    if (path === '/self') {
-      return Response.redirect('/echo', 302)
-    }
     if (path === '/none') {
       return new Response(null, { status: 204 })
     }
@@ -53,13 +50,13 @@ describe('directFetch', () => {
     })
   })
 
-  test('redirect manual returns the redirect; follow keeps credentials on one origin only', async () => {
+  test('redirect manual returns the redirect', async () => {
     const manual = await directFetch(`${base}/hop`, { redirect: 'manual' })
     expect(manual.status).toBe(302)
-    const headers = { authorization: 'Bearer s' }
-    const same = await directFetch(`${base}/self`, { headers })
-    expect(((await same.json()) as { auth: string }).auth).toBe('Bearer s')
-    const cross = await directFetch(`${base}/hop`, { headers })
+  })
+
+  test('follow drops the authorization header on a cross-origin redirect (fetch behaviour, pinned)', async () => {
+    const cross = await directFetch(`${base}/hop`, { headers: { authorization: 'Bearer s' } })
     expect(await cross.json()).toEqual({ auth: null })
   })
 
