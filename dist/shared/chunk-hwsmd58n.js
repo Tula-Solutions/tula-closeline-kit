@@ -35,7 +35,7 @@ import {
 } from "./chunk-hybwyj31.js";
 import {
   systemClock2
-} from "./chunk-mjkmsg3r.js";
+} from "./chunk-5cxd570z.js";
 import {
   AppError2,
   isAppError2
@@ -113,6 +113,272 @@ function parseAuditEntry2(input, clock = systemClock2) {
     });
   }
   return entry;
+}
+
+// src/messaging/deadline.ts
+function startMessagingDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new MessagingError2(MESSAGING_ERROR_CODES2.timeout, "The send took too long", {
+          details: { timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new MessagingError2(MESSAGING_ERROR_CODES2.aborted, "The send was cancelled");
+      }
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+
+class AttemptAborted extends Error {
+  constructor() {
+    super("The attempt was aborted");
+    this.name = "AttemptAborted";
+  }
+}
+function raceAbort(promise, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      promise.catch(() => {
+        return;
+      });
+      reject(new AttemptAborted);
+      return;
+    }
+    const onAbort = () => reject(new AttemptAborted);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+}
+function isRetryableMessagingError(error) {
+  return error instanceof MessagingError2 && error.code === MESSAGING_ERROR_CODES2.unavailable;
+}
+async function withMessagingRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableMessagingError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const delayMs = messagingRetryDelayMs2(n, options.policy, options.random);
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/calendar/deadline.ts
+function startCalendarDeadline(timeoutMs, caller) {
+  const controller = new AbortController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onCaller = () => controller.abort();
+  if (caller?.aborted) {
+    controller.abort();
+  }
+  caller?.addEventListener("abort", onCaller, { once: true });
+  return {
+    signal: controller.signal,
+    check() {
+      if (timedOut) {
+        throw new CalendarError2(CALENDAR_ERROR_CODES2.timeout, "The call took too long", {
+          details: { timeoutMs }
+        });
+      }
+      if (controller.signal.aborted) {
+        throw new CalendarError2(CALENDAR_ERROR_CODES2.aborted, "The call was cancelled");
+      }
+    },
+    stop() {
+      clearTimeout(timer);
+      caller?.removeEventListener("abort", onCaller);
+    }
+  };
+}
+function isRetryableCalendarError(error) {
+  return error instanceof CalendarError2 && error.code === CALENDAR_ERROR_CODES2.unavailable;
+}
+async function withCalendarRetry(attempt, options) {
+  const sleep = options.sleep ?? systemSleep2;
+  for (let n = 1;; n++) {
+    options.deadline.check();
+    try {
+      return await attempt(n);
+    } catch (error) {
+      options.deadline.check();
+      if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
+        throw error;
+      }
+      const computed = calendarRetryDelayMs2(n, options.policy, options.random);
+      const delayMs = options.adjustDelay?.(error, computed) ?? computed;
+      options.onRetry?.(n, delayMs);
+      await sleep(delayMs, options.deadline.signal);
+    }
+  }
+}
+
+// src/calendar/validate.ts
+import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
+import { z as z2 } from "zod";
+function invalid(what) {
+  throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function integerIn(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function checkOptions(options) {
+  if (options !== undefined && (typeof options !== "object" || options === null)) {
+    invalid("options");
+  }
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
+  if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
+    invalid("timeoutMs");
+  }
+  if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+    invalid("signal");
+  }
+  const policy = options?.retry;
+  const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn(maxRetries, 0, 5)) {
+    invalid("retry.maxRetries");
+  }
+  if (!integerIn(baseDelayMs, 1, 60000)) {
+    invalid("retry.baseDelayMs");
+  }
+  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
+    invalid("retry.maxDelayMs");
+  }
+  return {
+    timeoutMs,
+    retry: { maxRetries, baseDelayMs, maxDelayMs },
+    ...options?.signal === undefined ? {} : { signal: options.signal }
+  };
+}
+function parse(schema, value, what) {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
+    return invalid(path ? `${what}.${path}` : what);
+  }
+  return parsed.data;
+}
+var instant = z2.iso.datetime({ offset: true });
+var requestIdSchema = z2.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
+var eventIdSchema = z2.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/);
+var attendeeSchema = z2.strictObject({
+  email: z2.email().max(254),
+  name: z2.string().min(1).max(200).optional()
+});
+var titleSchema = z2.string().min(1).max(256);
+var descriptionSchema = z2.string().max(8192);
+var locationSchema = z2.string().max(512);
+var attendeesSchema = z2.array(attendeeSchema).max(MAX_EVENT_ATTENDEES2);
+var eventSchema = z2.strictObject({
+  title: titleSchema,
+  start: instant,
+  end: instant,
+  description: descriptionSchema.optional(),
+  location: locationSchema.optional(),
+  attendees: attendeesSchema.optional(),
+  conferencing: z2.enum(["video", "none"]).optional()
+});
+var changesSchema = z2.strictObject({
+  title: titleSchema.optional(),
+  start: instant.optional(),
+  end: instant.optional(),
+  description: descriptionSchema.optional(),
+  location: locationSchema.optional(),
+  attendees: attendeesSchema.optional()
+}).refine((c) => Object.values(c).some((v) => v !== undefined));
+var grantSchema = z2.discriminatedUnion("kind", [
+  z2.strictObject({
+    kind: z2.literal("authorization_code"),
+    code: z2.string().min(1).max(4096),
+    redirectUri: z2.url().max(2048),
+    codeVerifier: z2.string().min(1).max(256).optional()
+  }),
+  z2.strictObject({ kind: z2.literal("refresh_token"), refreshToken: z2.string().min(1).max(4096) })
+]);
+function checkOrganizationId(value) {
+  return organizationIdSchema2.safeParse(value).success ? value : invalid("organizationId");
+}
+function checkBase(request) {
+  if (typeof request !== "object" || request === null) {
+    return invalid("request");
+  }
+  checkOrganizationId(request.organizationId);
+  if (!(request.connection instanceof CalendarConnection2)) {
+    return invalid("connection");
+  }
+  if (request.connection.organizationId !== request.organizationId) {
+    return invalid("connection");
+  }
+  return request.connection;
+}
+function checkGrant(value) {
+  return parse(grantSchema, value, "grant");
+}
+function checkRequestId(value) {
+  return parse(requestIdSchema, value, "requestId");
+}
+function checkEventId(value) {
+  return parse(eventIdSchema, value, "eventId");
+}
+function checkRange(from, to) {
+  const fromMs = Date.parse(parse(instant, from, "from"));
+  const toMs = Date.parse(parse(instant, to, "to"));
+  if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
+    invalid("range");
+  }
+  return { fromMs, toMs };
+}
+function checkEventTimes(startMs, endMs) {
+  if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
+    invalid("event.times");
+  }
+}
+function checkEvent(value) {
+  const event = parse(eventSchema, value, "event");
+  const startMs = Date.parse(event.start);
+  const endMs = Date.parse(event.end);
+  checkEventTimes(startMs, endMs);
+  return { event, startMs, endMs };
+}
+function checkChanges(value) {
+  return parse(changesSchema, value, "changes");
 }
 
 // src/consent/port.ts
@@ -1234,8 +1500,271 @@ class TelephonyError2 extends AppError2 {
   }
 }
 
+// src/telephony/validate.ts
+import {
+  callIdSchema,
+  e164PhoneSchema,
+  membershipIdSchema,
+  organizationIdSchema as organizationIdSchema3
+} from "tula-closeline-contract";
+var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+var CONTROL = /[\u0000-\u001f\u007f]/;
+function invalid2(what) {
+  throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
+}
+function checkOrganizationId2(value) {
+  return organizationIdSchema3.safeParse(value).success ? value : invalid2("organizationId");
+}
+function checkCallId(value) {
+  return callIdSchema.safeParse(value).success ? value : invalid2("callId");
+}
+function checkIdentity(value) {
+  return membershipIdSchema.safeParse(value).success ? value : invalid2("identity");
+}
+function checkNumber(value, what) {
+  return e164PhoneSchema.safeParse(value).success ? value : invalid2(what);
+}
+function checkProviderId(value, what) {
+  return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid2(what);
+}
+function checkDisclosure(version, text, aiAssisted) {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    invalid2("wordingVersion");
+  }
+  if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_DISCLOSURE_TEXT_LENGTH2 || CONTROL.test(text)) {
+    invalid2("text");
+  }
+  if (typeof aiAssisted !== "boolean") {
+    invalid2("aiAssisted");
+  }
+}
+function checkRingIdentities(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RING_LEGS2) {
+    invalid2("ringIdentities");
+  }
+  const identities = value.map(checkIdentity);
+  return [...new Set(identities)];
+}
+function checkDestinationUrl(value, allowPlain) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
+    invalid2("destinationUrl");
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return invalid2("destinationUrl");
+  }
+  const secure = url.protocol === "wss:";
+  if (!(secure || allowPlain && url.protocol === "ws:") || url.username || url.password) {
+    invalid2("destinationUrl");
+  }
+  return value;
+}
+function resolveTimeout(options, fallback) {
+  const value = options?.timeoutMs ?? fallback;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_TELEPHONY_TIMEOUT_MS2) {
+    invalid2("timeoutMs");
+  }
+  return value;
+}
+function requireDisclosure(played, needsAi = false) {
+  if (!played) {
+    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure has not played on this call");
+  }
+  if (needsAi && !played.aiAssisted) {
+    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure did not say an AI takes part");
+  }
+  return played;
+}
+
+// src/messaging/consent.ts
+var DENIAL_CODES = [
+  "consent.missing",
+  "consent.withdrawn",
+  "consent.suppressed",
+  "consent.unavailable"
+];
+function denied(code) {
+  return new MessagingError2(MESSAGING_ERROR_CODES2.consentDenied, "The Contact Check did not allow this message", {
+    details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
+  });
+}
+async function requireConsent(guard, request, deadline) {
+  let result;
+  try {
+    result = await raceAbort(Promise.resolve().then(() => guard.check({
+      organizationId: request.organizationId,
+      prospectId: request.prospectId,
+      phone: request.to,
+      channel: request.channel,
+      purpose: request.purpose
+    })), deadline.signal);
+  } catch (error) {
+    if (error instanceof AttemptAborted) {
+      deadline.check();
+    }
+    throw denied("consent.unavailable");
+  }
+  if (typeof result !== "object" || result === null || result.allowed !== true) {
+    throw denied(typeof result === "object" && result !== null && "code" in result ? String(result.code) : "consent.unavailable");
+  }
+  if (typeof result.checkId !== "string") {
+    throw denied("consent.unavailable");
+  }
+  return { consentCheckId: result.checkId };
+}
+
+// src/messaging/validate.ts
+import { e164PhoneSchema as e164PhoneSchema2, organizationIdSchema as organizationIdSchema4, prospectIdSchema as prospectIdSchema2 } from "tula-closeline-contract";
+var KEY = /^[A-Za-z0-9_.:-]{1,200}$/;
+var TEMPLATE_ID = /^HX[0-9a-fA-F]{32}$/;
+var VARIABLE_NAME = /^[A-Za-z0-9_]{1,64}$/;
+var REQUEST_KEYS = new Set([
+  "organizationId",
+  "prospectId",
+  "channel",
+  "purpose",
+  "to",
+  "content",
+  "idempotencyKey",
+  "timeoutMs",
+  "retry",
+  "signal"
+]);
+function invalid3(what) {
+  throw new MessagingError2(MESSAGING_ERROR_CODES2.invalidRequest, `${what} is not acceptable`, {
+    details: { field: what }
+  });
+}
+function integerIn2(value, min, max) {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resolveMessagingRetryPolicy(policy) {
+  if (policy !== undefined && !isRecord(policy)) {
+    invalid3("retry");
+  }
+  const maxRetries = policy?.maxRetries ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxRetries;
+  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.baseDelayMs;
+  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxDelayMs;
+  if (!integerIn2(maxRetries, 0, 5)) {
+    invalid3("retry.maxRetries");
+  }
+  if (!integerIn2(baseDelayMs, 1, 60000)) {
+    invalid3("retry.baseDelayMs");
+  }
+  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
+    invalid3("retry.maxDelayMs");
+  }
+  return { maxRetries, baseDelayMs, maxDelayMs };
+}
+function checkContent(value, channel) {
+  if (!isRecord(value)) {
+    return invalid3("content");
+  }
+  const extra = (allowed) => Object.keys(value).some((k) => !allowed.includes(k));
+  if (value.kind === "text") {
+    if (extra(["kind", "body"])) {
+      invalid3("content");
+    }
+    const body = value.body;
+    if (typeof body !== "string" || body.length < 1 || body.length > MAX_MESSAGE_BODY_CHARS2) {
+      invalid3("content.body");
+    }
+    if (body.trim().length === 0) {
+      invalid3("content.body");
+    }
+    return { kind: "text", body };
+  }
+  if (value.kind === "template") {
+    if (extra(["kind", "templateId", "variables"])) {
+      invalid3("content");
+    }
+    if (channel !== "whatsapp") {
+      invalid3("content.kind");
+    }
+    const templateId = value.templateId;
+    if (typeof templateId !== "string" || !TEMPLATE_ID.test(templateId)) {
+      invalid3("content.templateId");
+    }
+    if (value.variables === undefined) {
+      return { kind: "template", templateId };
+    }
+    if (!isRecord(value.variables)) {
+      return invalid3("content.variables");
+    }
+    const entries = Object.entries(value.variables);
+    if (entries.length > MAX_TEMPLATE_VARIABLES2) {
+      invalid3("content.variables");
+    }
+    const variables = {};
+    for (const [name, text] of entries) {
+      if (!VARIABLE_NAME.test(name) || typeof text !== "string" || text.length > MAX_TEMPLATE_VARIABLE_CHARS2) {
+        invalid3("content.variables");
+      }
+      variables[name] = text;
+    }
+    return { kind: "template", templateId, variables };
+  }
+  return invalid3("content.kind");
+}
+function checkSendRequest(request) {
+  if (!isRecord(request)) {
+    return invalid3("request");
+  }
+  for (const key of Object.keys(request)) {
+    if (!REQUEST_KEYS.has(key)) {
+      invalid3("request");
+    }
+  }
+  const organization = organizationIdSchema4.safeParse(request.organizationId);
+  if (!organization.success) {
+    return invalid3("organizationId");
+  }
+  const prospect = prospectIdSchema2.safeParse(request.prospectId);
+  if (!prospect.success) {
+    return invalid3("prospectId");
+  }
+  const channel = MESSAGING_CHANNELS2.find((c) => c === request.channel);
+  if (channel === undefined) {
+    return invalid3("channel");
+  }
+  const purpose = MESSAGING_PURPOSES2.find((p) => p === request.purpose);
+  if (purpose === undefined) {
+    return invalid3("purpose");
+  }
+  if (!e164PhoneSchema2.safeParse(request.to).success || typeof request.to !== "string") {
+    return invalid3("to");
+  }
+  if (typeof request.idempotencyKey !== "string" || !KEY.test(request.idempotencyKey)) {
+    return invalid3("idempotencyKey");
+  }
+  const timeoutMs = request.timeoutMs ?? DEFAULT_MESSAGING_TIMEOUT_MS2;
+  if (!integerIn2(timeoutMs, 1, MAX_MESSAGING_TIMEOUT_MS2)) {
+    return invalid3("timeoutMs");
+  }
+  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
+    return invalid3("signal");
+  }
+  return {
+    organizationId: organization.data,
+    prospectId: prospect.data,
+    channel,
+    purpose,
+    to: request.to,
+    content: checkContent(request.content, channel),
+    idempotencyKey: request.idempotencyKey,
+    timeoutMs,
+    retry: resolveMessagingRetryPolicy(request.retry),
+    signal: request.signal
+  };
+}
+
 // src/messaging/webhook.ts
-import { e164PhoneSchema } from "tula-closeline-contract";
+import { e164PhoneSchema as e164PhoneSchema3 } from "tula-closeline-contract";
 var STOP = new Set(["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"]);
 var START = new Set(["START", "UNSTOP", "YES"]);
 var HELP = new Set(["HELP", "INFO"]);
@@ -1282,7 +1811,7 @@ function address(value) {
   }
   const whatsapp = value.startsWith("whatsapp:");
   const number = whatsapp ? value.slice("whatsapp:".length) : value;
-  if (!e164PhoneSchema.safeParse(number).success) {
+  if (!e164PhoneSchema3.safeParse(number).success) {
     return bad("address");
   }
   return { channel: whatsapp ? "whatsapp" : "sms", number };
@@ -1420,617 +1949,6 @@ function reconnectDelayMs2(attempt, policy, random = Math.random) {
   return Math.max(1, Math.floor(exponential * (0.5 + random())));
 }
 
-// src/tts/audio.ts
-var INSPECT = Symbol.for("nodejs.util.inspect.custom");
-
-class TtsAudioChunk2 {
-  sequence;
-  byteLength;
-  #audio;
-  constructor(sequence, audio) {
-    this.sequence = sequence;
-    this.byteLength = audio.byteLength;
-    this.#audio = audio;
-  }
-  get audio() {
-    return this.#audio;
-  }
-  toJSON() {
-    return { sequence: this.sequence, byteLength: this.byteLength };
-  }
-  toString() {
-    return `TtsAudioChunk(#${this.sequence}, ${this.byteLength} bytes)`;
-  }
-  [INSPECT]() {
-    return this.toString();
-  }
-}
-
-// src/tts/port.ts
-var DEFAULT_TTS_TIMEOUT_MS2 = 30000;
-var MAX_TTS_TIMEOUT_MS2 = 120000;
-var DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 2000;
-var MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 30000;
-var DEFAULT_TTS_MAX_TEXT_CHARS2 = 5000;
-var MAX_TTS_MAX_TEXT_CHARS2 = 20000;
-var MAX_TTS_AUDIO_CHUNK_BYTES2 = 65536;
-var DEFAULT_TTS_RETRY_POLICY2 = {
-  maxRetries: 1,
-  baseDelayMs: 50,
-  maxDelayMs: 250
-};
-function ttsRetryDelayMs2(retry, policy, random = Math.random) {
-  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
-  return Math.max(1, Math.floor(exponential * (0.5 + random())));
-}
-
-// src/vector/errors.ts
-var VECTOR_ERROR_CODES2 = {
-  invalidRequest: "vector.invalid_request",
-  dimensionMismatch: "vector.dimension_mismatch",
-  rejected: "vector.rejected",
-  unavailable: "vector.unavailable",
-  badResponse: "vector.bad_response"
-};
-var STATUS4 = {
-  "vector.invalid_request": 400,
-  "vector.dimension_mismatch": 422,
-  "vector.rejected": 500,
-  "vector.unavailable": 503,
-  "vector.bad_response": 502
-};
-
-class VectorError2 extends AppError2 {
-  constructor(code, message, options = {}) {
-    super({
-      code,
-      status: STATUS4[code],
-      message,
-      ...options.cause === undefined ? {} : { cause: options.cause },
-      ...options.details === undefined ? {} : { details: options.details }
-    });
-    this.name = "VectorError";
-  }
-}
-
-// src/vector/port.ts
-var MAX_UPSERT_BATCH2 = 500;
-var MAX_DELETE_BATCH2 = 500;
-var MAX_VECTOR_ID_LENGTH2 = 64;
-var MAX_TOP_K2 = 100;
-var MAX_DIMENSIONS2 = 4096;
-var MAX_ATTRIBUTES2 = 16;
-var MAX_ATTRIBUTE_STRING2 = 512;
-
-// src/messaging/deadline.ts
-function startMessagingDeadline(timeoutMs, caller) {
-  const controller = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  timer.unref?.();
-  const onCaller = () => controller.abort();
-  if (caller?.aborted) {
-    controller.abort();
-  }
-  caller?.addEventListener("abort", onCaller, { once: true });
-  return {
-    signal: controller.signal,
-    check() {
-      if (timedOut) {
-        throw new MessagingError2(MESSAGING_ERROR_CODES2.timeout, "The send took too long", {
-          details: { timeoutMs }
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new MessagingError2(MESSAGING_ERROR_CODES2.aborted, "The send was cancelled");
-      }
-    },
-    stop() {
-      clearTimeout(timer);
-      caller?.removeEventListener("abort", onCaller);
-    }
-  };
-}
-
-class AttemptAborted extends Error {
-  constructor() {
-    super("The attempt was aborted");
-    this.name = "AttemptAborted";
-  }
-}
-function raceAbort(promise, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      promise.catch(() => {
-        return;
-      });
-      reject(new AttemptAborted);
-      return;
-    }
-    const onAbort = () => reject(new AttemptAborted);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then((value) => {
-      signal.removeEventListener("abort", onAbort);
-      resolve(value);
-    }, (error) => {
-      signal.removeEventListener("abort", onAbort);
-      reject(error);
-    });
-  });
-}
-function isRetryableMessagingError(error) {
-  return error instanceof MessagingError2 && error.code === MESSAGING_ERROR_CODES2.unavailable;
-}
-async function withMessagingRetry(attempt, options) {
-  const sleep = options.sleep ?? systemSleep2;
-  for (let n = 1;; n++) {
-    options.deadline.check();
-    try {
-      return await attempt(n);
-    } catch (error) {
-      options.deadline.check();
-      if (!isRetryableMessagingError(error) || n > options.policy.maxRetries) {
-        throw error;
-      }
-      const delayMs = messagingRetryDelayMs2(n, options.policy, options.random);
-      options.onRetry?.(n, delayMs);
-      await sleep(delayMs, options.deadline.signal);
-    }
-  }
-}
-
-// src/calendar/deadline.ts
-function startCalendarDeadline(timeoutMs, caller) {
-  const controller = new AbortController;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const onCaller = () => controller.abort();
-  if (caller?.aborted) {
-    controller.abort();
-  }
-  caller?.addEventListener("abort", onCaller, { once: true });
-  return {
-    signal: controller.signal,
-    check() {
-      if (timedOut) {
-        throw new CalendarError2(CALENDAR_ERROR_CODES2.timeout, "The call took too long", {
-          details: { timeoutMs }
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new CalendarError2(CALENDAR_ERROR_CODES2.aborted, "The call was cancelled");
-      }
-    },
-    stop() {
-      clearTimeout(timer);
-      caller?.removeEventListener("abort", onCaller);
-    }
-  };
-}
-function isRetryableCalendarError(error) {
-  return error instanceof CalendarError2 && error.code === CALENDAR_ERROR_CODES2.unavailable;
-}
-async function withCalendarRetry(attempt, options) {
-  const sleep = options.sleep ?? systemSleep2;
-  for (let n = 1;; n++) {
-    options.deadline.check();
-    try {
-      return await attempt(n);
-    } catch (error) {
-      options.deadline.check();
-      if (!isRetryableCalendarError(error) || n > options.policy.maxRetries) {
-        throw error;
-      }
-      const computed = calendarRetryDelayMs2(n, options.policy, options.random);
-      const delayMs = options.adjustDelay?.(error, computed) ?? computed;
-      options.onRetry?.(n, delayMs);
-      await sleep(delayMs, options.deadline.signal);
-    }
-  }
-}
-
-// src/calendar/validate.ts
-import { organizationIdSchema as organizationIdSchema2 } from "tula-closeline-contract";
-import { z as z2 } from "zod";
-function invalid(what) {
-  throw new CalendarError2(CALENDAR_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function integerIn(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function checkOptions(options) {
-  if (options !== undefined && (typeof options !== "object" || options === null)) {
-    invalid("options");
-  }
-  const timeoutMs = options?.timeoutMs ?? DEFAULT_CALENDAR_TIMEOUT_MS2;
-  if (!integerIn(timeoutMs, 1, MAX_CALENDAR_TIMEOUT_MS2)) {
-    invalid("timeoutMs");
-  }
-  if (options?.signal !== undefined && !(options.signal instanceof AbortSignal)) {
-    invalid("signal");
-  }
-  const policy = options?.retry;
-  const maxRetries = policy?.maxRetries ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxRetries;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_CALENDAR_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn(maxRetries, 0, 5)) {
-    invalid("retry.maxRetries");
-  }
-  if (!integerIn(baseDelayMs, 1, 60000)) {
-    invalid("retry.baseDelayMs");
-  }
-  if (!integerIn(maxDelayMs, baseDelayMs, 60000)) {
-    invalid("retry.maxDelayMs");
-  }
-  return {
-    timeoutMs,
-    retry: { maxRetries, baseDelayMs, maxDelayMs },
-    ...options?.signal === undefined ? {} : { signal: options.signal }
-  };
-}
-function parse(schema, value, what) {
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) {
-    const path = parsed.error.issues[0]?.path.filter((p) => typeof p === "string").join(".");
-    return invalid(path ? `${what}.${path}` : what);
-  }
-  return parsed.data;
-}
-var instant = z2.iso.datetime({ offset: true });
-var requestIdSchema = z2.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
-var eventIdSchema = z2.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/);
-var attendeeSchema = z2.strictObject({
-  email: z2.email().max(254),
-  name: z2.string().min(1).max(200).optional()
-});
-var titleSchema = z2.string().min(1).max(256);
-var descriptionSchema = z2.string().max(8192);
-var locationSchema = z2.string().max(512);
-var attendeesSchema = z2.array(attendeeSchema).max(MAX_EVENT_ATTENDEES2);
-var eventSchema = z2.strictObject({
-  title: titleSchema,
-  start: instant,
-  end: instant,
-  description: descriptionSchema.optional(),
-  location: locationSchema.optional(),
-  attendees: attendeesSchema.optional(),
-  conferencing: z2.enum(["video", "none"]).optional()
-});
-var changesSchema = z2.strictObject({
-  title: titleSchema.optional(),
-  start: instant.optional(),
-  end: instant.optional(),
-  description: descriptionSchema.optional(),
-  location: locationSchema.optional(),
-  attendees: attendeesSchema.optional()
-}).refine((c) => Object.values(c).some((v) => v !== undefined));
-var grantSchema = z2.discriminatedUnion("kind", [
-  z2.strictObject({
-    kind: z2.literal("authorization_code"),
-    code: z2.string().min(1).max(4096),
-    redirectUri: z2.url().max(2048),
-    codeVerifier: z2.string().min(1).max(256).optional()
-  }),
-  z2.strictObject({ kind: z2.literal("refresh_token"), refreshToken: z2.string().min(1).max(4096) })
-]);
-function checkOrganizationId(value) {
-  return organizationIdSchema2.safeParse(value).success ? value : invalid("organizationId");
-}
-function checkBase(request) {
-  if (typeof request !== "object" || request === null) {
-    return invalid("request");
-  }
-  checkOrganizationId(request.organizationId);
-  if (!(request.connection instanceof CalendarConnection2)) {
-    return invalid("connection");
-  }
-  if (request.connection.organizationId !== request.organizationId) {
-    return invalid("connection");
-  }
-  return request.connection;
-}
-function checkGrant(value) {
-  return parse(grantSchema, value, "grant");
-}
-function checkRequestId(value) {
-  return parse(requestIdSchema, value, "requestId");
-}
-function checkEventId(value) {
-  return parse(eventIdSchema, value, "eventId");
-}
-function checkRange(from, to) {
-  const fromMs = Date.parse(parse(instant, from, "from"));
-  const toMs = Date.parse(parse(instant, to, "to"));
-  if (!(fromMs < toMs) || toMs - fromMs > MAX_BUSY_RANGE_MS2) {
-    invalid("range");
-  }
-  return { fromMs, toMs };
-}
-function checkEventTimes(startMs, endMs) {
-  if (!(startMs < endMs) || endMs - startMs > MAX_EVENT_DURATION_MS2) {
-    invalid("event.times");
-  }
-}
-function checkEvent(value) {
-  const event = parse(eventSchema, value, "event");
-  const startMs = Date.parse(event.start);
-  const endMs = Date.parse(event.end);
-  checkEventTimes(startMs, endMs);
-  return { event, startMs, endMs };
-}
-function checkChanges(value) {
-  return parse(changesSchema, value, "changes");
-}
-
-// src/telephony/validate.ts
-import {
-  callIdSchema,
-  e164PhoneSchema as e164PhoneSchema2,
-  membershipIdSchema,
-  organizationIdSchema as organizationIdSchema3
-} from "tula-closeline-contract";
-var PROVIDER_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-var CONTROL = /[\u0000-\u001f\u007f]/;
-function invalid2(what) {
-  throw new TelephonyError2(TELEPHONY_ERROR_CODES2.invalidRequest, `${what} is not acceptable`);
-}
-function checkOrganizationId2(value) {
-  return organizationIdSchema3.safeParse(value).success ? value : invalid2("organizationId");
-}
-function checkCallId(value) {
-  return callIdSchema.safeParse(value).success ? value : invalid2("callId");
-}
-function checkIdentity(value) {
-  return membershipIdSchema.safeParse(value).success ? value : invalid2("identity");
-}
-function checkNumber(value, what) {
-  return e164PhoneSchema2.safeParse(value).success ? value : invalid2(what);
-}
-function checkProviderId(value, what) {
-  return typeof value === "string" && PROVIDER_ID.test(value) ? value : invalid2(what);
-}
-function checkDisclosure(version, text, aiAssisted) {
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    invalid2("wordingVersion");
-  }
-  if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_DISCLOSURE_TEXT_LENGTH2 || CONTROL.test(text)) {
-    invalid2("text");
-  }
-  if (typeof aiAssisted !== "boolean") {
-    invalid2("aiAssisted");
-  }
-}
-function checkRingIdentities(value) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_RING_LEGS2) {
-    invalid2("ringIdentities");
-  }
-  const identities = value.map(checkIdentity);
-  return [...new Set(identities)];
-}
-function checkDestinationUrl(value, allowPlain) {
-  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
-    invalid2("destinationUrl");
-  }
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    return invalid2("destinationUrl");
-  }
-  const secure = url.protocol === "wss:";
-  if (!(secure || allowPlain && url.protocol === "ws:") || url.username || url.password) {
-    invalid2("destinationUrl");
-  }
-  return value;
-}
-function resolveTimeout(options, fallback) {
-  const value = options?.timeoutMs ?? fallback;
-  if (!Number.isInteger(value) || value < 1 || value > MAX_TELEPHONY_TIMEOUT_MS2) {
-    invalid2("timeoutMs");
-  }
-  return value;
-}
-function requireDisclosure(played, needsAi = false) {
-  if (!played) {
-    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure has not played on this call");
-  }
-  if (needsAi && !played.aiAssisted) {
-    throw new TelephonyError2(TELEPHONY_ERROR_CODES2.disclosureRequired, "The Disclosure did not say an AI takes part");
-  }
-  return played;
-}
-
-// src/messaging/consent.ts
-var DENIAL_CODES = [
-  "consent.missing",
-  "consent.withdrawn",
-  "consent.suppressed",
-  "consent.unavailable"
-];
-function denied(code) {
-  return new MessagingError2(MESSAGING_ERROR_CODES2.consentDenied, "The Contact Check did not allow this message", {
-    details: { code: DENIAL_CODES.includes(code) ? code : "consent.unavailable" }
-  });
-}
-async function requireConsent(guard, request, deadline) {
-  let result;
-  try {
-    result = await raceAbort(Promise.resolve().then(() => guard.check({
-      organizationId: request.organizationId,
-      prospectId: request.prospectId,
-      phone: request.to,
-      channel: request.channel,
-      purpose: request.purpose
-    })), deadline.signal);
-  } catch (error) {
-    if (error instanceof AttemptAborted) {
-      deadline.check();
-    }
-    throw denied("consent.unavailable");
-  }
-  if (typeof result !== "object" || result === null || result.allowed !== true) {
-    throw denied(typeof result === "object" && result !== null && "code" in result ? String(result.code) : "consent.unavailable");
-  }
-  if (typeof result.checkId !== "string") {
-    throw denied("consent.unavailable");
-  }
-  return { consentCheckId: result.checkId };
-}
-
-// src/messaging/validate.ts
-import { e164PhoneSchema as e164PhoneSchema3, organizationIdSchema as organizationIdSchema4, prospectIdSchema as prospectIdSchema2 } from "tula-closeline-contract";
-var KEY = /^[A-Za-z0-9_.:-]{1,200}$/;
-var TEMPLATE_ID = /^HX[0-9a-fA-F]{32}$/;
-var VARIABLE_NAME = /^[A-Za-z0-9_]{1,64}$/;
-var REQUEST_KEYS = new Set([
-  "organizationId",
-  "prospectId",
-  "channel",
-  "purpose",
-  "to",
-  "content",
-  "idempotencyKey",
-  "timeoutMs",
-  "retry",
-  "signal"
-]);
-function invalid3(what) {
-  throw new MessagingError2(MESSAGING_ERROR_CODES2.invalidRequest, `${what} is not acceptable`, {
-    details: { field: what }
-  });
-}
-function integerIn2(value, min, max) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
-}
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function resolveMessagingRetryPolicy(policy) {
-  if (policy !== undefined && !isRecord(policy)) {
-    invalid3("retry");
-  }
-  const maxRetries = policy?.maxRetries ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxRetries;
-  const baseDelayMs = policy?.baseDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.baseDelayMs;
-  const maxDelayMs = policy?.maxDelayMs ?? DEFAULT_MESSAGING_RETRY_POLICY2.maxDelayMs;
-  if (!integerIn2(maxRetries, 0, 5)) {
-    invalid3("retry.maxRetries");
-  }
-  if (!integerIn2(baseDelayMs, 1, 60000)) {
-    invalid3("retry.baseDelayMs");
-  }
-  if (!integerIn2(maxDelayMs, baseDelayMs, 60000)) {
-    invalid3("retry.maxDelayMs");
-  }
-  return { maxRetries, baseDelayMs, maxDelayMs };
-}
-function checkContent(value, channel) {
-  if (!isRecord(value)) {
-    return invalid3("content");
-  }
-  const extra = (allowed) => Object.keys(value).some((k) => !allowed.includes(k));
-  if (value.kind === "text") {
-    if (extra(["kind", "body"])) {
-      invalid3("content");
-    }
-    const body = value.body;
-    if (typeof body !== "string" || body.length < 1 || body.length > MAX_MESSAGE_BODY_CHARS2) {
-      invalid3("content.body");
-    }
-    if (body.trim().length === 0) {
-      invalid3("content.body");
-    }
-    return { kind: "text", body };
-  }
-  if (value.kind === "template") {
-    if (extra(["kind", "templateId", "variables"])) {
-      invalid3("content");
-    }
-    if (channel !== "whatsapp") {
-      invalid3("content.kind");
-    }
-    const templateId = value.templateId;
-    if (typeof templateId !== "string" || !TEMPLATE_ID.test(templateId)) {
-      invalid3("content.templateId");
-    }
-    if (value.variables === undefined) {
-      return { kind: "template", templateId };
-    }
-    if (!isRecord(value.variables)) {
-      return invalid3("content.variables");
-    }
-    const entries = Object.entries(value.variables);
-    if (entries.length > MAX_TEMPLATE_VARIABLES2) {
-      invalid3("content.variables");
-    }
-    const variables = {};
-    for (const [name, text] of entries) {
-      if (!VARIABLE_NAME.test(name) || typeof text !== "string" || text.length > MAX_TEMPLATE_VARIABLE_CHARS2) {
-        invalid3("content.variables");
-      }
-      variables[name] = text;
-    }
-    return { kind: "template", templateId, variables };
-  }
-  return invalid3("content.kind");
-}
-function checkSendRequest(request) {
-  if (!isRecord(request)) {
-    return invalid3("request");
-  }
-  for (const key of Object.keys(request)) {
-    if (!REQUEST_KEYS.has(key)) {
-      invalid3("request");
-    }
-  }
-  const organization = organizationIdSchema4.safeParse(request.organizationId);
-  if (!organization.success) {
-    return invalid3("organizationId");
-  }
-  const prospect = prospectIdSchema2.safeParse(request.prospectId);
-  if (!prospect.success) {
-    return invalid3("prospectId");
-  }
-  const channel = MESSAGING_CHANNELS2.find((c) => c === request.channel);
-  if (channel === undefined) {
-    return invalid3("channel");
-  }
-  const purpose = MESSAGING_PURPOSES2.find((p) => p === request.purpose);
-  if (purpose === undefined) {
-    return invalid3("purpose");
-  }
-  if (!e164PhoneSchema3.safeParse(request.to).success || typeof request.to !== "string") {
-    return invalid3("to");
-  }
-  if (typeof request.idempotencyKey !== "string" || !KEY.test(request.idempotencyKey)) {
-    return invalid3("idempotencyKey");
-  }
-  const timeoutMs = request.timeoutMs ?? DEFAULT_MESSAGING_TIMEOUT_MS2;
-  if (!integerIn2(timeoutMs, 1, MAX_MESSAGING_TIMEOUT_MS2)) {
-    return invalid3("timeoutMs");
-  }
-  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
-    return invalid3("signal");
-  }
-  return {
-    organizationId: organization.data,
-    prospectId: prospect.data,
-    channel,
-    purpose,
-    to: request.to,
-    content: checkContent(request.content, channel),
-    idempotencyKey: request.idempotencyKey,
-    timeoutMs,
-    retry: resolveMessagingRetryPolicy(request.retry),
-    signal: request.signal
-  };
-}
-
 // src/streaming-transcribe/validate.ts
 import { callIdSchema as callIdSchema2, organizationIdSchema as organizationIdSchema5 } from "tula-closeline-contract";
 var LANGUAGE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
@@ -2094,6 +2012,50 @@ function checkChunk(chunk) {
     return invalid4("chunk");
   }
   return chunk;
+}
+
+// src/tts/audio.ts
+var INSPECT = Symbol.for("nodejs.util.inspect.custom");
+
+class TtsAudioChunk2 {
+  sequence;
+  byteLength;
+  #audio;
+  constructor(sequence, audio) {
+    this.sequence = sequence;
+    this.byteLength = audio.byteLength;
+    this.#audio = audio;
+  }
+  get audio() {
+    return this.#audio;
+  }
+  toJSON() {
+    return { sequence: this.sequence, byteLength: this.byteLength };
+  }
+  toString() {
+    return `TtsAudioChunk(#${this.sequence}, ${this.byteLength} bytes)`;
+  }
+  [INSPECT]() {
+    return this.toString();
+  }
+}
+
+// src/tts/port.ts
+var DEFAULT_TTS_TIMEOUT_MS2 = 30000;
+var MAX_TTS_TIMEOUT_MS2 = 120000;
+var DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 2000;
+var MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2 = 30000;
+var DEFAULT_TTS_MAX_TEXT_CHARS2 = 5000;
+var MAX_TTS_MAX_TEXT_CHARS2 = 20000;
+var MAX_TTS_AUDIO_CHUNK_BYTES2 = 65536;
+var DEFAULT_TTS_RETRY_POLICY2 = {
+  maxRetries: 1,
+  baseDelayMs: 50,
+  maxDelayMs: 250
+};
+function ttsRetryDelayMs2(retry, policy, random = Math.random) {
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retry - 1));
+  return Math.max(1, Math.floor(exponential * (0.5 + random())));
 }
 
 // src/tts/deadline.ts
@@ -2240,5 +2202,43 @@ function checkOpenRequest2(request) {
     retry: resolveTtsRetryPolicy(request.retry)
   };
 }
+
+// src/vector/errors.ts
+var VECTOR_ERROR_CODES2 = {
+  invalidRequest: "vector.invalid_request",
+  dimensionMismatch: "vector.dimension_mismatch",
+  rejected: "vector.rejected",
+  unavailable: "vector.unavailable",
+  badResponse: "vector.bad_response"
+};
+var STATUS4 = {
+  "vector.invalid_request": 400,
+  "vector.dimension_mismatch": 422,
+  "vector.rejected": 500,
+  "vector.unavailable": 503,
+  "vector.bad_response": 502
+};
+
+class VectorError2 extends AppError2 {
+  constructor(code, message, options = {}) {
+    super({
+      code,
+      status: STATUS4[code],
+      message,
+      ...options.cause === undefined ? {} : { cause: options.cause },
+      ...options.details === undefined ? {} : { details: options.details }
+    });
+    this.name = "VectorError";
+  }
+}
+
+// src/vector/port.ts
+var MAX_UPSERT_BATCH2 = 500;
+var MAX_DELETE_BATCH2 = 500;
+var MAX_VECTOR_ID_LENGTH2 = 64;
+var MAX_TOP_K2 = 100;
+var MAX_DIMENSIONS2 = 4096;
+var MAX_ATTRIBUTES2 = 16;
+var MAX_ATTRIBUTE_STRING2 = 512;
 
 export { AUDIT_LIMITS2, AUDIT_DENIED_METADATA_KEYS2, auditMetadataSchema2, auditActorSchema2, auditSubjectSchema2, auditEventPayloadSchema2, auditEntrySchema2, parseAuditEntry2, startMessagingDeadline, AttemptAborted, raceAbort, withMessagingRetry, startCalendarDeadline, withCalendarRetry, invalid, checkOptions, checkOrganizationId, checkBase, checkGrant, checkRequestId, checkEventId, checkRange, checkEventTimes, checkEvent, checkChanges, CONTACT_UNAVAILABLE2, isContactGuardRequest2, withCaller2, isSensitiveKey, dropHighSurrogate2, cutText2, scrubText2, redactFields, prepareFields, signTwilioRequest2, twilioUrlVariants, sameText, TELEPHONY_ERROR_CODES2, TelephonyError2, invalid2, checkOrganizationId2, checkCallId, checkIdentity, checkNumber, checkProviderId, checkDisclosure, checkRingIdentities, checkDestinationUrl, resolveTimeout, requireDisclosure, requireConsent, invalid3, checkSendRequest, classifyMessageIntent2, verifyAndParseWebhook, shouldReportError2, STREAMING_TRANSCRIBE_ERROR_CODES2, StreamingTranscribeError2, DEFAULT_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_STREAMING_TRANSCRIBE_TIMEOUT_MS2, MAX_AUDIO_CHUNK_BYTES2, MAX_REPLAY_AUDIO_BYTES2, MAX_WORDS_PER_TURN2, DEFAULT_RECONNECT_POLICY2, reconnectDelayMs2, invalid4, checkOpenRequest, resolveTimeout2, checkChunk, TtsAudioChunk2, DEFAULT_TTS_TIMEOUT_MS2, MAX_TTS_TIMEOUT_MS2, DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_MS2, MAX_TTS_FIRST_CHUNK_TIMEOUT_MS2, DEFAULT_TTS_MAX_TEXT_CHARS2, MAX_TTS_MAX_TEXT_CHARS2, MAX_TTS_AUDIO_CHUNK_BYTES2, DEFAULT_TTS_RETRY_POLICY2, ttsRetryDelayMs2, startTtsDeadline, watchFirstChunk, withTtsRetry, invalid5, checkOpenRequest2, VECTOR_ERROR_CODES2, VectorError2, MAX_UPSERT_BATCH2, MAX_DELETE_BATCH2, MAX_VECTOR_ID_LENGTH2, MAX_TOP_K2, MAX_DIMENSIONS2, MAX_ATTRIBUTES2, MAX_ATTRIBUTE_STRING2 };
