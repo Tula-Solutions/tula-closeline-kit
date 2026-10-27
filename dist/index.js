@@ -808,6 +808,84 @@ function createTokenVerifier(options) {
 }
 // src/calendar/google.ts
 import { createHash, randomUUID } from "node:crypto";
+
+// src/http/direct-fetch.ts
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { Readable } from "node:stream";
+var MAX_REDIRECTS = 5;
+var NULL_BODY = new Set([101, 204, 205, 304]);
+var SENSITIVE = ["authorization", "cookie", "proxy-authorization"];
+async function directFetch(input, init = {}) {
+  const headers = new Headers(init.headers);
+  if (!headers.has("accept-encoding")) {
+    headers.set("accept-encoding", "identity");
+  }
+  let body;
+  if (init.body instanceof URLSearchParams) {
+    body = init.body.toString();
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/x-www-form-urlencoded;charset=UTF-8");
+    }
+  } else if (typeof init.body === "string" || init.body instanceof Uint8Array) {
+    body = init.body;
+  } else if (init.body !== undefined && init.body !== null) {
+    throw new TypeError("directFetch takes a string, URLSearchParams or Uint8Array body");
+  }
+  let url = new URL(input);
+  let method = init.method ?? "GET";
+  for (let hops = 0;; hops++) {
+    const response = await send(url, method, headers, body, init.signal ?? undefined);
+    const location = response.headers.get("location");
+    const redirect = response.status >= 300 && response.status < 400 && location !== null;
+    if (!redirect || (init.redirect ?? "follow") !== "follow") {
+      return response;
+    }
+    response.body?.cancel().catch(() => {
+      return;
+    });
+    if (hops >= MAX_REDIRECTS) {
+      throw new TypeError("too many redirects");
+    }
+    const next = new URL(location, url);
+    if (next.origin !== url.origin) {
+      for (const name of SENSITIVE) {
+        headers.delete(name);
+      }
+    }
+    if (response.status !== 307 && response.status !== 308) {
+      method = method === "HEAD" ? "HEAD" : "GET";
+      body = undefined;
+      headers.delete("content-type");
+    }
+    url = next;
+  }
+}
+function send(url, method, headers, body, signal) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new TypeError(`unsupported protocol ${url.protocol}`);
+  }
+  const open = url.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    const outgoing = open(url, { method, headers: Object.fromEntries(headers), agent: false, signal }, (incoming) => {
+      const answer = new Headers;
+      for (const [name, value] of Object.entries(incoming.headers)) {
+        for (const item of Array.isArray(value) ? value : [value ?? ""]) {
+          answer.append(name, item);
+        }
+      }
+      const status = incoming.statusCode ?? 0;
+      resolve(new Response(NULL_BODY.has(status) ? null : Readable.toWeb(incoming), {
+        status,
+        headers: answer
+      }));
+    });
+    outgoing.on("error", reject);
+    outgoing.end(body);
+  });
+}
+
+// src/calendar/google.ts
 var GOOGLE_CALENDAR_SCOPES = [
   "https://www.googleapis.com/auth/calendar.freebusy",
   "https://www.googleapis.com/auth/calendar.events"
@@ -957,7 +1035,7 @@ function createGoogleCalendar(options) {
   const { clientId, clientSecret } = options;
   const clock = options.clock ?? systemClock2;
   const sleep = options.sleep ?? systemSleep2;
-  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const doFetch = options.fetch ?? directFetch;
   const eventsUrl = `${API}/calendars/${encodeURIComponent(calendarId)}/events`;
   const tokens = new Map;
   function tokenKey(credential) {
@@ -1517,7 +1595,7 @@ function createOutlookCalendar(options) {
   const { clientId, clientSecret } = options;
   const clock = options.clock ?? systemClock2;
   const sleep = options.sleep ?? systemSleep2;
-  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const doFetch = options.fetch ?? directFetch;
   const tokenUrl = `${LOGIN}/${tenant}/oauth2/v2.0/token`;
   const calendarUrl = calendarId === undefined ? `${GRAPH}/me/calendar` : `${GRAPH}/me/calendars/${encodeURIComponent(calendarId)}`;
   const scope = OUTLOOK_CALENDAR_SCOPES.join(" ");
@@ -1958,8 +2036,8 @@ import {
 } from "tula-closeline-contract";
 
 // src/http/internal.ts
-import { Agent as HttpAgent, request as httpRequest } from "node:http";
-import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, request as httpRequest2 } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest2 } from "node:https";
 import { isIPv4 } from "node:net";
 var INTERNAL_IDEMPOTENCY_HEADER = "Idempotency-Key";
 var INTERNAL_DEFAULT_TIMEOUT_MS = 5000;
@@ -2116,7 +2194,7 @@ function createInternalClient(options) {
   }
   const sleep = options.sleep ?? timerSleep;
   const random = options.random ?? Math.random;
-  const send = base.secure ? httpsRequest : httpRequest;
+  const send = base.secure ? httpsRequest2 : httpRequest2;
   const agent = keepAlive ? new (base.secure ? HttpsAgent : HttpAgent)({
     keepAlive: true,
     maxSockets,
@@ -2887,7 +2965,7 @@ function createTwilioTelephony(options) {
   const http = createTwilioHttp({
     baseUrl: `https://${twilioApiHost(options.region, options.edge)}`,
     authorization: `Basic ${Buffer.from(`${apiKeySid}:${apiKeySecret}`).toString("base64")}`,
-    fetch: options.fetch ?? ((input, init) => fetch(input, init)),
+    fetch: options.fetch ?? directFetch,
     sleep,
     random,
     now: nowMs,
@@ -3361,7 +3439,7 @@ function createTwilioMessaging(options) {
   const { accountSid, authToken, guard } = options;
   const clock = options.clock ?? systemClock2;
   const sleep = options.sleep ?? systemSleep2;
-  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const doFetch = options.fetch ?? directFetch;
   const url = `https://${twilioApiHost(options.region, options.edge)}/2010-04-01/Accounts/${accountSid}/Messages.json`;
   const authorization = `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`;
   function form(request) {
@@ -5588,6 +5666,7 @@ export {
   createTwilioTelephony,
   cutText2 as cutText,
   defineMessage2 as defineMessage,
+  directFetch,
   dropHighSurrogate2 as dropHighSurrogate,
   environmentSchema,
   estimateSpeechMs,

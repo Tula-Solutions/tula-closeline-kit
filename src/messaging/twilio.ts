@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { e164PhoneSchema } from 'tula-closeline-contract'
 import { type Clock, systemClock } from '../clock'
 import type { ContactGuard } from '../consent/port'
+import { directFetch } from '../http/direct-fetch'
 import type { Logger } from '../logger'
 import { type Sleep, systemSleep } from '../queue/sleep'
 import type { ErrorReporter } from '../reporting/port'
@@ -188,7 +189,7 @@ export function createTwilioMessaging(options: TwilioMessagingOptions): Messagin
   const { accountSid, authToken, guard } = options
   const clock = options.clock ?? systemClock
   const sleep = options.sleep ?? systemSleep
-  const doFetch: TwilioFetch = options.fetch ?? ((input, init) => fetch(input, init))
+  const doFetch: TwilioFetch = options.fetch ?? directFetch
   const url = `https://${twilioApiHost(options.region, options.edge)}/2010-04-01/Accounts/${accountSid}/Messages.json`
   const authorization = `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString('base64')}`
 

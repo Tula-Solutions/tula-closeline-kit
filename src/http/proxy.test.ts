@@ -118,24 +118,30 @@ describe('probe: what honours proxy variables (the positive control)', () => {
     expect(result.output).toBe('ok 502\ndone')
   }, 20_000)
 
-  test.each([
-    ['ALL_PROXY', 'http'],
-    ['all_proxy', 'https'],
-  ] as const)(
-    'observed: Bun fetch ignores %s (%s), so a future change shows here',
-    async (variable, scheme) => {
-      const result = await probe('fetch', scheme, variable)
-      expect(result.hits).toBe(0)
-      expectDirect(result.output, scheme)
-    },
-    20_000
-  )
+  // Whether plain fetch follows ALL_PROXY differs by Bun version (1.4.3 yes, 1.4.2 no), so it is
+  // not pinned here: the adapters use directFetch, which the next suite pins for every variable.
 
   test('NO_PROXY naming the host stops fetch, which is why it is not the mechanism', async () => {
     const result = await probe('fetch', 'http', 'HTTP_PROXY', '127.0.0.1')
     expect(result.hits).toBe(0)
     expectDirect(result.output, 'http')
   }, 20_000)
+})
+
+describe('directFetch, used by the adapters that carry credentials', () => {
+  test.each(
+    VARIABLES.flatMap((variable) => (['http', 'https'] as const).map((s) => [variable, s] as const))
+  )(
+    'never reaches the proxy named by %s for an %s URL',
+    async (variable, scheme) => {
+      for (const noProxy of [undefined, '127.0.0.1']) {
+        const result = await probe('direct-fetch', scheme, variable, noProxy)
+        expect(result.hits).toBe(0)
+        expectDirect(result.output, scheme)
+      }
+    },
+    30_000
+  )
 })
 
 describe('probe: what ignores them', () => {
