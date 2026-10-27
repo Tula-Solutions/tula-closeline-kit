@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { OrganizationId } from 'tula-closeline-contract'
 import { type Clock, systemClock } from '../clock'
+import { directFetch } from '../http/direct-fetch'
 import type { Logger } from '../logger'
 import { AttemptAborted, raceAbort } from '../messaging/deadline'
 import { type Sleep, systemSleep } from '../queue/sleep'
@@ -279,7 +280,7 @@ export function createGoogleCalendar(options: GoogleCalendarOptions): CalendarPo
   const { clientId, clientSecret } = options
   const clock = options.clock ?? systemClock
   const sleep = options.sleep ?? systemSleep
-  const doFetch: GoogleCalendarFetch = options.fetch ?? ((input, init) => fetch(input, init))
+  const doFetch: GoogleCalendarFetch = options.fetch ?? directFetch
   const eventsUrl = `${API}/calendars/${encodeURIComponent(calendarId)}/events`
   const tokens = new Map<string, { accessToken: string; expiresAtMs: number }>()
 

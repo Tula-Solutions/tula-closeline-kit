@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { SignJWT } from 'jose'
 import type { SoftphoneToken } from 'tula-closeline-contract'
 import { type Clock, systemClock } from '../clock'
+import { directFetch } from '../http/direct-fetch'
 import { type Sleep, systemSleep } from '../queue/sleep'
 import type { Environment } from '../reporting/env'
 import { sameText, signTwilioRequest, twilioUrlVariants } from '../twilio-signature'
@@ -390,7 +391,7 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
   const http: TwilioHttp = createTwilioHttp({
     baseUrl: `https://${twilioApiHost(options.region, options.edge)}`,
     authorization: `Basic ${Buffer.from(`${apiKeySid}:${apiKeySecret}`).toString('base64')}`,
-    fetch: options.fetch ?? ((input, init) => fetch(input, init)),
+    fetch: options.fetch ?? directFetch,
     sleep,
     random,
     now: nowMs,

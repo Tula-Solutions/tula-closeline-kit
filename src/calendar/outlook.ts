@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { OrganizationId } from 'tula-closeline-contract'
 import { type Clock, systemClock } from '../clock'
+import { directFetch } from '../http/direct-fetch'
 import type { Logger } from '../logger'
 import { AttemptAborted, raceAbort } from '../messaging/deadline'
 import { type Sleep, systemSleep } from '../queue/sleep'
@@ -330,7 +331,7 @@ export function createOutlookCalendar(options: OutlookCalendarOptions): Calendar
   const { clientId, clientSecret } = options
   const clock = options.clock ?? systemClock
   const sleep = options.sleep ?? systemSleep
-  const doFetch: OutlookCalendarFetch = options.fetch ?? ((input, init) => fetch(input, init))
+  const doFetch: OutlookCalendarFetch = options.fetch ?? directFetch
   const tokenUrl = `${LOGIN}/${tenant}/oauth2/v2.0/token`
   const calendarUrl =
     calendarId === undefined

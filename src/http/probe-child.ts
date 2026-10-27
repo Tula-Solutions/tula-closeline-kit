@@ -5,6 +5,7 @@
  */
 import { Agent, request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
+import { directFetch } from './direct-fetch'
 import { createInternalClient, InternalCallError } from './internal'
 
 const [mode, rawUrl] = process.argv.slice(2)
@@ -52,6 +53,8 @@ async function run(): Promise<number> {
           signal: AbortSignal.timeout(3000),
         })
       ).status
+    case 'direct-fetch':
+      return (await directFetch(rawUrl as string, { signal: AbortSignal.timeout(3000) })).status
     case 'node-agent-false':
       return await viaNode(false)
     case 'node-keepalive-agent':
