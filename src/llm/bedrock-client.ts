@@ -58,6 +58,18 @@ export function assertModelInRegion(tier: ModelTier, modelId: unknown, region: s
   }
 }
 
+/**
+ * The id to send to Converse: a bare `anthropic.*` id gets the geographic inference profile prefix
+ * of `region` (on-demand Claude 5.5 is served only through profiles); any other id, or a Region
+ * with no geography, is sent as is. Never `global.`, so data stays in the Region's geography.
+ */
+export function callableModelId(modelId: string, region: string): string {
+  const geography = geographyOf(region)
+  return geography !== undefined && modelId.startsWith('anthropic.')
+    ? `${geography}.${modelId}`
+    : modelId
+}
+
 /** What {@link createBedrockClient} needs. */
 export interface BedrockClientSettings {
   region: string

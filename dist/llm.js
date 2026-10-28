@@ -65,6 +65,10 @@ function assertModelInRegion(tier, modelId, region) {
     throw new TypeError(`models.${tier} is an inference profile for "${head}", which does not match the Region ${region}`);
   }
 }
+function callableModelId(modelId, region) {
+  const geography = geographyOf(region);
+  return geography !== undefined && modelId.startsWith("anthropic.") ? `${geography}.${modelId}` : modelId;
+}
 function createBedrockClient(settings) {
   for (const name of ENDPOINT_VARIABLES) {
     if (process.env[name] !== undefined && process.env[name] !== "") {
@@ -146,6 +150,10 @@ function createBedrockLlm(options) {
   for (const tier of MODEL_TIERS2) {
     assertModelInRegion(tier, models[tier], options.region);
   }
+  const callable = {
+    fast: callableModelId(models.fast, options.region),
+    smart: callableModelId(models.smart, options.region)
+  };
   const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_BEDROCK_CONNECT_TIMEOUT_MS;
   if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 60000) {
     throw new TypeError("connectTimeoutMs must be a whole number from 1 to 60000");
@@ -210,7 +218,7 @@ function createBedrockLlm(options) {
       }
       const { $schema: _dropped, ...schemaBody } = jsonSchema;
       const input = {
-        modelId: models[request.tier],
+        modelId: callable[request.tier],
         ...toMessages(request),
         inferenceConfig: { maxTokens: checked.maxOutputTokens },
         toolConfig: {
@@ -256,7 +264,7 @@ function createBedrockLlm(options) {
     stream(request) {
       const checked = checkRequest(request);
       const input = {
-        modelId: models[request.tier],
+        modelId: callable[request.tier],
         ...toMessages(request),
         inferenceConfig: { maxTokens: checked.maxOutputTokens }
       };
