@@ -279,6 +279,19 @@ describe('twilio telephony: inbound, Disclosure, bridge, record, fork, hang up',
     ).toBe('telephony.call_ended')
   })
 
+  test('playDisclosure with a streamUrl reconnects the media stream instead of holding', async () => {
+    const h = harness(happy, { environment: 'local' })
+    const ref = await placed(h)
+    await h.telephony.playDisclosure({
+      ...ref,
+      ...wording,
+      streamUrl: 'ws://127.0.0.1:4427/m?a=1&b=2',
+    })
+    const twiml = h.seen.find((s) => s.form.get('Twiml')?.includes('<Say'))?.form.get('Twiml')
+    expect(twiml).toContain('<Connect><Stream url="ws://127.0.0.1:4427/m?a=1&amp;b=2"/></Connect>')
+    expect(twiml).not.toContain('<Pause')
+  })
+
   test('playDisclosure says the escaped text, waits, confirms the call and reports once per version', async () => {
     const h = harness(happy, { disclosureLanguage: 'en-GB' })
     const ref = await placed(h)

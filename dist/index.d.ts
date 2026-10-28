@@ -2325,6 +2325,12 @@ interface PlayDisclosureRequest extends ProviderCallRef {
 	text: string;
 	/** Whether the wording also says an AI takes part. Forking tracks to an AI needs `true`. */
 	aiAssisted: boolean;
+	/**
+	* An Agent Call's media socket (`wss:`; `ws:` only in `local`). When set, the Disclosure is
+	* followed by a `<Connect><Stream>` to it instead of a hold, so the Agent's audio still has a
+	* two-way stream after the Disclosure replaced the call's first instructions.
+	*/
+	streamUrl?: string;
 }
 /** What {@link TelephonyPort.playDisclosure} reports once the wording has finished playing. */
 interface DisclosurePlayed {
