@@ -37,6 +37,13 @@ describe('timeZoneForNumber', () => {
       expect(timeZoneForNumber(n)).toBeUndefined()
     }
   })
+  test('area codes spanning zones are refused', () => {
+    for (const code of '541 458 775 306 474 639 423 208 928 906 850 270 574 812 219 605 701 308 785 915 709 250 807 907'.split(
+      ' '
+    )) {
+      expect(timeZoneForNumber(`+1${code}5550100`)).toBeUndefined()
+    }
+  })
   test('override wins, and a bad override is unknown, not the number zone', () => {
     expect(timeZoneForNumber(NY, 'Asia/Kolkata')).toBe('Asia/Kolkata')
     expect(timeZoneForNumber(NY, 'Mars/Olympus')).toBeUndefined()
