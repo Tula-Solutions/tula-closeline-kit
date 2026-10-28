@@ -7,6 +7,7 @@ import {
 import { TELEPHONY_ERROR_CODES, TelephonyError } from './errors'
 import {
   type DisclosurePlayed,
+  MAX_DETECTION_WINDOW_MS,
   MAX_DISCLOSURE_TEXT_LENGTH,
   MAX_RING_LEGS,
   MAX_TELEPHONY_TIMEOUT_MS,
@@ -125,4 +126,17 @@ export function requireDisclosure(
     )
   }
   return played
+}
+
+/** Checks the detection window of an Agent-leg call: whole ms, 1 to the maximum; default the maximum. */
+export function checkDetectionWindow(value: unknown): number {
+  if (value === undefined) {
+    return MAX_DETECTION_WINDOW_MS
+  }
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= MAX_DETECTION_WINDOW_MS
+    ? value
+    : invalid('detectionWindowMs')
 }

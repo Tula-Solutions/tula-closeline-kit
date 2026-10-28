@@ -485,6 +485,13 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
   }
 
   return {
+    // Answering-machine detection on Twilio is ticket T6; until then Agent-leg calls are refused.
+    async placeAgentCall(): Promise<PlacedCall> {
+      throw new TelephonyError(
+        TELEPHONY_ERROR_CODES.rejected,
+        'Agent-leg calls are not supported by this adapter yet'
+      )
+    },
     async placeCall(request: PlaceCallRequest, opts?: TelephonyOptions): Promise<PlacedCall> {
       const organizationId = checkOrganizationId(request.organizationId)
       const callId = checkCallId(request.callId)
