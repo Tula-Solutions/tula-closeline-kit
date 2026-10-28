@@ -1661,6 +1661,18 @@ interface PlaceCallRequest {
 	/** The Prospect's number, in E.164. Tenant data: never logged. */
 	to: string;
 }
+/** Who answered an Agent-leg call, as answering-machine detection decides it. */
+type AnsweredBy = "human" | "machine" | "unknown";
+/** The call an Agent places to a Prospect: no browser leg, the audio goes to a media stream. */
+interface PlaceAgentCallRequest extends PlaceCallRequest {
+	/** A `wss:` URL (`ws:` only for an adapter in `local`) the call's audio streams to; built by the service, never from a user. */
+	streamUrl: string;
+	/**
+	* The most time, in ms, 1 to {@link MAX_DETECTION_WINDOW_MS} (default the maximum), the provider
+	* takes after the answer to report who answered. The Agent plays and says nothing meanwhile.
+	*/
+	detectionWindowMs?: number;
+}
 /** What {@link TelephonyPort.placeCall} reports. */
 interface PlacedCall {
 	/** The provider's id of the leg to the Prospect. */
@@ -1764,7 +1776,7 @@ interface BrowserTokenRequest {
 	ttlSeconds?: number;
 }
 /** What a provider tells us about a call, in the shape every adapter's webhooks are turned into. */
-type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "completed" | "recording_ready";
+type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "detection" | "completed" | "recording_ready";
 /** One thing that happened on a provider call. Carries no number, text or audio. */
 interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
@@ -1779,6 +1791,8 @@ interface TelephonyEvent {
 	at: string;
 	/** With `failed` (and `no_answer`, `busy`): why, as the contract names it. */
 	failureReason?: VoiceCallFailureReason;
+	/** With `detection`: who answered. `unknown` when the window passed without a decision. */
+	answeredBy?: AnsweredBy;
 	/** With `completed`: who hung up. */
 	endedBy?: "rep" | "prospect" | "system";
 	/** With `recording_ready`: the Recording. */
@@ -1810,6 +1824,16 @@ interface TelephonyPort {
 	* with another `to` or `from` is `telephony.invalid_request`. O(1).
 	*/
 	placeCall(request: PlaceCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
+	/**
+	* Places a call for an Agent: like {@link TelephonyPort.placeCall} (same idempotency, same
+	* refusal of a key reused for another call, and a key of one cannot be reused for the other) but
+	* with the audio on `streamUrl` and answering-machine detection. After `answered` comes one
+	* `detection` event within `detectionWindowMs`; on `machine` the service ends the call with
+	* {@link TelephonyPort.hangUp}, which is silent, so nothing is ever said to a machine. Hanging up
+	* before the answer cancels the call. No `detection` event follows a hang-up, and no number or
+	* audio is logged. An adapter without detection throws `telephony.rejected`.
+	*/
+	placeAgentCall(request: PlaceAgentCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
 	/**
 	* Answers an inbound call and rings the given browser legs. Repeating it for a call already
 	* answered returns the same count. O(legs).

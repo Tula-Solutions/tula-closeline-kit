@@ -1796,6 +1796,18 @@ interface PlaceCallRequest {
 	/** The Prospect's number, in E.164. Tenant data: never logged. */
 	to: string;
 }
+/** Who answered an Agent-leg call, as answering-machine detection decides it. */
+type AnsweredBy = "human" | "machine" | "unknown";
+/** The call an Agent places to a Prospect: no browser leg, the audio goes to a media stream. */
+interface PlaceAgentCallRequest extends PlaceCallRequest {
+	/** A `wss:` URL (`ws:` only for an adapter in `local`) the call's audio streams to; built by the service, never from a user. */
+	streamUrl: string;
+	/**
+	* The most time, in ms, 1 to {@link MAX_DETECTION_WINDOW_MS} (default the maximum), the provider
+	* takes after the answer to report who answered. The Agent plays and says nothing meanwhile.
+	*/
+	detectionWindowMs?: number;
+}
 /** What {@link TelephonyPort.placeCall} reports. */
 interface PlacedCall {
 	/** The provider's id of the leg to the Prospect. */
@@ -1899,7 +1911,7 @@ interface BrowserTokenRequest {
 	ttlSeconds?: number;
 }
 /** What a provider tells us about a call, in the shape every adapter's webhooks are turned into. */
-type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "completed" | "recording_ready";
+type TelephonyEventType = "ringing" | "answered" | "no_answer" | "busy" | "failed" | "detection" | "completed" | "recording_ready";
 /** One thing that happened on a provider call. Carries no number, text or audio. */
 interface TelephonyEvent {
 	/** The provider's id of this event: webhooks are idempotent by it. */
@@ -1914,6 +1926,8 @@ interface TelephonyEvent {
 	at: string;
 	/** With `failed` (and `no_answer`, `busy`): why, as the contract names it. */
 	failureReason?: VoiceCallFailureReason;
+	/** With `detection`: who answered. `unknown` when the window passed without a decision. */
+	answeredBy?: AnsweredBy;
 	/** With `completed`: who hung up. */
 	endedBy?: "rep" | "prospect" | "system";
 	/** With `recording_ready`: the Recording. */
@@ -1945,6 +1959,16 @@ interface TelephonyPort {
 	* with another `to` or `from` is `telephony.invalid_request`. O(1).
 	*/
 	placeCall(request: PlaceCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
+	/**
+	* Places a call for an Agent: like {@link TelephonyPort.placeCall} (same idempotency, same
+	* refusal of a key reused for another call, and a key of one cannot be reused for the other) but
+	* with the audio on `streamUrl` and answering-machine detection. After `answered` comes one
+	* `detection` event within `detectionWindowMs`; on `machine` the service ends the call with
+	* {@link TelephonyPort.hangUp}, which is silent, so nothing is ever said to a machine. Hanging up
+	* before the answer cancels the call. No `detection` event follows a hang-up, and no number or
+	* audio is logged. An adapter without detection throws `telephony.rejected`.
+	*/
+	placeAgentCall(request: PlaceAgentCallRequest, options?: TelephonyOptions): Promise<PlacedCall>;
 	/**
 	* Answers an inbound call and rings the given browser legs. Repeating it for a call already
 	* answered returns the same count. O(legs).
@@ -2007,6 +2031,7 @@ interface TelephonyPort {
 /** What a scripted Prospect does when the memory provider dials their number. */
 type ScriptedProspect = {
 	kind: "answers";
+	detection?: AnsweredBy;
 } | {
 	kind: "no_answer";
 } | {
@@ -2021,6 +2046,8 @@ type ScriptedProspect = {
 };
 /** The operations a test can make fail or stall. */
 type TelephonyOperation = "placeCall" | "answerCall" | "playDisclosure" | "bridge" | "startRecording" | "forkTracks" | "hangUp" | "fetchRecording" | "deleteRecording" | "mintBrowserToken";
+/** {@link TelephonyOperation} and the Agent-leg dial, which the shared suite does not time out. */
+type MemoryOperation = TelephonyOperation | "placeAgentCall";
 /** Options for {@link createMemoryTelephony}. */
 interface MemoryTelephonyOptions {
 	/** The clock for event times and token expiry; the system clock by default. */
@@ -2044,8 +2071,8 @@ interface MemoryCallView {
 	callId: CallId4 | null;
 	/** Placed by us, or received. */
 	direction: "outbound" | "inbound";
-	/** `incoming` until answered, `connected` while up, `ended` after. */
-	state: "incoming" | "connected" | "ended";
+	/** `ringing` for an Agent-leg call not yet played out, `incoming` until answered, `connected` while up, `ended` after. */
+	state: "incoming" | "ringing" | "connected" | "ended";
 	/** The Disclosure that played, if one has. */
 	disclosure: DisclosurePlayed | null;
 	/** The Rep whose browser leg is joined, if any. */
@@ -2060,7 +2087,7 @@ interface MemoryCallView {
 /** One operation the provider carried out, in order; the proof the Disclosure came first. */
 interface MemoryOperationRecord {
 	/** The operation. */
-	operation: TelephonyOperation | "prospectHangsUp";
+	operation: MemoryOperation | "prospectHangsUp";
 	/** The provider call it applied to, when it applied to one. */
 	providerCallId: string | null;
 }
@@ -2071,6 +2098,12 @@ interface SignedWebhook extends WebhookRequest {
 }
 /** A {@link TelephonyPort} that plays scripted Prospects in the process, for tests. Not for production. */
 interface MemoryTelephony extends TelephonyPort {
+	/**
+	* Plays out an Agent-leg call that is still ringing as its script says: answered then one
+	* `detection` event (`human` unless scripted), or no answer, busy or a carrier failure. A call that
+	* has ended (hung up or cancelled) is left alone, so no detection follows a hang-up.
+	*/
+	ring(organizationId: OrganizationId11, providerCallId: string): void;
 	/** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
 	script(number: string, behaviour: ScriptedProspect): void;
 	/** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
@@ -2078,9 +2111,9 @@ interface MemoryTelephony extends TelephonyPort {
 	/** Has the Prospect on this call hang up now; a call that has ended is left alone. */
 	prospectHangsUp(organizationId: OrganizationId11, providerCallId: string): void;
 	/** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
-	failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void;
+	failNext(operation: MemoryOperation, code: TelephonyErrorCode, times?: number): void;
 	/** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
-	stallNext(operation: TelephonyOperation, times?: number): void;
+	stallNext(operation: MemoryOperation, times?: number): void;
 	/** Every event so far, in order. */
 	readonly events: readonly TelephonyEvent[];
 	/** Returns the events not yet taken, in order, and forgets them. */
@@ -2715,4 +2748,4 @@ interface TestDeps {
 declare function createMemoryLogger(): MemoryLogger;
 /** Creates test deps: a clock fixed at 2026-01-01T00:00:00.000Z, a memory logger and a memory error reporter. */
 declare function createTestDeps(overrides?: Partial<TestDeps>): TestDeps;
-export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryAuditRecorder, MemoryAuditRecorderOptions, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintApiKeyTokenOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryAuditRecorder, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestApiKeyToken, mintTestToken, testApiKeyId, testNote, testOrganizationId, testPing, testUserId };
+export { CalendarScriptedFailure, CapturedError, ContactTarget, DEFAULT_TEST_ORGANIZATION_ID, DEFAULT_TEST_USER_ID, DeadLetter, HeldCopy, LogEntry, MEMORY_MESSAGING_AUTH_TOKEN, MEMORY_MESSAGING_WEBHOOK_URL, MemoryAuditRecorder, MemoryAuditRecorderOptions, MemoryCalendar, MemoryCalendarEvent, MemoryCalendarOptions, MemoryCalendarRequestView, MemoryCallView, MemoryContactGuard, MemoryErrorReporter, MemoryInboundFields, MemoryLlm, MemoryLlmOptions, MemoryLlmRequestView, MemoryLogger, MemoryMessaging, MemoryMessagingOptions, MemoryMessagingRequestView, MemoryObjectStore, MemoryObjectStoreOptions, MemoryOperation, MemoryOperationRecord, MemoryQueue, MemoryQueueOptions, MemoryStreamView, MemoryStreamingTranscribe, MemoryStreamingTranscribeOptions, MemoryTelephony, MemoryTelephonyOptions, MemoryTranscriber, MemoryTranscriberOptions, MemoryTts, MemoryTtsOptions, MemoryTtsRequestView, MemoryVectorStore, MemoryVectorStoreOptions, MintApiKeyTokenOptions, MintTokenOptions, ScriptedFailure, ScriptedMessagingFailure, ScriptedOutcome, ScriptedProspect, ScriptedReply, ScriptedSpeech, ScriptedTtsFailure, ScriptedTurn, SignedWebhook, TelephonyOperation, TestDefinition, TestDeps, TestEnvelope, TestKeyPair, TranscriberOperation, VirtualTime, createMemoryAuditRecorder, createMemoryCalendar, createMemoryContactGuard, createMemoryErrorReporter, createMemoryLlm, createMemoryLogger, createMemoryMessaging, createMemoryObjectStore, createMemoryQueue, createMemoryStreamingTranscribe, createMemoryTelephony, createMemoryTranscriber, createMemoryTts, createMemoryVectorStore, createTestDeps, createTestJwks, createTestKeyPair, createTestRegistry, createVirtualTime, mintTestApiKeyToken, mintTestToken, testApiKeyId, testNote, testOrganizationId, testPing, testUserId };

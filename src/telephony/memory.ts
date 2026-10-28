@@ -11,6 +11,7 @@ import type { Environment } from '../reporting/env'
 import { TELEPHONY_ERROR_CODES, TelephonyError, type TelephonyErrorCode } from './errors'
 import {
   type AnswerCallRequest,
+  type AnsweredBy,
   type AnsweredCall,
   type BridgeRequest,
   type BrowserTokenRequest,
@@ -21,6 +22,7 @@ import {
   type ForkTracksRequest,
   type HangUpRequest,
   MAX_WEBHOOK_BODY_BYTES,
+  type PlaceAgentCallRequest,
   type PlaceCallRequest,
   type PlacedCall,
   type PlayDisclosureRequest,
@@ -36,6 +38,7 @@ import {
 import {
   checkCallId,
   checkDestinationUrl,
+  checkDetectionWindow,
   checkDisclosure,
   checkIdentity,
   checkNumber,
@@ -50,7 +53,7 @@ import {
 /** What a scripted Prospect does when the memory provider dials their number. */
 export type ScriptedProspect =
   /** Answers at once; the default for a number nobody scripted. */
-  | { kind: 'answers' }
+  | { kind: 'answers'; detection?: AnsweredBy }
   /** Rings and never answers: the call ends with `no_answer`. */
   | { kind: 'no_answer' }
   /** Is busy: the call ends with `busy`. */
@@ -80,6 +83,9 @@ export type TelephonyOperation =
   | 'deleteRecording'
   | 'mintBrowserToken'
 
+/** {@link TelephonyOperation} and the Agent-leg dial, which the shared suite does not time out. */
+export type MemoryOperation = TelephonyOperation | 'placeAgentCall'
+
 /** Options for {@link createMemoryTelephony}. */
 export interface MemoryTelephonyOptions {
   /** The clock for event times and token expiry; the system clock by default. */
@@ -104,8 +110,8 @@ export interface MemoryCallView {
   callId: CallId | null
   /** Placed by us, or received. */
   direction: 'outbound' | 'inbound'
-  /** `incoming` until answered, `connected` while up, `ended` after. */
-  state: 'incoming' | 'connected' | 'ended'
+  /** `ringing` for an Agent-leg call not yet played out, `incoming` until answered, `connected` while up, `ended` after. */
+  state: 'incoming' | 'ringing' | 'connected' | 'ended'
   /** The Disclosure that played, if one has. */
   disclosure: DisclosurePlayed | null
   /** The Rep whose browser leg is joined, if any. */
@@ -121,7 +127,7 @@ export interface MemoryCallView {
 /** One operation the provider carried out, in order; the proof the Disclosure came first. */
 export interface MemoryOperationRecord {
   /** The operation. */
-  operation: TelephonyOperation | 'prospectHangsUp'
+  operation: MemoryOperation | 'prospectHangsUp'
   /** The provider call it applied to, when it applied to one. */
   providerCallId: string | null
 }
@@ -134,6 +140,12 @@ export interface SignedWebhook extends WebhookRequest {
 
 /** A {@link TelephonyPort} that plays scripted Prospects in the process, for tests. Not for production. */
 export interface MemoryTelephony extends TelephonyPort {
+  /**
+   * Plays out an Agent-leg call that is still ringing as its script says: answered then one
+   * `detection` event (`human` unless scripted), or no answer, busy or a carrier failure. A call that
+   * has ended (hung up or cancelled) is left alone, so no detection follows a hang-up.
+   */
+  ring(organizationId: OrganizationId, providerCallId: string): void
   /** Sets what the Prospect at `number` (E.164) does when dialed; a later script replaces the earlier. */
   script(number: string, behaviour: ScriptedProspect): void
   /** Receives an inbound call on a Line, as the provider's webhook would; returns the provider's call id. */
@@ -141,9 +153,9 @@ export interface MemoryTelephony extends TelephonyPort {
   /** Has the Prospect on this call hang up now; a call that has ended is left alone. */
   prospectHangsUp(organizationId: OrganizationId, providerCallId: string): void
   /** Makes the next `times` (default 1) calls of `operation` throw a TelephonyError with `code`, changing nothing. */
-  failNext(operation: TelephonyOperation, code: TelephonyErrorCode, times?: number): void
+  failNext(operation: MemoryOperation, code: TelephonyErrorCode, times?: number): void
   /** Makes the next `times` (default 1) calls of `operation` never answer, so the timeout fires; changes nothing. */
-  stallNext(operation: TelephonyOperation, times?: number): void
+  stallNext(operation: MemoryOperation, times?: number): void
   /** Every event so far, in order. */
   readonly events: readonly TelephonyEvent[]
   /** Returns the events not yet taken, in order, and forgets them. */
@@ -165,7 +177,7 @@ interface Call {
   providerCallId: string
   callId: CallId | null
   direction: 'outbound' | 'inbound'
-  state: 'incoming' | 'connected' | 'ended'
+  state: 'incoming' | 'ringing' | 'connected' | 'ended'
   to: string
   from: string
   script: ScriptedProspect
@@ -174,6 +186,7 @@ interface Call {
   recordingId: string | null
   streamId: string | null
   ringing: number | null
+  agent: boolean
   endedBy: 'rep' | 'prospect' | 'system' | null
 }
 
@@ -223,8 +236,8 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
   const recordings = new Map<string, Recording>()
   const placed = new Map<string, string>()
   const scripts = new Map<string, ScriptedProspect>()
-  const failures = new Map<TelephonyOperation, TelephonyErrorCode[]>()
-  const stalls = new Map<TelephonyOperation, number>()
+  const failures = new Map<MemoryOperation, TelephonyErrorCode[]>()
+  const stalls = new Map<MemoryOperation, number>()
   const events: TelephonyEvent[] = []
   const operations: MemoryOperationRecord[] = []
   let taken = 0
@@ -241,7 +254,9 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
   function emit(
     call: Call,
     type: TelephonyEventType,
-    extra: Partial<Pick<TelephonyEvent, 'failureReason' | 'endedBy' | 'recordingId'>> = {}
+    extra: Partial<
+      Pick<TelephonyEvent, 'failureReason' | 'endedBy' | 'recordingId' | 'answeredBy'>
+    > = {}
   ) {
     events.push({
       eventId: nextId('evt-'),
@@ -287,7 +302,7 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
     if (call.state === 'ended') {
       throw new TelephonyError(TELEPHONY_ERROR_CODES.callEnded, 'The call has ended')
     }
-    if (call.state === 'incoming') {
+    if (call.state === 'incoming' || call.state === 'ringing') {
       invalid('call: it has not been answered, so it')
     }
   }
@@ -302,7 +317,7 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
   }
 
   async function run<T>(
-    operation: TelephonyOperation,
+    operation: MemoryOperation,
     opts: TelephonyOptions | undefined,
     body: () => T
   ): Promise<T> {
@@ -327,58 +342,87 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
     operations.push({ operation, providerCallId })
   }
 
+  function dial(request: PlaceCallRequest, agent: boolean): PlacedCall {
+    checkOrganizationId(request.organizationId)
+    checkCallId(request.callId)
+    checkProviderId(request.idempotencyKey, 'idempotencyKey')
+    checkNumber(request.from, 'from')
+    checkNumber(request.to, 'to')
+    const key = `${request.organizationId}|${request.idempotencyKey}`
+    const existing = placed.get(key)
+    if (existing !== undefined) {
+      const first = calls.get(existing)
+      if (
+        first &&
+        (first.to !== request.to || first.from !== request.from || first.agent !== agent)
+      ) {
+        invalid('idempotencyKey: it was used for another call, so it')
+      }
+      return { providerCallId: existing, created: false }
+    }
+    const script = scripts.get(request.to) ?? { kind: 'answers' }
+    const call: Call = {
+      organizationId: request.organizationId,
+      providerCallId: nextId('memcall-'),
+      callId: request.callId,
+      direction: 'outbound',
+      state: 'connected',
+      to: request.to,
+      from: request.from,
+      script,
+      disclosure: null,
+      bridgedTo: null,
+      recordingId: null,
+      streamId: null,
+      ringing: null,
+      agent,
+      endedBy: null,
+    }
+    calls.set(call.providerCallId, call)
+    placed.set(key, call.providerCallId)
+    record(agent ? 'placeAgentCall' : 'placeCall', call.providerCallId)
+    emit(call, 'ringing')
+    if (agent) {
+      call.state = 'ringing'
+    } else {
+      play(call)
+    }
+    return { providerCallId: call.providerCallId, created: true }
+  }
+
+  /** Plays out what the Prospect's script says happens once the number rings. */
+  function play(call: Call) {
+    const script = call.script
+    if (script.kind === 'no_answer') {
+      call.state = 'ended'
+      emit(call, 'no_answer', { failureReason: 'no_answer' })
+    } else if (script.kind === 'busy') {
+      call.state = 'ended'
+      emit(call, 'busy', { failureReason: 'busy' })
+    } else if (script.kind === 'carrier_failure' && (script.when ?? 'dial') === 'dial') {
+      fail(call, script.reason ?? 'carrier_rejected')
+    } else {
+      call.state = 'connected'
+      emit(call, 'answered')
+      if (call.agent) {
+        emit(call, 'detection', {
+          answeredBy: script.kind === 'answers' ? (script.detection ?? 'human') : 'human',
+        })
+      }
+    }
+  }
+
   const port: MemoryTelephony = {
     events,
     operations,
     placeCall(request: PlaceCallRequest, opts) {
-      return run('placeCall', opts, (): PlacedCall => {
-        checkOrganizationId(request.organizationId)
-        checkCallId(request.callId)
-        checkProviderId(request.idempotencyKey, 'idempotencyKey')
-        checkNumber(request.from, 'from')
-        checkNumber(request.to, 'to')
-        const key = `${request.organizationId}|${request.idempotencyKey}`
-        const existing = placed.get(key)
-        if (existing !== undefined) {
-          const first = calls.get(existing)
-          if (first && (first.to !== request.to || first.from !== request.from)) {
-            invalid('idempotencyKey: it was used for another call, so it')
-          }
-          return { providerCallId: existing, created: false }
-        }
-        const script = scripts.get(request.to) ?? { kind: 'answers' }
-        const call: Call = {
-          organizationId: request.organizationId,
-          providerCallId: nextId('memcall-'),
-          callId: request.callId,
-          direction: 'outbound',
-          state: 'connected',
-          to: request.to,
-          from: request.from,
-          script,
-          disclosure: null,
-          bridgedTo: null,
-          recordingId: null,
-          streamId: null,
-          ringing: null,
-          endedBy: null,
-        }
-        calls.set(call.providerCallId, call)
-        placed.set(key, call.providerCallId)
-        record('placeCall', call.providerCallId)
-        emit(call, 'ringing')
-        if (script.kind === 'no_answer') {
-          call.state = 'ended'
-          emit(call, 'no_answer', { failureReason: 'no_answer' })
-        } else if (script.kind === 'busy') {
-          call.state = 'ended'
-          emit(call, 'busy', { failureReason: 'busy' })
-        } else if (script.kind === 'carrier_failure' && (script.when ?? 'dial') === 'dial') {
-          fail(call, script.reason ?? 'carrier_rejected')
-        } else {
-          emit(call, 'answered')
-        }
-        return { providerCallId: call.providerCallId, created: true }
+      return run('placeCall', opts, () => dial(request, false))
+    },
+    placeAgentCall(request: PlaceAgentCallRequest, opts) {
+      return run('placeAgentCall', opts, () => {
+        checkDestinationUrl(request.streamUrl, allowPlainSocket)
+        checkDetectionWindow(request.detectionWindowMs)
+        return dial(request, true)
       })
     },
     answerCall(request: AnswerCallRequest, opts) {
@@ -582,11 +626,18 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
         recordingId: null,
         streamId: null,
         ringing: null,
+        agent: false,
         endedBy: null,
       }
       calls.set(call.providerCallId, call)
       emit(call, 'ringing')
       return call.providerCallId
+    },
+    ring(organizationId, providerCallId) {
+      const call = find(organizationId, providerCallId)
+      if (call.state === 'ringing') {
+        play(call)
+      }
     },
     prospectHangsUp(organizationId, providerCallId) {
       const call = find(organizationId, providerCallId)
