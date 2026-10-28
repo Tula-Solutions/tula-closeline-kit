@@ -9,6 +9,7 @@ import { sameText, signTwilioRequest, twilioUrlVariants } from '../twilio-signat
 import { TELEPHONY_ERROR_CODES, TelephonyError } from './errors'
 import {
   type AnswerCallRequest,
+  type AnsweredBy,
   type AnsweredCall,
   type BridgeRequest,
   type BrowserTokenRequest,
@@ -19,6 +20,7 @@ import {
   type ForkTracksRequest,
   type HangUpRequest,
   MAX_WEBHOOK_BODY_BYTES,
+  type PlaceAgentCallRequest,
   type PlaceCallRequest,
   type PlacedCall,
   type PlayDisclosureRequest,
@@ -33,6 +35,7 @@ import { createTwilioHttp, type TwilioFetch, type TwilioHttp } from './twilio-ht
 import {
   checkCallId,
   checkDestinationUrl,
+  checkDetectionWindow,
   checkDisclosure,
   checkIdentity,
   checkNumber,
@@ -209,6 +212,12 @@ export interface TwilioOptions {
   environment?: Environment
   /** Where Twilio reports call progress; the adapter adds `organizationId` and `callId` to the query. */
   statusCallbackUrl?: string
+  /**
+   * Where Twilio reports who answered an Agent-leg call (asynchronous answering-machine
+   * detection); the adapter adds `organizationId` and `callId`. Without it `placeAgentCall`
+   * throws `telephony.rejected`, since a call that cannot tell a machine must not be placed.
+   */
+  detectionCallbackUrl?: string
   /** Where Twilio reports a finished Recording; the adapter adds `organizationId` and `callId`. */
   recordingStatusCallbackUrl?: string
   /** The store of per-call state; required outside `local` and `dev`, where it is in memory. */
@@ -264,6 +273,19 @@ function escapeXml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
+}
+
+/**
+ * Maps Twilio's `AnsweredBy` (from the detection callback) to the port's {@link AnsweredBy}:
+ * `human` is a human, every `machine_*` and `fax` is a machine, anything else is `unknown`.
+ */
+export function twilioAnsweredBy(value: unknown): AnsweredBy {
+  if (value === 'human') {
+    return 'human'
+  }
+  return typeof value === 'string' && (value.startsWith('machine_') || value === 'fax')
+    ? 'machine'
+    : 'unknown'
 }
 
 function hold(): string {
@@ -359,7 +381,11 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
   if (!LANGUAGE.test(language)) {
     throw new TypeError('disclosureLanguage is not a language tag')
   }
-  for (const url of [options.statusCallbackUrl, options.recordingStatusCallbackUrl]) {
+  for (const url of [
+    options.statusCallbackUrl,
+    options.recordingStatusCallbackUrl,
+    options.detectionCallbackUrl,
+  ]) {
     if (url !== undefined) {
       let parsed: URL
       try {
@@ -484,57 +510,91 @@ export function createTwilioTelephony(options: TwilioOptions): TelephonyPort {
     return new TelephonyError(TELEPHONY_ERROR_CODES.callEnded, 'The call is not in progress')
   }
 
+  /** Places a call; an Agent-leg one streams its audio and has answering-machine detection. */
+  async function place(
+    request: PlaceCallRequest,
+    opts: TelephonyOptions | undefined,
+    agent?: { streamUrl: string; windowMs: number; callbackUrl: string }
+  ): Promise<PlacedCall> {
+    const organizationId = checkOrganizationId(request.organizationId)
+    const callId = checkCallId(request.callId)
+    const key = checkProviderId(request.idempotencyKey, 'idempotencyKey')
+    const from = checkNumber(request.from, 'from')
+    const to = checkNumber(request.to, 'to')
+    const deadline = deadlineFor(opts)
+    const fingerprint = createHmac('sha256', apiKeySecret)
+      .update(`${agent ? 'agent\u0000' : ''}${from}\u0000${to}`)
+      .digest('hex')
+    const earlier = await store.getPlacement(organizationId, key)
+    if (earlier) {
+      if (earlier.fingerprint !== fingerprint) {
+        invalid('idempotencyKey')
+      }
+      return { providerCallId: earlier.providerCallId, created: false }
+    }
+    const form: Record<string, string | string[]> = {
+      To: to,
+      From: from,
+      Twiml: agent
+        ? `<Response><Connect><Stream url="${escapeXml(agent.streamUrl)}"/></Connect></Response>`
+        : hold(),
+    }
+    if (agent) {
+      // shortcut: Twilio's minimum detection timeout is 3 s, so a shorter window still waits 3 s.
+      form.MachineDetection = 'Enable'
+      form.AsyncAmd = 'true'
+      form.MachineDetectionTimeout = String(Math.max(3, Math.ceil(agent.windowMs / 1000)))
+      form.AsyncAmdStatusCallback = withTag(agent.callbackUrl, organizationId, callId)
+      form.AsyncAmdStatusCallbackMethod = 'POST'
+    }
+    if (options.statusCallbackUrl !== undefined) {
+      form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId)
+      form.StatusCallbackMethod = 'POST'
+      form.StatusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed']
+    }
+    const { json } = await http.json({
+      method: 'POST',
+      path: `${base}/Calls.json`,
+      form,
+      idempotencyToken: token('call', organizationId, key),
+      deadline,
+    })
+    const providerCallId = sid(json, 'CA')
+    await store.putCall(providerCallId, {
+      organizationId,
+      callId,
+      direction: 'outbound',
+      disclosure: null,
+      bridgedTo: null,
+      ringIdentities: [],
+      recordingId: null,
+      streamId: null,
+    })
+    await store.putPlacement(organizationId, key, { providerCallId, fingerprint })
+    return { providerCallId, created: true }
+  }
+
   return {
-    // Answering-machine detection on Twilio is ticket T6; until then Agent-leg calls are refused.
-    async placeAgentCall(): Promise<PlacedCall> {
-      throw new TelephonyError(
-        TELEPHONY_ERROR_CODES.rejected,
-        'Agent-leg calls are not supported by this adapter yet'
-      )
+    async placeAgentCall(
+      request: PlaceAgentCallRequest,
+      opts?: TelephonyOptions
+    ): Promise<PlacedCall> {
+      const streamUrl = checkDestinationUrl(request.streamUrl, environment === 'local')
+      const windowMs = checkDetectionWindow(request.detectionWindowMs)
+      if (options.detectionCallbackUrl === undefined) {
+        throw new TelephonyError(
+          TELEPHONY_ERROR_CODES.rejected,
+          'This adapter has no detection callback, so it cannot place an Agent-leg call'
+        )
+      }
+      return place(request, opts, {
+        streamUrl,
+        windowMs,
+        callbackUrl: options.detectionCallbackUrl,
+      })
     },
-    async placeCall(request: PlaceCallRequest, opts?: TelephonyOptions): Promise<PlacedCall> {
-      const organizationId = checkOrganizationId(request.organizationId)
-      const callId = checkCallId(request.callId)
-      const key = checkProviderId(request.idempotencyKey, 'idempotencyKey')
-      const from = checkNumber(request.from, 'from')
-      const to = checkNumber(request.to, 'to')
-      const deadline = deadlineFor(opts)
-      const fingerprint = createHmac('sha256', apiKeySecret)
-        .update(`${from}\u0000${to}`)
-        .digest('hex')
-      const earlier = await store.getPlacement(organizationId, key)
-      if (earlier) {
-        if (earlier.fingerprint !== fingerprint) {
-          invalid('idempotencyKey')
-        }
-        return { providerCallId: earlier.providerCallId, created: false }
-      }
-      const form: Record<string, string | string[]> = { To: to, From: from, Twiml: hold() }
-      if (options.statusCallbackUrl !== undefined) {
-        form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId)
-        form.StatusCallbackMethod = 'POST'
-        form.StatusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed']
-      }
-      const { json } = await http.json({
-        method: 'POST',
-        path: `${base}/Calls.json`,
-        form,
-        idempotencyToken: token('call', organizationId, key),
-        deadline,
-      })
-      const providerCallId = sid(json, 'CA')
-      await store.putCall(providerCallId, {
-        organizationId,
-        callId,
-        direction: 'outbound',
-        disclosure: null,
-        bridgedTo: null,
-        ringIdentities: [],
-        recordingId: null,
-        streamId: null,
-      })
-      await store.putPlacement(organizationId, key, { providerCallId, fingerprint })
-      return { providerCallId, created: true }
+    placeCall(request: PlaceCallRequest, opts?: TelephonyOptions): Promise<PlacedCall> {
+      return place(request, opts)
     },
 
     async answerCall(request: AnswerCallRequest, opts?: TelephonyOptions): Promise<AnsweredCall> {

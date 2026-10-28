@@ -49,6 +49,7 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
+  checkDetectionWindow,
   requireConsent,
   invalid3,
   checkSendRequest,
@@ -2937,6 +2938,12 @@ function estimateSpeechMs(text) {
 function escapeXml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
+function twilioAnsweredBy(value) {
+  if (value === "human") {
+    return "human";
+  }
+  return typeof value === "string" && (value.startsWith("machine_") || value === "fax") ? "machine" : "unknown";
+}
 function hold() {
   return `<Response><Pause length="${HOLD_SECONDS}"/></Response>`;
 }
@@ -3000,7 +3007,11 @@ function createTwilioTelephony(options) {
   if (!LANGUAGE.test(language)) {
     throw new TypeError("disclosureLanguage is not a language tag");
   }
-  for (const url of [options.statusCallbackUrl, options.recordingStatusCallbackUrl]) {
+  for (const url of [
+    options.statusCallbackUrl,
+    options.recordingStatusCallbackUrl,
+    options.detectionCallbackUrl
+  ]) {
     if (url !== undefined) {
       let parsed;
       try {
@@ -3094,51 +3105,74 @@ function createTwilioTelephony(options) {
   function callEnded() {
     return new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
   }
+  async function place(request, opts, agent) {
+    const organizationId = checkOrganizationId2(request.organizationId);
+    const callId = checkCallId(request.callId);
+    const key = checkProviderId(request.idempotencyKey, "idempotencyKey");
+    const from = checkNumber(request.from, "from");
+    const to = checkNumber(request.to, "to");
+    const deadline = deadlineFor(opts);
+    const fingerprint = createHmac("sha256", apiKeySecret).update(`${agent ? "agent\x00" : ""}${from}\x00${to}`).digest("hex");
+    const earlier = await store.getPlacement(organizationId, key);
+    if (earlier) {
+      if (earlier.fingerprint !== fingerprint) {
+        invalid2("idempotencyKey");
+      }
+      return { providerCallId: earlier.providerCallId, created: false };
+    }
+    const form = {
+      To: to,
+      From: from,
+      Twiml: agent ? `<Response><Connect><Stream url="${escapeXml(agent.streamUrl)}"/></Connect></Response>` : hold()
+    };
+    if (agent) {
+      form.MachineDetection = "Enable";
+      form.AsyncAmd = "true";
+      form.MachineDetectionTimeout = String(Math.max(3, Math.ceil(agent.windowMs / 1000)));
+      form.AsyncAmdStatusCallback = withTag(agent.callbackUrl, organizationId, callId);
+      form.AsyncAmdStatusCallbackMethod = "POST";
+    }
+    if (options.statusCallbackUrl !== undefined) {
+      form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId);
+      form.StatusCallbackMethod = "POST";
+      form.StatusCallbackEvent = ["initiated", "ringing", "answered", "completed"];
+    }
+    const { json } = await http.json({
+      method: "POST",
+      path: `${base}/Calls.json`,
+      form,
+      idempotencyToken: token("call", organizationId, key),
+      deadline
+    });
+    const providerCallId = sid(json, "CA");
+    await store.putCall(providerCallId, {
+      organizationId,
+      callId,
+      direction: "outbound",
+      disclosure: null,
+      bridgedTo: null,
+      ringIdentities: [],
+      recordingId: null,
+      streamId: null
+    });
+    await store.putPlacement(organizationId, key, { providerCallId, fingerprint });
+    return { providerCallId, created: true };
+  }
   return {
-    async placeAgentCall() {
-      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.rejected, "Agent-leg calls are not supported by this adapter yet");
+    async placeAgentCall(request, opts) {
+      const streamUrl = checkDestinationUrl(request.streamUrl, environment === "local");
+      const windowMs = checkDetectionWindow(request.detectionWindowMs);
+      if (options.detectionCallbackUrl === undefined) {
+        throw new TelephonyError2(TELEPHONY_ERROR_CODES2.rejected, "This adapter has no detection callback, so it cannot place an Agent-leg call");
+      }
+      return place(request, opts, {
+        streamUrl,
+        windowMs,
+        callbackUrl: options.detectionCallbackUrl
+      });
     },
-    async placeCall(request, opts) {
-      const organizationId = checkOrganizationId2(request.organizationId);
-      const callId = checkCallId(request.callId);
-      const key = checkProviderId(request.idempotencyKey, "idempotencyKey");
-      const from = checkNumber(request.from, "from");
-      const to = checkNumber(request.to, "to");
-      const deadline = deadlineFor(opts);
-      const fingerprint = createHmac("sha256", apiKeySecret).update(`${from}\x00${to}`).digest("hex");
-      const earlier = await store.getPlacement(organizationId, key);
-      if (earlier) {
-        if (earlier.fingerprint !== fingerprint) {
-          invalid2("idempotencyKey");
-        }
-        return { providerCallId: earlier.providerCallId, created: false };
-      }
-      const form = { To: to, From: from, Twiml: hold() };
-      if (options.statusCallbackUrl !== undefined) {
-        form.StatusCallback = withTag(options.statusCallbackUrl, organizationId, callId);
-        form.StatusCallbackMethod = "POST";
-        form.StatusCallbackEvent = ["initiated", "ringing", "answered", "completed"];
-      }
-      const { json } = await http.json({
-        method: "POST",
-        path: `${base}/Calls.json`,
-        form,
-        idempotencyToken: token("call", organizationId, key),
-        deadline
-      });
-      const providerCallId = sid(json, "CA");
-      await store.putCall(providerCallId, {
-        organizationId,
-        callId,
-        direction: "outbound",
-        disclosure: null,
-        bridgedTo: null,
-        ringIdentities: [],
-        recordingId: null,
-        streamId: null
-      });
-      await store.putPlacement(organizationId, key, { providerCallId, fingerprint });
-      return { providerCallId, created: true };
+    placeCall(request, opts) {
+      return place(request, opts);
     },
     async answerCall(request, opts) {
       const { organizationId, providerCallId } = refOf(request);
@@ -5764,6 +5798,7 @@ export {
   timeZoneForNumber,
   toErrorBody2 as toErrorBody,
   ttsRetryDelayMs2 as ttsRetryDelayMs,
+  twilioAnsweredBy,
   twilioApiHost,
   waitForTranscription2 as waitForTranscription,
   withCaller2 as withCaller

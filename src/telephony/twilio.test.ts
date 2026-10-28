@@ -11,6 +11,7 @@ import {
   estimateSpeechMs,
   signTwilioRequest,
   type TwilioOptions,
+  twilioAnsweredBy,
   twilioApiHost,
 } from './twilio'
 
@@ -1169,5 +1170,106 @@ describe('twilio telephony: answerCall retry', () => {
     release()
     await Promise.all([first, playing])
     expect(landed.at(-1)).toBe('say')
+  })
+})
+
+describe('twilio telephony: placeAgentCall', () => {
+  const agentOptions = { detectionCallbackUrl: 'https://voice.example.test/hooks/amd' }
+  const agentRequest = {
+    organizationId: org,
+    callId,
+    idempotencyKey: 'agent-1',
+    from: LINE,
+    to: PROSPECT,
+    streamUrl: 'wss://voice.example.test/media',
+  }
+
+  test('posts async detection, a stream TwiML and a tagged detection callback', async () => {
+    const h = harness(happy, agentOptions)
+    const result = await h.telephony.placeAgentCall({ ...agentRequest, detectionWindowMs: 2500 })
+    expect(result).toEqual({ providerCallId: CALL_SID, created: true })
+    const form = h.seen[0]?.form
+    expect(form?.get('Twiml')).toBe(
+      '<Response><Connect><Stream url="wss://voice.example.test/media"/></Connect></Response>'
+    )
+    expect(form?.get('MachineDetection')).toBe('Enable')
+    expect(form?.get('AsyncAmd')).toBe('true')
+    expect(form?.get('MachineDetectionTimeout')).toBe('3')
+    const callback = new URL(form?.get('AsyncAmdStatusCallback') ?? '')
+    expect(callback.searchParams.get('organizationId')).toBe(org)
+    expect(callback.searchParams.get('callId')).toBe(callId)
+    expect(form?.get('Twiml')).not.toContain('<Say')
+  })
+
+  test('the default window is the maximum and rounds up to whole seconds', async () => {
+    const h = harness(happy, agentOptions)
+    await h.telephony.placeAgentCall(agentRequest)
+    expect(h.seen[0]?.form.get('MachineDetectionTimeout')).toBe('4')
+  })
+
+  test('the same key places one call; a key of placeCall cannot be reused, nor the reverse', async () => {
+    const h = harness(happy, agentOptions)
+    const first = await h.telephony.placeAgentCall(agentRequest)
+    expect(await h.telephony.placeAgentCall(agentRequest)).toEqual({
+      providerCallId: first.providerCallId,
+      created: false,
+    })
+    expect(h.seen.filter((s) => s.method === 'POST')).toHaveLength(1)
+    const { streamUrl: _, ...plain } = agentRequest
+    expect(await code(h.telephony.placeCall(plain))).toBe('telephony.invalid_request')
+    await h.telephony.placeCall({ ...plain, idempotencyKey: 'plain-1' })
+    expect(
+      await code(h.telephony.placeAgentCall({ ...agentRequest, idempotencyKey: 'plain-1' }))
+    ).toBe('telephony.invalid_request')
+  })
+
+  test('refuses bad input and a missing callback before any request', async () => {
+    const h = harness(happy, agentOptions)
+    for (const bad of [
+      { ...agentRequest, streamUrl: 'https://voice.example.test/media' },
+      { ...agentRequest, streamUrl: 'ws://voice.example.test/media' },
+      { ...agentRequest, detectionWindowMs: 0 },
+      { ...agentRequest, detectionWindowMs: 4001 },
+      { ...agentRequest, to: 'nope' },
+    ]) {
+      expect(await code(h.telephony.placeAgentCall(bad))).toBe('telephony.invalid_request')
+    }
+    const bare = harness(happy)
+    expect(await code(bare.telephony.placeAgentCall(agentRequest))).toBe('telephony.rejected')
+    expect(h.seen).toHaveLength(0)
+    expect(bare.seen).toHaveLength(0)
+  })
+
+  test('retries a 503 with jitter, times out a stall', async () => {
+    let tries = 0
+    const h = harness(
+      (seen) => (seen.method === 'POST' && ++tries === 1 ? json(503, {}) : happy(seen)),
+      agentOptions
+    )
+    expect((await h.telephony.placeAgentCall(agentRequest)).created).toBe(true)
+    expect(h.sleeps).toHaveLength(1)
+    const stalled = harness(() => 'hang', agentOptions)
+    expect(await code(stalled.telephony.placeAgentCall(agentRequest, { timeoutMs: 20 }))).toBe(
+      'telephony.unavailable'
+    )
+  })
+
+  test('hanging up before the answer cancels the call; another Organization cannot', async () => {
+    const h = harness(happy, agentOptions)
+    const { providerCallId } = await h.telephony.placeAgentCall(agentRequest)
+    expect(await code(h.telephony.hangUp({ organizationId: otherOrg, providerCallId }))).toBe(
+      'telephony.not_found'
+    )
+    await h.telephony.hangUp({ organizationId: org, providerCallId })
+    expect(h.seen.at(-1)?.form.get('Status')).toBe('completed')
+  })
+
+  test('twilioAnsweredBy maps Twilio values to the port', () => {
+    expect(twilioAnsweredBy('human')).toBe('human')
+    for (const machine of ['machine_start', 'machine_end_beep', 'machine_end_other', 'fax']) {
+      expect(twilioAnsweredBy(machine)).toBe('machine')
+    }
+    expect(twilioAnsweredBy('unknown')).toBe('unknown')
+    expect(twilioAnsweredBy(undefined)).toBe('unknown')
   })
 })
