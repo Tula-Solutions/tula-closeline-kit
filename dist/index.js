@@ -1957,6 +1957,143 @@ function createOutlookCalendar(options) {
 function tooMany() {
   return new CalendarError2(CALENDAR_ERROR_CODES2.rejected, "The calendar has too many busy intervals", { details: { reason: "too_many_intervals", max: MAX_BUSY_INTERVALS2 } });
 }
+// src/calling-window/zones.ts
+var NANP_ZONES = {
+  "America/New_York": "202 203 207 212 215 216 220 223 226 229 234 239 240 248 249 252 260 267 272 289 301 302 304 305 313 315 321 330 332 339 343 347 351 352 365 380 382 386 401 404 407 410 412 413 416 423 437 440 443 445 463 470 475 478 484 508 513 516 517 518 519 540 548 551 561 567 570 571 582 585 586 603 607 609 610 613 614 616 617 631 640 646 647 656 667 678 680 681 686 689 703 704 705 717 718 724 727 732 734 740 742 743 754 757 765 771 772 774 781 786 802 803 804 810 813 814 835 838 839 843 845 848 854 856 857 859 862 863 864 865 878 904 905 908 910 912 914 917 919 929 934 937 941 943 947 948 954 959 973 978 980 984 989 502 606",
+  "America/Chicago": "205 214 217 218 224 225 228 251 254 256 262 274 281 309 312 314 316 318 319 320 325 331 334 337 346 361 402 405 409 414 417 430 469 479 501 504 507 512 515 531 534 539 557 563 572 573 580 601 608 612 615 618 629 630 636 641 651 659 660 662 682 708 712 713 715 726 731 737 763 769 773 779 806 815 816 817 830 832 847 870 872 901 903 913 918 920 931 936 938 940 952 956 972 975 979 985 204 431",
+  "America/Regina": "306 474 639",
+  "America/Denver": "303 307 385 403 406 435 505 575 587 368 719 720 780 801 825 970 983",
+  "America/Phoenix": "480 520 602 623",
+  "America/Los_Angeles": "206 209 213 253 424 279 310 323 341 360 408 415 425 442 458 503 509 510 530 559 562 564 604 619 626 628 650 657 661 669 702 707 714 725 747 760 775 805 818 820 831 840 858 909 916 925 949 951 971",
+  "Pacific/Honolulu": "808",
+  "America/Halifax": "506 782 902",
+  "America/Puerto_Rico": "787 939",
+  "America/St_Thomas": "340",
+  "America/Jamaica": "658 876",
+  "America/Santo_Domingo": "809 829 849",
+  "Pacific/Guam": "671"
+};
+var COUNTRY_ZONES = {
+  "31": "Europe/Amsterdam",
+  "32": "Europe/Brussels",
+  "33": "Europe/Paris",
+  "39": "Europe/Rome",
+  "41": "Europe/Zurich",
+  "43": "Europe/Vienna",
+  "44": "Europe/London",
+  "45": "Europe/Copenhagen",
+  "46": "Europe/Stockholm",
+  "47": "Europe/Oslo",
+  "48": "Europe/Warsaw",
+  "49": "Europe/Berlin",
+  "65": "Asia/Singapore",
+  "81": "Asia/Tokyo",
+  "82": "Asia/Seoul",
+  "86": "Asia/Shanghai",
+  "90": "Europe/Istanbul",
+  "91": "Asia/Kolkata",
+  "353": "Europe/Dublin",
+  "852": "Asia/Hong_Kong",
+  "971": "Asia/Dubai",
+  "972": "Asia/Jerusalem"
+};
+var AREA_CODE_ZONE = new Map;
+for (const [zone, codes] of Object.entries(NANP_ZONES)) {
+  for (const code of codes.split(" ")) {
+    if (!/^\d{3}$/.test(code)) {
+      throw new Error(`bad area code ${code}`);
+    }
+    if (AREA_CODE_ZONE.has(code)) {
+      throw new Error(`area code ${code} listed twice`);
+    }
+    AREA_CODE_ZONE.set(code, zone);
+  }
+}
+function isKnownTimeZone(zone) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function timeZoneForNumber(e164, override) {
+  if (override !== undefined) {
+    return isKnownTimeZone(override) ? override : undefined;
+  }
+  if (!/^\+[1-9]\d{6,14}$/.test(e164)) {
+    return;
+  }
+  if (e164.startsWith("+1")) {
+    return e164.length === 12 && /^\+1[2-9]/.test(e164) ? AREA_CODE_ZONE.get(e164.slice(2, 5)) : undefined;
+  }
+  for (const length of [3, 2]) {
+    const zone = COUNTRY_ZONES[e164.slice(1, 1 + length)];
+    if (zone) {
+      return zone;
+    }
+  }
+  return;
+}
+
+// src/calling-window/window.ts
+var PLATFORM_CALLING_WINDOW = { startMinute: 8 * 60, endMinute: 21 * 60 };
+var partsFormat = new Map;
+function localParts(zone, at) {
+  let format = partsFormat.get(zone);
+  if (!format) {
+    format = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      second: "numeric"
+    });
+    partsFormat.set(zone, format);
+  }
+  const p = {};
+  for (const { type, value } of format.formatToParts(at)) {
+    p[type] = Number(value);
+  }
+  return p;
+}
+function offsetMs(zone, at) {
+  const p = localParts(zone, at);
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return asUtc - Math.floor(at.getTime() / 1000) * 1000;
+}
+function localToInstant(zone, y, m, d, minute) {
+  const wall = Date.UTC(y, m - 1, d, 0, minute);
+  let guess = new Date(wall - offsetMs(zone, new Date(wall)));
+  guess = new Date(wall - offsetMs(zone, guess));
+  return guess;
+}
+function effectiveWindow(narrow) {
+  const start = Math.max(PLATFORM_CALLING_WINDOW.startMinute, narrow?.startMinute ?? 0);
+  const end = Math.min(PLATFORM_CALLING_WINDOW.endMinute, narrow?.endMinute ?? Number.POSITIVE_INFINITY);
+  return start < end ? { start, end } : null;
+}
+function checkCallingWindow(input) {
+  const timeZone = timeZoneForNumber(input.e164, input.timeZoneOverride);
+  if (!timeZone) {
+    return { allowed: false, reason: "timezone_unknown" };
+  }
+  const window = effectiveWindow(input.narrow);
+  if (!window) {
+    return { allowed: false, reason: "outside_hours", timeZone };
+  }
+  const p = localParts(timeZone, input.now);
+  const seconds = p.hour * 3600 + p.minute * 60 + p.second;
+  if (seconds >= window.start * 60 && seconds < window.end * 60) {
+    return { allowed: true, timeZone };
+  }
+  const dayOffset = seconds < window.start * 60 ? 0 : 1;
+  const nextOpening = localToInstant(timeZone, p.year, p.month, p.day + dayOffset, window.start);
+  return { allowed: false, reason: "outside_hours", timeZone, nextOpening };
+}
 // src/consent/http.ts
 import {
   CONSENT_ROUTES,
@@ -5537,6 +5674,7 @@ export {
   MessagingError2 as MessagingError,
   OUTLOOK_CALENDAR_SCOPES,
   PACKAGE,
+  PLATFORM_CALLING_WINDOW,
   QUEUE_ERROR_CODES2 as QUEUE_ERROR_CODES,
   QueueError2 as QueueError,
   STORAGE_ERROR_CODES2 as STORAGE_ERROR_CODES,
@@ -5571,6 +5709,7 @@ export {
   bunAssemblyAiSocket,
   bunCartesiaSocket,
   calendarRetryDelayMs2 as calendarRetryDelayMs,
+  checkCallingWindow,
   checkTranscriptionResult2 as checkTranscriptionResult,
   classifyMessageIntent2 as classifyMessageIntent,
   createAssemblyAiStreamingTranscribe,
@@ -5602,6 +5741,7 @@ export {
   estimateTokens2 as estimateTokens,
   isAppError2 as isAppError,
   isContactGuardRequest2 as isContactGuardRequest,
+  isKnownTimeZone,
   isReportableMessagingError2 as isReportableMessagingError,
   isScopeGuard,
   isSentryDsn,
@@ -5617,6 +5757,7 @@ export {
   signTwilioRequest2 as signTwilioRequest,
   systemClock2 as systemClock,
   systemSleep2 as systemSleep,
+  timeZoneForNumber,
   toErrorBody2 as toErrorBody,
   ttsRetryDelayMs2 as ttsRetryDelayMs,
   twilioApiHost,
