@@ -448,6 +448,9 @@ export function createMemoryTelephony(options: MemoryTelephonyOptions = {}): Mem
       return run('playDisclosure', opts, (): DisclosurePlayed => {
         checkRef(request)
         checkDisclosure(request.wordingVersion, request.text, request.aiAssisted)
+        if (request.streamUrl !== undefined) {
+          checkDestinationUrl(request.streamUrl, allowPlainSocket)
+        }
         const call = find(request.organizationId, request.providerCallId)
         if (call.disclosure !== null && call.disclosure.wordingVersion === request.wordingVersion) {
           return call.disclosure

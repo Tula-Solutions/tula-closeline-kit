@@ -3218,6 +3218,7 @@ function createTwilioTelephony(options) {
         return earlier;
       }
       const waitMs = estimateSpeechMs(request.text);
+      const after = request.streamUrl === undefined ? `<Pause length="${HOLD_SECONDS}"/>` : `<Connect><Stream url="${escapeXml(checkDestinationUrl(request.streamUrl, environment === "local"))}"/></Connect>`;
       if (options.disclosureDone === undefined && nowMs() + waitMs > deadline) {
         throw unavailable5();
       }
@@ -3227,7 +3228,7 @@ function createTwilioTelephony(options) {
         }
         await store.putCall(providerCallId, { ...fresh, disclosureStarted: true });
         await updateCall(providerCallId, {
-          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say><Pause length="${HOLD_SECONDS}"/></Response>`
+          Twiml: `<Response><Say language="${language}">${escapeXml(request.text)}</Say>${after}</Response>`
         }, deadline);
       });
       if (options.disclosureDone) {

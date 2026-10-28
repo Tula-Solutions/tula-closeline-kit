@@ -1828,6 +1828,9 @@ function createMemoryTelephony(options = {}) {
       return run("playDisclosure", opts, () => {
         checkRef(request);
         checkDisclosure(request.wordingVersion, request.text, request.aiAssisted);
+        if (request.streamUrl !== undefined) {
+          checkDestinationUrl(request.streamUrl, allowPlainSocket);
+        }
         const call = find(request.organizationId, request.providerCallId);
         if (call.disclosure !== null && call.disclosure.wordingVersion === request.wordingVersion) {
           return call.disclosure;
