@@ -14,7 +14,12 @@ import { isTransientAwsFailure, reduceAwsCause } from '../aws-failure'
 import type { Logger } from '../logger'
 import { type Sleep, systemSleep } from '../queue/sleep'
 import type { ErrorReporter } from '../reporting/port'
-import { assertModelInRegion, assertRegion, createBedrockClient } from './bedrock-client'
+import {
+  assertModelInRegion,
+  assertRegion,
+  callableModelId,
+  createBedrockClient,
+} from './bedrock-client'
 import { type Deadline, startDeadline, withLlmRetry } from './deadline'
 import { LLM_ERROR_CODES, LlmError } from './errors'
 import {
@@ -58,7 +63,7 @@ export interface BedrockSender {
 export interface BedrockLlmOptions {
   /** The AWS Region the calls are made in, such as `eu-west-1`; every call stays in it. */
   region: string
-  /** The model id of each tier; the Haiku 5.5 and Sonnet 5.5 ids by default. A cross-Region inference profile id must carry the prefix of `region`'s geography. */
+  /** The model id of each tier; the Haiku 5.5 and Sonnet 5.5 ids by default. A bare `anthropic.*` id is called through the `region` geography's inference profile; a profile id must carry the prefix of `region`'s geography. */
   models?: Partial<Record<ModelTier, string>>
   /** Time the SDK waits to connect, in ms; 5000 by default. */
   connectTimeoutMs?: number
@@ -160,6 +165,11 @@ export function createBedrockLlm(options: BedrockLlmOptions): LlmPort {
   for (const tier of MODEL_TIERS) {
     assertModelInRegion(tier, models[tier], options.region)
   }
+  // Metering stays keyed on the tier; only the id sent to Bedrock carries the profile prefix.
+  const callable = {
+    fast: callableModelId(models.fast, options.region),
+    smart: callableModelId(models.smart, options.region),
+  }
   const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_BEDROCK_CONNECT_TIMEOUT_MS
   if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 60_000) {
     throw new TypeError('connectTimeoutMs must be a whole number from 1 to 60000')
@@ -253,7 +263,7 @@ export function createBedrockLlm(options: BedrockLlmOptions): LlmPort {
       }
       const { $schema: _dropped, ...schemaBody } = jsonSchema
       const input: ConverseCommand['input'] = {
-        modelId: models[request.tier],
+        modelId: callable[request.tier],
         ...toMessages(request),
         inferenceConfig: { maxTokens: checked.maxOutputTokens },
         toolConfig: {
@@ -306,7 +316,7 @@ export function createBedrockLlm(options: BedrockLlmOptions): LlmPort {
     stream(request: LlmStreamRequest): AsyncIterable<LlmStreamEvent> {
       const checked = checkRequest(request)
       const input: ConverseCommand['input'] = {
-        modelId: models[request.tier],
+        modelId: callable[request.tier],
         ...toMessages(request),
         inferenceConfig: { maxTokens: checked.maxOutputTokens },
       }

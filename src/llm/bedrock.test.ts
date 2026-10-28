@@ -108,8 +108,38 @@ describe('Region and model guards', () => {
     }
     expect(fake.requests.map((r) => r.input.modelId)).toEqual([
       'eu.anthropic.fast-model',
-      'anthropic.smart-model',
+      'eu.anthropic.smart-model',
     ])
+  })
+
+  test.each([
+    ['us-east-1', 'us.anthropic.claude-sonnet-5-5'],
+    ['eu-west-1', 'eu.anthropic.claude-sonnet-5-5'],
+    ['ap-southeast-2', 'apac.anthropic.claude-sonnet-5-5'],
+    ['ca-central-1', 'anthropic.claude-sonnet-5-5'],
+    ['us-gov-west-1', 'anthropic.claude-sonnet-5-5'],
+  ])('a bare id is called through the profile of the Region: %s', async (region, expected) => {
+    const { fake, port } = build(region)
+    fake.reply('hi')
+    for await (const _ of port.stream({
+      organizationId: org,
+      tier: 'smart',
+      messages: [{ role: 'user', content: 'a' }],
+    })) {
+    }
+    expect(fake.requests[0]?.input.modelId).toBe(expected)
+  })
+
+  test('an id that already carries a profile prefix is left untouched', async () => {
+    const { fake, port } = build('us-east-1', { fast: 'us.anthropic.claude-haiku-5-5' })
+    fake.reply('hi')
+    for await (const _ of port.stream({
+      organizationId: org,
+      tier: 'fast',
+      messages: [{ role: 'user', content: 'a' }],
+    })) {
+    }
+    expect(fake.requests[0]?.input.modelId).toBe('us.anthropic.claude-haiku-5-5')
   })
 })
 
@@ -199,7 +229,7 @@ describe('request mapping', () => {
       usage: { inputTokens: 12, outputTokens: 4 },
     })
     const input = fake.requests[0]?.input
-    expect(input?.modelId).toBe('anthropic.claude-haiku-5-5')
+    expect(input?.modelId).toBe('eu.anthropic.claude-haiku-5-5')
     expect(input?.system).toEqual([{ text: 'be brief' }])
     expect(input?.messages).toEqual([
       { role: 'user', content: [{ text: 'one' }] },
@@ -247,7 +277,7 @@ describe('request mapping', () => {
       { type: 'text', text: 'beta' },
       { type: 'done', stopReason: 'end', usage: { inputTokens: 3, outputTokens: 2 } },
     ])
-    expect(fake.requests[0]?.input.modelId).toBe('anthropic.claude-sonnet-5-5')
+    expect(fake.requests[0]?.input.modelId).toBe('eu.anthropic.claude-sonnet-5-5')
     expect(fake.requests[0]?.input.toolConfig).toBeUndefined()
   })
 

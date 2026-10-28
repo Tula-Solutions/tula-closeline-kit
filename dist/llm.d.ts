@@ -199,7 +199,7 @@ interface BedrockSender {
 interface BedrockLlmOptions {
 	/** The AWS Region the calls are made in, such as `eu-west-1`; every call stays in it. */
 	region: string;
-	/** The model id of each tier; the Haiku 5.5 and Sonnet 5.5 ids by default. A cross-Region inference profile id must carry the prefix of `region`'s geography. */
+	/** The model id of each tier; the Haiku 5.5 and Sonnet 5.5 ids by default. A bare `anthropic.*` id is called through the `region` geography's inference profile; a profile id must carry the prefix of `region`'s geography. */
 	models?: Partial<Record<ModelTier, string>>;
 	/** Time the SDK waits to connect, in ms; 5000 by default. */
 	connectTimeoutMs?: number;
