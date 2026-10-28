@@ -35,6 +35,7 @@ import {
   checkDestinationUrl,
   resolveTimeout,
   requireDisclosure,
+  checkDetectionWindow,
   requireConsent,
   invalid3,
   checkSendRequest,
@@ -62,7 +63,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-hwsmd58n.js";
+} from "./shared/chunk-z7321nev.js";
 import {
   CalendarConnection2,
   CALENDAR_ERROR_CODES2,
@@ -83,7 +84,7 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-y4v94n67.js";
+} from "./shared/chunk-kqsgrawe.js";
 import {
   startDeadline,
   withLlmRetry,
@@ -1699,7 +1700,7 @@ function createMemoryTelephony(options = {}) {
     if (call.state === "ended") {
       throw new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call has ended");
     }
-    if (call.state === "incoming") {
+    if (call.state === "incoming" || call.state === "ringing") {
       invalid2("call: it has not been answered, so it");
     }
   }
@@ -1727,58 +1728,81 @@ function createMemoryTelephony(options = {}) {
   function record(operation, providerCallId) {
     operations.push({ operation, providerCallId });
   }
+  function dial(request, agent) {
+    checkOrganizationId2(request.organizationId);
+    checkCallId(request.callId);
+    checkProviderId(request.idempotencyKey, "idempotencyKey");
+    checkNumber(request.from, "from");
+    checkNumber(request.to, "to");
+    const key = `${request.organizationId}|${request.idempotencyKey}`;
+    const existing = placed.get(key);
+    if (existing !== undefined) {
+      const first = calls.get(existing);
+      if (first && (first.to !== request.to || first.from !== request.from || first.agent !== agent)) {
+        invalid2("idempotencyKey: it was used for another call, so it");
+      }
+      return { providerCallId: existing, created: false };
+    }
+    const script = scripts.get(request.to) ?? { kind: "answers" };
+    const call = {
+      organizationId: request.organizationId,
+      providerCallId: nextId("memcall-"),
+      callId: request.callId,
+      direction: "outbound",
+      state: "connected",
+      to: request.to,
+      from: request.from,
+      script,
+      disclosure: null,
+      bridgedTo: null,
+      recordingId: null,
+      streamId: null,
+      ringing: null,
+      agent,
+      endedBy: null
+    };
+    calls.set(call.providerCallId, call);
+    placed.set(key, call.providerCallId);
+    record(agent ? "placeAgentCall" : "placeCall", call.providerCallId);
+    emit(call, "ringing");
+    if (agent) {
+      call.state = "ringing";
+    } else {
+      play(call);
+    }
+    return { providerCallId: call.providerCallId, created: true };
+  }
+  function play(call) {
+    const script = call.script;
+    if (script.kind === "no_answer") {
+      call.state = "ended";
+      emit(call, "no_answer", { failureReason: "no_answer" });
+    } else if (script.kind === "busy") {
+      call.state = "ended";
+      emit(call, "busy", { failureReason: "busy" });
+    } else if (script.kind === "carrier_failure" && (script.when ?? "dial") === "dial") {
+      fail(call, script.reason ?? "carrier_rejected");
+    } else {
+      call.state = "connected";
+      emit(call, "answered");
+      if (call.agent) {
+        emit(call, "detection", {
+          answeredBy: script.kind === "answers" ? script.detection ?? "human" : "human"
+        });
+      }
+    }
+  }
   const port = {
     events,
     operations,
     placeCall(request, opts) {
-      return run("placeCall", opts, () => {
-        checkOrganizationId2(request.organizationId);
-        checkCallId(request.callId);
-        checkProviderId(request.idempotencyKey, "idempotencyKey");
-        checkNumber(request.from, "from");
-        checkNumber(request.to, "to");
-        const key = `${request.organizationId}|${request.idempotencyKey}`;
-        const existing = placed.get(key);
-        if (existing !== undefined) {
-          const first = calls.get(existing);
-          if (first && (first.to !== request.to || first.from !== request.from)) {
-            invalid2("idempotencyKey: it was used for another call, so it");
-          }
-          return { providerCallId: existing, created: false };
-        }
-        const script = scripts.get(request.to) ?? { kind: "answers" };
-        const call = {
-          organizationId: request.organizationId,
-          providerCallId: nextId("memcall-"),
-          callId: request.callId,
-          direction: "outbound",
-          state: "connected",
-          to: request.to,
-          from: request.from,
-          script,
-          disclosure: null,
-          bridgedTo: null,
-          recordingId: null,
-          streamId: null,
-          ringing: null,
-          endedBy: null
-        };
-        calls.set(call.providerCallId, call);
-        placed.set(key, call.providerCallId);
-        record("placeCall", call.providerCallId);
-        emit(call, "ringing");
-        if (script.kind === "no_answer") {
-          call.state = "ended";
-          emit(call, "no_answer", { failureReason: "no_answer" });
-        } else if (script.kind === "busy") {
-          call.state = "ended";
-          emit(call, "busy", { failureReason: "busy" });
-        } else if (script.kind === "carrier_failure" && (script.when ?? "dial") === "dial") {
-          fail(call, script.reason ?? "carrier_rejected");
-        } else {
-          emit(call, "answered");
-        }
-        return { providerCallId: call.providerCallId, created: true };
+      return run("placeCall", opts, () => dial(request, false));
+    },
+    placeAgentCall(request, opts) {
+      return run("placeAgentCall", opts, () => {
+        checkDestinationUrl(request.streamUrl, allowPlainSocket);
+        checkDetectionWindow(request.detectionWindowMs);
+        return dial(request, true);
       });
     },
     answerCall(request, opts) {
@@ -1971,11 +1995,18 @@ function createMemoryTelephony(options = {}) {
         recordingId: null,
         streamId: null,
         ringing: null,
+        agent: false,
         endedBy: null
       };
       calls.set(call.providerCallId, call);
       emit(call, "ringing");
       return call.providerCallId;
+    },
+    ring(organizationId, providerCallId) {
+      const call = find(organizationId, providerCallId);
+      if (call.state === "ringing") {
+        play(call);
+      }
     },
     prospectHangsUp(organizationId, providerCallId) {
       const call = find(organizationId, providerCallId);

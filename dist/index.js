@@ -92,7 +92,7 @@ import {
   MAX_DIMENSIONS2,
   MAX_ATTRIBUTES2,
   MAX_ATTRIBUTE_STRING2
-} from "./shared/chunk-hwsmd58n.js";
+} from "./shared/chunk-z7321nev.js";
 import {
   systemClock2,
   createFixedClock2,
@@ -136,6 +136,7 @@ import {
   MAX_DISCLOSURE_TEXT_LENGTH2,
   MAX_RING_LEGS2,
   MAX_WEBHOOK_BODY_BYTES2,
+  MAX_DETECTION_WINDOW_MS2,
   TRANSCRIBER_ERROR_CODES2,
   TranscriberError2,
   MAX_CLIENT_REFERENCE_LENGTH2,
@@ -155,7 +156,7 @@ import {
   checkTranscriptionResult2,
   TTS_ERROR_CODES2,
   TtsError2
-} from "./shared/chunk-y4v94n67.js";
+} from "./shared/chunk-kqsgrawe.js";
 import {
   STORAGE_ERROR_CODES2,
   StorageError2,
@@ -3094,6 +3095,9 @@ function createTwilioTelephony(options) {
     return new TelephonyError2(TELEPHONY_ERROR_CODES2.callEnded, "The call is not in progress");
   }
   return {
+    async placeAgentCall() {
+      throw new TelephonyError2(TELEPHONY_ERROR_CODES2.rejected, "Agent-leg calls are not supported by this adapter yet");
+    },
     async placeCall(request, opts) {
       const organizationId = checkOrganizationId2(request.organizationId);
       const callId = checkCallId(request.callId);
@@ -5620,6 +5624,7 @@ export {
   MAX_CHANNELS2 as MAX_CHANNELS,
   MAX_CLIENT_REFERENCE_LENGTH2 as MAX_CLIENT_REFERENCE_LENGTH,
   MAX_DELETE_BATCH2 as MAX_DELETE_BATCH,
+  MAX_DETECTION_WINDOW_MS2 as MAX_DETECTION_WINDOW_MS,
   MAX_DIMENSIONS2 as MAX_DIMENSIONS,
   MAX_DISCLOSURE_TEXT_LENGTH2 as MAX_DISCLOSURE_TEXT_LENGTH,
   MAX_EVENT_ATTENDEES2 as MAX_EVENT_ATTENDEES,
